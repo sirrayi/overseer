@@ -21,3 +21,23 @@ class ProviderError(OverseerError):
 
 class RedactionError(OverseerError):
     """Redaction failed (should never happen; defensive)."""
+
+
+class ProviderError(OverseerError):
+    """Model provider call failed (network, auth, malformed response)."""
+
+
+class ToolError(OverseerError):
+    """A tool failed to execute (missing file, bad args, command failure)."""
+
+
+class ApprovalDenied(OverseerError):
+    """An action was blocked by the approval gate (denylist or user denial)."""
+
+
+class Timeout(OverseerError):
+    """A provider call or tool execution exceeded its time budget."""
+
+
+class BudgetExceeded(OverseerError):
+    """The agent loop exceeded its token/cost budget."""
