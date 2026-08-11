@@ -72,6 +72,12 @@ ignore = ["S101"]  # allow assert in tests
 "tests/*" = ["S101"]
 # vault.py holds markdown template strings; E501/W291 apply to rendered content.
 "src/overseer/vault.py" = ["E501", "W291"]
+# Tests use /tmp as a scratch root (S108) — sandboxed by pytest tmp_path semantics.
+"tests/test_tools.py" = ["S108"]
+"tests/test_approval.py" = ["S108"]
+"tests/test_providers.py" = ["S108"]
+# terminal tool is a shell by design; gated by the approval gate (S602).
+"src/overseer/tools/terminal.py" = ["S602"]
 
 [tool.mypy]
 python_version = "3.11"

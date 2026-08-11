@@ -16,15 +16,12 @@ class VaultError(OverseerError):
 
 
 class ProviderError(OverseerError):
-    """Model provider configuration is missing or invalid."""
+    """Model provider configuration is missing, invalid, or a call failed
+    (network, auth, malformed response)."""
 
 
 class RedactionError(OverseerError):
     """Redaction failed (should never happen; defensive)."""
-
-
-class ProviderError(OverseerError):
-    """Model provider call failed (network, auth, malformed response)."""
 
 
 class ToolError(OverseerError):
