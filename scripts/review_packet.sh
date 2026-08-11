@@ -106,9 +106,9 @@ else
   echo "gitleaks not installed locally; CI runs it (see 09 + 13)" > "$OUT/10-gitleaks.txt"
 fi
 
-# 11 — pip-audit local output
-if command -v pip-audit >/dev/null 2>&1; then
-  uv export --no-dev 2>/dev/null | pip-audit -r /dev/stdin 2>&1 | tail -20 > "$OUT/11-pip-audit.txt" || true
+# 11 — pip-audit local output (audit the locked dependency set)
+if command -v uv >/dev/null 2>&1; then
+  uv run pip-audit 2>&1 | tail -20 > "$OUT/11-pip-audit.txt" || true
 else
   echo "pip-audit not installed locally; CI runs it (see 09 + 13)" > "$OUT/11-pip-audit.txt"
 fi
@@ -135,7 +135,7 @@ fi
 } > "$OUT/12-evidence.txt"
 
 # 13 — CI run URL
-gh run list --limit 1 --json databaseId,status,conclusion,displayTitle --jq '"https://github.com/sirrayi/overseer/actions/runs/" + .[0].databaseId + " — " + .[0].status + " / " + (.0.conclusion // "pending")' 2>/dev/null > "$OUT/13-ci-url.txt" || echo "gh unavailable" > "$OUT/13-ci-url.txt"
+gh run list --limit 1 --json databaseId,status,conclusion,displayTitle --jq '"https://github.com/sirrayi/overseer/actions/runs/" + (.[0].databaseId | tostring) + " — " + .[0].status + " / " + (.[0].conclusion // "pending")' 2>/dev/null > "$OUT/13-ci-url.txt" || echo "gh unavailable" > "$OUT/13-ci-url.txt"
 
 # 14 — this script (verbatim)
 git show HEAD:scripts/review_packet.sh 2>/dev/null > "$OUT/14-review-packet.sh" || cp "$0" "$OUT/14-review-packet.sh"
