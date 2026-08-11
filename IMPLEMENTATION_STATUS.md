@@ -9,7 +9,8 @@
 |---|---|---|
 | B0 Foundation | APPROVED | Qwen round 1: 10 critical/25 major/10 minor — all fixed, packet rebuilt verbatim, resubmitted. Round 2: APPROVED (upload corruption identified as the mangling cause, not the code). |
 | B1 Robot Body | APPROVED | Qwen round 2: verified live repo — symlink containment, denylist hardening, streaming, trust labels, structured denial all confirmed. 126 tests. |
-| B2 CLI + Sessions | IN PROGRESS (slices 1-3 done) | session store (create/resume/list/export), agent streaming, full CLI (chat/run/model/tools/config/sessions/trace/export/doctor), approval UX, stubs. 155 tests. CI green. |
+| B2 CLI + Sessions | APPROVED | Qwen: verified live repo at ea21c91 — session lifecycle, streaming, CLI surface, stubs, safety, efficiency all confirmed. 3 minor notes carried into B3 (all fixed). |
+| B3 Episodic Memory | IN PROGRESS (slices 1-4 done) | episodic store (SQLite WAL + FTS5), observation stream, vault session notes, search/rebuild CLI. 175 tests. CI green. |
 | B2 CLI | pending | full command surface, sessions, budget display |
 | B3 Episodic Memory | pending | observation stream, FTS5, session notes |
 | B4 Verification + Repo Intelligence | pending | project detection, repo maps, targeted tests, rollback |
@@ -183,6 +184,48 @@
 - test streaming provider was stateless (replayed events) -> stateful batches
 - gitleaks flagged new test files (fake keys) -> allowlist extended
 
+## B3 — Episodic Memory & Observation Stream (in progress)
+
+### Slices done (committed + pushed)
+- **Slice 1** (349a9a6): episodic.py — Event schema (type/session_id/trace_id/ts/
+  tool_name/content), EpisodicStore (SQLite WAL + busy_timeout + FTS5, append/
+  append_many/search/rebuild/count/close), redaction before write, thread lock
+  (sqlite3 connections are not thread-safe). 12 tests.
+- **Slice 2** (349a9a6): session.py — SessionStore owns an EpisodicStore; append
+  mirrors messages into the stream; observe_tool_call/observe_approval/
+  observe_error; transcript switched to true append mode (NOTE-01); provider
+  field on Session/Meta for cost (NOTE-02).
+- **Slice 3** (349a9a6): agent.py — observer hook (event_type, payload) fired for
+  tool calls (FINAL accumulated args, NOTE-03), approvals (allowed bool), and
+  errors. Loop stays store-agnostic; CLI wires it.
+- **Slice 4** (349a9a6): cli.py — sessions search <query> (FTS5 table),
+  sessions rebuild (derived-cache rule), _write_session_note vault bridge
+  (10-Sessions/, frontmatter validated, status mapped to vault vocabulary),
+  _session_cost provider-aware (NOTE-02). 6 tests.
+
+### B3 done-when status
+- [x] Observation stream: user/assistant/tool-call/tool-result/approval/error events
+- [x] Append-only events with timestamps, session IDs, trace IDs
+- [x] Redaction before disk (events, SQLite, vault notes)
+- [x] Episodic store: SQLite WAL + FTS5, .overseer/episodic.sqlite (derived cache)
+- [x] Rebuild from raw transcripts (deleting the DB loses nothing)
+- [x] Session note generation: 10-Sessions/, valid frontmatter, summary not dump
+- [x] Search: overseer search <query> (FTS5, session IDs + snippets)
+- [x] Efficiency: meta.json listing preserved, batch inserts, no full-DB loads
+- [x] Concurrency: WAL + busy_timeout + thread lock, concurrent append test
+- [x] NOTE-01: transcript true append mode (O(1) per append)
+- [x] NOTE-02: provider-aware cost via _cost_for
+- [x] NOTE-03: final accumulated tool calls only (no delta flooding)
+
+### B3 bugs found & fixed (bug-hunt pass)
+- sqlite3 connection shared across threads -> SystemError -> RLock guard
+- EV_SYSTEM missing from session.py import -> added
+- vault session status vocabulary (active/accepted/rejected/deprecated) vs
+  session status (done/error) -> mapped in _write_session_note
+- Runtime dataclass missing _current_session -> added (mypy)
+- test fake Cfg missing vault_path -> added
+- S112 try-except-continue in rebuild -> log + continue
+
 ## Next
-- B2 remaining: none blocking. Ready for Qwen review.
-- Then B3 Episodic Memory (observation stream, FTS5, session notes).
+- B3 remaining: none blocking. Ready for Qwen review.
+- Then B4 Verification + Repo Intelligence (project detection, repo maps, targeted tests, rollback).
