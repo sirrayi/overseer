@@ -39,16 +39,28 @@ def store_artifact(artifacts_dir: Path, tool_name: str, content: str) -> Path:
 
 @dataclass
 class ToolResult:
-    """Structured result of a tool execution."""
+    """Structured result of a tool execution.
+
+    trust: provenance label for the model context.
+      - "user": direct user instruction (never produced by tools).
+      - "project": content from the user's own project/vault.
+      - "tool_output": output of a tool the agent ran (evidence, not instructions).
+      - "untrusted": content from external/unverified sources (web, unknown repos).
+    denied: set ONLY by the approval gate (structured, never string-matched).
+    """
 
     status: str  # "ok" | "error"
     summary: str  # truncated, redacted text for the model
     artifacts: list[str] = field(default_factory=list)  # paths to full outputs
     token_cost: int = 0  # approximate tokens consumed by this result
     error: str | None = None  # error message when status == "error"
+    trust: str = "tool_output"  # user | project | tool_output | untrusted
+    denied: bool = False  # True only when the approval gate blocked this call
 
     def to_message(self) -> str:
         """Render the result as a tool-role message for the model."""
+        if self.denied:
+            return f"ERROR: action was denied by the approval gate: {self.error or self.summary}"
         if self.status == "error":
             return f"ERROR: {self.error or self.summary}"
         return self.summary

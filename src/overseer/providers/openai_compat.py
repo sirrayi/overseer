@@ -13,8 +13,9 @@ from typing import Any
 import httpx
 
 from overseer.errors import ProviderError, Timeout
-from overseer.providers.base import ChatMessage, ChatResult, Provider, ToolCall
+from overseer.providers.base import ChatMessage, ChatResult, Provider, StreamEvent, ToolCall
 from overseer.providers.registry import register_provider
+from overseer.redact import redact
 
 DEFAULT_TIMEOUT = 60.0
 
@@ -112,8 +113,9 @@ class OpenAICompatProvider(Provider):
             raise ProviderError(f"provider {self.name} request failed: {exc}") from exc
 
         if resp.status_code >= 400:
+            # Redact the body: provider errors can echo request headers/keys.
             raise ProviderError(
-                f"provider {self.name} returned HTTP {resp.status_code}: {resp.text[:300]}"
+                f"provider {self.name} returned HTTP {resp.status_code}: {redact(resp.text[:300])}"
             )
 
         try:
@@ -144,6 +146,99 @@ class OpenAICompatProvider(Provider):
             return ChatResult(content=content, tool_calls=tool_calls, usage=usage)
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError(f"provider {self.name} returned malformed response: {exc}") from exc
+
+    def stream(
+        self,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Stream a response as an iterator of StreamEvent.
+
+        Handles: partial tool-call argument deltas (accumulated by index),
+        malformed SSE/JSON (skipped, never crashes), timeouts, and
+        cancellation (generator close releases the connection). Error
+        messages are redacted before raising.
+        """
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": self._to_wire(messages),
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+        if kwargs:
+            payload.update(kwargs)
+
+        def _iter() -> Any:
+            # Accumulators for tool-call deltas, keyed by index.
+            acc: dict[int, dict[str, Any]] = {}
+            try:
+                with self._client_sync().stream("POST", "/chat/completions", json=payload) as resp:
+                    if resp.status_code >= 400:
+                        body = redact(resp.text[:300])
+                        raise ProviderError(
+                            f"provider {self.name} returned HTTP {resp.status_code}: {body}"
+                        )
+                    for line in resp.iter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except ValueError:
+                            continue  # malformed chunk: skip, don't crash
+                        try:
+                            delta = chunk["choices"][0]["delta"]
+                        except (KeyError, IndexError, TypeError):
+                            continue
+                        if delta.get("content"):
+                            yield StreamEvent(type="delta", content=delta["content"])
+                        for tc in delta.get("tool_calls") or []:
+                            idx = tc.get("index", 0)
+                            slot = acc.setdefault(idx, {"id": "", "name": "", "args": ""})
+                            if tc.get("id"):
+                                slot["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                slot["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                slot["args"] += fn["arguments"]
+                            # Emit the accumulated call (lenient parse).
+                            try:
+                                parsed = json.loads(slot["args"]) if slot["args"] else {}
+                            except ValueError:
+                                parsed = {}
+                            yield StreamEvent(
+                                type="tool_call_delta",
+                                tool_call=ToolCall(
+                                    id=slot["id"], name=slot["name"], arguments=parsed
+                                ),
+                            )
+                    # Final complete tool calls + usage.
+                    for idx in sorted(acc):
+                        slot = acc[idx]
+                        try:
+                            parsed = json.loads(slot["args"]) if slot["args"] else {}
+                        except ValueError:
+                            parsed = {}
+                        yield StreamEvent(
+                            type="tool_call_delta",
+                            tool_call=ToolCall(id=slot["id"], name=slot["name"], arguments=parsed),
+                        )
+                    yield StreamEvent(type="done")
+            except httpx.TimeoutException as exc:
+                raise Timeout(
+                    f"provider {self.name} stream timed out after {self.timeout}s"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise ProviderError(
+                    f"provider {self.name} stream failed: {redact(str(exc))}"
+                ) from exc
+
+        return _iter()
 
     def close(self) -> None:
         if self._client is not None:

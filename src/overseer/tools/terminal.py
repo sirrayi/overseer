@@ -12,6 +12,7 @@ import subprocess  # nosec B404 — terminal tool is a shell by design, gated by
 from pathlib import Path
 from typing import Any
 
+from overseer.redact import redact
 from overseer.tools.base import Tool, ToolContext, ToolResult, store_artifact
 from overseer.tools.registry import register_tool
 
@@ -66,10 +67,12 @@ class TerminalTool(Tool):
             output += f"\n[stderr]\n{proc.stderr}"
         output = output[:MAX_OUTPUT_CHARS]
 
+        # Artifacts are redacted too — raw output can leak secrets into later
+        # exports, session notes, or retrieval (Qwen review: artifact leakage).
         artifact = store_artifact(
             context.artifacts_dir if context else Path(".overseer/artifacts"),
             self.name,
-            output,
+            redact(output),
         )
         status = "ok" if proc.returncode == 0 else "error"
         summary = f"exit={proc.returncode}\n{output}"

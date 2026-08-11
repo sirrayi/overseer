@@ -49,6 +49,22 @@ class ChatResult:
         return bool(self.tool_calls)
 
 
+@dataclass
+class StreamEvent:
+    """One event from a streaming provider response.
+
+    - type="delta": incremental text content.
+    - type="tool_call_delta": a tool call (possibly partial; the final event
+      for a call carries the complete accumulated arguments).
+    - type="done": stream finished; carries usage when available.
+    """
+
+    type: str  # "delta" | "tool_call_delta" | "done"
+    content: str = ""
+    tool_call: ToolCall | None = None
+    usage: dict[str, int] = field(default_factory=dict)
+
+
 class Provider:
     """Base class for model providers. Subclasses implement `complete`."""
 
@@ -64,6 +80,21 @@ class Provider:
         """Send messages, return the model's response.
 
         Raises ProviderError on network/auth/malformed-response failures.
+        """
+        raise NotImplementedError
+
+    def stream(
+        self,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Stream a response as an iterator of StreamEvent.
+
+        Must be safe against: partial tool-call deltas, malformed SSE/JSON
+        (skip, don't crash), timeouts, and cancellation (closing the iterator
+        releases the connection). Errors raise ProviderError with redacted
+        messages. Subclasses implement this.
         """
         raise NotImplementedError
 

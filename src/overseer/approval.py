@@ -21,22 +21,33 @@ from typing import Any
 from overseer.errors import ApprovalDenied
 
 # Commands that are always blocked, regardless of approval.
+# Normalized (whitespace-collapsed) before matching, so shell tricks like
+# "rm  -rf  /" or "rm -r -f /" cannot bypass the patterns.
 DENYLIST_PATTERNS: list[str] = [
-    r"^\s*rm\s+-rf\s+/\s*$",  # rm -rf /
-    r"^\s*rm\s+-rf\s+~?\s*$",  # rm -rf ~
-    r"^\s*rm\s+-rf\s+\.\s*$",  # rm -rf .
-    r"^\s*shutdown\b",
-    r"^\s*reboot\b",
-    r"^\s*halt\b",
-    r"^\s*poweroff\b",
-    r"^\s*:\(\)\s*\{",  # fork bomb
-    r"^\s*dd\s+if=.*of=/dev/",  # dd to raw device
-    r"^\s*mkfs\b",
-    r"^\s*format\b",
-    r"^\s*diskutil\s+erase",
-    r"^\s*sudo\s+rm\b",
-    r"^\s*git\s+push\s+--force",
-    r"^\s*chmod\s+-R\s+777\s+/",
+    r"^rm\s+(-[a-z]*r[a-z]*\s+)*-[a-z]*f[a-z]*\s+/$",  # rm -rf / (any flag order)
+    r"^rm\s+(-[a-z]*r[a-z]*\s+)*-[a-z]*f[a-z]*\s+~/?$",  # rm -rf ~
+    r"^rm\s+(-[a-z]*r[a-z]*\s+)*-[a-z]*f[a-z]*\s+\.$",  # rm -rf .
+    r"^rm\s+(-[a-z]*r[a-z]*\s+)*-[a-z]*f[a-z]*\s+\$\{?HOME\}?/?$",  # rm -rf $HOME
+    r"^shutdown\b",
+    r"^reboot\b",
+    r"^halt\b",
+    r"^poweroff\b",
+    r"^:\(\)\s*\{",  # fork bomb
+    r"^dd\s+if=.*of=/dev/",  # dd to raw device
+    r"^mkfs\b",
+    r"^format\b",
+    r"^diskutil\s+erase",
+    r"^sudo\s+rm\b",
+    r"^git\s+push\s+(-f|--force|--force-with-lease)\b",  # force push variants
+    r"^chmod\s+(-R\s+)?777\s+/",  # chmod -R 777 /
+    r"^bash\s+(-c|-lc)\s+['\"]?rm\s+",  # bash -c "rm ..."
+    r"^sh\s+(-c|-lc)\s+['\"]?rm\s+",
+    r"^eval\s+",  # eval anything
+    r"^curl\s+.*\|\s*(ba)?sh\b",  # curl | sh
+    r"^wget\s+.*\|\s*(ba)?sh\b",  # wget | sh
+    r"^base64\s+(-d|--decode).*\|\s*(ba)?sh\b",  # base64 -d | sh
+    r"^python3?\s+-c\s+['\"].*rm\s+",  # python -c "...rm..."
+    r"^perl\s+-e\s+['\"].*rm\s+",
 ]
 
 # Commands auto-approved without prompting.
@@ -108,13 +119,19 @@ class ApprovalPolicy:
     def _matches(self, patterns: list[str], text: str) -> bool:
         return any(re.search(p, text) for p in patterns)
 
+    @staticmethod
+    def _normalize(command: str) -> str:
+        """Collapse whitespace so 'rm  -rf  /' matches 'rm -rf /'."""
+        return re.sub(r"\s+", " ", command).strip()
+
     def check_command(self, command: str) -> str:
         """Classify a command: 'allow' | 'deny' | 'risky'."""
-        if self._matches(self.denylist, command):
+        normalized = self._normalize(command)
+        if self._matches(self.denylist, normalized):
             return "deny"
-        if self._matches(self.allowlist, command):
+        if self._matches(self.allowlist, normalized):
             return "allow"
-        if self._matches(self.risky, command):
+        if self._matches(self.risky, normalized):
             return "risky"
         return "allow"  # unknown commands default to allow (documented)
 

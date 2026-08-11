@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from overseer.errors import ProviderError
@@ -279,3 +280,140 @@ def test_openai_compat_malformed_tool_arguments(monkeypatch):
     p = OpenAICompatProvider(base_url="https://api.example.com/v1", model="m")
     result = p.complete([ChatMessage(role="user", content="hi")])
     assert result.tool_calls[0].arguments == {}
+
+
+# --- streaming -------------------------------------------------------------
+
+
+class _FakeStreamResp:
+    """Simulates an httpx streaming response with SSE lines."""
+
+    def __init__(self, lines: list[str], status_code: int = 200, text: str = ""):
+        self._lines = lines
+        self.status_code = status_code
+        self.text = text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def iter_lines(self):
+        yield from self._lines
+
+
+def _stream_client(monkeypatch, resp):
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def stream(self, method, url, json=None):
+            return resp
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("overseer.providers.openai_compat.httpx.Client", _FakeClient)
+
+
+def test_stream_normal_text(monkeypatch):
+    from overseer.providers.openai_compat import OpenAICompatProvider
+
+    _stream_client(
+        monkeypatch,
+        _FakeStreamResp(
+            [
+                'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+                'data: {"choices":[{"delta":{"content":"lo"}}]}',
+                "data: [DONE]",
+            ]
+        ),
+    )
+    p = OpenAICompatProvider(base_url="https://api.example.com/v1", model="m")
+    events = list(p.stream([ChatMessage(role="user", content="hi")]))
+    deltas = [e.content for e in events if e.type == "delta"]
+    assert "".join(deltas) == "Hello"
+    assert events[-1].type == "done"
+
+
+def test_stream_partial_tool_call_deltas(monkeypatch):
+    """Tool-call arguments arrive in fragments; must accumulate correctly."""
+    from overseer.providers.openai_compat import OpenAICompatProvider
+
+    _stream_client(
+        monkeypatch,
+        _FakeStreamResp(
+            [
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+                '"function":{"name":"list_dir","arguments":""}}]}}]}',
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                '"function":{"arguments":"{\\"path\\":"}}]}}]}',
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                '"function":{"arguments":"\\"/tmp\\"}"}}]}}]}',
+                "data: [DONE]",
+            ]
+        ),
+    )
+    p = OpenAICompatProvider(base_url="https://api.example.com/v1", model="m")
+    events = list(p.stream([ChatMessage(role="user", content="list")]))
+    calls = [e.tool_call for e in events if e.type == "tool_call_delta" and e.tool_call]
+    assert calls[-1].name == "list_dir"
+    assert calls[-1].arguments == {"path": "/tmp"}
+
+
+def test_stream_malformed_sse_skipped(monkeypatch):
+    """Malformed chunks must be skipped, never crash the stream."""
+    from overseer.providers.openai_compat import OpenAICompatProvider
+
+    _stream_client(
+        monkeypatch,
+        _FakeStreamResp(
+            [
+                "data: {not json",
+                "not-a-data-line",
+                'data: {"choices":[{"delta":{"content":"ok"}}]}',
+                "data: [DONE]",
+            ]
+        ),
+    )
+    p = OpenAICompatProvider(base_url="https://api.example.com/v1", model="m")
+    events = list(p.stream([ChatMessage(role="user", content="hi")]))
+    assert any(e.type == "delta" and e.content == "ok" for e in events)
+
+
+def test_stream_http_error_redacted(monkeypatch):
+    """Streaming HTTP errors must be redacted (no secret leakage)."""
+    from overseer.providers.openai_compat import OpenAICompatProvider
+
+    _stream_client(
+        monkeypatch,
+        _FakeStreamResp(
+            [], status_code=401, text="invalid key sk-1234567890abcdef1234567890abcdef"
+        ),
+    )
+    p = OpenAICompatProvider(base_url="https://api.example.com/v1", model="m")
+    with pytest.raises(ProviderError) as excinfo:
+        list(p.stream([ChatMessage(role="user", content="hi")]))
+    assert "sk-1234567890abcdef1234567890abcdef" not in str(excinfo.value)
+    assert "401" in str(excinfo.value)
+
+
+def test_stream_provider_failure_raises(monkeypatch):
+    """Network failure during streaming raises ProviderError, not a crash."""
+    from overseer.providers.openai_compat import OpenAICompatProvider
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def stream(self, method, url, json=None):
+            raise httpx.ConnectError("connection refused")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("overseer.providers.openai_compat.httpx.Client", _FakeClient)
+    p = OpenAICompatProvider(base_url="https://api.example.com/v1", model="m")
+    with pytest.raises(ProviderError, match="stream failed"):
+        list(p.stream([ChatMessage(role="user", content="hi")]))

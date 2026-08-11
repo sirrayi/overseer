@@ -180,3 +180,41 @@ def test_terminal_timeout_capped(tmp_path):
     result = reg.dispatch("terminal", {"command": "sleep 1", "timeout": 999}, ctx)
     assert result.status == "error"
     assert "capped" in (result.error or "")
+
+
+def test_symlink_escape_blocked(tmp_path):
+    """A symlink inside the root pointing outside must not allow writes (Qwen)."""
+    outside = tmp_path.parent / "outside-target"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "link").symlink_to(outside, target_is_directory=True)
+    reg = _registry(tmp_path)
+    ctx = _ctx(tmp_path)
+    result = reg.dispatch("file_write", {"path": "link/evil.txt", "content": "x"}, ctx)
+    assert result.status == "error"
+    assert not (outside / "evil.txt").exists()
+
+
+def test_trust_label_on_tool_results(tmp_path):
+    """Tool results must carry trust metadata (Qwen: untrusted-content labeling)."""
+    reg = _registry(tmp_path)
+    ctx = _ctx(tmp_path)
+    write = reg.dispatch("file_write", {"path": "a.txt", "content": "x"}, ctx)
+    assert write.trust == "tool_output"
+    read = reg.dispatch("file_read", {"path": "a.txt"}, ctx)
+    assert read.trust == "tool_output"
+    listing = reg.dispatch("list_dir", {"path": str(tmp_path)}, ctx)
+    assert listing.trust == "tool_output"
+
+
+def test_terminal_artifact_redacted(tmp_path):
+    """Artifacts must be redacted too — no secret leakage via artifacts (Qwen)."""
+    reg = _registry(tmp_path)
+    ctx = _ctx(tmp_path, approver=lambda tool, args: True)
+    result = reg.dispatch(
+        "terminal", {"command": "echo 'key=sk-1234567890abcdef1234567890abcdef'"}, ctx
+    )
+    assert result.status == "ok"
+    assert result.artifacts
+    artifact_text = Path(result.artifacts[0]).read_text(encoding="utf-8")
+    assert "sk-1234567890abcdef1234567890abcdef" not in artifact_text
+    assert "sk-***REDACTED***" in artifact_text
