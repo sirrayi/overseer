@@ -8,7 +8,8 @@
 | Batch | Status | Notes |
 |---|---|---|
 | B0 Foundation | APPROVED | Qwen round 1: 10 critical/25 major/10 minor — all fixed, packet rebuilt verbatim, resubmitted. Round 2: APPROVED (upload corruption identified as the mangling cause, not the code). |
-| B1 Robot Body | IN PROGRESS (round 2 fixes done) | slices 1-4 + streaming, trust labels, structured denial, denylist hardening, symlink containment, artifact redaction, loop robustness. 126 tests. CI green. |
+| B1 Robot Body | APPROVED | Qwen round 2: verified live repo — symlink containment, denylist hardening, streaming, trust labels, structured denial all confirmed. 126 tests. |
+| B2 CLI + Sessions | IN PROGRESS (slices 1-3 done) | session store (create/resume/list/export), agent streaming, full CLI (chat/run/model/tools/config/sessions/trace/export/doctor), approval UX, stubs. 155 tests. CI green. |
 | B2 CLI | pending | full command surface, sessions, budget display |
 | B3 Episodic Memory | pending | observation stream, FTS5, session notes |
 | B4 Verification + Repo Intelligence | pending | project detection, repo maps, targeted tests, rollback |
@@ -131,6 +132,57 @@
 - duplicate ProviderError class -> deduped
 - gitleaks-action config_path input invalid -> removed (auto-detect)
 
+## B2 — CLI & Session Experience (in progress)
+
+### Slices done (committed + pushed)
+- **Slice 1** (13d0c93): session.py — SessionStore (create/load/append/list/export),
+  atomic append (temp carry-over), meta-only listing, redacted markdown export,
+  microsecond timestamps for deterministic sort. 11 tests.
+- **Slice 2** (13d0c93): agent streaming — run(stream=True) consumes Provider.stream()
+  (text deltas via stream_callback, tool-call deltas accumulated), falls back to
+  complete() when a provider has no streaming path, mid-stream failure falls back
+  down the chain. 4 tests.
+- **Slice 3** (13d0c93): cli.py rewrite — chat (interactive, streaming, resume),
+  run (one-shot), model (inspect/set, secrets never shown), tools (table),
+  config (view/validate), sessions (meta table), trace (redacted transcript),
+  export (redacted markdown), doctor (provider-wired), init (restored),
+  stubs (memory→B5, skills→B7, cron→refused). Approval UX: exact command/path +
+  risk reason + approve/deny prompt, decisions logged to .overseer/logs/approvals.log.
+  14 tests.
+- **Slice 4** (13d0c93): providers/factory.py (build_provider, no guessed endpoints),
+  providers/__init__.py imports openai_compat so registration runs (real bug found
+  by smoke test), sample config uses openai-compat + example base_url. README
+  quickstart + command table.
+
+### B2 done-when status
+- [x] chat: interactive session with the agent loop (streaming, resume)
+- [x] run: non-interactive single task
+- [x] model: inspect/switch provider config (no secrets)
+- [x] tools: list registered tools and schemas
+- [x] config: view/validate safely
+- [x] sessions: list/resume/export
+- [x] doctor: wired to provider system
+- [x] version + root --version: verified
+- [x] trace: inspect session transcript by ID
+- [x] stubs: memory (B5), skills (B7), cron (refused, B10)
+- [x] session lifecycle: unique IDs, persist, resume (no dup), export (redacted)
+- [x] budget display: warning at 80%, clear BudgetExceeded errors
+- [x] approval UX: exact command/path + risk reason + approve/deny + logged
+- [x] streaming UX: tokens as they arrive, mid-stream cancellation (Ctrl+C),
+      mid-stream provider failure (fallback chain)
+- [x] safety: redact all display/export, config never shows values
+- [x] efficiency: lazy imports, version/doctor never import agent/providers,
+      sessions list reads meta only
+
+### B2 bugs found & fixed (bug-hunt pass)
+- session append wiped prior events (temp file didn't carry transcript) -> fixed
+- session list sort unstable (second-precision timestamps) -> microseconds
+- provider registry empty (openai_compat never imported) -> __init__ imports it
+- sample config named unregistered provider (ollama-cloud) -> openai-compat
+- streaming double-emitted content (callback fired for full text after deltas) -> fixed
+- test streaming provider was stateless (replayed events) -> stateful batches
+- gitleaks flagged new test files (fake keys) -> allowlist extended
+
 ## Next
-- B1 remaining: streaming wiring, untrusted-content labeling, CLI chat/run (B2 overlap).
-- Then B2 CLI + session experience.
+- B2 remaining: none blocking. Ready for Qwen review.
+- Then B3 Episodic Memory (observation stream, FTS5, session notes).
