@@ -9,10 +9,10 @@ import re
 
 # Ordered: longer/more specific patterns first so they win over generic ones.
 _PATTERNS: list[tuple[str, str]] = [
+    # Anthropic-style keys (more specific — must precede generic sk-)
+    (r"sk-ant-[A-Za-z0-9_-]{16,}", "sk-ant-***REDACTED***"),
     # OpenAI-style keys
     (r"sk-[A-Za-z0-9_-]{16,}", "sk-***REDACTED***"),
-    # Anthropic-style keys
-    (r"sk-ant-[A-Za-z0-9_-]{16,}", "sk-ant-***REDACTED***"),
     # GitHub tokens
     (r"gh[pousr]_[A-Za-z0-9]{20,}", "gh***_REDACTED***"),
     # AWS access keys

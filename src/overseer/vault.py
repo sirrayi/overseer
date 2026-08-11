@@ -433,6 +433,46 @@ def _contained(root: Path, candidate: Path) -> Path:
     return resolved
 
 
+def _new_note_id(note_type: str) -> str:
+    """Generate a collision-safe stable note ID: OVR-<TYPE>-<uuid4 hex[:8]>."""
+    prefix = ID_PREFIXES[note_type]
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _validate_frontmatter(note_type: str, meta: dict[str, Any]) -> None:
+    """Enforce type-specific frontmatter governance (plan Part 5, MAJOR-16)."""
+    for field in REQUIRED_FRONTMATTER:
+        if field not in meta:
+            raise VaultError(f"note missing required frontmatter field: {field}")
+
+    statuses = {
+        "active",
+        "superseded",
+        "archived",
+        "draft",
+        "proposed",
+        "accepted",
+        "rejected",
+        "deprecated",
+    }
+    if meta.get("status") not in statuses:
+        raise VaultError(f"invalid status {meta.get('status')!r} (see Ontology)")
+
+    # Type-specific required fields (plan: governed memory).
+    type_required: dict[str, tuple[str, ...]] = {
+        "fact": ("scope", "confidence", "source"),
+        "correction": ("trigger", "mistake", "correction", "rule", "severity"),
+        "proposal": ("proposal_type", "risk", "approval"),
+        "skill": ("trigger", "risk", "use_count", "success_count", "failure_count"),
+        "preference": ("scope", "strength", "source"),
+        "decision": ("context", "alternatives", "consequences"),
+        "project": ("languages", "commands", "conventions", "risks"),
+    }
+    for field in type_required.get(note_type, ()):
+        if field not in meta:
+            raise VaultError(f"{note_type} note missing required frontmatter field: {field}")
+
+
 class Vault:
     """A canonical overseer vault."""
 
@@ -452,6 +492,12 @@ class Vault:
             (self.root / folder).mkdir(parents=True, exist_ok=True)
         for sub in OVERSER_SUBDIRS:
             (self.overseer_dir / sub).mkdir(parents=True, exist_ok=True)
+
+        # .overseer is derived/disposable and may hold secrets — never track it.
+        ov_gitignore = self.overseer_dir / ".gitignore"
+        if not ov_gitignore.exists():
+            _atomic_write(ov_gitignore, "*\n")
+            created.append(ov_gitignore)
 
         stamp = _now()
         defaults = {
@@ -493,13 +539,14 @@ class Vault:
     def write_note(self, note_type: str, title: str, body: str = "", **frontmatter: Any) -> Path:
         """Write an atomic note with stable frontmatter into the right folder.
 
-        Generates a stable ID (OVR-<TYPE>-<6 digits>) and timestamps.
+        Generates a collision-safe stable ID (OVR-<TYPE>-<hex>) and timestamps.
+        Filename includes the ID, so duplicate titles never overwrite each other.
         """
         folder = NOTE_TYPE_FOLDERS.get(note_type)
         if folder is None:
             raise VaultError(f"unknown note type: {note_type!r} (see Ontology)")
-        prefix = ID_PREFIXES[note_type]
-        note_id = f"{prefix}-{uuid.uuid4().int % 1_000_000:06d}"
+
+        note_id = _new_note_id(note_type)
         stamp = _now()
 
         meta: dict[str, Any] = {
@@ -513,13 +560,10 @@ class Vault:
         }
         meta.update(frontmatter)
 
-        # Validate required fields are present and well-formed.
-        for field in REQUIRED_FRONTMATTER:
-            if field not in meta:
-                raise VaultError(f"note missing required frontmatter field: {field}")
+        _validate_frontmatter(note_type, meta)
 
         slug = _slugify(title)
-        rel = Path(folder) / f"{slug}.md"
+        rel = Path(folder) / f"{note_id}-{slug}.md"
         path = _contained(self.root, self.root / rel)
 
         header = yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip()

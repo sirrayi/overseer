@@ -18,6 +18,26 @@ app = typer.Typer(
 console = Console()
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        console.print(f"overseer {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        help="Print version and exit.",
+        is_eager=True,
+        callback=_version_callback,
+    ),
+) -> None:
+    """Overseer — the engine. Everything."""
+
+
 @app.command()
 def init(
     vault_path: str = typer.Option(
@@ -29,11 +49,16 @@ def init(
 ) -> None:
     """Create a compliant vault and sample config (plan Part 3: overseer init)."""
     from overseer.config import write_sample_config
+    from overseer.errors import ConfigError
     from overseer.vault import Vault
 
     vault = Vault(vault_path)
     created = vault.init()
-    write_sample_config(config, vault_path=vault_path)
+    try:
+        write_sample_config(config, vault_path=vault_path)
+    except ConfigError as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
+        console.print("[yellow]config left untouched; vault is ready[/yellow]")
     console.print(f"[green]vault ready:[/green] {vault.root}")
     console.print(f"[green]created {len(created)} system/template notes[/green]")
     console.print(
@@ -49,10 +74,11 @@ def doctor(
     """Validate config, vault, provider, and permissions."""
     from overseer.config import load_config
     from overseer.doctor import run_doctor
+    from overseer.errors import ConfigError
 
     try:
         cfg = load_config(config)
-    except Exception as exc:  # ConfigError
+    except ConfigError as exc:
         console.print(f"[red]config failed to load:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 

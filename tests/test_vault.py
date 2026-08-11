@@ -37,7 +37,14 @@ def test_guardrails_contains_l3_guardrail(tmp_path):
 def test_write_note_creates_valid_frontmatter(tmp_path):
     vault = Vault(tmp_path / "vault")
     vault.init()
-    path = vault.write_note("fact", "Python 3.11 is required", "Overseer requires Python 3.11+.")
+    path = vault.write_note(
+        "fact",
+        "Python 3.11 is required",
+        "Overseer requires Python 3.11+.",
+        scope="project",
+        confidence="high",
+        source="test",
+    )
     assert path.exists()
     text = path.read_text(encoding="utf-8")
     assert text.startswith("---")
@@ -73,9 +80,11 @@ def test_write_note_path_containment(tmp_path):
 def test_list_notes_by_type(tmp_path):
     vault = Vault(tmp_path / "vault")
     vault.init()
-    vault.write_note("fact", "First fact")
-    vault.write_note("fact", "Second fact")
-    vault.write_note("preference", "Short answers")
+    vault.write_note("fact", "First fact", scope="project", confidence="high", source="test")
+    vault.write_note("fact", "Second fact", scope="project", confidence="high", source="test")
+    vault.write_note(
+        "preference", "Short answers", scope="global", strength="medium", source="test"
+    )
     facts = vault.list_notes("fact")
     prefs = vault.list_notes("preference")
     assert len(facts) == 2
@@ -85,5 +94,77 @@ def test_list_notes_by_type(tmp_path):
 def test_slugify_unicode_safe(tmp_path):
     vault = Vault(tmp_path / "vault")
     vault.init()
-    path = vault.write_note("fact", "Ünïcode & special: chars!")
-    assert path.name == "ünïcode-special-chars.md"
+    path = vault.write_note(
+        "fact", "Ünïcode & special: chars!", scope="project", confidence="high", source="test"
+    )
+    assert path.name.endswith("ünïcode-special-chars.md")
+    assert path.name.startswith("OVR-FACT-")
+
+
+def test_duplicate_titles_do_not_overwrite(tmp_path):
+    """Two notes with the same title must coexist (CRITICAL-05)."""
+    vault = Vault(tmp_path / "vault")
+    vault.init()
+    p1 = vault.write_note("fact", "Same title", scope="project", confidence="high", source="test")
+    p2 = vault.write_note("fact", "Same title", scope="project", confidence="high", source="test")
+    assert p1 != p2
+    assert p1.exists() and p2.exists()
+    assert len(vault.list_notes("fact")) == 2
+
+
+def test_note_ids_are_collision_safe(tmp_path):
+    """IDs must be unique and stable (CRITICAL-06)."""
+    vault = Vault(tmp_path / "vault")
+    vault.init()
+    ids = {
+        vault.write_note(
+            "fact", f"Note {i}", scope="project", confidence="high", source="test"
+        ).name.split("-", 3)[2]
+        for i in range(50)
+    }
+    assert len(ids) == 50
+
+
+def test_type_specific_frontmatter_governance(tmp_path):
+    """fact requires scope/confidence/source; correction requires trigger (MAJOR-16)."""
+    vault = Vault(tmp_path / "vault")
+    vault.init()
+    with pytest.raises(VaultError, match="scope"):
+        vault.write_note("fact", "Missing governance")
+    with pytest.raises(VaultError, match="trigger"):
+        vault.write_note("correction", "Missing trigger")
+    # Valid fact passes.
+    path = vault.write_note("fact", "Valid fact", scope="project", confidence="high", source="test")
+    assert path.exists()
+
+
+def test_invalid_status_rejected(tmp_path):
+    vault = Vault(tmp_path / "vault")
+    vault.init()
+    with pytest.raises(VaultError, match="invalid status"):
+        vault.write_note(
+            "fact", "Bad status", status="bogus", scope="x", confidence="high", source="y"
+        )
+
+
+def test_overseer_gitignore_created(tmp_path):
+    """.overseer must never be tracked (MAJOR-15)."""
+    vault = Vault(tmp_path / "vault")
+    vault.init()
+    gi = vault.overseer_dir / ".gitignore"
+    assert gi.exists()
+    assert gi.read_text(encoding="utf-8") == "*\n"
+
+
+def test_all_generated_notes_have_valid_frontmatter(tmp_path):
+    """Every system/template note must parse as frontmatter markdown (CRITICAL-07)."""
+    vault = Vault(tmp_path / "vault")
+    vault.init()
+    for path in vault.root.glob("**/*.md"):
+        text = path.read_text(encoding="utf-8")
+        assert text.startswith("---"), f"{path} missing frontmatter open"
+        parts = text.split("---", 2)
+        assert len(parts) >= 3, f"{path} missing frontmatter close"
+        fm = yaml.safe_load(parts[1])
+        assert isinstance(fm, dict), f"{path} frontmatter not a mapping"
+        assert "id" in fm and "type" in fm, f"{path} missing id/type"

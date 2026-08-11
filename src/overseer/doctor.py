@@ -78,9 +78,17 @@ def _check_permissions(cfg: Config) -> CheckResult:
     vault = Vault(cfg.vault_path)
     if vault.root.exists() and not os.access(vault.root, os.W_OK):
         errors.append(f"vault not writable: {vault.root}")
-    log_dir = Path(cfg.log_dir).expanduser()
-    if log_dir.exists() and not os.access(log_dir, os.W_OK):
-        errors.append(f"log dir not writable: {log_dir}")
+    # .overseer and its subdirs must be writable/creatable (MAJOR-18).
+    for sub in ("logs", "artifacts", "tmp", "secrets", "telemetry.local"):
+        target = vault.overseer_dir / sub
+        if target.exists() and not os.access(target, os.W_OK):
+            errors.append(f".overseer/{sub} not writable: {target}")
+    # Log dir must be creatable, not just existing (MAJOR-17).
+    log_dir = Path(cfg.log_dir).expanduser().resolve()
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        errors.append(f"log dir cannot be created: {log_dir}: {exc}")
     detail = f"vault_writable={not errors}"
     return CheckResult("permissions", not errors, detail, errors)
 
@@ -92,6 +100,8 @@ def _check_provider(cfg: Config) -> CheckResult:
         errors.append("provider.name is empty")
     if not provider.model:
         errors.append("provider.model is empty")
+    if provider.base_url and not str(provider.base_url).startswith(("http://", "https://")):
+        errors.append(f"provider.base_url must be http(s), got {provider.base_url!r}")
     if provider.api_key_env and not os.environ.get(provider.api_key_env):
         errors.append(f"env var {provider.api_key_env} is not set (provider key missing)")
     detail = f"{provider.name}/{provider.model}"

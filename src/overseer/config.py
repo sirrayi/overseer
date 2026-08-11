@@ -68,7 +68,11 @@ class Config(BaseModel):
 
 
 def _env_override(key: str, current: Any) -> Any:
-    """Apply OVERSEEER_* env override for a dotted config key."""
+    """Apply OVERSEER_* env override for a dotted config key.
+
+    OVERSEER_PROVIDER_MODEL overrides provider.model; OVERSEER_POWER_MODE
+    overrides power_mode. Raises ConfigError on malformed values.
+    """
     env_name = ENV_PREFIX + key.upper().replace(".", "_")
     value = os.environ.get(env_name)
     if value is None:
@@ -76,17 +80,24 @@ def _env_override(key: str, current: Any) -> Any:
     if isinstance(current, bool):
         return value.strip().lower() in ("1", "true", "yes", "on")
     if isinstance(current, int):
-        return int(value)
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ConfigError(f"env var {env_name} must be an integer, got {value!r}") from exc
     return value
 
 
-def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
-    """Walk the config dict and apply OVERSEER_* overrides for known keys."""
+def _apply_env_overrides(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Walk the config dict and apply OVERSEER_* overrides for known keys.
+
+    Nested keys use dotted prefixes: provider.model -> OVERSEER_PROVIDER_MODEL.
+    """
     for key in list(data.keys()):
+        dotted = f"{prefix}.{key}" if prefix else key
         if isinstance(data[key], dict):
-            data[key] = _apply_env_overrides(data[key])
+            data[key] = _apply_env_overrides(data[key], prefix=dotted)
         else:
-            data[key] = _env_override(key, data[key])
+            data[key] = _env_override(dotted, data[key])
     return data
 
 
@@ -118,8 +129,14 @@ def load_config(path: str | Path | None = None) -> Config:
         raise ConfigError(f"config validation failed: {exc}") from exc
 
 
-def write_sample_config(path: str | Path, vault_path: str = "~/overseer-vault") -> None:
-    """Write a sample config with placeholders only (no real secrets)."""
+def write_sample_config(path: str | Path, vault_path: str = "~/overseer-vault") -> Path:
+    """Write a sample config with placeholders only (no real secrets).
+
+    Never overwrites an existing config. Returns the path written.
+    """
+    p = Path(path)
+    if p.exists():
+        raise ConfigError(f"config already exists: {p} (refusing to overwrite)")
     sample = {
         "vault_path": vault_path,
         "log_dir": "logs",
@@ -141,3 +158,4 @@ def write_sample_config(path: str | Path, vault_path: str = "~/overseer-vault") 
         + yaml.safe_dump(sample, sort_keys=False),
         encoding="utf-8",
     )
+    return p

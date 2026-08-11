@@ -15,6 +15,12 @@ def test_version():
     assert "overseer" in result.output
 
 
+def test_version_flag():
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0
+    assert "overseer 0.1.0" in result.output
+
+
 def test_init_creates_vault(tmp_path):
     vault = str(tmp_path / "vault")
     result = runner.invoke(

@@ -11,13 +11,18 @@ from overseer.redact import redact
 
 
 class RedactingFormatter(logging.Formatter):
-    """Formatter that redacts secrets from every record before output."""
+    """Formatter that redacts secrets from every record before output.
+
+    Redacts the final formatted string (including exception text), not just
+    the message, so secrets in tracebacks cannot leak.
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         original = record.getMessage()
         record.msg = redact(original)
         record.args = ()
-        return super().format(record)
+        formatted = super().format(record)
+        return redact(formatted)
 
 
 def setup_logging(log_dir: str | Path, level: int = logging.INFO) -> Path:
@@ -25,7 +30,7 @@ def setup_logging(log_dir: str | Path, level: int = logging.INFO) -> Path:
 
     Returns the log file path. Creates the log directory if needed.
     """
-    log_path = Path(log_dir)
+    log_path = Path(log_dir).expanduser().resolve()
     log_path.mkdir(parents=True, exist_ok=True)
     log_file = log_path / "overseer.log"
 

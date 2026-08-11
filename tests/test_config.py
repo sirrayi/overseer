@@ -52,12 +52,31 @@ def test_env_override_bool(tmp_path, monkeypatch):
     assert cfg.live_learning is False
 
 
-def test_env_override_int(tmp_path, monkeypatch):
+def test_env_override_nested_provider(tmp_path, monkeypatch):
+    """OVERSEER_PROVIDER_MODEL must override provider.model (CRITICAL-04)."""
+    p = tmp_path / "config.yaml"
+    p.write_text("provider:\n  model: deepseek-v4-flash\n", encoding="utf-8")
+    monkeypatch.setenv("OVERSEER_PROVIDER_MODEL", "kimi-k3")
+    cfg = load_config(p)
+    assert cfg.provider.model == "kimi-k3"
+
+
+def test_env_override_invalid_int_raises_config_error(tmp_path, monkeypatch):
+    """Malformed int env must raise ConfigError, not ValueError (MAJOR-14)."""
     p = tmp_path / "config.yaml"
     p.write_text("max_tokens_per_turn: 8000\n", encoding="utf-8")
-    monkeypatch.setenv("OVERSEER_MAX_TOKENS_PER_TURN", "4000")
-    cfg = load_config(p)
-    assert cfg.max_tokens_per_turn == 4000
+    monkeypatch.setenv("OVERSEER_MAX_TOKENS_PER_TURN", "not-a-number")
+    with pytest.raises(ConfigError, match="must be an integer"):
+        load_config(p)
+
+
+def test_write_sample_config_refuses_overwrite(tmp_path):
+    """init must never destroy an existing config (MAJOR-12)."""
+    p = tmp_path / "config.yaml"
+    p.write_text("power_mode: eco\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="already exists"):
+        write_sample_config(p)
+    assert p.read_text(encoding="utf-8") == "power_mode: eco\n"
 
 
 def test_sample_config_roundtrip(tmp_path):

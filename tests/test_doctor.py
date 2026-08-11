@@ -67,3 +67,29 @@ def test_doctor_render_mentions_result(tmp_path, monkeypatch):
     cfg = load_config(_write_config(tmp_path))
     report = run_doctor(cfg)
     assert "all checks passed" in report.render()
+
+
+def test_doctor_rejects_bad_base_url(tmp_path, monkeypatch):
+    Vault(tmp_path / "vault").init()
+    monkeypatch.setenv("OVERSEER_API_KEY", "test-key")
+    cfg = load_config(_write_config(tmp_path, provider={"base_url": "not-a-url"}))
+    report = run_doctor(cfg)
+    assert not report.ok
+    assert any("base_url" in e for c in report.checks for e in c.errors)
+
+
+def test_doctor_checks_overseer_subdirs(tmp_path, monkeypatch):
+    """doctor must not false-OK when .overseer subdirs are unwritable (MAJOR-18)."""
+    Vault(tmp_path / "vault").init()
+    monkeypatch.setenv("OVERSEER_API_KEY", "test-key")
+    cfg = load_config(_write_config(tmp_path))
+    # Make .overseer/logs read-only.
+    logs = tmp_path / "vault" / ".overseer" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    logs.chmod(0o500)
+    try:
+        report = run_doctor(cfg)
+        assert not report.ok
+        assert any("logs" in e for c in report.checks for e in c.errors)
+    finally:
+        logs.chmod(0o700)
