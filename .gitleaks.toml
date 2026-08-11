@@ -1,0 +1,11 @@
+# Gitleaks config for overseer.
+# tests/test_redact.py intentionally contains FAKE secret-shaped strings to
+# verify redaction. They are not real secrets — allowlist the file.
+
+[extend]
+useDefault = true
+
+[allowlist]
+paths = [
+  '''tests/test_redact.py''',
+]
