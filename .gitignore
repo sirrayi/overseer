@@ -1,0 +1,48 @@
+# --- Overseer .gitignore ---
+# Secrets — never commit these (plan: security is continuous)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+auth.json
+credentials/
+token.json
+secrets/
+
+# Derived caches — disposable by design (plan: vault is canonical, caches are not)
+.overseer/
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Logs and artifacts
+logs/
+*.log
+artifacts/
+
+# Private project docs — never public (machine audit, recon, personal intel)
+.local-docs/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor noise
+.idea/
+.vscode/
+*.swp

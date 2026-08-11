@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: lint + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Set up Python
+        run: uv python install 3.11
+      - name: Install project
+        run: uv sync --all-extras --dev
+      - name: Lint
+        run: uv run ruff check .
+      - name: Format check
+        run: uv run ruff format --check .
+      - name: Type check
+        run: uv run mypy src/overseer
+      - name: Test
+        run: uv run pytest -q
+      - name: Config validation
+        run: uv run python -c "from overseer.config import load_config; load_config(None)"
+      - name: Vault template validation
+        run: |
+          uv run python - <<'EOF'
+          import tempfile
+          from pathlib import Path
+          from overseer.vault import Vault
+          with tempfile.TemporaryDirectory() as d:
+              v = Vault(Path(d) / 'vault')
+              v.init()
+              assert v.is_vault()
+              print('vault template OK')
+          EOF
+      - name: Secrets gitignore check
+        run: |
+          for f in .env auth.json credentials/ token.json; do
+            if git check-ignore -q "$f" 2>/dev/null; then
+              echo "ignored: $f"
+            else
+              echo "NOT IGNORED: $f" && exit 1
+            fi
+          done
+
+  security:
+    name: security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Dependency audit
+        run: |
+          pip install pip-audit
+          uv export --no-dev > /tmp/overseer-requirements.txt || true
+          pip-audit -r /tmp/overseer-requirements.txt || true
