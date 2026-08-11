@@ -119,9 +119,15 @@ class ApprovalPolicy:
         return "allow"  # unknown commands default to allow (documented)
 
     def check_path(self, path: Path) -> bool:
-        """True if a write to `path` is inside an allowed root."""
+        """True if a write to `path` is inside an allowed root.
+
+        Relative paths resolve against the first allowed root (matching how
+        the file tools resolve them), not against the process CWD.
+        """
         if not self.allowed_roots:
             return False
+        if not path.is_absolute():
+            path = self.allowed_roots[0] / path
         resolved = path.resolve()
         return any(resolved.is_relative_to(r.resolve()) for r in self.allowed_roots)
 

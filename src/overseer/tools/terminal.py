@@ -8,7 +8,7 @@ Security:
 
 from __future__ import annotations
 
-import subprocess
+import subprocess  # nosec B404 — terminal tool is a shell by design, gated by approval
 from pathlib import Path
 from typing import Any
 
@@ -47,9 +47,11 @@ class TerminalTool(Tool):
             return self._error(f"command not approved: {command[:200]}")
 
         try:
+            # nosec B602: this tool IS a shell by design; every command is gated
+            # by the approval policy (denylist/allowlist/risky) before reaching here.
             proc = subprocess.run(
                 command,
-                shell=True,
+                shell=True,  # nosec B602
                 capture_output=True,
                 text=True,
                 timeout=timeout,
