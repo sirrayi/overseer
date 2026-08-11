@@ -7,8 +7,8 @@
 
 | Batch | Status | Notes |
 |---|---|---|
-| B0 Foundation | NEEDS FIXES → FIXED, resubmitted | Qwen review round 1: 10 critical, 25 major, 10 minor. All real findings fixed; packet artifacts identified & packet generator rebuilt verbatim. Resubmitted 2026-08-11. |
-| B1 Robot Body | pending | provider abstraction, agent loop, tool registry, approvals, fallbacks |
+| B0 Foundation | APPROVED | Qwen round 1: 10 critical/25 major/10 minor — all fixed, packet rebuilt verbatim, resubmitted. Round 2: APPROVED (upload corruption identified as the mangling cause, not the code). |
+| B1 Robot Body | IN PROGRESS (slices 1-4 done) | providers + registry + fallbacks, tool registry + 6 core tools, approval gate, agent loop. 103 tests. CI green. |
 | B2 CLI | pending | full command surface, sessions, budget display |
 | B3 Episodic Memory | pending | observation stream, FTS5, session notes |
 | B4 Verification + Repo Intelligence | pending | project detection, repo maps, targeted tests, rollback |
@@ -77,6 +77,42 @@
 - R-03: power_mode/live_learning config placeholders until B8/B4.5 (explicit)
 - R-04: gitleaks allowlists tests/test_redact.py (fake keys only — verified no real secrets)
 
+## B1 — Robot Body (in progress)
+
+### Slices done (committed + pushed)
+- **Slice 1** (5c56eff): providers/ — base adapter (ChatMessage/ChatResult/ToolCall),
+  registry with fallback chains, OpenAI-compatible impl (httpx, tool-call wire format,
+  auth via env var). 12 tests.
+- **Slices 2-3** (b8ee1ab): tools/ — self-registering registry, base Tool + ToolResult
+  (status/summary/artifacts/token_cost), 6 core tools (terminal, file_read, file_write,
+  file_patch, list_dir, grep), approval.py policy engine (denylist > allowlist > risky,
+  path policy). Fail-closed terminal. 30 tests.
+- **Slice 4** (14fbf63): agent.py — AgentLoop state machine (build messages -> call model
+  with fallback -> parse tool calls -> approval-gated dispatch -> append results -> repeat),
+  stop conditions (final_answer/max_iterations/budget/error), APPROVAL_DENIED marker,
+  e2e verified (write+read+artifact+final answer). 11 tests.
+
+### B1 done-when status
+- [x] End-to-end loop completes a real task with tools (e2e test + smoke run)
+- [x] Risky terminal command requires approval (denylist/risky tests)
+- [x] File write outside allowed path requires approval (path policy tests)
+- [x] Tool outputs stored as artifacts and summarized (artifact tests)
+- [x] Basic security checks pass (redaction, containment, fail-closed, bandit/gitleaks clean)
+- [ ] Streaming (provider supports stream_callback; loop wiring pending)
+- [ ] Untrusted-content labeling in system prompt (B1 deliverable, pending)
+- [ ] CLI wiring (B2: overseer chat/run)
+
+### B1 bugs found & fixed (bug-hunt pass)
+- file_read resolved relative paths against CWD, not allowed root -> fixed
+- _resolve raised ToolError out of run() instead of structured error -> fixed
+- terminal failed OPEN without approver -> fail-closed
+- approval gate not enforced for file_write/file_patch in agent dispatch -> fixed
+- approvals_denied never counted (message mismatch) -> APPROVAL_DENIED marker
+- check_path resolved relative paths against CWD -> fixed (allowed_roots[0])
+- unknown tool in _dispatch crashed loop -> error result fed back
+- duplicate ProviderError class -> deduped
+- gitleaks-action config_path input invalid -> removed (auto-detect)
+
 ## Next
-- Resubmit B0 packet to Qwen (round 2).
-- On approval: B1 Robot Body (provider abstraction, agent loop, tool registry, approvals, fallbacks).
+- B1 remaining: streaming wiring, untrusted-content labeling, CLI chat/run (B2 overlap).
+- Then B2 CLI + session experience.
