@@ -13,4 +13,6 @@ paths = [
   '''tests/test_tools.py''',
   '''tests/test_agent.py''',
   '''tests/test_logging.py''',
+  '''tests/test_cli_b2.py''',
+  '''tests/test_session.py''',
 ]
