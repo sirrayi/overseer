@@ -66,8 +66,7 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          config_path: .gitleaks.toml
+        # gitleaks-action auto-detects .gitleaks.toml in the repo root.
       - name: Dependency audit
         run: |
           pip install pip-audit
