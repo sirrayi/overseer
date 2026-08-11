@@ -55,6 +55,9 @@ jobs:
   security:
     name: security scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write  # required for SARIF upload to code scanning
     steps:
       - uses: actions/checkout@v4
         with:
