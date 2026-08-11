@@ -8,7 +8,7 @@
 | Batch | Status | Notes |
 |---|---|---|
 | B0 Foundation | APPROVED | Qwen round 1: 10 critical/25 major/10 minor — all fixed, packet rebuilt verbatim, resubmitted. Round 2: APPROVED (upload corruption identified as the mangling cause, not the code). |
-| B1 Robot Body | IN PROGRESS (slices 1-4 done) | providers + registry + fallbacks, tool registry + 6 core tools, approval gate, agent loop. 103 tests. CI green. |
+| B1 Robot Body | IN PROGRESS (round 2 fixes done) | slices 1-4 + streaming, trust labels, structured denial, denylist hardening, symlink containment, artifact redaction, loop robustness. 126 tests. CI green. |
 | B2 CLI | pending | full command surface, sessions, budget display |
 | B3 Episodic Memory | pending | observation stream, FTS5, session notes |
 | B4 Verification + Repo Intelligence | pending | project detection, repo maps, targeted tests, rollback |
@@ -98,9 +98,27 @@
 - [x] File write outside allowed path requires approval (path policy tests)
 - [x] Tool outputs stored as artifacts and summarized (artifact tests)
 - [x] Basic security checks pass (redaction, containment, fail-closed, bandit/gitleaks clean)
-- [ ] Streaming (provider supports stream_callback; loop wiring pending)
-- [ ] Untrusted-content labeling in system prompt (B1 deliverable, pending)
+- [x] Streaming (Provider.stream + SSE parsing, partial tool-call deltas, malformed-safe, redacted errors)
+- [x] Untrusted-content labeling (ToolResult.trust + system-prompt rule + hostile-file test)
+- [x] Structured denial (ToolResult.denied, never string-matched)
+- [x] Denylist bypass hardening (whitespace tricks, $HOME, force-push variants, curl|sh, bash -c, eval, base64|sh, python -c, chmod 777)
+- [x] Symlink containment (resolve-based, tested)
+- [x] Artifact redaction (terminal artifacts redacted, tested)
+- [x] Provider error redaction (HTTP bodies redacted, tested)
+- [x] Loop robustness (empty responses, budget estimator, duplicate IDs, non-dict args, transcript for resume)
 - [ ] CLI wiring (B2: overseer chat/run)
+
+### B1 round 2 (Qwen review) — disposition
+- Streaming wiring: DONE (Provider.stream, StreamEvent, partial tool-call delta accumulation, malformed SSE skipped, timeout/cancellation, redacted errors, 5 streaming tests)
+- Untrusted-content labeling: DONE (ToolResult.trust, UNTRUSTED_RULE in system prompt, hostile-file test)
+- APPROVAL_DENIED marker spoofing: FIXED (structured ToolResult.denied, no string matching)
+- Terminal denylist bypass: FIXED (whitespace normalization + 10 new bypass patterns + 8 bypass tests)
+- Filesystem symlink escape: FIXED (resolve-based containment, symlink test)
+- Artifact leakage: FIXED (terminal artifacts redacted, test)
+- Provider error credential leak: FIXED (HTTP bodies redacted, test)
+- Budget without usage: FIXED (conservative estimator, test)
+- Empty responses / duplicate IDs / non-dict args: FIXED (tests)
+- Fallback with tool calls: documented — provider failure before dispatch is retryable; after dispatch, tool results are already in history (no duplicate work)
 
 ### B1 bugs found & fixed (bug-hunt pass)
 - file_read resolved relative paths against CWD, not allowed root -> fixed
