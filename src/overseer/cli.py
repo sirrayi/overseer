@@ -67,6 +67,7 @@ class Runtime:
     context: Any
     session_store: Any
     approvals_log: Path
+    _current_session: Any = None  # set by chat/run; observation stream target
 
 
 def _load_cfg(config: str) -> Any:
@@ -137,6 +138,21 @@ def _build_runtime(config: str, provider_registry: Any | None = None) -> Runtime
 def _build_loop(runtime: Runtime, stream_callback: Any | None = None) -> Any:
     from overseer.agent import AgentLoop
 
+    store = runtime.session_store
+
+    def observer(event_type: str, payload: dict[str, Any]) -> None:
+        # Observation stream (plan B3): mirror loop events into the
+        # episodic store. The session is the current one (set by chat/run).
+        session = getattr(runtime, "_current_session", None)
+        if session is None:
+            return
+        if event_type == "tool_call":
+            store.observe_tool_call(session, payload["name"], payload["arguments"])
+        elif event_type == "approval":
+            store.observe_approval(session, payload["tool_name"], payload["allowed"])
+        elif event_type == "error":
+            store.observe_error(session, payload["message"])
+
     return AgentLoop(
         providers=runtime.providers,
         tools=runtime.tools,
@@ -144,11 +160,67 @@ def _build_loop(runtime: Runtime, stream_callback: Any | None = None) -> Any:
         context=runtime.context,
         max_tokens=runtime.cfg.max_tokens_per_turn,
         stream_callback=stream_callback,
+        observer=observer,
     )
 
 
 def _chain(runtime: Runtime) -> list[str]:
     return [runtime.cfg.provider.name]
+
+
+def _session_cost(runtime: Runtime, tokens: int) -> float:
+    """Provider-aware cost estimate (NOTE-02): uses _cost_for, not a constant."""
+    from overseer.session import _cost_for
+
+    return _cost_for(runtime.cfg.provider.name, tokens)
+
+
+def _write_session_note(runtime: Runtime, session: Any) -> None:
+    """Vault bridge (plan B3): write a summary note to 10-Sessions/.
+
+    The note is a summary, not a transcript dump. Raw logs stay in
+    .overseer/sessions/. Frontmatter is validated by Vault.write_note.
+    """
+    from overseer.vault import Vault
+
+    vault = Vault(runtime.cfg.vault_path)
+    vault.init()  # idempotent
+    body = _session_note_body(session)
+    # Map session status to the vault's session status vocabulary.
+    vault_status = {"done": "accepted", "error": "rejected"}.get(session.status, "active")
+    vault.write_note(
+        "session",
+        f"Session {session.id}",
+        body,
+        session_id=session.id,
+        status=vault_status,
+        tokens=session.tokens,
+        cost=session.cost,
+    )
+
+
+def _session_note_body(session: Any) -> str:
+    """Human-readable summary of a session (redacted, not a dump)."""
+    lines = [
+        f"Task: {redact(session.task)[:200]}",
+        f"Status: {session.status}",
+        f"Tokens: {session.tokens}",
+        f"Cost: ${session.cost:.4f}",
+        "",
+        "## Summary",
+        "",
+    ]
+    # First user message + final assistant answer give the arc.
+    user_msgs = [m for m in session.messages if m.role == "user"]
+    final = [m for m in session.messages if m.role == "assistant" and m.content]
+    if user_msgs:
+        lines.append(f"**Request:** {redact(user_msgs[0].content)[:300]}")
+    if final:
+        lines.append(f"**Result:** {redact(final[-1].content)[:500]}")
+    tool_names = sorted({m.tool_call_id or "" for m in session.messages if m.role == "tool"})
+    if tool_names:
+        lines.append(f"**Tools used:** {', '.join(t for t in tool_names if t)}")
+    return "\n".join(lines)
 
 
 def _show_budget_warning(runtime: Runtime, tokens: int) -> None:
@@ -210,6 +282,7 @@ def chat(
 
     runtime = _build_runtime(config)
     session = runtime.session_store.load(resume) if resume else runtime.session_store.create()
+    runtime._current_session = session  # observation stream target
     console.print(f"[dim]session {session.id}[/dim] (type 'exit' to quit, Ctrl+C to stop)")
 
     history = [ChatMessage(role=m.role, content=m.content) for m in session.messages]
@@ -246,7 +319,7 @@ def chat(
                 session, ChatMessage(role="assistant", content=result.content)
             )
         session.tokens += result.total_tokens
-        session.cost = session.tokens / 1_000_000 * 2.0  # rough display estimate
+        session.cost = _session_cost(runtime, session.tokens)  # NOTE-02
         runtime.session_store.save_meta(session)
         _show_budget_warning(runtime, session.tokens)
         if result.stopped_reason == "max_iterations":
@@ -254,6 +327,7 @@ def chat(
 
     session.status = "done"
     runtime.session_store.save_meta(session)
+    _write_session_note(runtime, session)  # vault bridge (plan B3)
     console.print(
         f"[dim]session {session.id} saved — {session.tokens} tokens, ${session.cost:.4f}[/dim]"
     )
@@ -275,6 +349,7 @@ def run(
 
     runtime = _build_runtime(config)
     session = runtime.session_store.create(task=task)
+    runtime._current_session = session  # observation stream target
     loop = _build_loop(runtime, stream_callback=lambda t: console.print(t, end=""))
 
     console.print(f"[dim]session {session.id} — {redact(task)[:80]}[/dim]")
@@ -294,9 +369,10 @@ def run(
         console.print()
         console.print(redact(result.content))
     session.tokens = result.total_tokens
-    session.cost = session.tokens / 1_000_000 * 2.0
+    session.cost = _session_cost(runtime, session.tokens)  # NOTE-02
     session.status = "done" if result.stopped_reason == "final_answer" else "error"
     runtime.session_store.save_meta(session)
+    _write_session_note(runtime, session)  # vault bridge (plan B3)
     _show_budget_warning(runtime, session.tokens)
     console.print(
         f"[dim]done — {result.iterations} iterations, {result.tool_calls_made} tool calls, "
@@ -409,6 +485,51 @@ def sessions(
     for m in metas:
         table.add_row(m.id, m.created[5:16], redact(m.task)[:40], m.status, str(m.tokens))
     console.print(table)
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="Full-text query over session events."),
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),
+    limit: int = typer.Option(20, "--limit", "-l", help="Max results."),
+) -> None:
+    """Search the episodic store (FTS5) for session events."""
+    runtime = _build_runtime(config)
+    hits = runtime.session_store.episodic.search(query, limit=limit)
+    if not hits:
+        console.print("[dim]no matches[/dim]")
+        return
+    table = Table(title=f"search: {query}")
+    table.add_column("session")
+    table.add_column("type")
+    table.add_column("ts")
+    table.add_column("snippet")
+    for h in hits:
+        table.add_row(h["session_id"], h["type"], h["ts"][5:16], h["snippet"][:80])
+    console.print(table)
+
+
+@app.command()
+def rebuild(
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),
+) -> None:
+    """Rebuild the episodic index from raw transcript logs (derived cache)."""
+    runtime = _build_runtime(config)
+    transcripts: list[tuple[str, list[dict[str, str]]]] = []
+    for meta in runtime.session_store.list():
+        try:
+            session = runtime.session_store.load(meta.id)
+        except Exception as exc:
+            # A corrupt session must not kill the rebuild; skip and continue.
+            console.print(f"[dim]skipping corrupt session {meta.id}: {redact(str(exc))}[/dim]")
+            continue
+        lines = [
+            {"role": m.role, "content": m.content, "tool_call_id": m.tool_call_id or ""}
+            for m in session.messages
+        ]
+        transcripts.append((meta.id, lines))
+    n = runtime.session_store.episodic.rebuild(transcripts)
+    console.print(f"[green]rebuilt episodic index:[/green] {n} events")
 
 
 @app.command()

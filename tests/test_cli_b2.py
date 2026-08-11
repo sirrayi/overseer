@@ -49,7 +49,11 @@ def _fake_runtime(tmp_path: Path, responses: list[ChatResult]):
         cfg=type(
             "Cfg",
             (),
-            {"provider": type("P", (), {"name": "scripted"})(), "max_tokens_per_turn": 10000},
+            {
+                "provider": type("P", (), {"name": "scripted"})(),
+                "max_tokens_per_turn": 10000,
+                "vault_path": str(vault),
+            },
         )(),
         providers=reg,
         tools=tools,

@@ -80,6 +80,7 @@ class AgentLoop:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         context: ToolContext | None = None,
         stream_callback: Callable[[str], None] | None = None,
+        observer: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.providers = providers
         self.tools = tools
@@ -91,6 +92,14 @@ class AgentLoop:
         # Wire the approval gate into the tool context (terminal checks it).
         self.context.approver = self._approver
         self.stream_callback = stream_callback
+        # Observation hook (plan B3): called with (event_type, payload) for
+        # tool calls, approvals, and errors. The CLI wires this to the
+        # episodic store; the loop itself stays store-agnostic.
+        self.observer = observer
+
+    def _observe(self, event_type: str, **payload: Any) -> None:
+        if self.observer:
+            self.observer(event_type, payload)
 
     def _approver(self, tool_name: str, args: dict[str, Any]) -> bool:
         """Approval gate callback wired into the tool context."""
@@ -130,6 +139,7 @@ class AgentLoop:
                         chain, history, tools=tool_specs
                     )
             except ProviderError as exc:
+                self._observe("error", message=str(exc))
                 return AgentResult(
                     content=f"provider error: {exc}",
                     iterations=iteration + 1,
@@ -184,9 +194,15 @@ class AgentLoop:
                     continue
                 seen_ids.add(call.id)
                 tool_calls_made += 1
+                # Observe the FINAL accumulated tool call (NOTE-03): the
+                # episodic store must not be flooded with partial deltas.
+                self._observe("tool_call", name=call.name, arguments=call.arguments)
                 tool_result = self._dispatch(call)
                 if tool_result.denied:
                     approvals_denied += 1
+                    self._observe("approval", tool_name=call.name, allowed=False)
+                else:
+                    self._observe("approval", tool_name=call.name, allowed=True)
                 history.append(
                     ChatMessage(
                         role="tool",

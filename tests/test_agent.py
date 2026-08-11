@@ -531,3 +531,44 @@ def test_streaming_provider_failure_falls_back(tmp_path):
     )
     assert result.content == "recovered"
     assert result.stopped_reason == "final_answer"
+
+
+def test_observer_records_tool_calls_and_approvals(tmp_path):
+    """The observation hook must fire for tool calls and approvals (B3)."""
+    provider = _ScriptedProvider(
+        [
+            ChatResult(
+                tool_calls=[ToolCall(id="c1", name="list_dir", arguments={"path": str(tmp_path)})]
+            ),
+            ChatResult(content="done"),
+        ]
+    )
+    events: list[tuple[str, dict]] = []
+    loop = _loop(tmp_path, provider, observer=lambda e, p: events.append((e, p)))
+    result = loop.run([ChatMessage(role="user", content="list")], chain=["scripted"])
+    assert result.content == "done"
+    kinds = [e[0] for e in events]
+    assert "tool_call" in kinds
+    assert "approval" in kinds
+    # The tool_call event carries the FINAL arguments (NOTE-03), not deltas.
+    tc = next(p for e, p in events if e == "tool_call")
+    assert tc["name"] == "list_dir"
+    assert tc["arguments"] == {"path": str(tmp_path)}
+
+
+def test_observer_records_denial(tmp_path):
+    """A denied tool call must fire an approval event with allowed=False."""
+    provider = _ScriptedProvider(
+        [
+            ChatResult(
+                tool_calls=[ToolCall(id="c1", name="terminal", arguments={"command": "rm -rf /"})]
+            ),
+            ChatResult(content="ok"),
+        ]
+    )
+    events: list[tuple[str, dict]] = []
+    loop = _loop(tmp_path, provider, observer=lambda e, p: events.append((e, p)))
+    result = loop.run([ChatMessage(role="user", content="go")], chain=["scripted"])
+    assert result.approvals_denied == 1
+    approvals = [p for e, p in events if e == "approval"]
+    assert approvals and approvals[0]["allowed"] is False

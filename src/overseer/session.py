@@ -18,6 +18,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from overseer.episodic import (
+    EV_APPROVAL,
+    EV_ASSISTANT,
+    EV_ERROR,
+    EV_SYSTEM,
+    EV_TOOL_CALL,
+    EV_TOOL_RESULT,
+    EV_USER,
+    EpisodicStore,
+    Event,
+)
 from overseer.errors import SessionError
 from overseer.providers.base import ChatMessage
 from overseer.redact import redact
@@ -58,6 +69,7 @@ class SessionMeta:
     status: str = "active"  # active | done | error
     tokens: int = 0
     cost: float = 0.0
+    provider: str = ""
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> SessionMeta:
@@ -75,6 +87,7 @@ class Session:
     status: str = "active"
     tokens: int = 0
     cost: float = 0.0
+    provider: str = ""
     messages: list[ChatMessage] = field(default_factory=list)
 
     def meta(self) -> SessionMeta:
@@ -86,6 +99,7 @@ class Session:
             status=self.status,
             tokens=self.tokens,
             cost=self.cost,
+            provider=self.provider,
         )
 
 
@@ -94,6 +108,7 @@ class SessionStore:
 
     def __init__(self, vault_root: str | Path) -> None:
         self.root = Path(vault_root).expanduser().resolve() / ".overseer" / SESSIONS_DIR
+        self.episodic = EpisodicStore(Path(vault_root).expanduser().resolve() / ".overseer")
 
     def _dir(self, session_id: str) -> Path:
         # Session ids are uuid4 hex — no traversal risk, but guard anyway.
@@ -132,6 +147,7 @@ class SessionStore:
             status=meta.get("status", "active"),
             tokens=meta.get("tokens", 0),
             cost=meta.get("cost", 0.0),
+            provider=meta.get("provider", ""),
         )
         transcript_path = d / TRANSCRIPT_FILE
         if transcript_path.is_file():
@@ -150,10 +166,11 @@ class SessionStore:
         return session
 
     def append(self, session: Session, message: ChatMessage) -> None:
-        """Append one message to the transcript (append-only, atomic).
+        """Append one message to the transcript (true append mode, NOTE-01).
 
-        The temp file carries over the existing transcript so os.replace
-        never wipes prior events.
+        B3: switched from read-whole-file + os.replace to open(..., "a") —
+        O(1) per append, safe for the heavy observation stream. The
+        transcript is a raw log; the episodic store is the derived index.
         """
         d = self._dir(session.id)
         d.mkdir(parents=True, exist_ok=True)
@@ -163,16 +180,57 @@ class SessionStore:
             "tool_call_id": message.tool_call_id,
         }
         line = json.dumps(event, ensure_ascii=False) + "\n"
-        transcript = d / TRANSCRIPT_FILE
-        tmp = d / f".{TRANSCRIPT_FILE}.tmp"
-        if transcript.is_file():
-            tmp.write_bytes(transcript.read_bytes() + line.encode("utf-8"))
-        else:
-            tmp.write_text(line, encoding="utf-8")
-        os.replace(tmp, transcript)
+        with open(d / TRANSCRIPT_FILE, "a", encoding="utf-8") as fh:
+            fh.write(line)
         session.messages.append(message)
         session.updated = _now()
         self._save_meta(session)  # keep meta.updated in sync for listing
+        # Observation stream: mirror the message into the episodic store.
+        self.observe_message(session, message)
+
+    # --- observation stream (plan B3) -------------------------------------
+
+    def observe_message(self, session: Session, message: ChatMessage) -> None:
+        """Record a chat message as an episodic event."""
+        etype = {
+            "user": EV_USER,
+            "assistant": EV_ASSISTANT,
+            "tool": EV_TOOL_RESULT,
+        }.get(message.role, EV_SYSTEM)
+        self.episodic.append(
+            Event(
+                type=etype,
+                session_id=session.id,
+                content=message.content,
+                tool_name=message.tool_call_id or "",
+            )
+        )
+
+    def observe_tool_call(self, session: Session, name: str, args: dict[str, Any]) -> None:
+        """Record a tool call (final accumulated arguments, NOTE-03)."""
+        self.episodic.append(
+            Event(
+                type=EV_TOOL_CALL,
+                session_id=session.id,
+                content=json.dumps(args, ensure_ascii=False, sort_keys=True),
+                tool_name=name,
+            )
+        )
+
+    def observe_approval(self, session: Session, tool_name: str, allowed: bool) -> None:
+        """Record an approval decision."""
+        self.episodic.append(
+            Event(
+                type=EV_APPROVAL,
+                session_id=session.id,
+                content=f"{tool_name}: {'approved' if allowed else 'denied'}",
+                tool_name=tool_name,
+            )
+        )
+
+    def observe_error(self, session: Session, message: str) -> None:
+        """Record an error (redacted)."""
+        self.episodic.append(Event(type=EV_ERROR, session_id=session.id, content=message))
 
     def save_meta(self, session: Session) -> None:
         """Persist meta (status, tokens, cost) after a run."""
