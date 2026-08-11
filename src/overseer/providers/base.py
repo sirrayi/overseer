@@ -70,6 +70,17 @@ class Provider:
 
     name: str = "base"
 
+    def __init__(
+        self,
+        base_url: str = "",
+        model: str = "",
+        api_key_env: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.base_url = base_url
+        self.model = model
+        self.api_key_env = api_key_env
+
     def complete(
         self,
         messages: list[ChatMessage],

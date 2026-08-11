@@ -17,10 +17,11 @@ skills.
 
 ## Status
 
-Early development — Batch 0 (Foundation) in progress. Not yet usable as an
-agent. See [ROADMAP.md](ROADMAP.md) for the full master plan (44 parts,
-13 batches) and [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for
-what exists.
+Early development — Batch 2 (CLI + Session Experience) in progress. The
+agent loop, provider abstraction, tool registry, and approval gate are
+functional; the CLI is becoming a daily driver. See
+[ROADMAP.md](ROADMAP.md) for the full master plan (44 parts, 13 batches)
+and [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for what exists.
 
 ## Core ideas
 
@@ -38,18 +39,41 @@ what exists.
   laptop-friendly. Eco, balanced, and performance modes.
 - **Self-modification is proposal-only.** See the guardrail above.
 
-## Quickstart (Batch 0 scope)
+## Quickstart
 
 ```bash
 uv sync --dev
 uv run overseer init --vault ~/overseer-vault
 uv run overseer doctor
-uv run overseer version
+uv run overseer run "explain this repo"   # one-shot task
+uv run overseer chat                      # interactive session
 ```
 
 `overseer init` creates a compliant vault (00-Inbox through 99-Meta) plus a
 sample config with placeholders. Real secrets go in environment variables
 (`OVERSEER_*`), never in config files.
+
+### Commands
+
+| command | purpose |
+|---|---|
+| `overseer chat` | interactive session with the agent loop (streaming) |
+| `overseer run <task>` | non-interactive single task |
+| `overseer model` | inspect/switch provider model (secrets never shown) |
+| `overseer tools` | list registered tools and schemas |
+| `overseer config` | view/validate config safely |
+| `overseer sessions` | list sessions (meta only) |
+| `overseer trace <id>` | inspect a session transcript (redacted) |
+| `overseer export <id>` | export a session as redacted markdown |
+| `overseer doctor` | validate config, vault, provider, permissions |
+| `overseer init` | create a vault + sample config |
+| `overseer memory` | stub — knowledge layer arrives in B5 |
+| `overseer skills` | stub — recursive learning arrives in B7 |
+| `overseer cron` | refused — scheduled execution needs B10 hardening |
+
+Sessions persist under `<vault>/.overseer/sessions/`. Risky terminal
+commands and writes outside the vault prompt for approval; denials are
+logged. All output is redacted before display or export.
 
 ## Development
 

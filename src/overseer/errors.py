@@ -38,3 +38,7 @@ class Timeout(OverseerError):
 
 class BudgetExceeded(OverseerError):
     """The agent loop exceeded its token/cost budget."""
+
+
+class SessionError(OverseerError):
+    """Session store is missing, corrupt, or the session does not exist."""

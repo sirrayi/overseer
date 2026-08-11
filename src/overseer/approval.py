@@ -148,6 +148,23 @@ class ApprovalPolicy:
         resolved = path.resolve()
         return any(resolved.is_relative_to(r.resolve()) for r in self.allowed_roots)
 
+    def describe(self, tool_name: str, args: dict[str, Any]) -> str:
+        """Human-readable risk reason for the approval prompt (plan B2 UX)."""
+        if tool_name == "terminal":
+            command = args.get("command", "")
+            normalized = self._normalize(command)
+            if self._matches(self.denylist, normalized):
+                return "command matches a denylist pattern (always blocked)"
+            if self._matches(self.risky, normalized):
+                return "command matches a risky pattern (needs approval)"
+            return "command is not on the allowlist"
+        if tool_name in ("file_write", "file_patch"):
+            path = Path(args.get("path", "")).expanduser()
+            if not self.check_path(path):
+                return f"write target is outside allowed roots: {path}"
+            return "write target inside allowed roots"
+        return "unknown tool"
+
     def approve(self, tool_name: str, args: dict[str, Any]) -> bool:
         """Gate a tool call. Raises ApprovalDenied when blocked."""
         if tool_name == "terminal":

@@ -144,8 +144,8 @@ def write_sample_config(path: str | Path, vault_path: str = "~/overseer-vault") 
         "live_learning": True,
         "max_tokens_per_turn": 8000,
         "provider": {
-            "name": "ollama-cloud",
-            "base_url": None,
+            "name": "openai-compat",
+            "base_url": "https://api.example.com/v1",
             "model": "deepseek-v4-flash",
             "api_key_env": "OVERSEER_API_KEY",
         },

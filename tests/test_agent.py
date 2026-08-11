@@ -8,7 +8,7 @@ import pytest
 
 from overseer.agent import AgentLoop
 from overseer.approval import ApprovalPolicy
-from overseer.errors import BudgetExceeded
+from overseer.errors import BudgetExceeded, ProviderError
 from overseer.providers.base import ChatMessage, ChatResult, Provider, ToolCall
 from overseer.providers.registry import ProviderRegistry
 from overseer.tools import ToolContext, ToolRegistry, get_tool_class, registered_tools
@@ -392,3 +392,142 @@ def test_transcript_recorded_for_resume(tmp_path):
     assert "user" in roles
     assert "assistant" in roles
     assert "tool" in roles
+
+
+# --- B2: streaming in the agent loop ----------------------------------------
+
+
+class _StreamingProvider(Provider):
+    """Provider with a scripted stream() and no complete() (streaming-only).
+
+    Stateful: each call advances to the next event batch (like a real
+    provider would produce a fresh stream per request).
+    """
+
+    name = "streaming"
+
+    def __init__(self, batches: list[list]) -> None:
+        self.batches = batches
+        self.calls = 0
+
+    def complete(self, messages, tools=None, stream_callback=None, **kwargs):
+        raise NotImplementedError
+
+    def stream(self, messages, tools=None, **kwargs):
+        if self.calls >= len(self.batches):
+            return iter([])
+        events = self.batches[self.calls]
+        self.calls += 1
+        return iter(events)
+
+
+def _stream_loop(tmp_path: Path, provider: Provider, **kw) -> AgentLoop:
+
+    reg = ProviderRegistry()
+    reg.add(provider.name, provider)
+    tools = _tool_registry(tmp_path)
+    return AgentLoop(
+        providers=reg,
+        tools=tools,
+        policy=ApprovalPolicy(allowed_roots=[tmp_path]),
+        context=_ctx(tmp_path),
+        **kw,
+    )
+
+
+def test_streaming_text_deltas(tmp_path):
+    """stream=True must deliver text deltas via stream_callback."""
+    from overseer.providers.base import StreamEvent
+
+    provider = _StreamingProvider(
+        [
+            [
+                StreamEvent(type="delta", content="Hel"),
+                StreamEvent(type="delta", content="lo"),
+                StreamEvent(type="done"),
+            ]
+        ]
+    )
+    received: list[str] = []
+    loop = _stream_loop(tmp_path, provider, stream_callback=received.append)
+    result = loop.run([ChatMessage(role="user", content="hi")], chain=["streaming"], stream=True)
+    assert result.content == "Hello"
+    assert "".join(received) == "Hello"
+    assert result.stopped_reason == "final_answer"
+
+
+def test_streaming_tool_calls(tmp_path):
+    """stream=True must accumulate tool-call deltas and dispatch them."""
+    from overseer.providers.base import StreamEvent, ToolCall
+
+    provider = _StreamingProvider(
+        [
+            [
+                StreamEvent(
+                    type="tool_call_delta",
+                    tool_call=ToolCall(id="c1", name="list_dir", arguments={"path": str(tmp_path)}),
+                ),
+                StreamEvent(type="done"),
+            ],
+            [
+                StreamEvent(type="delta", content="listed"),
+                StreamEvent(type="done"),
+            ],
+        ]
+    )
+    loop = _stream_loop(tmp_path, provider)
+    result = loop.run([ChatMessage(role="user", content="list")], chain=["streaming"], stream=True)
+    assert result.content == "listed"
+    assert result.tool_calls_made == 1
+    assert result.stopped_reason == "final_answer"
+
+
+def test_streaming_falls_back_to_complete(tmp_path):
+    """A provider without stream() must fall back to complete() (B2)."""
+    provider = _ScriptedProvider([ChatResult(content="one-shot answer")])
+    reg = ProviderRegistry()
+    reg.add("scripted", provider)
+    tools = _tool_registry(tmp_path)
+    loop = AgentLoop(
+        providers=reg,
+        tools=tools,
+        policy=ApprovalPolicy(allowed_roots=[tmp_path]),
+        context=_ctx(tmp_path),
+    )
+    result = loop.run([ChatMessage(role="user", content="hi")], chain=["scripted"], stream=True)
+    assert result.content == "one-shot answer"
+    assert provider.calls == 1
+
+
+def test_streaming_provider_failure_falls_back(tmp_path):
+    """Mid-stream failure must fall back to the next provider in the chain."""
+    from overseer.providers.base import StreamEvent
+
+    class _BrokenStream(Provider):
+        name = "broken"
+
+        def complete(self, messages, tools=None, stream_callback=None, **kwargs):
+            raise NotImplementedError
+
+        def stream(self, messages, tools=None, **kwargs):
+            def gen():
+                yield StreamEvent(type="delta", content="partial")
+                raise ProviderError("connection dropped")
+
+            return gen()
+
+    reg = ProviderRegistry()
+    reg.add("broken", _BrokenStream())
+    reg.add("scripted", _ScriptedProvider([ChatResult(content="recovered")]))
+    tools = _tool_registry(tmp_path)
+    loop = AgentLoop(
+        providers=reg,
+        tools=tools,
+        policy=ApprovalPolicy(allowed_roots=[tmp_path]),
+        context=_ctx(tmp_path),
+    )
+    result = loop.run(
+        [ChatMessage(role="user", content="hi")], chain=["broken", "scripted"], stream=True
+    )
+    assert result.content == "recovered"
+    assert result.stopped_reason == "final_answer"
