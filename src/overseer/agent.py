@@ -20,8 +20,10 @@ Security:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from overseer.approval import ApprovalPolicy
@@ -81,6 +83,7 @@ class AgentLoop:
         context: ToolContext | None = None,
         stream_callback: Callable[[str], None] | None = None,
         observer: Callable[[str, dict[str, Any]], None] | None = None,
+        verifier: Callable[[], Any] | None = None,
     ) -> None:
         self.providers = providers
         self.tools = tools
@@ -96,6 +99,10 @@ class AgentLoop:
         # tool calls, approvals, and errors. The CLI wires this to the
         # episodic store; the loop itself stays store-agnostic.
         self.observer = observer
+        # Verification hook (plan B4): called after a checkpointed write;
+        # returns a VerificationResult. On failure the loop rolls back and
+        # feeds the failure card to the model.
+        self.verifier = verifier
 
     def _observe(self, event_type: str, **payload: Any) -> None:
         if self.observer:
@@ -203,6 +210,29 @@ class AgentLoop:
                     self._observe("approval", tool_name=call.name, allowed=False)
                 else:
                     self._observe("approval", tool_name=call.name, allowed=True)
+                # Verification-driven iteration (plan B4): after a
+                # checkpointed write, run the verifier. On failure, roll
+                # back to the checkpoint and feed the failure card back.
+                if (
+                    tool_result.status == "ok"
+                    and tool_result.checkpoint
+                    and self.verifier is not None
+                ):
+                    vres = self.verifier()
+                    if vres is not None and not vres.ok:
+                        self._rollback(tool_result.checkpoint)
+                        self._observe("error", message=f"verification failed: {vres.summary()}")
+                        history.append(
+                            ChatMessage(
+                                role="tool",
+                                content=(
+                                    "VERIFICATION FAILED after the change; the change was "
+                                    f"rolled back.\n{vres.summary()}"
+                                ),
+                                tool_call_id=call.id,
+                            )
+                        )
+                        continue
                 history.append(
                     ChatMessage(
                         role="tool",
@@ -269,6 +299,17 @@ class AgentLoop:
                 errors.append(f"{name}: {exc}")
                 continue
         raise ProviderError("all providers failed: " + "; ".join(errors))
+
+    def _rollback(self, checkpoint: str) -> None:
+        """Restore a file from its checkpoint (plan B4). Best-effort."""
+        try:
+            payload = json.loads(checkpoint)
+            backup = Path(payload["backup"])
+            original = Path(payload["original"])
+            if backup.is_file():
+                original.write_bytes(backup.read_bytes())
+        except (OSError, KeyError, json.JSONDecodeError):
+            pass  # rollback is best-effort; the failure card still reaches the model
 
     def _dispatch(self, call: ToolCall) -> ToolResult:
         """Dispatch one tool call, routing through the approval gate.

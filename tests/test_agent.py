@@ -572,3 +572,81 @@ def test_observer_records_denial(tmp_path):
     assert result.approvals_denied == 1
     approvals = [p for e, p in events if e == "approval"]
     assert approvals and approvals[0]["allowed"] is False
+
+
+# --- B4: verification-driven iteration --------------------------------------
+
+
+class _FakeVerifier:
+    """Scripted verifier: ok for the first N calls, then failing."""
+
+    def __init__(self, fail_after: int = 0) -> None:
+        self.calls = 0
+        self.fail_after = fail_after
+
+    def __call__(self):
+        self.calls += 1
+        if self.calls > self.fail_after:
+            return type(
+                "VR",
+                (),
+                {
+                    "ok": False,
+                    "summary": lambda self: "FAILED tests/test_x.py - AssertionError: boom",
+                },
+            )()
+        return type("VR", (), {"ok": True, "summary": lambda self: "ok"})()
+
+
+def test_verification_rolls_back_failed_write(tmp_path):
+    """A failed verification must roll back the file and feed the card back."""
+    target = tmp_path / "app.py"
+    target.write_text("original\n")
+    provider = _ScriptedProvider(
+        [
+            ChatResult(
+                tool_calls=[
+                    ToolCall(
+                        id="c1",
+                        name="file_write",
+                        arguments={"path": str(target), "content": "broken\n"},
+                    )
+                ]
+            ),
+            ChatResult(content="fixed it"),
+        ]
+    )
+    verifier = _FakeVerifier(fail_after=0)  # first verification fails
+    loop = _loop(tmp_path, provider, verifier=verifier)
+    result = loop.run([ChatMessage(role="user", content="edit")], chain=["scripted"])
+    assert result.content == "fixed it"
+    # The file must be rolled back to its original content.
+    assert target.read_text() == "original\n"
+    # The model must have seen the failure card.
+    tool_msgs = [m for m in result.transcript if m.role == "tool"]
+    assert any("VERIFICATION FAILED" in m.content for m in tool_msgs)
+
+
+def test_verification_passes_keeps_change(tmp_path):
+    """A passing verification must keep the change."""
+    target = tmp_path / "app.py"
+    target.write_text("original\n")
+    provider = _ScriptedProvider(
+        [
+            ChatResult(
+                tool_calls=[
+                    ToolCall(
+                        id="c1",
+                        name="file_write",
+                        arguments={"path": str(target), "content": "new\n"},
+                    )
+                ]
+            ),
+            ChatResult(content="done"),
+        ]
+    )
+    verifier = _FakeVerifier(fail_after=999)  # always passes
+    loop = _loop(tmp_path, provider, verifier=verifier)
+    result = loop.run([ChatMessage(role="user", content="edit")], chain=["scripted"])
+    assert result.content == "done"
+    assert target.read_text() == "new\n"

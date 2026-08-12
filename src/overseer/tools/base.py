@@ -56,6 +56,7 @@ class ToolResult:
     error: str | None = None  # error message when status == "error"
     trust: str = "tool_output"  # user | project | tool_output | untrusted
     denied: bool = False  # True only when the approval gate blocked this call
+    checkpoint: str | None = None  # rollback checkpoint path (plan B4)
 
     def to_message(self) -> str:
         """Render the result as a tool-role message for the model."""

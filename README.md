@@ -67,6 +67,8 @@ sample config with placeholders. Real secrets go in environment variables
 | `overseer export <id>` | export a session as redacted markdown |
 | `overseer doctor` | validate config, vault, provider, permissions |
 | `overseer init` | create a vault + sample config |
+| `overseer search <query>` | full-text search over session events (FTS5) |
+| `overseer rebuild` | rebuild the episodic index from raw transcripts |
 | `overseer memory` | stub — knowledge layer arrives in B5 |
 | `overseer skills` | stub — recursive learning arrives in B7 |
 | `overseer cron` | refused — scheduled execution needs B10 hardening |
@@ -74,6 +76,15 @@ sample config with placeholders. Real secrets go in environment variables
 Sessions persist under `<vault>/.overseer/sessions/`. Risky terminal
 commands and writes outside the vault prompt for approval; denials are
 logged. All output is redacted before display or export.
+
+### Verification (B4)
+
+Overseer detects the project environment (language, package manager, test
+runner, linter, typechecker) from the standard manifests, generates a
+cached repo map, and runs targeted checks. Failed checks become failure
+cards fed back to the model; checkpointed writes are rolled back when
+verification fails. Git tools (`repo_map`, `git_status`, `git_diff`,
+`git_log`) are read-only; destructive git commands require approval.
 
 ## Development
 

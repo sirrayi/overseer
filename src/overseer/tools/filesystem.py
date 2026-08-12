@@ -8,7 +8,9 @@ as an artifact.
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,25 @@ def _resolve(root: Path, path: str) -> Path:
 def _contained_in_any(path: Path, roots: list[Path]) -> bool:
     resolved = path.resolve()
     return any(resolved.is_relative_to(r.resolve()) for r in roots)
+
+
+def _checkpoint(context: ToolContext | None, path: Path) -> str | None:
+    """Copy the current file to .overseer/tmp as a rollback checkpoint (B4).
+
+    Returns a JSON payload {"backup": <path>, "original": <path>} so the
+    agent loop can restore the file to its original location, or None if
+    the file does not exist yet (a fresh write has nothing to roll back to).
+    """
+    if context is None or not path.is_file():
+        return None
+    tmp_dir = context.artifacts_dir.parent / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    cp = tmp_dir / f"{path.name}.{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.bak"
+    try:
+        cp.write_bytes(path.read_bytes())
+        return json.dumps({"backup": str(cp), "original": str(path.resolve())})
+    except OSError:
+        return None
 
 
 @register_tool
@@ -101,12 +122,15 @@ class FileWriteTool(Tool):
             return self._error(str(exc))
         if not _contained_in_any(path, context.allowed_roots):
             return self._error(f"write outside allowed roots: {path}")
+        cp = _checkpoint(context, path)  # rollback checkpoint (plan B4)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(args["content"], encoding="utf-8")
         except OSError as exc:
             return self._error(f"cannot write {path}: {exc}")
-        return self._result(f"wrote {len(args['content'])} chars to {path}")
+        result = self._result(f"wrote {len(args['content'])} chars to {path}")
+        result.checkpoint = cp
+        return result
 
 
 @register_tool
@@ -143,11 +167,14 @@ class FilePatchTool(Tool):
             return self._error(f"old text not found in {path}")
         count = text.count(old) if args.get("replace_all") else 1
         text = text.replace(old, new, -1 if args.get("replace_all") else 1)
+        cp = _checkpoint(context, path)  # rollback checkpoint (plan B4)
         try:
             path.write_text(text, encoding="utf-8")
         except OSError as exc:
             return self._error(f"cannot write {path}: {exc}")
-        return self._result(f"patched {count} occurrence(s) in {path}")
+        result = self._result(f"patched {count} occurrence(s) in {path}")
+        result.checkpoint = cp
+        return result
 
 
 @register_tool
