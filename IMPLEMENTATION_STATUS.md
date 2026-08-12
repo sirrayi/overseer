@@ -10,7 +10,8 @@
 | B0 Foundation | APPROVED | Qwen round 1: 10 critical/25 major/10 minor — all fixed, packet rebuilt verbatim, resubmitted. Round 2: APPROVED (upload corruption identified as the mangling cause, not the code). |
 | B1 Robot Body | APPROVED | Qwen round 2: verified live repo — symlink containment, denylist hardening, streaming, trust labels, structured denial all confirmed. 126 tests. |
 | B2 CLI + Sessions | APPROVED | Qwen: verified live repo at ea21c91 — session lifecycle, streaming, CLI surface, stubs, safety, efficiency all confirmed. 3 minor notes carried into B3 (all fixed). |
-| B3 Episodic Memory | IN PROGRESS (slices 1-4 done) | episodic store (SQLite WAL + FTS5), observation stream, vault session notes, search/rebuild CLI. 175 tests. CI green. |
+| B3 Episodic Memory | APPROVED | Qwen: verified live repo at 3cd91c5 — O(1) append, WAL + RLock, FTS5 + redaction, observer hooks, derived-cache rebuild all confirmed. 175 tests. |
+| B4 Verification + Repo Intel | IN PROGRESS (slices 1-4 done) | project detection, repo maps, failure cards, rollback checkpoints, git tools, verification-driven iteration. 204 tests. CI green. |
 | B2 CLI | pending | full command surface, sessions, budget display |
 | B3 Episodic Memory | pending | observation stream, FTS5, session notes |
 | B4 Verification + Repo Intelligence | pending | project detection, repo maps, targeted tests, rollback |
@@ -226,6 +227,47 @@
 - test fake Cfg missing vault_path -> added
 - S112 try-except-continue in rebuild -> log + continue
 
+## B4 — Verification & Repo Intelligence (in progress)
+
+### Slices done (committed + pushed)
+- **Slice 1** (fdbe851): project.py — ProjectContext (name/language/framework/
+  package_manager/test_runner/linter/typechecker/build_system + commands),
+  detect_project reads pyproject.toml/package.json/Cargo.toml/go.mod/Makefile/
+  requirements.txt, RepoMap (lightweight tree, skips noise dirs, cached by
+  root signature). 10 tests.
+- **Slice 2** (fdbe851): verification.py — VerificationRunner (run_tests
+  targeted, run_linter, run_typechecker, verify merges cards), parse_failures
+  (pytest/lint/typecheck signatures -> FailureCard file/line/error_type/
+  message), checkpoint/rollback (JSON payload with backup+original paths),
+  cache by command+file hash, timeout. 11 tests.
+- **Slice 3** (fdbe851): tools/repo.py — repo_map, git_status, git_diff,
+  git_log (read-only, timeout, redacted). 6 tests.
+- **Slice 4** (fdbe851): filesystem.py checkpoints before file_write/
+  file_patch (ToolResult.checkpoint); agent.py verifier hook — after a
+  checkpointed write, run verification; on failure roll back + feed the
+  failure card to the model. 2 tests.
+
+### B4 done-when status
+- [x] Project detection (language, framework, package manager, test runner,
+      linter, typechecker, build system)
+- [x] Repo map generated and cached (lightweight, no full reads)
+- [x] Targeted test selection (pytest file paths)
+- [x] Failure card generation (file/line/error_type/message)
+- [x] Patch validation + rollback checkpoints (never leave repo broken)
+- [x] Git integration (git_status, git_diff, git_log; destructive gated)
+- [x] Verification-driven iteration (fail -> rollback -> card to model)
+- [x] Safety: destructive git approval-gated, output redacted + truncated
+- [x] Efficiency: repo map cached, verification cached by hash, targeted tests
+
+### B4 bugs found & fixed (bug-hunt pass)
+- os.walk yields str not Path -> wrapped
+- bare requirements.txt not detected as Python -> added
+- ProjectContext missing name field -> added
+- proc.exitcode doesn't exist -> proc.returncode
+- checkpoint path didn't carry original location -> JSON payload
+- bandit B603/B607 on git tools -> pyproject skips + -c pyproject.toml
+- ruff S603/S607 on tests -> tests/* glob extended
+
 ## Next
-- B3 remaining: none blocking. Ready for Qwen review.
-- Then B4 Verification + Repo Intelligence (project detection, repo maps, targeted tests, rollback).
+- B4 remaining: none blocking. Ready for Qwen review.
+- Then B4.5 Live Learning Engine (per-turn micro-reflection, session working memory, provisional candidates).
