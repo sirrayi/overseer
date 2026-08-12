@@ -12,7 +12,8 @@
 | B2 CLI + Sessions | APPROVED | Qwen: verified live repo at ea21c91 — session lifecycle, streaming, CLI surface, stubs, safety, efficiency all confirmed. 3 minor notes carried into B3 (all fixed). |
 | B3 Episodic Memory | APPROVED | Qwen: verified live repo at 3cd91c5 — O(1) append, WAL + RLock, FTS5 + redaction, observer hooks, derived-cache rebuild all confirmed. 175 tests. |
 | B4 Verification + Repo Intel | APPROVED | Qwen: verified live repo at 194eb1f — project detection, repo maps, failure cards, rollback checkpoints, git tools, verifier hook all confirmed. 204 tests. |
-| B4.5 Live Learning | IN PROGRESS (slices 1-2 done) | signal detector, session memory, provisional candidates, live-learn CLI, micro-reflection hook. 219 tests. CI green. |
+| B4.5 Live Learning | APPROVED | Qwen: verified live repo at deba794 — signal detector, session memory, provisional candidates, untrusted blocking, latency budgets all confirmed. 219 tests. |
+| B5 Knowledge Layer | IN PROGRESS (slices 1-3 done) | reflection pipeline, confidence/salience scoring, vault consolidation (dedup + conflicts), retrieval, consolidate CLI. 233 tests. CI green. |
 | B2 CLI | pending | full command surface, sessions, budget display |
 | B3 Episodic Memory | pending | observation stream, FTS5, session notes |
 | B4 Verification + Repo Intelligence | pending | project detection, repo maps, targeted tests, rollback |
@@ -300,6 +301,45 @@
 ### B4.5 bugs found & fixed (bug-hunt pass)
 - B007 unused loop var in test -> _
 
+## B5 — Knowledge Layer (in progress)
+
+### Slices done (committed + pushed)
+- **Slice 1** (499ec1b): knowledge.py — MemoryCandidate (note_type/content/
+  confidence/evidence/scope/trigger/salience), extract_candidates (heuristic
+  extraction from episodic + live events), confidence tiers (explicit 0.9 >
+  repeated 0.75 > implicit 0.4 > untrusted 0.1), salience (importance x
+  recency x access). 12 tests.
+- **Slice 2** (499ec1b): KnowledgeBase.consolidate — vault writes via governed
+  write_note (type-specific frontmatter), dedup (facts by scope, others by
+  trigger/content), conflict flagging to 99-Meta/ (never silent overwrite),
+  evidence linking in every note. 12 tests.
+- **Slice 3** (499ec1b): retrieve(query, note_types) — top-N salient notes;
+  episodic.by_session (exact session match, not FTS); cli consolidate
+  command. 2 tests.
+
+### B5 done-when status
+- [x] Reflection pipeline: consume episodic + live candidates
+- [x] Confidence scoring: explicit > repeated verified > implicit
+- [x] Salience scoring: importance x recency x access
+- [x] Vault canonical storage: facts→30-Facts, preferences→50-Preferences,
+      corrections→80-Corrections, skills→40-Skills, projects→60-Projects
+- [x] Strict frontmatter governance (type-specific required fields)
+- [x] Evidence linking (session id / artifact / user quote in every note)
+- [x] Deduplication (update existing, never duplicate)
+- [x] Conflict detection (99-Meta/ flag for human review, no silent overwrite)
+- [x] Retrieval API (retrieve(query, note_types) -> top-N salient)
+- [x] Untrusted content never high-confidence
+- [x] overseer consolidate <id> command
+
+### B5 bugs found & fixed (bug-hunt pass)
+- EV_USER events got CONF_IMPLICIT (0.4) and were filtered -> CONF_EXPLICIT
+- _parse_note split on the body's --- (evidence block) -> first --- pair
+- fact dedup by content prefix missed same-scope facts -> scope match
+- _is_conflict compared against full body incl. evidence -> first line only
+- _write_note returned truncated id -> full OVR-<TYPE>-<hex>
+- consolidate used FTS search instead of exact session match -> by_session()
+- UnboundLocalError after ev->evt rename -> all references fixed
+
 ## Next
-- B4.5 remaining: none blocking. Ready for Qwen review.
-- Then B5 Recursive Learning (consume live events, consolidate provisional memories, mine patterns).
+- B5 remaining: none blocking. Ready for Qwen review.
+- Then B6 Context Compiler (token-budgeted injection, progressive disclosure).
