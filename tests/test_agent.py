@@ -650,3 +650,21 @@ def test_verification_passes_keeps_change(tmp_path):
     result = loop.run([ChatMessage(role="user", content="edit")], chain=["scripted"])
     assert result.content == "done"
     assert target.read_text() == "new\n"
+
+
+# --- B4.5: live learning hook -------------------------------------------------
+
+
+def test_live_learning_hook_fires_on_user_message(tmp_path):
+    """The micro-reflection hook must fire on the user's latest message."""
+    provider = _ScriptedProvider([ChatResult(content="ok")])
+    calls: list[tuple[str, str, bool]] = []
+
+    def ll_hook(text: str, session_id: str, untrusted: bool) -> list:
+        calls.append((text, session_id, untrusted))
+        return []
+
+    loop = _loop(tmp_path, provider, live_learning=ll_hook)
+    loop.run([ChatMessage(role="user", content="no, use pytest")], chain=["scripted"])
+    assert calls and calls[0][0] == "no, use pytest"
+    assert calls[0][2] is False  # user content, not untrusted

@@ -84,6 +84,7 @@ class AgentLoop:
         stream_callback: Callable[[str], None] | None = None,
         observer: Callable[[str, dict[str, Any]], None] | None = None,
         verifier: Callable[[], Any] | None = None,
+        live_learning: Callable[[str, str, bool], list[Any]] | None = None,
     ) -> None:
         self.providers = providers
         self.tools = tools
@@ -103,6 +104,10 @@ class AgentLoop:
         # returns a VerificationResult. On failure the loop rolls back and
         # feeds the failure card to the model.
         self.verifier = verifier
+        # Live learning hook (plan B4.5): called with (text, session_id,
+        # untrusted) after each model turn. The CLI wires the engine; the
+        # loop stays engine-agnostic.
+        self.live_learning = live_learning
 
     def _observe(self, event_type: str, **payload: Any) -> None:
         if self.observer:
@@ -130,6 +135,15 @@ class AgentLoop:
         """
         history: list[ChatMessage] = [ChatMessage(role="system", content=self.system_prompt)]
         history.extend(messages)
+
+        # Live learning micro-reflection (plan B4.5): detect signals in the
+        # user's latest message before the loop runs. Corrections/preferences
+        # apply to session memory immediately; the context block is injected
+        # on the next build.
+        if self.live_learning:
+            user_msgs = [m for m in messages if m.role == "user"]
+            if user_msgs:
+                self.live_learning(user_msgs[-1].content, "", False)
 
         total_tokens = 0
         tool_calls_made = 0

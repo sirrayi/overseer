@@ -68,6 +68,7 @@ class Runtime:
     session_store: Any
     approvals_log: Path
     _current_session: Any = None  # set by chat/run; observation stream target
+    live_learning: Any = None  # LiveLearningEngine (plan B4.5)
 
 
 def _load_cfg(config: str) -> Any:
@@ -107,6 +108,11 @@ def _build_runtime(config: str, provider_registry: Any | None = None) -> Runtime
     )
     store = SessionStore(vault_root)
 
+    # Live learning engine (plan B4.5): per-turn micro-reflection.
+    from overseer.live_learning import LiveLearningEngine
+
+    ll_engine = LiveLearningEngine(vault_root, enabled=cfg.live_learning)
+
     runtime = Runtime(
         cfg=cfg,
         providers=provider_registry,
@@ -115,6 +121,7 @@ def _build_runtime(config: str, provider_registry: Any | None = None) -> Runtime
         context=context,
         session_store=store,
         approvals_log=approvals_log,
+        live_learning=ll_engine,
     )
 
     # Approval UX: prompt the user, log the decision.
@@ -161,6 +168,7 @@ def _build_loop(runtime: Runtime, stream_callback: Any | None = None) -> Any:
         max_tokens=runtime.cfg.max_tokens_per_turn,
         stream_callback=stream_callback,
         observer=observer,
+        live_learning=(runtime.live_learning.detect_and_apply if runtime.live_learning else None),
     )
 
 
@@ -305,7 +313,15 @@ def chat(
 
         console.print("[bold]overseer[/bold] ", end="")
         try:
-            result = loop.run(history, chain=_chain(runtime), stream=not no_stream)
+            # Inject active live-learning constraints/preferences (B4.5).
+            ll_block = runtime.live_learning.context_block() if runtime.live_learning else ""
+            turn_history = history
+            if ll_block:
+                turn_history = [
+                    ChatMessage(role="system", content=ll_block),
+                    *history,
+                ]
+            result = loop.run(turn_history, chain=_chain(runtime), stream=not no_stream)
         except Exception as exc:  # BudgetExceeded etc.
             console.print(f"[red]{redact(str(exc))}[/red]")
             continue
@@ -570,6 +586,36 @@ def export(
         console.print(f"[green]exported:[/green] {out}")
     else:
         console.print(md)
+
+
+# ---------------------------------------------------------------------------
+# live-learn (plan B4.5)
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def live_learn(
+    action: str = typer.Argument(
+        "inspect", help="inspect | undo (revert the last live-learning update)."
+    ),
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),
+) -> None:
+    """Inspect or undo live-learning state for the current session."""
+    runtime = _build_runtime(config)
+    engine = runtime.live_learning
+    if engine is None:
+        console.print("[yellow]live learning is disabled in config[/yellow]")
+        return
+    if action == "inspect":
+        console.print(engine.to_json())
+    elif action == "undo":
+        if engine.undo():
+            console.print("[green]reverted the last live-learning update[/green]")
+        else:
+            console.print("[dim]nothing to undo[/dim]")
+    else:
+        console.print(f"[red]unknown action: {action} (use inspect or undo)[/red]")
+        raise typer.Exit(code=1)
 
 
 # ---------------------------------------------------------------------------
