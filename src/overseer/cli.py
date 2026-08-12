@@ -549,6 +549,43 @@ def rebuild(
 
 
 @app.command()
+def consolidate(
+    session_id: str = typer.Argument(..., help="Session id to consolidate."),
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),
+) -> None:
+    """Consolidate a session's events into durable vault knowledge (B5)."""
+    from overseer.episodic import Event
+    from overseer.knowledge import KnowledgeBase, extract_candidates
+
+    runtime = _build_runtime(config)
+    try:
+        runtime.session_store.load(session_id)  # existence check
+    except Exception as exc:
+        console.print(f"[red]{redact(str(exc))}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    # Pull the session's episodic events (exact session match, not FTS).
+    events = [
+        Event(
+            type=ev["type"],
+            session_id=ev["session_id"],
+            content=ev["content"],
+            tool_name=ev.get("tool_name", ""),
+        )
+        for ev in runtime.session_store.episodic.by_session(session_id, limit=500)
+    ]
+    candidates = extract_candidates(events)
+    kb = KnowledgeBase(runtime.cfg.vault_path)
+    res = kb.consolidate(candidates, session_id=session_id)
+    console.print(
+        f"[green]consolidated:[/green] {len(res['created'])} created, "
+        f"{len(res['updated'])} updated, {len(res['conflicts'])} conflicts flagged"
+    )
+    for cid in res["conflicts"]:
+        console.print(f"[yellow]conflict flagged:[/yellow] {cid} (see 99-Meta/)")
+
+
+@app.command()
 def trace(
     session_id: str = typer.Argument(..., help="Session id to inspect."),
     config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),

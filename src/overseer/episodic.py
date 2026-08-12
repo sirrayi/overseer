@@ -162,6 +162,28 @@ class EpisodicStore:
             for row in rows
         ]
 
+    def by_session(self, session_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        """All events for a session (not FTS — exact session_id match)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT id, type, session_id, trace_id, ts, tool_name, content "
+                "FROM events WHERE session_id = ? ORDER BY id ASC LIMIT ?",
+                (session_id, limit),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "id": r[0],
+                "type": r[1],
+                "session_id": r[2],
+                "trace_id": r[3],
+                "ts": r[4],
+                "tool_name": r[5],
+                "content": redact(r[6] or ""),
+            }
+            for r in rows
+        ]
+
     def count(self) -> int:
         with self._lock:
             cur = self._conn.execute("SELECT COUNT(*) FROM events")

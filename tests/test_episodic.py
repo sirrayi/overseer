@@ -135,3 +135,14 @@ def test_close_then_reopen(tmp_path):
     store2 = _store(tmp_path)
     assert store2.count() == 1
     store2.close()
+
+
+def test_by_session_filters(tmp_path):
+    """by_session must return only that session's events (exact match)."""
+    store = _store(tmp_path)
+    store.append(Event(type="user", session_id="s1", content="hello"))
+    store.append(Event(type="user", session_id="s2", content="other"))
+    store.append(Event(type="assistant", session_id="s1", content="hi"))
+    rows = store.by_session("s1")
+    assert len(rows) == 2
+    assert all(r["session_id"] == "s1" for r in rows)
