@@ -70,6 +70,8 @@ class Runtime:
     approvals_log: Path
     _current_session: Any = None  # set by chat/run; observation stream target
     live_learning: Any = None  # LiveLearningEngine (plan B4.5)
+    router: Any = None  # Router (plan B8)
+    telemetry: Any = None  # Telemetry (plan B8)
 
 
 def _load_cfg(config: str) -> Any:
@@ -114,6 +116,24 @@ def _build_runtime(config: str, provider_registry: Any | None = None) -> Runtime
 
     ll_engine = LiveLearningEngine(vault_root, enabled=cfg.live_learning)
 
+    # Router + telemetry (plan B8): task routing and cost tracking.
+    from overseer.routing import Router
+    from overseer.telemetry import Telemetry
+
+    chains: dict[int, list[str]] = {
+        0: [cfg.provider.name],
+        1: [cfg.provider.name],
+        2: [cfg.provider.name],
+        3: [cfg.provider.name],
+    }
+    router = Router(chains=chains, power_mode=getattr(cfg, "power_mode", "balanced"))
+    telemetry = Telemetry(
+        log_dir=vault_root / ".overseer" / "logs",
+        max_cost_per_session=getattr(cfg, "max_cost_per_session", 5.0),
+        max_cost_per_day=getattr(cfg, "max_cost_per_day", 20.0),
+        max_tokens_per_session=getattr(cfg, "max_tokens_per_session", 500_000),
+    )
+
     runtime = Runtime(
         cfg=cfg,
         providers=provider_registry,
@@ -123,6 +143,8 @@ def _build_runtime(config: str, provider_registry: Any | None = None) -> Runtime
         session_store=store,
         approvals_log=approvals_log,
         live_learning=ll_engine,
+        router=router,
+        telemetry=telemetry,
     )
 
     # Approval UX: prompt the user, log the decision.
@@ -171,6 +193,8 @@ def _build_loop(runtime: Runtime, stream_callback: Any | None = None) -> Any:
         observer=observer,
         live_learning=(runtime.live_learning.detect_and_apply if runtime.live_learning else None),
         compiler=_make_compiler(runtime),
+        router=runtime.router,
+        telemetry=runtime.telemetry,
     )
 
 
@@ -690,6 +714,31 @@ def live_learn(
     else:
         console.print(f"[red]unknown action: {action} (use inspect or undo)[/red]")
         raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# cost / telemetry (plan B8)
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def cost(
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),
+) -> None:
+    """Show token usage and estimated cost for the current session."""
+    runtime = _build_runtime(config)
+    telemetry = runtime.telemetry
+    if telemetry is None:
+        console.print("[yellow]telemetry is disabled[/yellow]")
+        return
+    s = telemetry.summary()
+    console.print(f"calls: {s['calls']}")
+    console.print(f"session tokens: {s['session_tokens']}")
+    console.print(f"session cost: ${s['session_cost']:.4f}")
+    console.print(f"day cost: ${s['day_cost']:.4f}")
+    console.print(f"limits: {s['limits']}")
+    for w in s["warnings"]:
+        console.print(f"[yellow]warning: {w}[/yellow]")
 
 
 # ---------------------------------------------------------------------------

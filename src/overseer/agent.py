@@ -86,6 +86,8 @@ class AgentLoop:
         verifier: Callable[[], Any] | None = None,
         live_learning: Callable[[str, str, bool], list[Any]] | None = None,
         compiler: Any | None = None,
+        router: Any | None = None,
+        telemetry: Any | None = None,
     ) -> None:
         self.providers = providers
         self.tools = tools
@@ -113,6 +115,12 @@ class AgentLoop:
         # token-budgeted message list before each model call. When None,
         # the raw history is used (backward compatible).
         self.compiler = compiler
+        # Router (plan B8): picks the provider chain per call based on
+        # complexity, privacy, and power mode. When None, the caller's
+        # chain is used as-is.
+        self.router = router
+        # Telemetry (plan B8): token/cost tracking + budget guard.
+        self.telemetry = telemetry
 
     def _observe(self, event_type: str, **payload: Any) -> None:
         if self.observer:
@@ -156,16 +164,24 @@ class AgentLoop:
         tool_specs = tools if tools is not None else self.tools.specs()
 
         for iteration in range(self.max_iterations):
-            # 0. Compile the context under the token budget (plan B6).
+            # 0a. Compile the context under the token budget (plan B6).
             call_history = self._compile_context(history)
+
+            # 0b. Route the call (plan B8): ask the router which chain to use.
+            call_chain = chain
+            if self.router is not None:
+                last_user = next((m.content for m in reversed(history) if m.role == "user"), "")
+                _, routed_chain, _ = self.router.route(last_user)
+                if routed_chain:
+                    call_chain = routed_chain
 
             # 1. Call the model (with fallback chain).
             try:
                 if stream:
-                    result = self._call_model_streaming(chain, call_history, tool_specs)
+                    result = self._call_model_streaming(call_chain, call_history, tool_specs)
                 else:
                     result, _used = self.providers.complete_with_fallback(
-                        chain, call_history, tools=tool_specs
+                        call_chain, call_history, tools=tool_specs
                     )
             except ProviderError as exc:
                 self._observe("error", message=str(exc))
@@ -178,6 +194,12 @@ class AgentLoop:
                     stopped_reason="error",
                     transcript=history,
                 )
+
+            # 1b. Record telemetry (plan B8): tokens + estimated cost.
+            if self.telemetry is not None:
+                reported = result.usage.get("total_tokens", 0)
+                used_tokens = reported or _estimate_tokens(history)
+                self.telemetry.record(tokens=used_tokens, tier="mid")
 
             # 2. Token accounting: use reported usage, else conservative estimate.
             reported = result.usage.get("total_tokens", 0)

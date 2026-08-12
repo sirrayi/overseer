@@ -697,3 +697,47 @@ def test_compiler_none_uses_raw_history(tmp_path):
     result = loop.run([ChatMessage(role="user", content="hi")], chain=["scripted"])
     assert result.content == "ok"
     assert provider.calls == 1
+
+
+# --- B8: routing + telemetry integration --------------------------------------
+
+
+def test_router_picks_chain_for_call(tmp_path):
+    """The loop must use the router's chain for the model call."""
+    from overseer.routing import Router
+
+    provider = _ScriptedProvider([ChatResult(content="ok")])
+    router = Router(
+        chains={0: ["scripted"], 1: ["scripted"], 2: ["scripted"], 3: ["scripted"]},
+        power_mode="eco",
+    )
+    loop = _loop(tmp_path, provider, router=router)
+    result = loop.run(
+        [ChatMessage(role="user", content="debug the race condition")],
+        chain=["scripted"],
+    )
+    assert result.content == "ok"
+    assert provider.calls == 1
+
+
+def test_telemetry_records_and_halts(tmp_path):
+    """Telemetry must record tokens and raise BudgetExceeded on limits."""
+    from overseer.errors import BudgetExceeded
+    from overseer.telemetry import Telemetry
+
+    telemetry = Telemetry(max_cost_per_session=0.00001)  # tiny budget
+    provider = _ScriptedProvider([ChatResult(content="ok")])
+    loop = _loop(tmp_path, provider, telemetry=telemetry)
+    with pytest.raises(BudgetExceeded):
+        loop.run([ChatMessage(role="user", content="hi")], chain=["scripted"])
+
+
+def test_telemetry_records_without_halt(tmp_path):
+    from overseer.telemetry import Telemetry
+
+    telemetry = Telemetry()
+    provider = _ScriptedProvider([ChatResult(content="ok")])
+    loop = _loop(tmp_path, provider, telemetry=telemetry)
+    result = loop.run([ChatMessage(role="user", content="hi")], chain=["scripted"])
+    assert result.content == "ok"
+    assert telemetry.session_tokens() > 0
