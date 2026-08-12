@@ -14,14 +14,14 @@
 | B4 Verification + Repo Intel | APPROVED | Qwen: verified live repo at 194eb1f — project detection, repo maps, failure cards, rollback checkpoints, git tools, verifier hook all confirmed. 204 tests. |
 | B4.5 Live Learning | APPROVED | Qwen: verified live repo at deba794 — signal detector, session memory, provisional candidates, untrusted blocking, latency budgets all confirmed. 219 tests. |
 | B5 Knowledge Layer | APPROVED | Qwen: verified live repo at 0eb9c8f — confidence tiers, extraction, vault consolidation, dedup, conflict flags, evidence linking, retrieve API all confirmed. 233 tests. |
-| B6 Context Compiler | IN PROGRESS (slices 1-2 done) | tiered assembly, token budget + reserve, eviction order, progressive disclosure, stable prefix caching, loop integration. 242 tests. CI green. |
+| B6 Context Compiler | APPROVED | Qwen: verified live repo at 7f3aecc — budget+reserve, tiered assembly, eviction, progressive disclosure, stable prefix, loop hook all confirmed. 242 tests. CI green. |
+| B7 Recursive Learning | IN PROGRESS (slices 1-4 done) | PatternMiner (episode chunking, feature extraction, clustering, evidence gates), SkillRegistry curator (risk classification, promotion gates, governed 40-Skills writes), Correction Memory replay, `overseer mine` + `skills list/promote` CLI. 259 tests. CI green. |
 | B2 CLI | pending | full command surface, sessions, budget display |
 | B3 Episodic Memory | pending | observation stream, FTS5, session notes |
 | B4 Verification + Repo Intelligence | pending | project detection, repo maps, targeted tests, rollback |
 | B4.5 Live Learning Engine | pending | 5 speeds, signal detector, provisional memory |
 | B5 Knowledge Layer | pending | facts/prefs/corrections, salience, prune |
 | B6 Context Compiler | pending | budget engine, tiers, token accounting |
-| B7 Recursive Learning | pending | pattern miner, skill proposals, curator |
 | B8 Routing, Economy, Power Governor | pending | power modes, budgets, telemetry |
 | B9 Adapter Pipeline | pending | dataset builder, MLX LoRA, validation gate |
 | B10 Recursive Closure | pending | meta-stats, L2/L3 proposals |
@@ -341,7 +341,7 @@
 - consolidate used FTS search instead of exact session match -> by_session()
 - UnboundLocalError after ev->evt rename -> all references fixed
 
-## B6 — Context Compiler (in progress)
+## B6 — Context Compiler (approved)
 
 ### Slices done (committed + pushed)
 - **Slice 1** (34f0353): context_compiler.py — ContextItem (tier/content/value/
@@ -369,6 +369,48 @@
 - telemetry utilization rounding -> smaller budget in test
 - mypy no-any-return on compiler hook -> typed annotation
 
+## B7 — Recursive Learning: Pattern Miner & Skill Auto-Promotion (in progress)
+
+### Slices done
+- **Slice 1** (curator.py): SkillRegistry — governed 40-Skills writes via
+  Vault.write_note, risk classification (high/low by tool), promotion gates
+  (low-risk auto-promotes after 2 successes; high-risk always requires human
+  approval and a 90% success threshold), in-place counter updates preserving
+  note ID.
+- **Slice 2** (miner.py): PatternMiner — episode chunking (per-session), feature
+  extraction (tools, task types, error signal, corrections), deterministic
+  clustering by tool+task key, evidence gates (>=3 independent verified
+  successes; >=70% low-risk / >=90% high-risk), skill drafting, Correction
+  Memory replay (rejects/conflict-flags drafts contradicting corrections).
+- **Slice 3** (cli.py): `overseer mine` (power-aware, defers in eco), `overseer
+  skills list`, `overseer skills promote <id>` (human approval gate).
+- **Slice 4** (test_miner.py): 17 tests — evidence floor, success threshold,
+  high-risk manual promotion, correction replay blocking, frontmatter
+  validation, roundtrip persistence, CLI integration.
+
+### B7 done-when status
+- [x] PatternMiner consumes episodic events, chunks episodes, extracts features
+- [x] Clusters similar episodes (tool+task key)
+- [x] Evidence gates: >=3 independent verified successes; 70% low / 90% high
+- [x] Never mines from unverified outcomes (session status must be done + no errors)
+- [x] Skill drafts compiled to canonical 40-Skills notes with strict frontmatter
+- [x] Curator flow: draft/proposed/active lifecycle
+- [x] Low-risk auto-promotes after 2 manual adoptions
+- [x] High-risk ALWAYS requires human approval
+- [x] Correction Memory replayed during mining (conflict -> reject)
+- [x] Mining is manual (`overseer mine`) + power-aware (defers in eco)
+- [x] No skill bypasses the approval gate
+
+### B7 bugs found & fixed (bug-hunt pass)
+- `SkillRegistry.update()` minted a new note ID on every bump -> rewrote the
+  existing file in place, preserving the OVR-SKILL id and counters.
+- `mine` required a provider (failed without one) -> now builds the session
+  store directly from config, no provider needed.
+- Correction replay marker regex missed "do not use X" -> added do not /
+  should not / is wrong patterns so the guard actually fires.
+- Correction replay was wired to the transient in-memory live-learning engine
+  -> now reads durable Correction Memory from the vault (B4.5/B5).
+
 ## Next
-- B6 remaining: none blocking. Ready for Qwen review.
-- Then B7 Pattern Miner + skill auto-promotion (cross-session patterns, skill drafts -> active).
+- B7 remaining: none blocking. Ready for Qwen review.
+- Then B8 Routing, Economy & Power Governor (power modes, budgets, telemetry).

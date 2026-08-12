@@ -42,3 +42,7 @@ class BudgetExceeded(OverseerError):
 
 class SessionError(OverseerError):
     """Session store is missing, corrupt, or the session does not exist."""
+
+
+class CuratorError(OverseerError):
+    """Skill curation failed (duplicate id, unknown id, bad transition)."""

@@ -171,10 +171,13 @@ def test_memory_stub():
     assert "B5" in result.output
 
 
-def test_skills_stub():
-    result = runner.invoke(app, ["skills"])
+def test_skills_list(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("vault_path: {}\n".format(tmp_path / "vault"), encoding="utf-8")
+    result = runner.invoke(app, ["skills", "list", "-c", str(cfg)])
     assert result.exit_code == 0
-    assert "B7" in result.output
+    # No skills in a fresh vault -> empty table, but the command runs.
+    assert "Skills" in result.output
 
 
 def test_cron_refuses():

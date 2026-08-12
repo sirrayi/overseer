@@ -21,6 +21,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from overseer import __version__
+from overseer.curator import MIN_EVIDENCE_SESSIONS
 from overseer.redact import redact
 
 app = typer.Typer(
@@ -738,12 +739,160 @@ def memory() -> None:
 
 
 @app.command()
-def skills() -> None:
-    """Stub: recursive learning arrives in B7."""
+def mine(
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),
+    min_evidence: int = typer.Option(
+        MIN_EVIDENCE_SESSIONS, "--min-evidence", help="Minimum independent successes required."
+    ),
+) -> None:
+    """Mine patterns from completed sessions and draft skills (B7).
+
+    Reads every completed session from the episodic store, clusters episodes,
+    applies the evidence gates, and writes qualifying patterns as ``draft``
+    skill notes in 40-Skills. High-risk and conflicting drafts are flagged for
+    human review, never auto-promoted. Defers automatically in ``eco`` mode.
+    Correction Memory (B4.5/B5) is replayed: a draft that contradicts a
+    high-confidence correction is rejected.
+    """
+    from overseer.curator import Skill, SkillRegistry
+    from overseer.knowledge import KnowledgeBase
+    from overseer.miner import PatternMiner, extract_episode
+    from overseer.session import SessionStore
+
+    cfg = _load_cfg(config)
+
+    # Power-aware: defer in eco mode (mining is a heavy, optional job).
+    if getattr(cfg, "power_mode", "balanced") == "eco":
+        console.print(
+            "[yellow]mine:[/yellow] deferred — power_mode is eco. "
+            "Run with a balanced/performance mode to mine."
+        )
+        raise typer.Exit(code=1)
+
+    vault_root = Path(cfg.vault_path).expanduser().resolve()
+    session_store = SessionStore(vault_root)
+    miner = PatternMiner(min_evidence=min_evidence)
+    episodes = []
+
+    for meta in session_store.list():
+        if meta.status != "done":
+            continue  # never mine unverified / in-flight sessions
+        events = session_store.episodic.by_session(meta.id, limit=1000)
+        if not events:
+            continue
+        ep = extract_episode(meta.id, meta.status, events)
+        episodes.append(ep)
+
+    drafts = miner.mine(episodes)
+
+    if not drafts:
+        console.print("[dim]mine:[/dim] no patterns passed the evidence gates yet.")
+        return
+
+    # Replay durable Correction Memory (B4.5/B5) against the drafted skills.
+    kb = KnowledgeBase(vault_root)
+    corrections = [c["content"] for c in kb.retrieve("", note_types=["correction"], limit=500)]
+    if corrections:
+        drafts = miner.replay_corrections(drafts, corrections)
+
+    registry = SkillRegistry(vault_root)
+    created, conflicts = [], []
+    for draft in drafts:
+        if draft.conflict:
+            conflicts.append(draft)
+            continue  # never write a conflicting draft
+        skill = Skill(
+            id="",
+            title=draft.title,
+            trigger=draft.trigger,
+            steps=draft.steps,
+            risk=draft.risk,
+            confidence=draft.confidence,
+            evidence=draft.evidence_sessions,
+            use_count=len(draft.evidence_sessions),
+            success_count=len(draft.evidence_sessions),
+            failure_count=0,
+        )
+        sid = registry.create_draft(skill)
+        created.append(sid)
+        console.print(
+            f"[green]drafted:[/green] {draft.title} "
+            f"({draft.risk} risk, {len(draft.evidence_sessions)} sessions, "
+            f"{draft.success_rate:.0%} success)"
+        )
+        if draft.risk == "high":
+            console.print("  [yellow]high-risk — requires human approval to promote[/yellow]")
+
+    for draft in conflicts:
+        console.print(f"[red]conflict rejected:[/red] {draft.title} — {draft.conflict_reason}")
+
     console.print(
-        "[yellow]skills:[/yellow] recursive learning arrives in B7. "
-        "Skill proposals and the curator are not available yet."
+        f"\n[bold]{len(created)}[/bold] skill draft(s) written, "
+        f"{len(conflicts)} rejected (correction conflict)."
     )
+
+
+@app.command()
+def skills(
+    action: str = typer.Argument("list", help="list | promote"),
+    skill_id: str = typer.Argument(None, help="Skill id to promote (for 'promote')."),
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),
+) -> None:
+    """List skills or promote one to active (B7 curator).
+
+    ``overseer skills list``      — show all skill notes with status + counters.
+    ``overseer skills promote <id>`` — human approval gate. High-risk skills
+        only become active when they pass the success threshold; the CLI asks
+        for explicit confirmation before promoting.
+    """
+    from overseer.curator import SkillRegistry
+
+    cfg = _load_cfg(config)
+    registry = SkillRegistry(cfg.vault_path)
+
+    if action == "list":
+        table = Table(title="Skills")
+        table.add_column("ID", style="dim")
+        table.add_column("Title")
+        table.add_column("Risk")
+        table.add_column("Status")
+        table.add_column("Uses", justify="right")
+        table.add_column("Succ", justify="right")
+        table.add_column("Fail", justify="right")
+        for skill in registry.load_all():
+            table.add_row(
+                skill.id,
+                skill.title,
+                skill.risk,
+                skill.status,
+                str(skill.use_count),
+                str(skill.success_count),
+                str(skill.failure_count),
+            )
+        console.print(table)
+        return
+
+    if action == "promote":
+        if not skill_id:
+            console.print("[red]skills promote[/red] requires a skill id.")
+            raise typer.Exit(code=1)
+        target = registry.get(skill_id)
+        if target is None:
+            console.print(f"[red]skill not found:[/red] {skill_id}")
+            raise typer.Exit(code=1)
+        console.print(
+            f"[bold]{target.title}[/bold] ({target.risk} risk, "
+            f"{target.success_rate:.0%} success over {target.use_count} uses)"
+        )
+        if not Confirm.ask("Promote this skill to active?", default=False):
+            console.print("[yellow]promotion cancelled[/yellow]")
+            raise typer.Exit(code=1)
+        updated = registry.promote(skill_id, approved=True)
+        console.print(f"[green]promoted:[/green] {updated.id} -> {updated.status}")
+        return
+
+    console.print(f"[red]unknown action:[/red] {action} (use 'list' or 'promote')")
+    raise typer.Exit(code=1)
 
 
 @app.command()
