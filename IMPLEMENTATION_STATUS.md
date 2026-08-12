@@ -11,7 +11,8 @@
 | B1 Robot Body | APPROVED | Qwen round 2: verified live repo — symlink containment, denylist hardening, streaming, trust labels, structured denial all confirmed. 126 tests. |
 | B2 CLI + Sessions | APPROVED | Qwen: verified live repo at ea21c91 — session lifecycle, streaming, CLI surface, stubs, safety, efficiency all confirmed. 3 minor notes carried into B3 (all fixed). |
 | B3 Episodic Memory | APPROVED | Qwen: verified live repo at 3cd91c5 — O(1) append, WAL + RLock, FTS5 + redaction, observer hooks, derived-cache rebuild all confirmed. 175 tests. |
-| B4 Verification + Repo Intel | IN PROGRESS (slices 1-4 done) | project detection, repo maps, failure cards, rollback checkpoints, git tools, verification-driven iteration. 204 tests. CI green. |
+| B4 Verification + Repo Intel | APPROVED | Qwen: verified live repo at 194eb1f — project detection, repo maps, failure cards, rollback checkpoints, git tools, verifier hook all confirmed. 204 tests. |
+| B4.5 Live Learning | IN PROGRESS (slices 1-2 done) | signal detector, session memory, provisional candidates, live-learn CLI, micro-reflection hook. 219 tests. CI green. |
 | B2 CLI | pending | full command surface, sessions, budget display |
 | B3 Episodic Memory | pending | observation stream, FTS5, session notes |
 | B4 Verification + Repo Intelligence | pending | project detection, repo maps, targeted tests, rollback |
@@ -268,6 +269,37 @@
 - bandit B603/B607 on git tools -> pyproject skips + -c pyproject.toml
 - ruff S603/S607 on tests -> tests/* glob extended
 
+## B4.5 — Live Learning Engine (in progress)
+
+### Slices done (committed + pushed)
+- **Slice 1** (c153e6c): live_learning.py — LiveEvent schema (9 types, 5 scopes),
+  detect_signals (heuristic, no model call), SessionMemory (constraints/
+  preferences/rules, undo stack), ProvisionalStore (vault inbox candidates),
+  LiveLearningEngine (detect_and_apply, untrusted blocking, token budgets).
+  12 tests.
+- **Slice 2** (c153e6c): agent.py live_learning hook (fires on user message
+  before each run); cli.py wires the engine into the runtime, injects the
+  context block into each turn, adds live-learn inspect/undo. 3 tests.
+
+### B4.5 done-when status
+- [x] Event schema: correction/preference/fact/constraint/tool_outcome/
+      risk_signal/uncertainty_signal/repeated_pattern/explicit_memory
+- [x] Scopes: turn/session/provisional/project/global
+- [x] Per-turn micro-reflection (Speed 0/1): heuristic detector, no latency
+- [x] Corrections/preferences apply to session immediately
+- [x] Active constraints injected into next context build
+- [x] Provisional candidates (Speed 2): implicit -> low confidence, inbox
+- [x] Explicit "remember this" (Speed 3): durable candidate immediately
+- [x] Untrusted content blocked from durable memory
+- [x] Live learning toggle in config (live_learning: bool)
+- [x] overseer live-learn inspect/undo
+- [x] Reversible: undo stack
+- [x] Latency budget: max_events_per_turn/session
+- [x] Cannot override guardrails or bypass approvals (session-scoped only)
+
+### B4.5 bugs found & fixed (bug-hunt pass)
+- B007 unused loop var in test -> _
+
 ## Next
-- B4 remaining: none blocking. Ready for Qwen review.
-- Then B4.5 Live Learning Engine (per-turn micro-reflection, session working memory, provisional candidates).
+- B4.5 remaining: none blocking. Ready for Qwen review.
+- Then B5 Recursive Learning (consume live events, consolidate provisional memories, mine patterns).
