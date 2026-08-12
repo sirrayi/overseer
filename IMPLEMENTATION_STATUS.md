@@ -13,7 +13,8 @@
 | B3 Episodic Memory | APPROVED | Qwen: verified live repo at 3cd91c5 — O(1) append, WAL + RLock, FTS5 + redaction, observer hooks, derived-cache rebuild all confirmed. 175 tests. |
 | B4 Verification + Repo Intel | APPROVED | Qwen: verified live repo at 194eb1f — project detection, repo maps, failure cards, rollback checkpoints, git tools, verifier hook all confirmed. 204 tests. |
 | B4.5 Live Learning | APPROVED | Qwen: verified live repo at deba794 — signal detector, session memory, provisional candidates, untrusted blocking, latency budgets all confirmed. 219 tests. |
-| B5 Knowledge Layer | IN PROGRESS (slices 1-3 done) | reflection pipeline, confidence/salience scoring, vault consolidation (dedup + conflicts), retrieval, consolidate CLI. 233 tests. CI green. |
+| B5 Knowledge Layer | APPROVED | Qwen: verified live repo at 0eb9c8f — confidence tiers, extraction, vault consolidation, dedup, conflict flags, evidence linking, retrieve API all confirmed. 233 tests. |
+| B6 Context Compiler | IN PROGRESS (slices 1-2 done) | tiered assembly, token budget + reserve, eviction order, progressive disclosure, stable prefix caching, loop integration. 242 tests. CI green. |
 | B2 CLI | pending | full command surface, sessions, budget display |
 | B3 Episodic Memory | pending | observation stream, FTS5, session notes |
 | B4 Verification + Repo Intelligence | pending | project detection, repo maps, targeted tests, rollback |
@@ -340,6 +341,34 @@
 - consolidate used FTS search instead of exact session match -> by_session()
 - UnboundLocalError after ev->evt rename -> all references fixed
 
+## B6 — Context Compiler (in progress)
+
+### Slices done (committed + pushed)
+- **Slice 1** (34f0353): context_compiler.py — ContextItem (tier/content/value/
+  tokens/snippet), ContextCompiler (budget + reserve, tiered assembly,
+  eviction order Tier 4->3->2, never evicts Tier 0/1, progressive disclosure
+  for long knowledge/environment items, stable prefix first for caching,
+  telemetry). 7 tests.
+- **Slice 2** (34f0353): agent.py compiler hook (_compile_context before each
+  model call, backward compatible when None); cli.py _make_compiler bridges
+  history -> tiered ContextItems -> budgeted ChatMessages. 2 tests.
+
+### B6 done-when status
+- [x] Context budget engine (max_tokens_per_turn, reserve for response)
+- [x] Tiered assembly: pinned/adaptation/knowledge/environment/optional
+- [x] Token accounting (len//4 conservative baseline)
+- [x] Eviction order: Tier 4 -> 3 -> 2; Tier 0/1 never evicted
+- [x] Progressive disclosure (snippets + link, not full notes)
+- [x] Stable prefix caching (system + pinned at front, dynamic at end)
+- [x] Loop integration (compiler before every model call)
+- [x] Context telemetry (tokens used, budget, utilization)
+
+### B6 bugs found & fixed (bug-hunt pass)
+- progressive disclosure not applied during compile -> snippet for tier>=2
+- test budgets too generous (items fit) -> tightened
+- telemetry utilization rounding -> smaller budget in test
+- mypy no-any-return on compiler hook -> typed annotation
+
 ## Next
-- B5 remaining: none blocking. Ready for Qwen review.
-- Then B6 Context Compiler (token-budgeted injection, progressive disclosure).
+- B6 remaining: none blocking. Ready for Qwen review.
+- Then B7 Pattern Miner + skill auto-promotion (cross-session patterns, skill drafts -> active).
