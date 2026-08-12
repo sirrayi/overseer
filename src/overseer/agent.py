@@ -85,6 +85,7 @@ class AgentLoop:
         observer: Callable[[str, dict[str, Any]], None] | None = None,
         verifier: Callable[[], Any] | None = None,
         live_learning: Callable[[str, str, bool], list[Any]] | None = None,
+        compiler: Any | None = None,
     ) -> None:
         self.providers = providers
         self.tools = tools
@@ -108,6 +109,10 @@ class AgentLoop:
         # untrusted) after each model turn. The CLI wires the engine; the
         # loop stays engine-agnostic.
         self.live_learning = live_learning
+        # Context compiler (plan B6): transforms the history into a
+        # token-budgeted message list before each model call. When None,
+        # the raw history is used (backward compatible).
+        self.compiler = compiler
 
     def _observe(self, event_type: str, **payload: Any) -> None:
         if self.observer:
@@ -151,13 +156,16 @@ class AgentLoop:
         tool_specs = tools if tools is not None else self.tools.specs()
 
         for iteration in range(self.max_iterations):
+            # 0. Compile the context under the token budget (plan B6).
+            call_history = self._compile_context(history)
+
             # 1. Call the model (with fallback chain).
             try:
                 if stream:
-                    result = self._call_model_streaming(chain, history, tool_specs)
+                    result = self._call_model_streaming(chain, call_history, tool_specs)
                 else:
                     result, _used = self.providers.complete_with_fallback(
-                        chain, history, tools=tool_specs
+                        chain, call_history, tools=tool_specs
                     )
             except ProviderError as exc:
                 self._observe("error", message=str(exc))
@@ -264,6 +272,19 @@ class AgentLoop:
             stopped_reason="max_iterations",
             transcript=history,
         )
+
+    def _compile_context(self, history: list[ChatMessage]) -> list[ChatMessage]:
+        """Budget the context before a model call (plan B6).
+
+        With a compiler hook, the history is transformed into a budgeted
+        message list. Without one, the raw history is used unchanged.
+        """
+        if self.compiler is None:
+            return history
+        compiled: list[ChatMessage] = self.compiler(history, self.system_prompt)
+        if not compiled:
+            return history
+        return compiled
 
     def _call_model_streaming(
         self, chain: list[str], history: list[ChatMessage], tool_specs: list[dict[str, Any]]

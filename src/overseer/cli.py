@@ -169,7 +169,43 @@ def _build_loop(runtime: Runtime, stream_callback: Any | None = None) -> Any:
         stream_callback=stream_callback,
         observer=observer,
         live_learning=(runtime.live_learning.detect_and_apply if runtime.live_learning else None),
+        compiler=_make_compiler(runtime),
     )
+
+
+def _make_compiler(runtime: Any) -> Any | None:
+    """Build the context-compiler hook (plan B6).
+
+    The hook receives (history, system_prompt) and returns a budgeted
+    list of ChatMessages. History messages become tiered ContextItems:
+    the system prompt + pinned guardrails are Tier 0, the latest user
+    message is Tier 1 (adaptation), and older turns are Tier 3.
+    """
+    from overseer.context_compiler import (
+        TIER_ADAPTATION,
+        TIER_ENVIRONMENT,
+        TIER_PINNED,
+        ContextCompiler,
+        ContextItem,
+    )
+    from overseer.providers.base import ChatMessage
+
+    cc = ContextCompiler(budget=runtime.cfg.max_tokens_per_turn)
+
+    def hook(history: list[ChatMessage], system_prompt: str) -> list[ChatMessage]:
+        items: list[ContextItem] = []
+        for i, m in enumerate(history):
+            if m.role == "system":
+                items.append(ContextItem(tier=TIER_PINNED, content=m.content, value=1.0))
+            elif i == len(history) - 1 and m.role == "user":
+                # Latest user message: adaptation tier (never evicted).
+                items.append(ContextItem(tier=TIER_ADAPTATION, content=m.content, value=0.95))
+            else:
+                items.append(ContextItem(tier=TIER_ENVIRONMENT, content=m.content, value=0.5))
+        compiled = cc.compile(items, system_prompt=system_prompt)
+        return [ChatMessage(role="system", content=msg["content"]) for msg in compiled]
+
+    return hook
 
 
 def _chain(runtime: Runtime) -> list[str]:

@@ -668,3 +668,32 @@ def test_live_learning_hook_fires_on_user_message(tmp_path):
     loop.run([ChatMessage(role="user", content="no, use pytest")], chain=["scripted"])
     assert calls and calls[0][0] == "no, use pytest"
     assert calls[0][2] is False  # user content, not untrusted
+
+
+# --- B6: context compiler integration ----------------------------------------
+
+
+def test_compiler_hook_called_before_model_call(tmp_path):
+    """The compiler hook must transform history before each model call."""
+    provider = _ScriptedProvider([ChatResult(content="ok")])
+    calls: list[list] = []
+
+    def fake_compiler(history, system_prompt):
+        calls.append(history)
+        return [ChatMessage(role="system", content="COMPILED: " + system_prompt)]
+
+    loop = _loop(tmp_path, provider, compiler=fake_compiler)
+    result = loop.run([ChatMessage(role="user", content="hi")], chain=["scripted"])
+    assert result.content == "ok"
+    assert calls  # the hook fired
+    # The provider must have seen the compiled message, not the raw history.
+    assert provider.calls == 1
+
+
+def test_compiler_none_uses_raw_history(tmp_path):
+    """Without a compiler, the raw history must be used unchanged."""
+    provider = _ScriptedProvider([ChatResult(content="ok")])
+    loop = _loop(tmp_path, provider)  # no compiler
+    result = loop.run([ChatMessage(role="user", content="hi")], chain=["scripted"])
+    assert result.content == "ok"
+    assert provider.calls == 1
