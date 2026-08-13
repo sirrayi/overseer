@@ -15,4 +15,5 @@ paths = [
   '''tests/test_logging.py''',
   '''tests/test_cli_b2.py''',
   '''tests/test_session.py''',
+  '''tests/test_datasets.py''',
 ]
