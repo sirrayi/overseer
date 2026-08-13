@@ -17,7 +17,8 @@
 | B6 Context Compiler | APPROVED | Qwen: verified live repo at 7f3aecc — budget+reserve, tiered assembly, eviction, progressive disclosure, stable prefix, loop hook all confirmed. 242 tests. CI green. |
 | B7 Recursive Learning | APPROVED | Qwen: verified live repo at fc97362 — PatternMiner evidence gates, correction replay, SkillRegistry governed writes, promotion gates all confirmed. 259 tests. |
 | B8 Routing + Economy | APPROVED | Qwen: verified live repo — complexity router, privacy routing, power-mode ceilings, telemetry + budget guard, cost CLI, loop integration all confirmed. 3 notes fixed (tier telemetry, provider_tiers config, TIER_NAMES). 275 tests. |
-| B9 Flesh + Integrations | IN PROGRESS (slices 1-3 done) | MCP client/server (approval-gated, untrusted outputs), isolated subagents (budget halt, inherits gate), packaging verified (wheel + entrypoint). 285 tests. CI green. |
+| B9 Flesh + Integrations | APPROVED | Qwen: verified live repo at 1bb4260 — MCP client/server approval routing, untrusted labeling, subagent isolation, packaging, all B8 notes fixed. 285 tests. |
+| B10 Recursive Closure | IN PROGRESS (slices 1-2 done) | meta-stats tracker, shadow-mode canary evaluation, proposal generation with L3 guardrail, meta + proposals CLI. 296 tests. CI green. |
 | B2 CLI | pending | full command surface, sessions, budget display |
 | B3 Episodic Memory | pending | observation stream, FTS5, session notes |
 | B4 Verification + Repo Intelligence | pending | project detection, repo maps, targeted tests, rollback |
@@ -414,5 +415,5 @@
   -> now reads durable Correction Memory from the vault (B4.5/B5).
 
 ## Next
-- B9 remaining: none blocking. Ready for Qwen review.
-- Then B10 Recursive Closure + self-tuning thresholds (statistical safeguards, threshold adaptation).
+- B10 remaining: none blocking. Ready for Qwen review.
+- Then B11 Adapter Pipeline (weight-level adaptation, dataset builder, MLX LoRA).
