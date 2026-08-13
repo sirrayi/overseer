@@ -76,15 +76,19 @@ ignore = ["S101"]  # allow assert in tests
 "tests/test_tools.py" = ["S108"]
 "tests/test_approval.py" = ["S108"]
 "tests/test_providers.py" = ["S108"]
+"tests/test_meta.py" = ["S108"]
 # terminal tool is a shell by design; gated by the approval gate (S602).
 "src/overseer/tools/terminal.py" = ["S602"]
 # repo.py runs a fixed git binary with validated args (S602/S603/S607).
 "src/overseer/tools/repo.py" = ["S602", "S603", "S607"]
+# meta.py shadow evaluator skips corrupt/missing sessions by design (S112).
+"src/overseer/meta.py" = ["S112"]
 
 [tool.bandit]
 # repo.py runs a fixed git binary with validated args; verification.py runs
 # project-detected commands by design. Both are gated by the approval system.
-skips = ["B603", "B607"]
+# meta.py shadow evaluator skips corrupt/missing sessions by design (B112).
+skips = ["B603", "B607", "B112"]
 
 [tool.mypy]
 python_version = "3.11"

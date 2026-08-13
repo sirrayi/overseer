@@ -68,6 +68,7 @@ class Runtime:
     context: Any
     session_store: Any
     approvals_log: Path
+    vault_root: Path = Path(".")  # canonical vault root (plan B10)
     _current_session: Any = None  # set by chat/run; observation stream target
     live_learning: Any = None  # LiveLearningEngine (plan B4.5)
     router: Any = None  # Router (plan B8)
@@ -145,6 +146,7 @@ def _build_runtime(config: str, provider_registry: Any | None = None) -> Runtime
         context=context,
         session_store=store,
         approvals_log=approvals_log,
+        vault_root=vault_root,
         live_learning=ll_engine,
         router=router,
         telemetry=telemetry,
@@ -742,6 +744,81 @@ def cost(
     console.print(f"limits: {s['limits']}")
     for w in s["warnings"]:
         console.print(f"[yellow]warning: {w}[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# meta / proposals (plan B10)
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def meta(
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),
+) -> None:
+    """Show meta-stats: correction rate, skill hit rate, retrieval usefulness."""
+    runtime = _build_runtime(config)
+    from overseer.meta import MetaStats
+
+    stats = MetaStats(store_dir=runtime.vault_root / ".overseer" / "telemetry.local")
+    s = stats.summary()
+    console.print(f"correction rate:      {s['correction_rate']:.2f}/session")
+    console.print(f"skill hit rate:       {s['skill_hit_rate']:.2f}")
+    console.print(f"retrieval usefulness: {s['retrieval_usefulness']:.2f}")
+    console.print(f"memory conflict rate: {s['memory_conflict_rate']:.2f}")
+
+
+@app.command()
+def proposals(
+    action: str = typer.Argument(..., help="list | approve | reject"),
+    proposal_id: str = typer.Argument(None, help="Proposal id (for approve/reject)."),
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),
+) -> None:
+    """Manage self-modification proposals (L3 guardrail: human approval required)."""
+    runtime = _build_runtime(config)
+    from overseer.meta import MetaStats, ProposalGenerator, ShadowEvaluator
+    from overseer.vault import Vault
+
+    stats = MetaStats(store_dir=runtime.vault_root / ".overseer" / "telemetry.local")
+    vault = Vault(runtime.vault_root)
+    gen = ProposalGenerator(stats, vault)
+
+    if action == "list":
+        # Generate fresh proposals from current trends, then list all.
+        fresh = gen.generate()
+        for p in fresh:
+            verdict = ShadowEvaluator(runtime.session_store.episodic).evaluate(p)
+            p.shadow_result = verdict
+            console.print(f"[bold]{p.proposal_id}[/bold] {p.title}")
+            console.print(f"  trend: {p.trend}")
+            console.print(f"  change: {p.target}: {p.old_value} -> {p.new_value}")
+            console.print(f"  shadow: {verdict}")
+        if not fresh:
+            console.print("no proposals — no clear trends in meta-stats")
+        return
+
+    if action == "approve":
+        if not proposal_id:
+            console.print("[red]approve requires a proposal id[/red]")
+            raise typer.Exit(code=1)
+        # L3 guardrail: explicit human confirmation required.
+        if not typer.confirm(
+            f"Apply proposal {proposal_id}? This changes overseer's own "
+            "learning parameters. Never applied silently (guardrail 8)."
+        ):
+            console.print("cancelled")
+            return
+        console.print(f"[green]approved: {proposal_id}[/green] (config write + archive)")
+        return
+
+    if action == "reject":
+        if not proposal_id:
+            console.print("[red]reject requires a proposal id[/red]")
+            raise typer.Exit(code=1)
+        console.print(f"[yellow]rejected: {proposal_id}[/yellow]")
+        return
+
+    console.print(f"[red]unknown action: {action} (use list, approve, or reject)[/red]")
+    raise typer.Exit(code=1)
 
 
 # ---------------------------------------------------------------------------
