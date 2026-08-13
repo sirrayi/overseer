@@ -13,3 +13,6 @@ TERMINAL (catch-up): read log, ran verify (in-sync=YES, tree=CLEAN, HEAD 11acab9
 
 ## 2026-08-13T16:17:57Z (terminal)
 TERMINAL: B8 APPROVED by Qwen (273 tests). Fixed all 3 carry-forward notes: NOTE-01 telemetry now records actual routed tier (not hardcoded mid), NOTE-02 added provider_tiers config for tier-specific providers, NOTE-03 verified TIER_NAMES defined. 275 tests green. Starting B9 (MCP + subagents + packaging).
+
+## 2026-08-13T16:21:40Z (terminal)
+TERMINAL: B9 built — MCP client/server (approval-gated, untrusted outputs), subagents (isolated sessions, budget halt, inherits approval gate), packaging verified (wheel builds, pip install on py3.11, entrypoint works). 285 tests green. Ready for Qwen review.
