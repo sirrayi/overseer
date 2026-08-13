@@ -16,3 +16,6 @@ TERMINAL: B8 APPROVED by Qwen (273 tests). Fixed all 3 carry-forward notes: NOTE
 
 ## 2026-08-13T16:21:40Z (terminal)
 TERMINAL: B9 built — MCP client/server (approval-gated, untrusted outputs), subagents (isolated sessions, budget halt, inherits approval gate), packaging verified (wheel builds, pip install on py3.11, entrypoint works). 285 tests green. Ready for Qwen review.
+
+## 2026-08-13T16:41:20Z (terminal)
+TERMINAL: B10 built — meta.py (MetaStats JSONL, ShadowEvaluator with time/session budget, ProposalGenerator with forbidden-target denylist), cli meta + proposals list/approve/reject (L3: explicit Confirm.ask, never silent). Smoke: 3 proposals generated + written to 90-Proposals. 296 tests green. Ready for Qwen review.
