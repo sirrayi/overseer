@@ -75,3 +75,28 @@ def test_warning_at_80_percent():
     t = Telemetry(max_cost_per_session=0.01, warn_ratio=0.8)
     t.record(tokens=8000, tier="mid")  # 0.008 = 80%
     assert t.near_limits()
+
+
+def test_telemetry_records_routed_tier(tmp_path):
+    """NOTE-01: telemetry must record the ACTUAL routed tier, not 'mid'."""
+    from overseer.telemetry import Telemetry
+
+    t = Telemetry(log_dir=tmp_path)
+    t.record(tokens=1000, tier="frontier")
+    t.record(tokens=500, tier="local")
+    assert t.session_entries[0].tier == "frontier"
+    assert t.session_entries[1].tier == "local"
+    assert t.session_entries[0].cost != t.session_entries[1].cost
+
+
+def test_provider_tiers_config(tmp_path):
+    """NOTE-02: provider_tiers must map tiers to distinct providers."""
+    from overseer.config import Config
+
+    cfg = Config(
+        provider_tiers={"local": "cheap-model", "frontier": "big-model"},
+    )
+    assert cfg.provider_tiers["local"] == "cheap-model"
+    assert cfg.provider_tiers["frontier"] == "big-model"
+    # Unset tiers fall back to the default provider name.
+    assert "mid" not in cfg.provider_tiers

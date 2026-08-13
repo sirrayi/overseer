@@ -120,12 +120,15 @@ def _build_runtime(config: str, provider_registry: Any | None = None) -> Runtime
     from overseer.routing import Router
     from overseer.telemetry import Telemetry
 
-    chains: dict[int, list[str]] = {
-        0: [cfg.provider.name],
-        1: [cfg.provider.name],
-        2: [cfg.provider.name],
-        3: [cfg.provider.name],
-    }
+    # NOTE-02 (B8): tier-specific providers from config. Keys are
+    # local/mid/frontier/vision; unset tiers fall back to the default
+    # provider. This lets a multi-provider setup route cheap work to
+    # cheap models and hard work to frontier models.
+    tier_keys = ("local", "mid", "frontier", "vision")
+    chains: dict[int, list[str]] = {}
+    for idx, key in enumerate(tier_keys):
+        provider_name = getattr(cfg, "provider_tiers", {}).get(key) or cfg.provider.name
+        chains[idx] = [provider_name]
     router = Router(chains=chains, power_mode=getattr(cfg, "power_mode", "balanced"))
     telemetry = Telemetry(
         log_dir=vault_root / ".overseer" / "logs",

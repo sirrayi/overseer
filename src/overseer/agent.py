@@ -169,9 +169,10 @@ class AgentLoop:
 
             # 0b. Route the call (plan B8): ask the router which chain to use.
             call_chain = chain
+            call_tier = "mid"
             if self.router is not None:
                 last_user = next((m.content for m in reversed(history) if m.role == "user"), "")
-                _, routed_chain, _ = self.router.route(last_user)
+                call_tier, routed_chain, _ = self.router.route(last_user)
                 if routed_chain:
                     call_chain = routed_chain
 
@@ -196,10 +197,12 @@ class AgentLoop:
                 )
 
             # 1b. Record telemetry (plan B8): tokens + estimated cost.
+            # NOTE-01 (B8): pass the ACTUAL routed tier so cost estimates
+            # reflect the model that really ran, not a hardcoded "mid".
             if self.telemetry is not None:
                 reported = result.usage.get("total_tokens", 0)
                 used_tokens = reported or _estimate_tokens(history)
-                self.telemetry.record(tokens=used_tokens, tier="mid")
+                self.telemetry.record(tokens=used_tokens, tier=call_tier)
 
             # 2. Token accounting: use reported usage, else conservative estimate.
             reported = result.usage.get("total_tokens", 0)

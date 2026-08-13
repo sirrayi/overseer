@@ -53,6 +53,14 @@ class Config(BaseModel):
     max_tokens_per_turn: int = Field(
         default=8000, ge=256, description="Context budget per model call (plan Part 43)."
     )
+    # NOTE-02 (B8): tier-specific provider names for routing. Keys are
+    # "local" | "mid" | "frontier" | "vision"; values are provider names
+    # registered in the ProviderRegistry. When unset, all tiers use
+    # `provider.name` (single-provider setups).
+    provider_tiers: dict[str, str] = Field(
+        default_factory=dict,
+        description="Tier -> provider name for routing (plan B8/B9).",
+    )
 
     @field_validator("power_mode")
     @classmethod
