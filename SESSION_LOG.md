@@ -19,3 +19,6 @@ TERMINAL: B9 built — MCP client/server (approval-gated, untrusted outputs), su
 
 ## 2026-08-13T16:41:20Z (terminal)
 TERMINAL: B10 built — meta.py (MetaStats JSONL, ShadowEvaluator with time/session budget, ProposalGenerator with forbidden-target denylist), cli meta + proposals list/approve/reject (L3: explicit Confirm.ask, never silent). Smoke: 3 proposals generated + written to 90-Proposals. 296 tests green. Ready for Qwen review.
+
+## 2026-08-13T19:28:01Z (terminal)
+TERMINAL: B11 built — datasets.py (correction/preference pairs + tool traces, deep redact before disk, hosted upload gated), adapter.py (registry, validation gate rejects regressions, hot-swap, rollback, power-aware training hook), config flags adapter_training_enabled + hosted_training_enabled (both default False), dataset + adapter CLI. Smoke: build->train->validate->activate->rollback all verified. 315 tests green. Ready for Qwen review.
