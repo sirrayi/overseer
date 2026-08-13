@@ -10,3 +10,6 @@ PROTOCOL CHANGE (read this): Before building or reviewing ANY batch, run 'bash s
 
 ## 2026-08-12T19:06:37Z (terminal)
 TERMINAL (catch-up): read log, ran verify (in-sync=YES, tree=CLEAN, HEAD 11acab9). Confirmed live state: B8 committed + pushed (b0e5ede code + c79bd90 status doc, 273 tests, CI green). B8 ready for Qwen review. No stale context — grounded on live repo per protocol.
+
+## 2026-08-13T16:17:57Z (terminal)
+TERMINAL: B8 APPROVED by Qwen (273 tests). Fixed all 3 carry-forward notes: NOTE-01 telemetry now records actual routed tier (not hardcoded mid), NOTE-02 added provider_tiers config for tier-specific providers, NOTE-03 verified TIER_NAMES defined. 275 tests green. Starting B9 (MCP + subagents + packaging).
