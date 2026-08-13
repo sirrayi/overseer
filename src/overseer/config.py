@@ -61,6 +61,15 @@ class Config(BaseModel):
         default_factory=dict,
         description="Tier -> provider name for routing (plan B8/B9).",
     )
+    # B11: weight-level adaptation (Tier 2). Strictly opt-in.
+    adapter_training_enabled: bool = Field(
+        default=False,
+        description="Enable local LoRA/DPO adapter training (plan B11).",
+    )
+    hosted_training_enabled: bool = Field(
+        default=False,
+        description="Allow redacted datasets to leave the machine (plan B11).",
+    )
 
     @field_validator("power_mode")
     @classmethod

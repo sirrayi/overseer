@@ -822,6 +822,106 @@ def proposals(
 
 
 # ---------------------------------------------------------------------------
+# dataset / adapter (plan B11)
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def dataset(
+    action: str = typer.Argument(..., help="build"),
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),
+) -> None:
+    """Build a redacted training dataset from the vault + episodic store."""
+    runtime = _build_runtime(config)
+    from overseer.datasets import DatasetBuilder
+
+    builder = DatasetBuilder(
+        runtime.vault_root,
+        episodic=runtime.session_store.episodic,
+        hosted_training_enabled=getattr(runtime.cfg, "hosted_training_enabled", False),
+    )
+    if action == "build":
+        path = builder.build()
+        console.print(f"[green]dataset built:[/green] {path} ({len(builder.records)} records)")
+        if not builder.upload_stub(path):
+            console.print("[yellow]hosted upload: blocked (hosted_training_enabled=False)[/yellow]")
+        return
+    console.print(f"[red]unknown action: {action} (use build)[/red]")
+    raise typer.Exit(code=1)
+
+
+@app.command()
+def adapter(
+    action: str = typer.Argument(..., help="train | activate | rollback | list"),
+    version: str = typer.Argument(None, help="Adapter version (for activate)."),
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file."),
+) -> None:
+    """Manage weight-level adapters (Tier 2, strictly opt-in)."""
+    runtime = _build_runtime(config)
+    from overseer.adapter import AdapterRegistry, TrainingHook
+
+    registry = AdapterRegistry(runtime.vault_root)
+
+    if action == "list":
+        for a in registry.list():
+            state = "active" if a.active else ("validated" if a.validated else "draft")
+            console.print(
+                f"[bold]{a.version}[/bold] {state} — {a.validation_report or 'not validated'}"
+            )
+        return
+
+    if action == "train":
+        hook = TrainingHook(
+            runtime.vault_root,
+            enabled=getattr(runtime.cfg, "adapter_training_enabled", False),
+            power_mode=getattr(runtime.cfg, "power_mode", "balanced"),
+            on_battery=False,  # battery check is a B12 concern (env/config)
+        )
+        allowed, reason = hook.can_train()
+        if not allowed:
+            console.print(f"[yellow]training blocked: {reason}[/yellow]")
+            return
+        # Build the dataset first, then train on it.
+        from overseer.datasets import DatasetBuilder
+
+        builder = DatasetBuilder(
+            runtime.vault_root,
+            episodic=runtime.session_store.episodic,
+            hosted_training_enabled=getattr(runtime.cfg, "hosted_training_enabled", False),
+        )
+        ds_path = builder.build()
+        adapter = hook.train(ds_path, version=version)
+        console.print(f"[green]trained:[/green] {adapter.version} ({adapter.path})")
+        console.print("[yellow]not activated — must pass the validation gate first[/yellow]")
+        return
+
+    if action == "activate":
+        if not version:
+            console.print("[red]activate requires a version[/red]")
+            raise typer.Exit(code=1)
+        try:
+            adapter = registry.activate(version)
+        except Exception as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        console.print(f"[green]activated: {adapter.version}[/green]")
+        return
+
+    if action == "rollback":
+        old = registry.rollback()
+        if old is None:
+            console.print("no active adapter to roll back")
+        else:
+            console.print(
+                f"[yellow]rolled back: {old.version} deactivated (base model active)[/yellow]"
+            )
+        return
+
+    console.print(f"[red]unknown action: {action} (use train, activate, rollback, or list)[/red]")
+    raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
 # doctor / version
 # ---------------------------------------------------------------------------
 
