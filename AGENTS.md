@@ -31,3 +31,24 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
 - Test: `cargo test`
 - Run: `ANTHROPIC_API_KEY=... cargo run -p overseer-cli -- exec "task"`
 - JSONL event stream: add `--json`; resume: `--resume <session-dir>`
+
+## Git workflow (github.com/sirrayi/overseer, private)
+
+Branch ladder — promotion flows upward, work flows downward:
+
+```
+main   ← tagged releases only; never push directly
+dev    ← stress-testing / dev-release builds cut from here
+review ← default branch; all PRs target here first
+*      ← feature branches fork off review
+```
+
+- Branch off `review` with typed names: `feat/<slug>`, `fix/<slug>`,
+  `chore/<slug>`, `docs/<slug>`, `eval/<slug>`
+- Open PR → `review`. Fix conflicts + final polish there.
+- `review` → `dev` merge gates a dev release (stress testing).
+- `dev` → `main` only when a release is finalized.
+- Direct pushes to `main` are forbidden by convention (no Pro-tier
+  protection available on a private repo — enforced socially).
+- CI runs on PRs and on pushes to `main`; keep main pushes rare to
+  conserve Actions minutes.
