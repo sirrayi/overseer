@@ -1,0 +1,16 @@
+[package]
+name = "overseer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Overseer agent engine: turn IR, event log, ledger, tools, provider adapters, ReAct loop"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v7", "serde"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "json", "platform-verifier"] }
+ignore = "0.4"
+globset = "0.4"
+regex-lite = "0.1"

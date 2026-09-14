@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Resource budgets (playbook Ch.10 §5): fail CI when exceeded.
+  BINARY_SIZE_BUDGET_BYTES: 15728640   # 15 MB release binary
+  STARTUP_BUDGET_MS: 300               # --version wall-clock
+
+jobs:
+  build-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build
+        run: cargo build --workspace
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  budgets:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: release build
+        run: cargo build --release -p overseer-cli
+
+      - name: binary size gate
+        run: |
+          size=$(stat -f%z target/release/overseer)
+          echo "binary size: $size bytes"
+          [ "$size" -lt "$BINARY_SIZE_BUDGET_BYTES" ] || {
+            echo "::error::binary $size exceeds budget $BINARY_SIZE_BUDGET_BYTES"; exit 1; }
+
+      - name: startup time gate
+        run: |
+          # Best-of-5 --version wall time in ms (python3 for ms resolution).
+          python3 - <<'EOF'
+          import subprocess, time, sys, os
+          budget = float(os.environ["STARTUP_BUDGET_MS"])
+          times = []
+          for _ in range(5):
+              t = time.perf_counter()
+              subprocess.run(["./target/release/overseer", "--version"],
+                             stdout=subprocess.DEVNULL)
+              times.append((time.perf_counter() - t) * 1000)
+          best = min(times)
+          print(f"startup: {best:.1f} ms (best of 5)")
+          sys.exit(0 if best < budget else 1)
+          EOF

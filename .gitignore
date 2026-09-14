@@ -1,0 +1,7 @@
+/target
+.overseer/
+playbook.txt
+*.log
+.DS_Store
+eval/results/
+eval/workspaces/

@@ -1,0 +1,21 @@
+# Example task spec — the immutable unit of the rig (playbook Ch.8 §4).
+# Every field travels with the trajectory; anything not pinned here is a
+# confound in the benchmark tuple {model × scaffold × environment × grading}.
+id: example-hello-cli
+version: 1
+tags: [smoke]
+instruction: >
+  Create a file hello.py containing a function hello() that returns
+  "hello world", then run it to confirm it works.
+env:
+  image_digest: null        # docker image digest once tasks run in containers
+  workdir: ./workspaces/example-hello-cli
+limits:
+  max_steps: 20
+  max_cost_usd: 0.50
+grader:
+  type: bash_assert         # deterministic grader; no model judge
+  script: |
+    test -f hello.py && python3 -c "from hello import hello; assert hello()=='hello world'"
+reference: |
+  printf 'def hello():\n    return "hello world"\n' > hello.py && python3 -c "from hello import hello; print(hello())"

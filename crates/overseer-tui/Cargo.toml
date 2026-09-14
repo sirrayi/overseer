@@ -1,0 +1,10 @@
+[package]
+name = "overseer-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Overseer TUI (Phase 2: Ratatui, cell-diffed double buffer, sync output)"
+
+[dependencies]
+overseer-core = { path = "../overseer-core" }
+overseer-proto = { path = "../overseer-proto" }
