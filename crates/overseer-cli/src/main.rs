@@ -70,6 +70,8 @@ fn usage() {
          \x20 --max-steps <n>     Step budget (default: 100)\n\
          \x20 --max-cost <usd>    Cost budget in USD (default: 5.0)\n\
          \x20 --thinking <tok>    Enable extended thinking with token budget\n\
+         \x20 --full-access       Disable the permission gate (benchmarks/\n\
+         \x20                     sandboxed envs only)\n\
          \n\
          ENV:\n\
          \x20 OVERSEER_API_KEY    Provider key (preferred, any provider)\n\
@@ -90,6 +92,7 @@ struct ExecFlags {
     max_steps: u32,
     max_cost: f64,
     thinking: Option<u32>,
+    full_access: bool,
     prompt: Option<String>,
 }
 
@@ -105,6 +108,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         max_steps: 100,
         max_cost: 5.0,
         thinking: None,
+        full_access: false,
         prompt: None,
     };
     let mut i = 0;
@@ -126,6 +130,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
             "--max-steps" => f.max_steps = take(&mut i)?.parse().map_err(|_| "bad --max-steps")?,
             "--max-cost" => f.max_cost = take(&mut i)?.parse().map_err(|_| "bad --max-cost")?,
             "--thinking" => f.thinking = Some(take(&mut i)?.parse().map_err(|_| "bad --thinking")?),
+            "--full-access" => f.full_access = true,
             "-" => {
                 // Read the prompt from stdin (CI-friendly).
                 let mut buf = String::new();
@@ -182,6 +187,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         max_output_tokens: 16_384,
         thinking_budget: flags.thinking,
         cwd: flags.cwd.clone(),
+        full_access: flags.full_access,
     };
 
     let mut agent = if flags.resume.is_some() {

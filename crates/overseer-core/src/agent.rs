@@ -33,6 +33,9 @@ pub struct AgentConfig {
     /// Anthropic thinking budget; None disables.
     pub thinking_budget: Option<u32>,
     pub cwd: PathBuf,
+    /// Benchmark mode: disable the permission gate entirely. Only valid when
+    /// the environment itself is the sandbox (per-task container).
+    pub full_access: bool,
 }
 
 impl Default for AgentConfig {
@@ -44,6 +47,7 @@ impl Default for AgentConfig {
             max_output_tokens: 16_384,
             thinking_budget: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            full_access: false,
         }
     }
 }
@@ -96,12 +100,13 @@ impl<'a> Agent<'a> {
         std::fs::create_dir_all(&session_dir)?;
         let log = EventLog::create(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::create(session_dir.join("ledger.jsonl"))?;
+        let tools = ToolRegistry::core(Self::policy(&config));
         let mut agent = Agent {
             provider,
             config,
             log,
             ledger,
-            tools: ToolRegistry::core(),
+            tools,
             messages: Vec::new(),
             session_dir,
             stuck: StuckDetector::new(),
@@ -128,12 +133,13 @@ impl<'a> Agent<'a> {
         let messages = rehydrate_messages(&events);
         let log = EventLog::open(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::open(session_dir.join("ledger.jsonl"))?;
+        let tools = ToolRegistry::core(Self::policy(&config));
         Ok(Agent {
             provider,
             config,
             log,
             ledger,
-            tools: ToolRegistry::core(),
+            tools,
             messages,
             session_dir,
             stuck: StuckDetector::new(),
@@ -285,6 +291,7 @@ impl<'a> Agent<'a> {
                         is_error: out.is_error,
                         raw_bytes: out.raw_bytes,
                         spilled_to: out.spilled_to.clone(),
+                        denied: out.denied,
                     },
                     on_event,
                 )?;
@@ -346,6 +353,14 @@ impl<'a> Agent<'a> {
         self.messages.push(Message::user_text(text.clone()));
         self.emit(EventKind::Nudge { text }, on_event)?;
         Ok(None)
+    }
+
+    fn policy(config: &AgentConfig) -> crate::perm::Policy {
+        if config.full_access {
+            crate::perm::Policy::allow_all()
+        } else {
+            crate::perm::Policy::headless(config.cwd.clone())
+        }
     }
 
     /// Append an event and hand it to the sink.
