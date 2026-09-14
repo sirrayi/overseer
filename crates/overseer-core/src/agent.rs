@@ -56,8 +56,8 @@ pub enum RunOutcome {
 
 /// A running agent: owns the event log, ledger, tool registry, and the
 /// message view rehydrated from the log.
-pub struct Agent<'a, P: Provider> {
-    provider: &'a P,
+pub struct Agent<'a> {
+    provider: &'a dyn Provider,
     config: AgentConfig,
     log: EventLog,
     ledger: Ledger,
@@ -66,10 +66,10 @@ pub struct Agent<'a, P: Provider> {
     session_dir: PathBuf,
 }
 
-impl<'a, P: Provider> Agent<'a, P> {
+impl<'a> Agent<'a> {
     /// Start a fresh session in `session_dir` (must exist / be creatable).
     pub fn start(
-        provider: &'a P,
+        provider: &'a dyn Provider,
         config: AgentConfig,
         session_dir: PathBuf,
         session_id: String,
@@ -99,7 +99,7 @@ impl<'a, P: Provider> Agent<'a, P> {
 
     /// Resume an existing session dir: replay events, rebuild the message view.
     pub fn resume(
-        provider: &'a P,
+        provider: &'a dyn Provider,
         config: AgentConfig,
         session_dir: PathBuf,
     ) -> std::io::Result<Self> {
