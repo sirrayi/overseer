@@ -22,7 +22,7 @@ pub fn render(text: &str) -> Vec<Line<'static>> {
         if in_fence {
             out.push(Line::from(Span::styled(
                 format!("  {line}"),
-                theme::CODE,
+                theme::code(),
             )));
             continue;
         }
@@ -66,7 +66,7 @@ fn inline_spans(text: &str) -> Vec<Span<'static>> {
                     code.push(c2);
                 }
                 if closed {
-                    spans.push(Span::styled(code, theme::CODE));
+                    spans.push(Span::styled(code, theme::code()));
                 } else {
                     // Unclosed tick: keep literal, don't eat the text.
                     buf.push('`');

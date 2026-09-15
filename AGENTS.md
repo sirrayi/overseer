@@ -40,17 +40,27 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   rule to `~/.overseer/rules` (deny rules still win; headless stays
   fail-closed). Keys: Esc interrupt, Shift+Tab mode cycle, Ctrl+T
   plan, Ctrl+X cancel queued, Ctrl+S stash, Ctrl+_ undo, Ctrl+W
-  del-word, Ctrl+P session picker, Ctrl+O transcript search, ? help,
-  /help /quit /sessions /fork /rewind /diff /approve. Session
-  switches and rewinds rebuild the agent via `WorkerCmd::SwitchSession`
-  → `Agent::resume` (never mid-run); the transcript reseeds from the
-  new log. Modal overlays (sessions/rewind/transcript/diff) own the
-  live region while open — key hints render last so top-clipping
-  can't hide them. `/diff` reads checkpoint manifests (earliest
-  snapshot per path), Enter reverts a file after stashing the current
-  content into `checkpoints/revert-stash`. `/approve` exits plan mode
-  and submits "implement the plan". Toasts self-expire in the status
-  area.
+  del-word, Ctrl+P sessions, Ctrl+O search, Ctrl+Y copy last reply
+  (OSC 52), Alt+E/`/edit` $EDITOR draft, Tab completes `/cmd` or
+  `@path`, `!cmd` runs shell locally (never sent to the model),
+  ? help, /help /quit /sessions /fork /rewind /diff /approve /search.
+  Session switches and rewinds rebuild the agent via
+  `WorkerCmd::SwitchSession` → `Agent::resume` (never mid-run); the
+  transcript reseeds from the new log. Modal overlays
+  (sessions/rewind/transcript/diff) own the live region while open —
+  key hints render last so top-clipping can't hide them. `/diff`
+  reads checkpoint manifests (earliest snapshot per path), Enter
+  reverts a file after stashing current content into
+  `checkpoints/revert-stash`. `/approve` exits plan mode and submits
+  "implement the plan". Toasts self-expire in the status area.
+  Polish layer (2.8): `theme.rs` is a runtime palette
+  (`OVERSEER_THEME=mono|default|high-contrast`; NO_COLOR/TERM=dumb →
+  mono); DECSET-1004 focus tracking gates BEL+OSC 9/99/777
+  notifications (unfocused only, escape-sanitized); OSC 133 prompt
+  marks + OSC 8 file links emit raw into the scrollback stream (muxes
+  off via `caps.osc`); REDUCE_MOTION freezes the spinner;
+  `--no-tui` is a plain-text REPL sharing the same worker (`run_line`,
+  asks answered by one-line replies, /quit or Ctrl+D exits).
 - `eval/` — Inspect AI evaluation rig (scaffold)
 
 ## Invariants (do not violate)
