@@ -68,7 +68,7 @@ impl StopReason {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Response {
     pub blocks: Vec<crate::ir::Block>,
     pub stop_reason: StopReason,
