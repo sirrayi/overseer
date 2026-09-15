@@ -401,4 +401,46 @@ mod tests {
         assert!(bad.is_error);
         assert!(bad.text.contains("pending|in_progress|completed"));
     }
+
+    #[test]
+    fn edit_returns_hunk_and_validates_json() {
+        let dir = tmpdir();
+        let file = (1..=20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("b.txt"), &file).unwrap();
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut c = ctx(&dir);
+
+        reg.call("read", &json!({"path": "b.txt"}), &mut c);
+        let out = reg.call(
+            "edit",
+            &json!({"path": "b.txt", "old_string": "line10", "new_string": "LINE10"}),
+            &mut c,
+        );
+        assert!(!out.is_error);
+        // Hunk = the change + context, never the whole file.
+        assert!(out.text.contains("LINE10"));
+        assert!(out.text.contains("line9"));
+        assert!(out.text.contains("line11"));
+        assert!(!out.text.contains("line1\n"));
+        assert!(!out.text.contains("line20"));
+
+        // Apply-time validation: a JSON-corrupting edit is refused,
+        // file untouched.
+        std::fs::write(dir.join("c.json"), "{\"a\": 1}").unwrap();
+        reg.call("read", &json!({"path": "c.json"}), &mut c);
+        let bad = reg.call(
+            "edit",
+            &json!({"path": "c.json", "old_string": "1", "new_string": "1,"}),
+            &mut c,
+        );
+        assert!(bad.is_error);
+        assert!(bad.text.contains("invalid JSON"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("c.json")).unwrap(),
+            "{\"a\": 1}"
+        );
+    }
 }
