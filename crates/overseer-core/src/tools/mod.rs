@@ -17,6 +17,7 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod read;
+pub mod task;
 pub mod write;
 
 /// Hard cap on inline tool results (proven default: Claude Code's ~30K).
@@ -25,12 +26,19 @@ pub const INLINE_CAP: usize = 30_000;
 pub const SPILL_THRESHOLD: usize = 30_000;
 
 /// Per-invocation context passed to tools.
-pub struct ToolCtx {
+pub struct ToolCtx<'a> {
     pub cwd: PathBuf,
     /// Session dir for spilled tool output (…/tool-outputs/).
     pub session_dir: PathBuf,
     /// Monotonic counter for naming spilled files.
     pub spill_seq: u64,
+    /// Provider handle for the `task` subagent tool; None in contexts with
+    /// no provider (tests, dry runs) → `task` fails with an honest error.
+    pub provider: Option<&'a dyn crate::provider::Provider>,
+    /// Parent agent config for subagent inheritance (model, cwd, budgets).
+    pub agent_config: Option<crate::agent::AgentConfig>,
+    /// Subagent spawn counter for session-dir naming.
+    pub subagent_seq: u64,
 }
 
 /// What a tool produced. `text` is what enters context.
@@ -95,7 +103,19 @@ impl ToolRegistry {
                 edit::spec(),
                 grep::spec(),
                 glob::spec(),
+                task::spec(),
             ],
+            read_paths: HashSet::new(),
+            policy,
+        }
+    }
+
+    /// Read-only registry for quarantined subagents (playbook Ch.3 §9.6):
+    /// writes stay single-threaded in the parent agent. No `task` either —
+    /// subagents cannot spawn subagents.
+    pub fn readonly(policy: crate::perm::Policy) -> Self {
+        ToolRegistry {
+            specs: vec![read::spec(), grep::spec(), glob::spec()],
             read_paths: HashSet::new(),
             policy,
         }
@@ -131,8 +151,9 @@ impl ToolRegistry {
             "edit" => edit::run(input, ctx, self),
             "grep" => grep::run(input, ctx),
             "glob" => glob::run(input, ctx),
+            "task" => task::run(input, ctx),
             other => ToolOutput::err(format!(
-                "Unknown tool '{other}'. Available tools: bash, read, write, edit, grep, glob."
+                "Unknown tool '{other}'. Available tools: bash, read, write, edit, grep, glob, task."
             )),
         };
         enforce_budget(out, ctx)
