@@ -7,8 +7,9 @@
 //! {path, preview, size} so the model can re-read on demand.
 //! Error messages are prompts: name the invariant violated, suggest the repair.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
@@ -82,6 +83,14 @@ impl ToolOutput {
     }
 }
 
+/// One completed read: the file's mtime at read time + the line range
+/// returned. Dedup key is (path, mtime, range) per playbook Ch.6 §2.3.
+struct ReadRecord {
+    mtime: Option<SystemTime>,
+    start: usize,
+    end: usize,
+}
+
 /// The resident tool registry + per-session tool state (e.g. the read-before-
 /// edit tracker — a harness-enforced anti-hallucination invariant, Ch.4 §2.3).
 /// Owns the permission policy: the gate lives at the dispatch boundary so no
@@ -90,6 +99,8 @@ pub struct ToolRegistry {
     pub specs: Vec<crate::provider::ToolSpec>,
     /// Paths the agent has read this session (canonicalized).
     read_paths: HashSet<PathBuf>,
+    /// Read history for dedup: canonical path → (mtime, line range) list.
+    read_log: HashMap<PathBuf, Vec<ReadRecord>>,
     policy: crate::perm::Policy,
 }
 
@@ -110,6 +121,7 @@ impl ToolRegistry {
         ToolRegistry {
             specs,
             read_paths: HashSet::new(),
+            read_log: HashMap::new(),
             policy,
         }
     }
@@ -121,6 +133,7 @@ impl ToolRegistry {
         ToolRegistry {
             specs: vec![read::spec(), grep::spec(), glob::spec()],
             read_paths: HashSet::new(),
+            read_log: HashMap::new(),
             policy,
         }
     }
@@ -135,6 +148,52 @@ impl ToolRegistry {
         path.canonicalize()
             .map(|p| self.read_paths.contains(&p))
             .unwrap_or(false)
+    }
+
+    /// P1.3 read dedup: true when `path` was already read with the same
+    /// `mtime` and a range covering `[start, end)` — the identical content
+    /// is already in context, so the caller returns a stub instead.
+    pub fn dedup_hit(
+        &self,
+        path: &Path,
+        mtime: Option<SystemTime>,
+        start: usize,
+        end: usize,
+    ) -> bool {
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.read_log
+            .get(&key)
+            .map(|recs| {
+                recs.iter()
+                    .any(|r| r.mtime == mtime && r.start <= start && end <= r.end)
+            })
+            .unwrap_or(false)
+    }
+
+    /// True when `path` has read history but every record's mtime differs —
+    /// the file changed since the last read (the "diff" half of the rule).
+    pub fn mtime_changed(&self, path: &Path, mtime: Option<SystemTime>) -> bool {
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.read_log
+            .get(&key)
+            .map(|recs| !recs.is_empty() && recs.iter().all(|r| r.mtime != mtime))
+            .unwrap_or(false)
+    }
+
+    /// Record a completed read for dedup (and the read-before-edit tracker).
+    pub fn record_read(
+        &mut self,
+        path: &Path,
+        mtime: Option<SystemTime>,
+        start: usize,
+        end: usize,
+    ) {
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.read_log
+            .entry(key)
+            .or_default()
+            .push(ReadRecord { mtime, start, end });
+        self.mark_read(path);
     }
 
     /// Dispatch a tool call. The permission gate runs first — Deny and
@@ -251,4 +310,57 @@ pub fn schema(properties: Value, required: &[&str]) -> Value {
         "required": required,
         "additionalProperties": false
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("overseer-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn ctx(dir: &Path) -> ToolCtx<'static> {
+        ToolCtx {
+            cwd: dir.to_path_buf(),
+            session_dir: dir.join("session"),
+            spill_seq: 0,
+            provider: None,
+            agent_config: None,
+            subagent_seq: 0,
+        }
+    }
+
+    #[test]
+    fn read_dedup_returns_stub_for_unchanged_reread() {
+        let dir = tmpdir();
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut c = ctx(&dir);
+
+        let first = reg.call("read", &json!({"path": "a.txt"}), &mut c);
+        assert!(first.text.contains("one"));
+        // Identical re-read → stub, not the bytes again.
+        let second = reg.call("read", &json!({"path": "a.txt"}), &mut c);
+        assert!(second.text.contains("[unchanged]"));
+        assert!(!second.text.contains("two"));
+        // A covered sub-range is also deduped.
+        let sub = reg.call(
+            "read",
+            &json!({"path": "a.txt", "offset": 2, "limit": 1}),
+            &mut c,
+        );
+        assert!(sub.text.contains("[unchanged]"));
+
+        // Modify the file → fresh content with a change note.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(dir.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        let third = reg.call("read", &json!({"path": "a.txt"}), &mut c);
+        assert!(third
+            .text
+            .contains("[file modified since your previous read]"));
+        assert!(third.text.contains("TWO"));
+    }
 }
