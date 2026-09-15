@@ -44,12 +44,183 @@ fn real_main() -> i32 {
     match args[0].as_str() {
         "exec" => cmd_exec(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
+        "rewind" => cmd_rewind(&args[1..]),
         other => {
             eprintln!("overseer: unknown command '{other}'");
             usage();
             2
         }
     }
+}
+
+/// `overseer rewind <session-dir> [--checkpoint <n>] [--mode <m>]` —
+/// P1.9 checkpoint rewind. Modes: `code` (restore snapshotted files),
+/// `conversation` (truncate events at the checkpoint boundary),
+/// `both` (default), `summarize` (truncate + compact what remains).
+/// Blind spot: `bash` side effects are never snapshotted — only
+/// write/edit edits are recorded in the manifest.
+fn cmd_rewind(args: &[String]) -> i32 {
+    let mut dir: Option<PathBuf> = None;
+    let mut want_cp: Option<u64> = None;
+    let mut mode = "both".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--checkpoint" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("overseer rewind: --checkpoint needs a value");
+                    return 2;
+                };
+                want_cp = v.trim_start_matches('e').parse().ok();
+                if want_cp.is_none() {
+                    eprintln!("overseer rewind: bad --checkpoint '{v}'");
+                    return 2;
+                }
+            }
+            "--mode" => {
+                i += 1;
+                match args.get(i).map(|s| s.as_str()) {
+                    Some(m @ ("code" | "conversation" | "both" | "summarize")) => {
+                        mode = m.to_string()
+                    }
+                    other => {
+                        eprintln!(
+                            "overseer rewind: bad --mode {:?} (code|conversation|both|summarize)",
+                            other
+                        );
+                        return 2;
+                    }
+                }
+            }
+            s if s.starts_with('-') => {
+                eprintln!("overseer rewind: unknown flag '{s}'");
+                return 2;
+            }
+            s => dir = Some(PathBuf::from(s)),
+        }
+        i += 1;
+    }
+    let Some(dir) = dir else {
+        eprintln!("overseer rewind: session dir required");
+        return 2;
+    };
+
+    // Checkpoint dirs are named e<user-input-event-id>.
+    let cp_root = dir.join("checkpoints");
+    let mut cps: Vec<u64> = std::fs::read_dir(&cp_root)
+        .map(|d| {
+            d.filter_map(|e| {
+                e.ok()?
+                    .file_name()
+                    .to_string_lossy()
+                    .strip_prefix('e')
+                    .and_then(|n| n.parse().ok())
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    cps.sort_unstable();
+    let boundary = match want_cp.or_else(|| cps.last().copied()) {
+        Some(b) if cps.contains(&b) => b,
+        Some(b) => {
+            eprintln!(
+                "overseer rewind: no checkpoint e{b} in {}",
+                cp_root.display()
+            );
+            return 1;
+        }
+        None => {
+            eprintln!("overseer rewind: no checkpoints in {}", cp_root.display());
+            return 1;
+        }
+    };
+    let cp_dir = cp_root.join(format!("e{boundary}"));
+
+    if mode == "code" || mode == "both" {
+        let mut restored = 0u32;
+        let mut deleted = 0u32;
+        if let Ok(manifest) = std::fs::read_to_string(cp_dir.join("manifest.jsonl")) {
+            for line in manifest.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let (Some(path), Some(stored)) = (
+                    v.get("path").and_then(|p| p.as_str()),
+                    v.get("stored").and_then(|s| s.as_str()),
+                ) else {
+                    continue;
+                };
+                if v.get("existed").and_then(|e| e.as_bool()).unwrap_or(false) {
+                    let src = cp_dir.join("files").join(stored);
+                    let dst = PathBuf::from(path);
+                    if let Some(parent) = dst.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::copy(&src, &dst).is_ok() {
+                        restored += 1;
+                    }
+                } else if std::fs::remove_file(path).is_ok() {
+                    deleted += 1;
+                }
+            }
+        }
+        println!("code: restored {restored} file(s), removed {deleted} created file(s)");
+    }
+
+    if mode != "code" {
+        // Truncate the log at the boundary (the user input that opened the
+        // checkpoint stays; everything the agent did for it goes).
+        let events_path = dir.join("events.jsonl");
+        let Ok(text) = std::fs::read_to_string(&events_path) else {
+            eprintln!("overseer rewind: cannot read {}", events_path.display());
+            return 1;
+        };
+        let kept: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(|id| id.as_u64()))
+                    .map(|id| id <= boundary)
+                    .unwrap_or(true)
+            })
+            .collect();
+        let dropped = text.lines().count() - kept.len();
+        let tmp = events_path.with_extension("jsonl.tmp");
+        if std::fs::write(&tmp, kept.join("\n") + "\n").is_err()
+            || std::fs::rename(&tmp, &events_path).is_err()
+        {
+            eprintln!("overseer rewind: failed writing {}", events_path.display());
+            return 1;
+        }
+        println!("conversation: truncated {dropped} event(s) at boundary e{boundary}");
+
+        if mode == "summarize" {
+            use overseer_core::compact;
+            use overseer_core::event::{EventKind, EventLog};
+            let events = EventLog::replay(&events_path).unwrap_or_default();
+            if let Some(anchor) = compact::tail_anchor(&events, compact::TAIL_TURNS, 0) {
+                let summary = compact::summarize(&events, anchor);
+                match EventLog::open(&events_path) {
+                    Ok(mut log) => {
+                        if log
+                            .append(EventKind::Compaction {
+                                summary,
+                                tail_from: anchor,
+                            })
+                            .and_then(|_| log.flush())
+                            .is_ok()
+                        {
+                            println!("conversation: appended compaction summary at e{anchor}");
+                        }
+                    }
+                    Err(e) => eprintln!("overseer rewind: compaction append failed: {e}"),
+                }
+            }
+        }
+    }
+    0
 }
 
 /// `overseer stats <session-dir>` — the cache-hit-rate dashboard
@@ -93,6 +264,9 @@ fn usage() {
          USAGE:\n\
          \x20 overseer exec [FLAGS] <prompt>\n\
          \x20 overseer stats <session-dir>   ledger dashboard (tokens, cache-hit, cost)\n\
+         \x20 overseer rewind <session-dir> [--checkpoint <n>] [--mode <m>]\n\
+         \x20                             restore a checkpoint; m = code|\n\
+         \x20                             conversation|both|summarize\n\
          \x20 overseer --version\n\
          \n\
          FLAGS (exec):\n\
