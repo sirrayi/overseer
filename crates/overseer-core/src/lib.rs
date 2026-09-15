@@ -9,6 +9,7 @@ pub mod compact;
 pub mod event;
 pub mod ir;
 pub mod ledger;
+pub mod memory;
 pub mod perm;
 pub mod profile;
 pub mod provider;
