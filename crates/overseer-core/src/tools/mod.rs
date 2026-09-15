@@ -168,6 +168,9 @@ pub struct ToolRegistry {
     /// Read history for dedup: canonical path → (mtime, line range) list.
     read_log: HashMap<PathBuf, Vec<ReadRecord>>,
     policy: crate::perm::Policy,
+    /// Rule-of-Two latch notices (P3.10): drained by the agent loop and
+    /// emitted as `Tainted` events.
+    pub taint_notices: Vec<String>,
 }
 
 impl ToolRegistry {
@@ -193,6 +196,7 @@ impl ToolRegistry {
             read_paths: HashSet::new(),
             read_log: HashMap::new(),
             policy,
+            taint_notices: Vec::new(),
         }
     }
 
@@ -205,6 +209,7 @@ impl ToolRegistry {
             read_paths: HashSet::new(),
             read_log: HashMap::new(),
             policy,
+            taint_notices: Vec::new(),
         }
     }
 
@@ -219,6 +224,7 @@ impl ToolRegistry {
             read_paths: HashSet::new(),
             read_log: HashMap::new(),
             policy,
+            taint_notices: Vec::new(),
         }
     }
 
@@ -310,6 +316,11 @@ impl ToolRegistry {
                 "Unknown tool '{other}'. Available tools: bash, read, write, edit, grep, glob, plan, task, skill, repo_map, symbol."
             )),
         };
+        // Rule-of-Two bookkeeping (P3.10): this result may carry untrusted
+        // content or secret material — latch before the next call is gated.
+        if let Some(notice) = self.policy.note_result(name, input, &out.text) {
+            self.taint_notices.push(notice);
+        }
         enforce_budget(out, ctx)
     }
 }
@@ -356,6 +367,15 @@ pub fn enforce_budget(out: ToolOutput, ctx: &mut ToolCtx) -> ToolOutput {
             }
         }
     }
+}
+
+/// Provenance wrap (P3.10): tool output enters the model context inside
+/// explicit markers so injected instructions can't pose as user/system
+/// text. Applied at the IR layer (Block::ToolResult.content) — the event
+/// log stores raw output and rehydrate re-wraps, so live and resumed
+/// views stay byte-identical.
+pub fn provenance_wrap(name: &str, text: &str) -> String {
+    format!("<tool_result tool=\"{name}\">\n{text}\n</tool_result>")
 }
 
 /// Middle-truncate a string to `cap` chars, keeping head and tail
