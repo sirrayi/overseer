@@ -115,7 +115,18 @@ fn cmd_tui(args: &[String]) -> i32 {
 
 /// Session directory + whether to resume it. Precedence: --resume >
 /// --continue (cwd-scoped) > --last > --session > fresh timestamped dir.
+/// `--bare` never lands in ~/.overseer — the session is a throwaway.
 fn resolve_session(flags: &ExecFlags) -> (PathBuf, bool) {
+    if flags.bare {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        return (
+            std::env::temp_dir().join(format!("overseer-bare-{ts}")),
+            false,
+        );
+    }
     if let Some(d) = &flags.resume {
         return (d.clone(), true);
     }
@@ -174,7 +185,14 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
         verify_block_cap: flags.verify_cap,
         sandbox_bash: flags.sandbox,
         ask_handler: None,
-        rules_path: Some(dirs_home().join("rules")),
+        // --bare: no persisted rules — a CI run must not inherit or
+        // mutate the operator's allow-list. Ask verdicts still
+        // fail-closed to deny either way.
+        rules_path: if flags.bare {
+            None
+        } else {
+            Some(dirs_home().join("rules"))
+        },
     }
 }
 
@@ -309,6 +327,10 @@ fn usage() {
          \n\
          FLAGS (exec):\n\
          \x20 --json              Emit the event stream as JSONL on stdout\n\
+         \x20 --bare              Hermetic CI mode: --json + throwaway\n\
+         \x20                     session in temp dir + no persisted\n\
+         \x20                     rules (mutually exclusive with resume\n\
+         \x20                     flags)\n\
          \x20 --resume <dir>      Resume an existing session directory\n\
          \x20 --continue, -c      Resume the most recent session for this cwd\n\
          \x20 --last              Resume the most recent session anywhere\n\
@@ -351,6 +373,9 @@ struct ExecFlags {
     cont: bool,
     /// `--last`: resume the most recent session anywhere.
     last: bool,
+    /// `--bare`: hermetic CI mode — JSONL out, fresh session in a temp
+    /// dir, no persisted rules, resume flags rejected.
+    bare: bool,
     cwd: PathBuf,
     model: String,
     provider: String,
@@ -377,6 +402,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         session: None,
         cont: false,
         last: false,
+        bare: false,
         cwd: std::env::current_dir().map_err(|e| e.to_string())?,
         model: "claude-sonnet-5".into(),
         provider: "anthropic".into(),
@@ -405,6 +431,10 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         };
         match a {
             "--json" => f.json = true,
+            "--bare" => {
+                f.bare = true;
+                f.json = true;
+            }
             "--resume" => f.resume = Some(PathBuf::from(take(&mut i)?)),
             "--continue" | "-c" => f.cont = true,
             "--last" => f.last = true,
@@ -470,6 +500,13 @@ fn cmd_exec(args: &[String]) -> i32 {
             return 2;
         }
     };
+    if flags.bare && (flags.resume.is_some() || flags.cont || flags.last || flags.session.is_some())
+    {
+        eprintln!(
+            "overseer exec: --bare is hermetic — drop --resume/--continue/--last/--session"
+        );
+        return 2;
+    }
 
     let (session_dir, resume) = resolve_session(&flags);
 
@@ -645,4 +682,32 @@ fn dirs_home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".overseer")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_implies_json_and_hermetic_session() {
+        let f = parse_exec(&["--bare".into(), "do it".into()]).unwrap();
+        assert!(f.bare);
+        assert!(f.json, "--bare must imply --json");
+        let (dir, resume) = resolve_session(&f);
+        assert!(!resume, "--bare never resumes");
+        // Throwaway session — never under ~/.overseer.
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "bare session must live in temp: {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn bare_still_enforces_sandbox_and_omits_rules() {
+        let f = parse_exec(&["--bare".into(), "x".into()]).unwrap();
+        let cfg = agent_config(&f);
+        assert!(cfg.sandbox_bash, "--bare must not weaken the sandbox");
+        assert!(cfg.rules_path.is_none(), "--bare loads no user rules");
+    }
 }

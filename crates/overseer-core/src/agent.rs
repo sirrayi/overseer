@@ -212,6 +212,7 @@ impl<'a> Agent<'a> {
             cwd,
             model: agent.config.model.clone(),
             harness_version: env!("CARGO_PKG_VERSION").to_string(),
+            parent: None,
         })?;
         agent.log.flush()?;
         Ok(agent)
