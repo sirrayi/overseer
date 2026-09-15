@@ -3,8 +3,23 @@ name = "overseer-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Overseer TUI (Phase 2: Ratatui, cell-diffed double buffer, sync output)"
+description = "Overseer TUI (Phase 2: Ratatui, inline scrollback viewport, sync output)"
+
+[lib]
+name = "overseer_tui"
+path = "src/lib.rs"
 
 [dependencies]
 overseer-core = { path = "../overseer-core" }
 overseer-proto = { path = "../overseer-proto" }
+ratatui = { version = "0.30", features = ["scrolling-regions"] }
+crossterm = { version = "0.29", features = ["bracketed-paste"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+insta = "1"

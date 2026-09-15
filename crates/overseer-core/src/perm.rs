@@ -6,7 +6,9 @@
 //! Phase 0 scope: headless mode is fail-closed — there is no Ask channel
 //! yet, so anything not allowed is denied with a reason the model can act on.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -17,6 +19,53 @@ pub enum Verdict {
     Allow,
     Ask { reason: String },
     Deny { reason: String },
+}
+
+/// A pending permission question handed to a human (L5) when the gate
+/// returns `Ask`. The handler is invoked on the agent's tool thread and
+/// blocks until the frontend answers — the gate stays deterministic,
+/// the human is just another verdict source.
+#[derive(Debug, Clone)]
+pub struct AskRequest {
+    pub tool: String,
+    pub input: Value,
+    pub reason: String,
+}
+
+/// The human's answer to an `AskRequest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskDecision {
+    /// Run this call only.
+    AllowOnce,
+    /// Run this call and every later call with the same tool+resource
+    /// key (exact bash command string, canonical file path).
+    AllowSession,
+    Deny,
+}
+
+/// Human-verdict channel attached to a `Policy`. `Send + Sync`: the agent
+/// runs on a worker thread while the frontend answers on the UI thread.
+#[derive(Clone)]
+pub struct AskHandler(pub Arc<dyn Fn(&AskRequest) -> AskDecision + Send + Sync>);
+
+impl AskHandler {
+    pub fn ask(&self, req: &AskRequest) -> AskDecision {
+        (self.0)(req)
+    }
+}
+
+impl std::fmt::Debug for AskHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AskHandler(..)")
+    }
+}
+
+/// The gate's effective answer after human resolution: what the dispatcher
+/// acts on.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Gate {
+    Allow,
+    Deny(String),
 }
 
 /// Policy presets (playbook P1.4): the shipped configurations.
@@ -92,6 +141,12 @@ pub struct Policy {
     pub preset: Preset,
     /// When true (benchmark/full-access mode), every check returns Allow.
     pub allow_all: bool,
+    /// Human verdict channel (P2): consulted when `check` returns Ask.
+    /// Headless frontends leave this `None` → Ask still fails closed.
+    pub ask_handler: Option<AskHandler>,
+    /// Tool+resource keys the human allowed for the session
+    /// (`AllowSession`). Interior-mutable: `check` takes `&self`.
+    session_allow: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Policy {
@@ -102,6 +157,8 @@ impl Policy {
             root,
             preset: Preset::WorkspaceWrite,
             allow_all: false,
+            ask_handler: None,
+            session_allow: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -111,6 +168,8 @@ impl Policy {
             root,
             preset,
             allow_all: false,
+            ask_handler: None,
+            session_allow: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -121,6 +180,64 @@ impl Policy {
             root: PathBuf::from("/"),
             preset: Preset::WorkspaceWrite,
             allow_all: true,
+            ask_handler: None,
+            session_allow: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Session-scoped allow key: what `AllowSession` records and later
+    /// `check`s match. Bash keys on the exact command string; file tools
+    /// key on the canonicalized path.
+    fn session_key(&self, tool: &str, input: &Value) -> Option<String> {
+        match tool {
+            "bash" => input
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|c| format!("bash:{c}")),
+            _ => None,
+        }
+    }
+
+    fn session_allowed(&self, tool: &str, input: &Value) -> bool {
+        let Some(key) = self.session_key(tool, input) else {
+            return false;
+        };
+        self.session_allow
+            .lock()
+            .map(|s| s.contains(&key))
+            .unwrap_or(false)
+    }
+
+    /// The verdict the dispatcher acts on: `check` first, then — for Ask —
+    /// the human channel. No handler (headless) collapses Ask to Deny
+    /// (fail-closed). `AllowSession` is recorded so later identical calls
+    /// pass `check` without re-asking.
+    pub fn gate(&self, tool: &str, input: &Value) -> Gate {
+        match self.check(tool, input) {
+            Verdict::Allow => Gate::Allow,
+            Verdict::Deny { reason } => Gate::Deny(reason),
+            Verdict::Ask { reason } => {
+                let Some(handler) = &self.ask_handler else {
+                    return Gate::Deny(reason);
+                };
+                let req = AskRequest {
+                    tool: tool.to_string(),
+                    input: input.clone(),
+                    reason: reason.clone(),
+                };
+                match handler.ask(&req) {
+                    AskDecision::AllowOnce => Gate::Allow,
+                    AskDecision::AllowSession => {
+                        if let Some(key) = self.session_key(tool, input) {
+                            if let Ok(mut s) = self.session_allow.lock() {
+                                s.insert(key);
+                            }
+                        }
+                        Gate::Allow
+                    }
+                    AskDecision::Deny => Gate::Deny(format!("{reason} — denied by user")),
+                }
+            }
         }
     }
 
@@ -200,6 +317,11 @@ impl Policy {
                             reason: format!("bash: '{pattern}' denied — {why}"),
                         };
                     }
+                }
+                // Deny rules are absolute; a session-allowed command skips
+                // the ask rules but never the deny list.
+                if self.session_allowed("bash", input) {
+                    return Verdict::Allow;
                 }
                 for (pattern, why) in BASH_ASK {
                     if glob_match(pattern, cmd) {
@@ -409,5 +531,54 @@ mod tests {
         ));
         let names: Vec<&str> = reg.specs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["glob", "grep", "plan", "read"]);
+    }
+
+    #[test]
+    fn ask_fails_closed_without_handler() {
+        let dir = std::env::temp_dir().join("overseer-ask-closed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = Policy::preset(Preset::WorkspaceWrite, dir);
+        // `git push` matches an ask rule; headless has no human → Deny.
+        assert!(matches!(
+            p.gate("bash", &json!({"command": "git push origin main"})),
+            Gate::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn ask_handler_resolves_and_session_allow_sticks() {
+        let dir = std::env::temp_dir().join("overseer-ask-session");
+        std::fs::create_dir_all(&dir).unwrap();
+        let asks = Arc::new(Mutex::new(0u32));
+        let asks2 = asks.clone();
+        let mut p = Policy::preset(Preset::WorkspaceWrite, dir);
+        p.ask_handler = Some(AskHandler(Arc::new(move |req: &AskRequest| {
+            *asks2.lock().unwrap() += 1;
+            assert!(req.reason.contains("git push"));
+            AskDecision::AllowSession
+        })));
+        let cmd = json!({"command": "git push origin main"});
+        assert_eq!(p.gate("bash", &cmd), Gate::Allow);
+        // Identical command: session-allow short-circuits before the ask
+        // rules — the human is not consulted twice.
+        assert_eq!(p.gate("bash", &cmd), Gate::Allow);
+        assert_eq!(*asks.lock().unwrap(), 1);
+        // Deny rules are absolute — a session allow never lifts them.
+        assert!(matches!(
+            p.check("bash", &json!({"command": "git push -f origin main"})),
+            Verdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn ask_deny_surfaces_reason() {
+        let dir = std::env::temp_dir().join("overseer-ask-deny");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = Policy::preset(Preset::WorkspaceWrite, dir);
+        p.ask_handler = Some(AskHandler(Arc::new(|_| AskDecision::Deny)));
+        match p.gate("bash", &json!({"command": "git push"})) {
+            Gate::Deny(r) => assert!(r.contains("denied by user")),
+            Gate::Allow => panic!("expected deny"),
+        }
     }
 }

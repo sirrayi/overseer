@@ -1,0 +1,21 @@
+---
+source: crates/overseer-tui/tests/snapshots.rs
+expression: screen(&term)
+---
+
+
+
+
+
+
+
+
+
+
+❯ fix the flaky test
+I'll look at the test file first.
+
+  ls tests/
+◌ bash cargo test flaky
+❯
+ workspace  /repo                        test-model · $0.000

@@ -11,7 +11,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use overseer_core::agent::{Agent, AgentConfig, RunOutcome};
+use overseer_core::agent::{Agent, RunOutcome};
 use overseer_core::event::{Event, EventKind};
 use overseer_core::provider::anthropic::Anthropic;
 use overseer_core::provider::openai::OpenAiCompatible;
@@ -34,14 +34,23 @@ fn real_main() -> i32 {
             println!("overseer {VERSION}");
             return 0;
         }
-        Some("--help") | Some("-h") | None => {
+        Some("--help") | Some("-h") => {
             usage();
-            return if args.is_empty() { 2 } else { 0 };
+            return 0;
         }
+        // Bare `overseer` is the TUI (Codex model: one binary, interactive
+        // by default, `exec` for headless).
+        None => return cmd_tui(&[]),
         _ => {}
     }
 
+    // `overseer --flags` — flags with no subcommand go to the TUI.
+    if args[0].starts_with('-') {
+        return cmd_tui(&args);
+    }
+
     match args[0].as_str() {
+        "tui" => cmd_tui(&args[1..]),
         "exec" => cmd_exec(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
         "rewind" => cmd_rewind(&args[1..]),
@@ -50,6 +59,91 @@ fn real_main() -> i32 {
             usage();
             2
         }
+    }
+}
+
+/// `overseer tui [exec flags]` / bare `overseer` — the interactive
+/// terminal frontend. Same engine, same event stream, same flags as
+/// `exec` (minus --json and the positional prompt).
+fn cmd_tui(args: &[String]) -> i32 {
+    let flags = match parse_exec(args) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("overseer tui: {e}");
+            return 2;
+        }
+    };
+    if flags.prompt.is_some() {
+        eprintln!("overseer tui: no positional prompt — type inside the session");
+        return 2;
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        eprintln!("overseer: stdout is not a terminal — use `overseer exec` for pipes/CI");
+        return 2;
+    }
+    let provider = match build_provider(&flags) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("overseer: {msg}");
+            return 2;
+        }
+    };
+    let session_dir = session_dir(&flags);
+    let config = agent_config(&flags);
+    let resume = flags.resume.is_some();
+    match overseer_tui::run(overseer_tui::TuiConfig {
+        provider,
+        agent: config,
+        session_dir,
+        resume,
+    }) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("overseer tui: {e}");
+            1
+        }
+    }
+}
+
+fn session_dir(flags: &ExecFlags) -> PathBuf {
+    match (&flags.session, &flags.resume) {
+        (Some(d), _) | (_, Some(d)) => d.clone(),
+        _ => {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            dirs_home().join("sessions").join(format!("{ts}"))
+        }
+    }
+}
+
+fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
+    let cwd_canonical = flags
+        .cwd
+        .canonicalize()
+        .unwrap_or_else(|_| flags.cwd.clone());
+    overseer_core::agent::AgentConfig {
+        model: flags.model.clone(),
+        max_steps: flags.max_steps,
+        max_cost_usd: flags.max_cost,
+        max_output_tokens: 16_384,
+        thinking_budget: flags.thinking,
+        // Canonicalize once: every subsystem (snapshots, read dedup, the
+        // permission gate's containment check) assumes an absolute root —
+        // a relative --cwd like "." would silently leak relative paths
+        // into checkpoint manifests and policy checks.
+        cwd: cwd_canonical.clone(),
+        full_access: flags.full_access,
+        policy_preset: flags.policy,
+        auto_compact: flags.auto_compact,
+        compact_at: flags.compact_at,
+        memory_dir: flags.memory.then(|| cwd_canonical.join("memory")),
+        keep_tool_results: flags.keep_results,
+        verify_cmd: flags.verify.clone(),
+        verify_block_cap: flags.verify_cap,
+        sandbox_bash: flags.sandbox,
+        ask_handler: None,
     }
 }
 
@@ -262,6 +356,7 @@ fn usage() {
         "overseer {VERSION} — agentic coding engine\n\
          \n\
          USAGE:\n\
+         \x20 overseer [tui] [FLAGS]          interactive TUI (bare `overseer`)\n\
          \x20 overseer exec [FLAGS] <prompt>\n\
          \x20 overseer stats <session-dir>   ledger dashboard (tokens, cache-hit, cost)\n\
          \x20 overseer rewind <session-dir> [--checkpoint <n>] [--mode <m>]\n\
@@ -423,16 +518,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         }
     };
 
-    let session_dir = match (&flags.session, &flags.resume) {
-        (Some(d), _) | (_, Some(d)) => d.clone(),
-        _ => {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            dirs_home().join("sessions").join(format!("{ts}"))
-        }
-    };
+    let session_dir = session_dir(&flags);
 
     let provider: Box<dyn Provider> = match build_provider(&flags) {
         Ok(p) => p,
@@ -441,31 +527,7 @@ fn cmd_exec(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let cwd_canonical = flags
-        .cwd
-        .canonicalize()
-        .unwrap_or_else(|_| flags.cwd.clone());
-    let config = AgentConfig {
-        model: flags.model.clone(),
-        max_steps: flags.max_steps,
-        max_cost_usd: flags.max_cost,
-        max_output_tokens: 16_384,
-        thinking_budget: flags.thinking,
-        // Canonicalize once: every subsystem (snapshots, read dedup, the
-        // permission gate's containment check) assumes an absolute root —
-        // a relative --cwd like "." would silently leak relative paths
-        // into checkpoint manifests and policy checks.
-        cwd: cwd_canonical.clone(),
-        full_access: flags.full_access,
-        policy_preset: flags.policy,
-        auto_compact: flags.auto_compact,
-        compact_at: flags.compact_at,
-        memory_dir: flags.memory.then(|| cwd_canonical.join("memory")),
-        keep_tool_results: flags.keep_results,
-        verify_cmd: flags.verify.clone(),
-        verify_block_cap: flags.verify_cap,
-        sandbox_bash: flags.sandbox,
-    };
+    let config = agent_config(&flags);
 
     let mut agent = if flags.resume.is_some() {
         match Agent::resume(provider.as_ref(), config, session_dir.clone()) {
@@ -538,6 +600,12 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(RunOutcome::Provider(msg)) => {
             eprintln!("provider error: {msg}");
             4
+        }
+        Ok(RunOutcome::Interrupted { steps, .. }) => {
+            // Headless exec has no interrupter; reachable only if the
+            // default Control were set — treat as a clean stop.
+            eprintln!("run interrupted ({steps} steps)");
+            130
         }
         Err(e) => {
             eprintln!("overseer exec: {e}");
