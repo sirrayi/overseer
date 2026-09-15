@@ -8,7 +8,55 @@ use serde_json::Value;
 use crate::ir::{Message, Usage};
 
 pub mod anthropic;
+pub mod gemini;
 pub mod openai;
+
+/// Cross-provider effort ladder (P3.2). Each adapter maps the enum onto
+/// its native knob — Anthropic `thinking.budget_tokens`, OpenAI
+/// `reasoning_effort`, Gemini `thinkingConfig.thinkingBudget`. A raw
+/// `thinking_budget` on the request wins where the API takes tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Min,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl Effort {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "min" => Self::Min,
+            "low" => Self::Low,
+            "medium" | "med" => Self::Medium,
+            "high" => Self::High,
+            "max" => Self::Max,
+            _ => return None,
+        })
+    }
+
+    /// One notch up (adaptive effort on failure signals). Stays at Max.
+    pub fn bumped(self) -> Self {
+        match self {
+            Self::Min => Self::Low,
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High | Self::Max => Self::Max,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Min => "min",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
 
 /// A tool definition as sent to the provider.
 #[derive(Debug, Clone)]
@@ -36,8 +84,12 @@ pub struct Request<'a> {
     pub tools: &'a [ToolSpec],
     pub messages: &'a [Message],
     pub max_tokens: u32,
-    /// Thinking budget in tokens; None = thinking off.
+    /// Thinking budget in tokens; None = thinking off. Wins over
+    /// `effort` on APIs that take a token budget.
     pub thinking_budget: Option<u32>,
+    /// Cross-provider effort knob (P3.2); adapters map it onto their
+    /// native parameter. None = provider default.
+    pub effort: Option<Effort>,
     /// Attach provider cache breakpoints to the prefix tail.
     pub cache_breakpoints: bool,
 }

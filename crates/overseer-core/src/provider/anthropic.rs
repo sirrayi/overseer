@@ -88,7 +88,17 @@ impl Anthropic {
             "tools": tools,
             "messages": messages,
         });
-        if let Some(budget) = req.thinking_budget {
+        // Effort → thinking budget (raw thinking_budget wins). Min =
+        // thinking off entirely — no `thinking` field sent.
+        if let Some(budget) = req.thinking_budget.or_else(|| {
+            req.effort.and_then(|e| match e {
+                super::Effort::Min => None,
+                super::Effort::Low => Some(1_024),
+                super::Effort::Medium => Some(4_096),
+                super::Effort::High => Some(16_384),
+                super::Effort::Max => Some(32_768),
+            })
+        }) {
             body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
         }
         body
@@ -274,6 +284,7 @@ mod tests {
             messages: msgs,
             max_tokens: 8192,
             thinking_budget: None,
+            effort: None,
             cache_breakpoints: true,
         }
     }

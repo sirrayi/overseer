@@ -81,12 +81,24 @@ impl OpenAiCompatible {
             })
             .collect();
 
-        json!({
+        let mut body = json!({
             "model": req.model,
             "max_tokens": req.max_tokens,
             "messages": messages,
             "tools": tools,
-        })
+        });
+        // Effort → reasoning_effort (OpenAI-compatible gateways that
+        // don't know the field ignore it — harmless passthrough).
+        if let Some(e) = req.effort {
+            body["reasoning_effort"] = json!(match e {
+                super::Effort::Min => "minimal",
+                super::Effort::Low => "low",
+                super::Effort::Medium => "medium",
+                // No tier above "high" exists on this API family.
+                super::Effort::High | super::Effort::Max => "high",
+            });
+        }
+        body
     }
 
     fn parse_response(
@@ -413,6 +425,7 @@ mod tests {
             messages: &msgs,
             max_tokens: 100,
             thinking_budget: None,
+            effort: None,
             cache_breakpoints: false,
         };
         let body = OpenAiCompatible::build_body(&req);

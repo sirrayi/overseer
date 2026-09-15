@@ -28,6 +28,12 @@ pub struct AgentConfig {
     pub max_output_tokens: u32,
     /// Anthropic thinking budget; None disables.
     pub thinking_budget: Option<u32>,
+    /// Cross-provider effort knob (P3.2); adapters map it per-API.
+    /// `thinking_budget` wins where the API takes tokens.
+    pub effort: Option<crate::provider::Effort>,
+    /// Small-tier model for aux calls (P3.2): titles, consolidation,
+    /// guardrails. None → aux calls use the main model.
+    pub small_model: Option<String>,
     pub cwd: PathBuf,
     /// Benchmark mode: disable the permission gate entirely. Only valid when
     /// the environment itself is the sandbox (per-task container).
@@ -82,6 +88,8 @@ impl Default for AgentConfig {
             max_cost_usd: 5.0,
             max_output_tokens: 16_384,
             thinking_budget: None,
+            effort: None,
+            small_model: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             full_access: false,
             policy_preset: crate::perm::Preset::WorkspaceWrite,
@@ -153,6 +161,9 @@ pub struct Agent<'a> {
     stuck_nudged: bool,
     /// Consecutive responses with no text and no tool calls (silent-END).
     empty_responses: u8,
+    /// Adaptive-effort escalations (P3.2): each stuck trip bumps the
+    /// request effort one notch for the rest of the run.
+    effort_boost: u8,
     /// Compact at the next loop boundary (set by the context-budget trigger
     /// or a provider context-window stop).
     pending_compact: bool,
@@ -196,6 +207,7 @@ impl<'a> Agent<'a> {
             stuck: StuckDetector::new(),
             stuck_nudged: false,
             empty_responses: 0,
+            effort_boost: 0,
             pending_compact: false,
             ctx_wall_stop: false,
             spill_seq: 0,
@@ -245,6 +257,7 @@ impl<'a> Agent<'a> {
             stuck: StuckDetector::new(),
             stuck_nudged: false,
             empty_responses: 0,
+            effort_boost: 0,
             pending_compact: false,
             ctx_wall_stop: false,
             spill_seq,
@@ -386,6 +399,7 @@ impl<'a> Agent<'a> {
                 messages: &self.messages,
                 max_tokens: self.config.max_output_tokens,
                 thinking_budget: self.config.thinking_budget,
+                effort: Some(self.effort_now()),
                 cache_breakpoints: true,
             };
 
@@ -646,6 +660,71 @@ impl<'a> Agent<'a> {
         }
     }
 
+    /// Effective effort for the next request: configured level plus one
+    /// bump per stuck-detector trip (per-run adaptive effort).
+    fn effort_now(&self) -> crate::provider::Effort {
+        let mut e = self
+            .config
+            .effort
+            .unwrap_or(crate::provider::Effort::Medium);
+        for _ in 0..self.effort_boost {
+            e = e.bumped();
+        }
+        e
+    }
+
+    /// Small-tier call (P3.2): one stateless request on `small_model`
+    /// for titles/consolidation/guardrails. Escalates to the main model
+    /// when the small call fails — the tier contract is "cheap first,
+    /// correct always". Min effort; these calls never need reasoning.
+    pub fn aux_call(&self, prompt: &str) -> Result<String, crate::provider::ProviderError> {
+        let msgs = [Message::user_text(prompt)];
+        if let Some(small) = &self.config.small_model {
+            let req = Request {
+                model: small,
+                system: &[],
+                tools: &[],
+                messages: &msgs,
+                max_tokens: 1_024,
+                thinking_budget: None,
+                effort: Some(crate::provider::Effort::Min),
+                cache_breakpoints: false,
+            };
+            // Small tier first; empty text or a provider error escalates.
+            if let Ok(r) = self.provider.complete(&req) {
+                let text = r
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                if !text.trim().is_empty() {
+                    return Ok(text);
+                }
+            }
+        }
+        let req = Request {
+            model: &self.config.model,
+            system: &[],
+            tools: &[],
+            messages: &msgs,
+            max_tokens: 1_024,
+            thinking_budget: None,
+            effort: Some(crate::provider::Effort::Min),
+            cache_breakpoints: false,
+        };
+        let r = self.provider.complete(&req)?;
+        Ok(r.blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Handle a detector trip: log it, inject one course-correction nudge,
     /// terminate on the second trip. Never leaves a partial tool batch.
     fn on_stuck(
@@ -669,6 +748,9 @@ impl<'a> Agent<'a> {
             }));
         }
         self.stuck_nudged = true;
+        // Failure signal ⇒ next steps run one notch harder (P3.2
+        // escalation). Deterministic, bounded at Max.
+        self.effort_boost = self.effort_boost.saturating_add(1);
         let text = format!(
             "[overseer] Stuck detector: {}. Change approach — re-read the actual \
              error output, inspect real state with a different tool, or stop and \
@@ -859,6 +941,9 @@ mod tests {
     struct Mock {
         responses: Mutex<VecDeque<Response>>,
         seen_systems: Mutex<Vec<Vec<String>>>,
+        seen_models: Mutex<Vec<String>>,
+        /// Models that always error — drives the aux-call escalation path.
+        fail_models: Vec<String>,
     }
 
     impl Mock {
@@ -866,7 +951,15 @@ mod tests {
             Mock {
                 responses: Mutex::new(VecDeque::from(responses)),
                 seen_systems: Mutex::new(Vec::new()),
+                seen_models: Mutex::new(Vec::new()),
+                fail_models: Vec::new(),
             }
+        }
+
+        fn failing_on(models: &[&str], responses: Vec<Response>) -> Self {
+            let mut m = Self::new(responses);
+            m.fail_models = models.iter().map(|s| s.to_string()).collect();
+            m
         }
     }
 
@@ -876,6 +969,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(req.system.iter().map(|s| s.text.clone()).collect());
+            self.seen_models
+                .lock()
+                .unwrap()
+                .push(req.model.to_string());
+            if self.fail_models.iter().any(|m| m == req.model) {
+                return Err(ProviderError::Transport("mock fail".into()));
+            }
             let mut q = self.responses.lock().unwrap();
             if q.len() > 1 {
                 Ok(q.pop_front().unwrap())
@@ -1309,5 +1409,54 @@ mod tests {
                 if *denied && content.contains("denied by user"))
         });
         assert!(denied, "expected a denied ToolResult event");
+    }
+
+    /// P3.2: aux calls hit the small tier when configured.
+    #[test]
+    fn aux_call_prefers_small_model() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            small_model: Some("tiny-1".into()),
+            ..AgentConfig::default()
+        };
+        let provider = Mock::new(vec![done()]);
+        let agent = Agent::start(&provider, cfg, dir, "s".into()).unwrap();
+        let out = agent.aux_call("title this").unwrap();
+        assert_eq!(out.trim(), "all done");
+        let models = provider.seen_models.lock().unwrap();
+        assert_eq!(models.as_slice(), &["tiny-1"]);
+    }
+
+    /// P3.2: a failing small call escalates to the main model.
+    #[test]
+    fn aux_call_escalates_on_failure() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            small_model: Some("tiny-1".into()),
+            ..AgentConfig::default()
+        };
+        let provider = Mock::failing_on(&["tiny-1"], vec![done()]);
+        let agent = Agent::start(&provider, cfg, dir, "s".into()).unwrap();
+        let out = agent.aux_call("title this").unwrap();
+        assert_eq!(out.trim(), "all done");
+        let models = provider.seen_models.lock().unwrap();
+        assert_eq!(models.as_slice(), &["tiny-1", "claude-sonnet-5"]);
+    }
+
+    /// P3.2: effort bumps one notch per stuck-detector trip.
+    #[test]
+    fn effort_escalates_on_stuck() {
+        use crate::provider::Effort;
+        let mut e = Effort::Medium;
+        e = e.bumped();
+        assert_eq!(e, Effort::High);
+        e = e.bumped().bumped();
+        assert_eq!(e, Effort::Max, "bounded at Max");
+        assert_eq!(Effort::parse("med"), Some(Effort::Medium));
+        assert_eq!(Effort::parse("bogus"), None);
     }
 }
