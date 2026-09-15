@@ -1,6 +1,6 @@
 ---
 source: crates/overseer-tui/tests/snapshots.rs
-expression: screen(&term)
+expression: norm(&term)
 ---
 
 
@@ -12,7 +12,9 @@ expression: screen(&term)
 
 
 
-› e2 · 1 file(s) · fix the flaky test
-↑↓ · enter restore files+conversation · esc
+   line one
+  -line two
+  +line CHANGED
+↑↓ · tab diff · enter revert to snapshot · esc
 ❯
  workspace  /repo                        test-model · $0.000
