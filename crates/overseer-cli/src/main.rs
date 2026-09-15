@@ -357,8 +357,18 @@ fn render_human(e: &Event) {
             eprintln!("  [${cost_usd:.4}]");
         }
         EventKind::ToolCallStart { name, .. } => eprintln!("  → {name}"),
-        EventKind::ToolResult { is_error, .. } if *is_error => {
-            eprintln!("  ✗ tool error");
+        EventKind::ToolResult {
+            name,
+            content,
+            is_error,
+            ..
+        } => {
+            if *is_error {
+                eprintln!("  ✗ tool error");
+            } else if name == "plan" {
+                // Plan artifact stays user-visible in the transcript (P1.7).
+                eprintln!("  {content}");
+            }
         }
         _ => {}
     }
