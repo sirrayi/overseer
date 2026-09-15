@@ -8,9 +8,23 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
 - `crates/overseer-core` — engine: canonical turn IR (`ir.rs`), append-only
   JSONL event log (`event.rs`), usage ledger (`ledger.rs`), model profiles
   (`profile.rs`), tool registry + tools (`tools/`), provider trait +
-  Anthropic + OpenAI-compatible adapters (`provider/`), ReAct loop with
-  budgets (`agent.rs`), stuck detector (`stuck.rs`), L4 permission gate
-  (`perm.rs`), deterministic compaction (`compact.rs`). Bash calls run
+  Anthropic + OpenAI-compatible + Gemini adapters (`provider/`; Gemini
+  pairs tool calls by name, thought/thoughtSignature parts ride the
+  opaque Reasoning block), ReAct loop with budgets (`agent.rs`), stuck
+  detector (`stuck.rs`), L4 permission gate (`perm.rs`), deterministic
+  compaction (`compact.rs`). `Effort` (min..max) maps per provider;
+  `small_model` covers aux calls (consolidation) with escalate-to-main;
+  each stuck trip bumps effort one notch. `memory.rs` is the
+  git-versioned INDEX.md store; `consolidate` dedupes it via a
+  small-tier call. `skills.rs` keeps SKILL.md metadata resident and
+  loads bodies on demand through the `skill` tool,
+  provenance-wrapped. `repomap.rs` builds a bounded (~1K token)
+  ranked symbol index behind `repo_map`/`symbol` tools. `task` has
+  read/write/background modes — writers isolate into git worktrees,
+  background results land via SubagentDone notices (max 4 in flight).
+  Rule-of-Two (perm.rs): untrusted-content + sensitive-data latches
+  arm the exfil gate (side effects force Ask); tool results enter the
+  model view provenance-wrapped. Bash calls run
   under a platform sandbox by default (macOS `sandbox-exec`, Linux
   `bwrap`): deny-by-default network, writes confined to the workspace +
   temp dirs, common secret dirs (`~/.ssh` etc.) read-denied. Falls back
