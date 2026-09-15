@@ -170,6 +170,8 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
         max_cost_usd: flags.max_cost,
         max_output_tokens: 16_384,
         thinking_budget: flags.thinking,
+        effort: flags.effort,
+        small_model: flags.small_model.clone(),
         // Canonicalize once: every subsystem (snapshots, read dedup, the
         // permission gate's containment check) assumes an absolute root —
         // a relative --cwd like "." would silently leak relative paths
@@ -337,7 +339,9 @@ fn usage() {
          \x20 --session <dir>     Session directory (default: ~/.overseer/sessions/<ts>)\n\
          \x20 --cwd <dir>         Working directory for tools (default: .)\n\
          \x20 --model <id>        Model id (default: claude-sonnet-5)\n\
-         \x20 --provider <name>   anthropic | openai | legionedge (default: anthropic)\n\
+         \x20 --provider <name>   anthropic | openai | legionedge | gemini (default: anthropic)\n\
+         \x20 --effort <level>    min | low | medium | high | max (default: medium)\n\
+         \x20 --small-model <id>  small-tier model for aux calls (titles, consolidation)\n\
          \x20 --base-url <url>    API base URL for openai-compatible providers\n\
          \x20 --max-steps <n>     Step budget (default: 100)\n\
          \x20 --max-cost <usd>    Cost budget in USD (default: 5.0)\n\
@@ -361,6 +365,7 @@ fn usage() {
          \x20 OVERSEER_API_KEY    Provider key (preferred, any provider)\n\
          \x20 ANTHROPIC_API_KEY   Anthropic key\n\
          \x20 OPENAI_API_KEY      OpenAI-compatible key\n\
+         \x20 GOOGLE_API_KEY      Gemini key (GEMINI_API_KEY also works)\n\
          \x20 LEK_API_KEY         LegionEdge key (fallback)"
     );
 }
@@ -383,6 +388,8 @@ struct ExecFlags {
     max_steps: u32,
     max_cost: f64,
     thinking: Option<u32>,
+    effort: Option<overseer_core::provider::Effort>,
+    small_model: Option<String>,
     full_access: bool,
     policy: overseer_core::perm::Preset,
     auto_compact: bool,
@@ -410,6 +417,8 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         max_steps: 100,
         max_cost: 5.0,
         thinking: None,
+        effort: None,
+        small_model: None,
         full_access: false,
         policy: overseer_core::perm::Preset::WorkspaceWrite,
         auto_compact: true,
@@ -446,6 +455,13 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
             "--max-steps" => f.max_steps = take(&mut i)?.parse().map_err(|_| "bad --max-steps")?,
             "--max-cost" => f.max_cost = take(&mut i)?.parse().map_err(|_| "bad --max-cost")?,
             "--thinking" => f.thinking = Some(take(&mut i)?.parse().map_err(|_| "bad --thinking")?),
+            "--effort" => {
+                f.effort = Some(
+                    overseer_core::provider::Effort::parse(take(&mut i)?)
+                        .ok_or("bad --effort (min|low|medium|high|max)")?,
+                )
+            }
+            "--small-model" => f.small_model = Some(take(&mut i)?.clone()),
             "--full-access" => f.full_access = true,
             "--policy" => {
                 f.policy = match take(&mut i)?.as_str() {
@@ -643,6 +659,7 @@ fn build_provider(flags: &ExecFlags) -> Result<Box<dyn Provider>, String> {
     let key = env("OVERSEER_API_KEY")
         .or_else(|| match flags.provider.as_str() {
             "anthropic" => env("ANTHROPIC_API_KEY"),
+            "gemini" => env("GOOGLE_API_KEY").or_else(|| env("GEMINI_API_KEY")),
             _ => env("OPENAI_API_KEY"),
         })
         .or_else(|| env("LEK_API_KEY"))
@@ -661,6 +678,13 @@ fn build_provider(flags: &ExecFlags) -> Result<Box<dyn Provider>, String> {
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+        )),
+        "gemini" => Box::new(overseer_core::provider::gemini::Gemini::new(
+            key,
+            flags
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".into()),
         )),
         "legionedge" => Box::new(OpenAiCompatible::new(
             key,
