@@ -5,9 +5,14 @@
 //! with engine-enforced budgets. Frontends attach via overseer-proto.
 
 pub mod agent;
+pub mod compact;
 pub mod event;
 pub mod ir;
 pub mod ledger;
+pub mod memory;
+pub mod perm;
 pub mod profile;
+pub mod prompt;
 pub mod provider;
+pub mod stuck;
 pub mod tools;

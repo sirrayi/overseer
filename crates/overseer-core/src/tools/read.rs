@@ -46,7 +46,6 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
             ))
         }
     };
-    reg.mark_read(&path);
 
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
@@ -59,7 +58,23 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
     }
     let end = (start + limit).min(total);
 
+    // P1.3 read dedup (path + mtime + range): an unchanged re-read whose
+    // range is already covered returns a stub instead of the same bytes.
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    if reg.dedup_hit(&path, mtime, start, end) {
+        reg.mark_read(&path);
+        return ToolOutput::ok(format!(
+            "[unchanged] {} lines {}-{} already returned this session; \
+             the file has not been modified since.",
+            path.display(),
+            start + 1,
+            end
+        ));
+    }
     let mut out = String::new();
+    if reg.mtime_changed(&path, mtime) {
+        out.push_str("[file modified since your previous read]\n");
+    }
     for (i, line) in lines[start..end].iter().enumerate() {
         let n = start + i + 1;
         if line.len() > MAX_LINE {
@@ -80,5 +95,6 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
     if out.is_empty() {
         out.push_str("(empty file)");
     }
+    reg.record_read(&path, mtime, start, end);
     ToolOutput::ok(out)
 }

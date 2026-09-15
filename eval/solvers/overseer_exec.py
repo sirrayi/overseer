@@ -1,10 +1,11 @@
-"""Inspect AI solver: drive Overseer headlessly.
+"""Overseer solver — drives the real harness headlessly.
 
-Launches `overseer exec --json <instruction>` in the task workdir, captures
-the JSONL event stream as the trajectory, and writes it to the trajectory
-store. The solver never interprets events — the scorer grades the workdir.
+Runs `overseer exec --json --provider fleet --model <M>` in the task
+workdir; the JSONL event stream is the trajectory. The solver never grades —
+the task's deterministic grader sees only the workdir afterwards.
 
-Requires OVERSEER_BIN (default: target/release/overseer) and a provider key.
+Env: OVERSEER_BIN (default: target/release/overseer), OVERSEER_API_KEY,
+OVERSEER_BASE_URL, OVERSEER_MODEL.
 """
 from __future__ import annotations
 
@@ -14,31 +15,42 @@ import subprocess
 import time
 from pathlib import Path
 
-OVERSEER_BIN = os.environ.get("OVERSEER_BIN", "target/release/overseer")
+OVERSEER_BIN = os.environ.get(
+    "OVERSEER_BIN",
+    str(Path(__file__).resolve().parents[2] / "target" / "release" / "overseer"),
+)
+BASE_URL = os.environ.get("OVERSEER_BASE_URL", "https://inference.fleet.ai/v1")
+MODEL = os.environ.get("OVERSEER_MODEL", "fleet-turbo")
 
 
-def run_task(instruction: str, workdir: Path, session_dir: Path,
-             max_steps: int = 100, max_cost: float = 5.0) -> dict:
-    """Execute one task; return trajectory + run metadata."""
-    session_dir.mkdir(parents=True, exist_ok=True)
+def solve(instruction: str, workdir: str, session_dir: str,
+          max_steps: int = 30) -> dict:
+    Path(session_dir).mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     proc = subprocess.run(
         [OVERSEER_BIN, "exec", "--json",
-         "--session", str(session_dir),
-         "--cwd", str(workdir),
-         "--max-steps", str(max_steps),
-         "--max-cost", str(max_cost),
-         "-"],
-        input=instruction, capture_output=True, text=True,
-    )
+         "--provider", "openai", "--base-url", BASE_URL,
+         "--model", MODEL,
+         "--session", session_dir, "--cwd", workdir,
+         "--max-steps", str(max_steps), "--full-access", "-"],
+        input=instruction, capture_output=True, text=True, timeout=900)
     wall_s = time.time() - t0
     events = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
-    traj_path = session_dir / "trajectory.jsonl"
-    traj_path.write_text("\n".join(json.dumps(e) for e in events))
+    (Path(session_dir) / "trajectory.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in events))
+    # Metrics the playbook requires per run.
+    usage = [e for e in events if e.get("type") == "model_response"]
+    total_in = sum(e["usage"]["fresh_input"] + e["usage"]["cache_read"]
+                   + e["usage"]["cache_write"] for e in usage)
+    cache_read = sum(e["usage"]["cache_read"] for e in usage)
     return {
+        "done": proc.returncode == 0,
+        "steps": len(usage),
+        "wall_s": round(wall_s, 1),
+        "tokens_in": total_in,
+        "tokens_out": sum(e["usage"]["output"] for e in usage),
+        "cache_hit_rate": round(cache_read / total_in, 3) if total_in else 0.0,
+        "cost_usd": sum(e.get("cost_usd", 0.0) for e in usage),
         "exit_code": proc.returncode,
-        "wall_s": wall_s,
-        "n_events": len(events),
-        "trajectory": str(traj_path),
         "stderr": proc.stderr[-2000:],
     }
