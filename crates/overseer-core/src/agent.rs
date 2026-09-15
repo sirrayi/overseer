@@ -57,6 +57,11 @@ pub struct AgentConfig {
     /// Consecutive verify-block cap before the run ends anyway (~8 per
     /// the playbook). Counted per session, not reset between blocks.
     pub verify_block_cap: u32,
+    /// P1.5 sandbox v1: wrap bash calls in sandbox-exec (macOS) or bwrap
+    /// (Linux) when available — deny-by-default network, writes confined
+    /// to the workspace. Falls back to unsandboxed exec with a warning
+    /// when no backend exists.
+    pub sandbox_bash: bool,
 }
 
 impl Default for AgentConfig {
@@ -76,6 +81,7 @@ impl Default for AgentConfig {
             keep_tool_results: 5,
             verify_cmd: None,
             verify_block_cap: 8,
+            sandbox_bash: true,
         }
     }
 }
@@ -478,6 +484,7 @@ impl<'a> Agent<'a> {
                 agent_config: Some(self.config.clone()),
                 subagent_seq: 0,
                 checkpoint: checkpoint.as_mut(),
+                sandbox: self.config.sandbox_bash,
             };
             let mut results = Vec::new();
             for (call_id, name, input) in calls {
