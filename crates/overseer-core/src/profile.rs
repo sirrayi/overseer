@@ -34,6 +34,10 @@ pub struct ModelProfile {
     pub parallel_calls: bool,
     /// Reasoning/thinking support for the Anthropic family regime.
     pub reasoning: ReasoningSpec,
+    /// Compaction trigger as a fraction of `context_in` — the *effective*
+    /// window, not the advertised one (playbook Ch.3 §9.2: Claude ~0.83,
+    /// Codex ~0.9–0.95, Gemini 0.5; tune down for weak-retrieval models).
+    pub compact_at: f32,
     pub price: PriceTable,
 }
 
@@ -62,6 +66,7 @@ static PROFILES: &[ModelProfile] = &[
             supported: true,
             min_budget: 1024,
         },
+        compact_at: 0.83,
         price: PriceTable {
             input: 10.0,
             cache_read: 1.0,
@@ -85,6 +90,7 @@ static PROFILES: &[ModelProfile] = &[
             supported: true,
             min_budget: 1024,
         },
+        compact_at: 0.83,
         price: PriceTable {
             input: 5.0,
             cache_read: 0.5,
@@ -103,6 +109,7 @@ static PROFILES: &[ModelProfile] = &[
             supported: true,
             min_budget: 1024,
         },
+        compact_at: 0.83,
         price: PriceTable {
             input: 2.0,
             cache_read: 0.2,
@@ -121,6 +128,7 @@ static PROFILES: &[ModelProfile] = &[
             supported: true,
             min_budget: 1024,
         },
+        compact_at: 0.83,
         price: PriceTable {
             input: 3.0,
             cache_read: 0.3,
@@ -143,6 +151,7 @@ static PROFILES: &[ModelProfile] = &[
             supported: true,
             min_budget: 0,
         },
+        compact_at: 0.70,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -161,6 +170,7 @@ static PROFILES: &[ModelProfile] = &[
             supported: true,
             min_budget: 0,
         },
+        compact_at: 0.70,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -179,6 +189,7 @@ static PROFILES: &[ModelProfile] = &[
             supported: true,
             min_budget: 0,
         },
+        compact_at: 0.70,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -197,6 +208,7 @@ static PROFILES: &[ModelProfile] = &[
             supported: true,
             min_budget: 0,
         },
+        compact_at: 0.70,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -215,6 +227,7 @@ static PROFILES: &[ModelProfile] = &[
             supported: true,
             min_budget: 0,
         },
+        compact_at: 0.70,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -233,6 +246,7 @@ static PROFILES: &[ModelProfile] = &[
             supported: true,
             min_budget: 1024,
         },
+        compact_at: 0.83,
         price: PriceTable {
             input: 1.0,
             cache_read: 0.1,
@@ -255,6 +269,7 @@ static FALLBACK: ModelProfile = ModelProfile {
         supported: true,
         min_budget: 1024,
     },
+    compact_at: 0.80,
     price: PriceTable {
         input: 3.0,
         cache_read: 0.3,
