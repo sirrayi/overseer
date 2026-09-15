@@ -602,7 +602,7 @@ impl Agent {
                         )?;
                         results.push(Block::ToolResult {
                             tool_use_id: call_id.clone(),
-                            content: skipped.to_string(),
+                            content: crate::tools::provenance_wrap(name, skipped),
                             is_error: true,
                         });
                     }
@@ -640,9 +640,15 @@ impl Agent {
 
                 results.push(Block::ToolResult {
                     tool_use_id: call_id.clone(),
-                    content: out.text,
+                    content: crate::tools::provenance_wrap(name, &out.text),
                     is_error: out.is_error,
                 });
+
+                // Rule-of-Two latch flips are auditable events (P3.10).
+                let notices: Vec<String> = self.tools.taint_notices.drain(..).collect();
+                for notice in notices {
+                    self.emit(EventKind::Tainted { detail: notice }, on_event)?;
+                }
             }
             self.messages.push(Message::tool_results(results));
             // Carry the session-monotonic spill counter forward; hand the
@@ -1495,6 +1501,42 @@ mod tests {
         assert_eq!(out.trim(), "all done");
         let models = provider.seen_models.lock().unwrap();
         assert_eq!(models.as_slice(), &["tiny-1", "claude-sonnet-5"]);
+    }
+
+    /// P3.10: tool results enter the model view provenance-wrapped, and
+    /// the resumed view is byte-identical (rehydrate re-wraps).
+    #[test]
+    fn tool_results_are_provenance_wrapped() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        let provider = Arc::new(Mock::new(vec![tool_turn(1), done()]));
+        let mut agent = Agent::start(provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        agent.run_turn("go", &mut sink).unwrap();
+
+        let wrapped = agent
+            .messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .any(|b| matches!(b, Block::ToolResult { content, .. }
+                if content.contains("<tool_result tool=\"bash\">")));
+        assert!(wrapped, "tool results must be provenance-wrapped");
+
+        // Event log stays raw; the resumed view re-wraps identically.
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        let raw = events.iter().any(|e| matches!(&e.kind,
+            EventKind::ToolResult { content, .. } if !content.contains("<tool_result")));
+        assert!(raw, "event log stores raw output");
+        let resumed = rehydrate_messages(&events);
+        let rewrapped = resumed.iter().flat_map(|m| m.content.iter()).any(|b| {
+            matches!(b, Block::ToolResult { content, .. }
+                if content.contains("<tool_result tool=\"bash\">"))
+        });
+        assert!(rewrapped, "resumed view must match the live view");
     }
 
     /// P3.4: a finished background subagent lands as a SubagentDone
