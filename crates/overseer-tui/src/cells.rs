@@ -331,6 +331,10 @@ pub fn feed(ev: &Event) -> Feed {
             style: theme::meta(),
             text: format!("⤷ subagent {id} finished — trace {}", trace),
         }]),
+        EventKind::Tainted { detail } => Feed::NewCells(vec![Cell::Meta {
+            style: theme::error(),
+            text: format!("⛨ {detail} — side effects now need confirmation"),
+        }]),
         EventKind::StuckDetected { pattern } => Feed::NewCells(vec![Cell::Meta {
             style: theme::error(),
             text: format!("⚠ stuck: {pattern}"),
