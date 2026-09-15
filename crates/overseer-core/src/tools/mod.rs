@@ -140,6 +140,20 @@ impl ToolRegistry {
         }
     }
 
+    /// Plan-mode registry (P1.4 capability removal): mutating tools aren't
+    /// merely denied — they're absent from the spec list, so the model
+    /// cannot call them at all. Read tools + the plan artifact tool.
+    pub fn plan_mode(policy: crate::perm::Policy) -> Self {
+        let mut specs = vec![read::spec(), grep::spec(), glob::spec(), plan::spec()];
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        ToolRegistry {
+            specs,
+            read_paths: HashSet::new(),
+            read_log: HashMap::new(),
+            policy,
+        }
+    }
+
     pub fn mark_read(&mut self, path: &Path) {
         if let Ok(p) = path.canonicalize() {
             self.read_paths.insert(p);
