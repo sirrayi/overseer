@@ -56,7 +56,8 @@ def chat(messages: list[dict]) -> str:
 
 def extract_action(text: str) -> tuple[str, str]:
     """Return (kind, payload): bash | done | none."""
-    m = re.search(r"```bash\n(.*?)```", text, re.S)
+    # Accept closed OR unclosed fences — models regularly drop the tail fence.
+    m = re.search(r"```bash\n(.*?)(?:```|$)", text, re.S)
     if m:
         return "bash", m.group(1).strip()
     if "overseer_done" in text:
