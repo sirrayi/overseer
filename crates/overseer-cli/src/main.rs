@@ -111,6 +111,8 @@ fn usage() {
          \x20 --compact-at <f>    Compaction trigger, fraction of context\n\
          \x20                     window (default: model profile's)\n\
          \x20 --no-compact        Disable context-engine compaction\n\
+         \x20 --keep-results <n>  Recent tool results kept verbatim (default: 5,\n\
+         \x20                     0 disables stale-result clearing)\n\
          \x20 --memory            Enable file memory at <cwd>/memory\n\
          \n\
          ENV:\n\
@@ -135,6 +137,7 @@ struct ExecFlags {
     full_access: bool,
     auto_compact: bool,
     compact_at: Option<f32>,
+    keep_results: usize,
     memory: bool,
     prompt: Option<String>,
 }
@@ -154,6 +157,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         full_access: false,
         auto_compact: true,
         compact_at: None,
+        keep_results: 5,
         memory: false,
         prompt: None,
     };
@@ -181,6 +185,9 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
                 f.compact_at = Some(take(&mut i)?.parse().map_err(|_| "bad --compact-at")?)
             }
             "--no-compact" => f.auto_compact = false,
+            "--keep-results" => {
+                f.keep_results = take(&mut i)?.parse().map_err(|_| "bad --keep-results")?
+            }
             "--memory" => f.memory = true,
             "-" => {
                 // Read the prompt from stdin (CI-friendly).
@@ -242,6 +249,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         auto_compact: flags.auto_compact,
         compact_at: flags.compact_at,
         memory_dir: flags.memory.then(|| flags.cwd.join("memory")),
+        keep_tool_results: flags.keep_results,
     };
 
     let mut agent = if flags.resume.is_some() {

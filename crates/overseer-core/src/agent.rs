@@ -41,6 +41,10 @@ pub struct AgentConfig {
     /// the end of the static prompt region each turn. None = memory off.
     /// Must sit under `cwd` for the permission gate to allow writes.
     pub memory_dir: Option<PathBuf>,
+    /// P1.2 stale tool-result clearing: this many most-recent ToolResult
+    /// blocks stay verbatim; older ones render as a placeholder in the view
+    /// (events untouched). 0 disables clearing.
+    pub keep_tool_results: usize,
 }
 
 impl Default for AgentConfig {
@@ -56,6 +60,7 @@ impl Default for AgentConfig {
             auto_compact: true,
             compact_at: None,
             memory_dir: None,
+            keep_tool_results: 5,
         }
     }
 }
@@ -247,6 +252,16 @@ impl<'a> Agent<'a> {
                         cost_usd: self.ledger.total_cost_usd,
                     });
                 }
+            }
+
+            // P1.2: clear stale tool results in the view (events untouched).
+            // In-place on the view — idempotent, so resume and live runs
+            // render identically.
+            if self.config.keep_tool_results > 0 {
+                crate::event::clear_stale_tool_results(
+                    &mut self.messages,
+                    self.config.keep_tool_results,
+                );
             }
 
             // System segments assemble per turn via the section pipeline:
