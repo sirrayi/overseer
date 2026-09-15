@@ -1,0 +1,9 @@
+{
+  "id": "fix-bug",
+  "version": 1,
+  "tags": ["smoke", "edit", "debug"],
+  "instruction": "The file calc.py has a bug: add() subtracts instead of adding, and divide() crashes on zero instead of returning None. Read it, fix both functions, and verify with python3.",
+  "setup": "cat > calc.py <<'PY'\ndef add(a, b):\n    return a - b\n\ndef divide(a, b):\n    return a / b\nPY",
+  "grader": {"type": "bash_assert", "script": "python3 -c \"from calc import add, divide; assert add(2,3)==5; assert divide(1,0) is None; assert divide(4,2)==2\""},
+  "limits": {"max_steps": 15}
+}
