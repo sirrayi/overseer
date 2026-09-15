@@ -11,7 +11,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use overseer_core::agent::{Agent, RunOutcome};
+use overseer_core::agent::{Agent, AgentConfig, RunOutcome};
 use overseer_core::event::{Event, EventKind};
 use overseer_core::provider::anthropic::Anthropic;
 use overseer_core::provider::openai::OpenAiCompatible;
@@ -52,6 +52,7 @@ fn real_main() -> i32 {
     match args[0].as_str() {
         "tui" => cmd_tui(&args[1..]),
         "exec" => cmd_exec(&args[1..]),
+        "consolidate" => cmd_consolidate(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
         "rewind" => cmd_rewind(&args[1..]),
         other => {
@@ -85,8 +86,8 @@ fn cmd_tui(args: &[String]) -> i32 {
         eprintln!("overseer: stdout is not a terminal — use `overseer exec` for pipes/CI");
         return 2;
     }
-    let provider = match build_provider(&flags) {
-        Ok(p) => p,
+    let provider: std::sync::Arc<dyn Provider> = match build_provider(&flags) {
+        Ok(p) => p.into(),
         Err(msg) => {
             eprintln!("overseer: {msg}");
             return 2;
@@ -204,6 +205,161 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
 /// `both` (default), `summarize` (truncate + compact what remains).
 /// Blind spot: `bash` side effects are never snapshotted — only
 /// write/edit edits are recorded in the manifest.
+/// `overseer consolidate [--memory <dir>]` — sleep-time memory pass
+/// (P3.8): small-tier dedupe of INDEX.md, git-committed.
+fn cmd_consolidate(args: &[String]) -> i32 {
+    let mut flags = match parse_exec(args) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("overseer consolidate: {e}");
+            return 2;
+        }
+    };
+    flags.memory = true; // the command exists to touch memory
+    let provider: std::sync::Arc<dyn Provider> = match build_provider(&flags) {
+        Ok(p) => p.into(),
+        Err(msg) => {
+            eprintln!("overseer: {msg}");
+            return 2;
+        }
+    };
+    let dir = flags.cwd.join("memory");
+    let model = flags
+        .small_model
+        .clone()
+        .unwrap_or_else(|| flags.model.clone());
+    match overseer_core::memory::consolidate(provider.as_ref(), &model, &dir) {
+        Ok(msg) => {
+            println!("{msg}");
+            0
+        }
+        Err(e) => {
+            eprintln!("overseer consolidate: {e}");
+            1
+        }
+    }
+}
+
+/// `--best-of N` (P3.9): N attempts run in parallel, each in its own git
+/// worktree + session dir under the parent session. The winner is the
+/// first attempt whose `--verify` command exits 0 in its worktree (with
+/// no verify, the first clean completion wins). Attempt dirs persist for
+/// audit; nothing is merged back automatically — the winner's branch
+/// path is printed for review.
+fn run_best_of(
+    flags: &ExecFlags,
+    provider: std::sync::Arc<dyn Provider>,
+    base: AgentConfig,
+    session_dir: PathBuf,
+) -> i32 {
+    let prompt = flags.prompt.clone().unwrap_or_default();
+    // Worktrees need a repo; check before spawning anything.
+    let repo = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&flags.cwd)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !repo {
+        eprintln!("overseer exec: --best-of needs a git repo at {}", flags.cwd.display());
+        return 2;
+    }
+
+    let n = flags.best_of.clamp(2, 4);
+    let root = session_dir.join("bestof");
+    let verify = flags.verify.clone();
+    let mut handles = Vec::new();
+    for i in 0..n {
+        let provider = provider.clone();
+        let mut cfg = base.clone();
+        let wt = root.join(format!("attempt-{i}"));
+        let sess = root.join(format!("sess-{i}"));
+        let prompt = prompt.clone();
+        let verify = verify.clone();
+        let cwd = flags.cwd.clone();
+        handles.push(std::thread::spawn(move || {
+            let branch = format!("overseer-bon-{i}");
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&cwd)
+                .args(["worktree", "add", "-b", &branch])
+                .arg(&wt)
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    return (
+                        i,
+                        false,
+                        format!("worktree failed: {}", String::from_utf8_lossy(&o.stderr)),
+                    );
+                }
+                Err(e) => return (i, false, format!("git: {e}")),
+            }
+            cfg.cwd = wt.clone();
+            cfg.verify_cmd = None; // selection verifies explicitly below
+            let id = format!("bon-{i}");
+            let mut agent = match Agent::start(provider, cfg, sess.clone(), id) {
+                Ok(a) => a,
+                Err(e) => return (i, false, format!("start: {e}")),
+            };
+            let mut sink = |_: &Event| {};
+            let outcome = agent.run_turn(&prompt, &mut sink);
+            let answer = agent
+                .messages()
+                .last()
+                .map(|m| m.text())
+                .unwrap_or_default();
+            let passed = match (&verify, &outcome) {
+                (Some(v), Ok(_)) => std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(v)
+                    .current_dir(&wt)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false),
+                (None, Ok(_)) => true, // no gate ⇒ completion wins
+                (_, Err(_)) => false,
+            };
+            let note = format!(
+                "{}\n[attempt {i} — branch `{branch}`, trace {}, outcome {outcome:?}]",
+                overseer_core::tools::middle_truncate(&answer, 8_000),
+                sess.display()
+            );
+            (i, passed, note)
+        }));
+    }
+    let mut winner: Option<(u32, String)> = None;
+    let mut notes = Vec::new();
+    for h in handles {
+        let (i, passed, note) = h.join().unwrap_or((u32::MAX, false, "thread panic".into()));
+        if passed && winner.is_none() {
+            winner = Some((i, note.clone()));
+        }
+        notes.push((i, passed));
+    }
+    notes.sort();
+    match winner {
+        Some((i, note)) => {
+            println!("{note}");
+            for (j, ok) in &notes {
+                if *j != i {
+                    eprintln!("  attempt {j}: {}", if *ok { "passed (not first)" } else { "failed" });
+                }
+            }
+            0
+        }
+        None => {
+            eprintln!("best-of-{n}: all attempts failed");
+            for (i, ok) in &notes {
+                eprintln!("  attempt {i}: {}", if *ok { "passed" } else { "failed" });
+            }
+            1
+        }
+    }
+}
+
 fn cmd_rewind(args: &[String]) -> i32 {
     let mut dir: Option<PathBuf> = None;
     let mut want_cp: Option<u64> = None;
@@ -357,6 +513,8 @@ fn usage() {
          \x20 --verify <cmd>      Definition-of-done check; blocks finish on\n\
          \x20                     failure (stop-hook gate)\n\
          \x20 --verify-cap <n>    Max consecutive verify blocks (default: 8)\n\
+         \x20 --best-of <n>       N parallel attempts in git worktrees (2-4);\n\
+         \x20                     first attempt passing --verify wins\n\
          \x20 --no-sandbox        Run bash unsandboxed (default: sandbox-exec/\n\
          \x20                     bwrap wrapper when available)\n\
          \x20 --memory            Enable file memory at <cwd>/memory\n\
@@ -397,6 +555,9 @@ struct ExecFlags {
     keep_results: usize,
     verify: Option<String>,
     verify_cap: u32,
+    /// `--best-of N`: N parallel attempts in isolated git worktrees;
+    /// first attempt whose verify command exits 0 wins.
+    best_of: u32,
     sandbox: bool,
     memory: bool,
     prompt: Option<String>,
@@ -426,6 +587,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         keep_results: 5,
         verify: None,
         verify_cap: 8,
+        best_of: 0,
         sandbox: true,
         memory: false,
         prompt: None,
@@ -481,6 +643,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
                 f.keep_results = take(&mut i)?.parse().map_err(|_| "bad --keep-results")?
             }
             "--verify" => f.verify = Some(take(&mut i)?.clone()),
+            "--best-of" => f.best_of = take(&mut i)?.parse().map_err(|_| "bad --best-of")?,
             "--verify-cap" => {
                 f.verify_cap = take(&mut i)?.parse().map_err(|_| "bad --verify-cap")?
             }
@@ -526,8 +689,8 @@ fn cmd_exec(args: &[String]) -> i32 {
 
     let (session_dir, resume) = resolve_session(&flags);
 
-    let provider: Box<dyn Provider> = match build_provider(&flags) {
-        Ok(p) => p,
+    let provider: std::sync::Arc<dyn Provider> = match build_provider(&flags) {
+        Ok(p) => p.into(),
         Err(msg) => {
             eprintln!("overseer exec: {msg}");
             return 2;
@@ -535,8 +698,12 @@ fn cmd_exec(args: &[String]) -> i32 {
     };
     let config = agent_config(&flags);
 
+    if flags.best_of >= 2 {
+        return run_best_of(&flags, provider, config, session_dir);
+    }
+
     let mut agent = if resume {
-        match Agent::resume(provider.as_ref(), config, session_dir.clone()) {
+        match Agent::resume(provider.clone(), config, session_dir.clone()) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!(
@@ -551,7 +718,7 @@ fn cmd_exec(args: &[String]) -> i32 {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "session".into());
-        match Agent::start(provider.as_ref(), config, session_dir.clone(), session_id) {
+        match Agent::start(provider.clone(), config, session_dir.clone(), session_id) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("overseer exec: cannot start session: {e}");

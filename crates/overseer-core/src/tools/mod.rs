@@ -36,7 +36,8 @@ pub struct ToolCtx<'a> {
     pub spill_seq: u64,
     /// Provider handle for the `task` subagent tool; None in contexts with
     /// no provider (tests, dry runs) → `task` fails with an honest error.
-    pub provider: Option<&'a dyn crate::provider::Provider>,
+    /// `Arc` so background subagents can own a handle across threads.
+    pub provider: Option<std::sync::Arc<dyn crate::provider::Provider>>,
     /// Parent agent config for subagent inheritance (model, cwd, budgets).
     pub agent_config: Option<crate::agent::AgentConfig>,
     /// Subagent spawn counter for session-dir naming.

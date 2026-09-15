@@ -75,6 +75,15 @@ pub enum EventKind {
         steps: u32,
         total_cost_usd: f64,
     },
+    /// A background subagent finished (P3.4 fire-and-notify): its bounded
+    /// digest is injected as a user message at the next step boundary;
+    /// `trace` is the subagent's session dir for audit.
+    SubagentDone {
+        /// Named `task_id` — `id` collides with the envelope field under
+        /// serde flatten.
+        task_id: String,
+        trace: String,
+    },
     /// Stuck detector tripped — records which of the five patterns fired.
     StuckDetected {
         pattern: String,
@@ -241,6 +250,18 @@ pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
             EventKind::UserInput { text } | EventKind::Nudge { text } => {
                 flush_results(&mut pending_results, &mut messages);
                 messages.push(Message::user_text(text.clone()));
+            }
+            // Background-subagent notices rehydrate as user text — same
+            // pairing position as the live drain (after tool results).
+            EventKind::SubagentDone { task_id: id, trace } => {
+                flush_results(&mut pending_results, &mut messages);
+                let digest = std::fs::read_to_string(
+                    std::path::Path::new(trace).join("done.txt"),
+                )
+                .unwrap_or_else(|_| "(digest missing)".into());
+                messages.push(Message::user_text(format!(
+                    "[subagent {id} finished]\n{digest}"
+                )));
             }
             EventKind::ModelResponse { blocks, .. } => {
                 flush_results(&mut pending_results, &mut messages);
