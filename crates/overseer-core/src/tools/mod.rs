@@ -44,6 +44,8 @@ pub struct ToolCtx<'a> {
     /// Active checkpoint for this user prompt (P1.9): write/edit snapshot
     /// files here before touching them. None = checkpointing off.
     pub checkpoint: Option<&'a mut Checkpoint>,
+    /// P1.5: wrap bash calls in the platform sandbox when one exists.
+    pub sandbox: bool,
 }
 
 /// A per-user-prompt checkpoint (P1.9): `dir` holds file snapshots +
@@ -396,6 +398,7 @@ mod tests {
             agent_config: None,
             subagent_seq: 0,
             checkpoint: None,
+            sandbox: false,
         }
     }
 
@@ -524,6 +527,7 @@ mod tests {
             agent_config: None,
             subagent_seq: 0,
             checkpoint: Some(&mut cp),
+            sandbox: false,
         };
 
         reg.call(
