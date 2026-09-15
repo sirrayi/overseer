@@ -75,6 +75,7 @@ fn usage() {
          \x20 --compact-at <f>    Compaction trigger, fraction of context\n\
          \x20                     window (default: model profile's)\n\
          \x20 --no-compact        Disable context-engine compaction\n\
+         \x20 --memory            Enable file memory at <cwd>/memory\n\
          \n\
          ENV:\n\
          \x20 OVERSEER_API_KEY    Provider key (preferred, any provider)\n\
@@ -98,6 +99,7 @@ struct ExecFlags {
     full_access: bool,
     auto_compact: bool,
     compact_at: Option<f32>,
+    memory: bool,
     prompt: Option<String>,
 }
 
@@ -116,6 +118,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         full_access: false,
         auto_compact: true,
         compact_at: None,
+        memory: false,
         prompt: None,
     };
     let mut i = 0;
@@ -142,6 +145,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
                 f.compact_at = Some(take(&mut i)?.parse().map_err(|_| "bad --compact-at")?)
             }
             "--no-compact" => f.auto_compact = false,
+            "--memory" => f.memory = true,
             "-" => {
                 // Read the prompt from stdin (CI-friendly).
                 let mut buf = String::new();
@@ -201,6 +205,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         full_access: flags.full_access,
         auto_compact: flags.auto_compact,
         compact_at: flags.compact_at,
+        memory_dir: flags.memory.then(|| flags.cwd.join("memory")),
     };
 
     let mut agent = if flags.resume.is_some() {
