@@ -128,6 +128,7 @@ fn spawn_worker(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let provider = cfg.provider;
+        let agent_cfg = cfg.agent.clone();
         let agent = if cfg.resume {
             Agent::resume(provider.as_ref(), cfg.agent, cfg.session_dir.clone())
         } else {
@@ -151,6 +152,22 @@ fn spawn_worker(
 
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
+                WorkerCmd::SwitchSession { dir } => {
+                    // Rebuild the agent on another log — session switch,
+                    // post-fork, and post-rewind all rebuild context here.
+                    match Agent::resume(provider.as_ref(), agent_cfg.clone(), dir.clone()) {
+                        Ok(a) => {
+                            agent = a;
+                            let _ = engine_tx.send(EngineMsg::SessionSwitched { dir });
+                        }
+                        Err(e) => {
+                            let _ = engine_tx.send(EngineMsg::RunError(format!(
+                                "cannot open session {}: {e}",
+                                dir.display()
+                            )));
+                        }
+                    }
+                }
                 WorkerCmd::Submit { text, control } => {
                     agent.set_control(control);
                     let sink_tx = engine_tx.clone();

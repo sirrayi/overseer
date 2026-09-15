@@ -88,9 +88,8 @@ fn cmd_tui(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let session_dir = session_dir(&flags);
+    let (session_dir, resume) = resolve_session(&flags);
     let config = agent_config(&flags);
-    let resume = flags.resume.is_some();
     match overseer_tui::run(overseer_tui::TuiConfig {
         provider,
         agent: config,
@@ -105,17 +104,39 @@ fn cmd_tui(args: &[String]) -> i32 {
     }
 }
 
-fn session_dir(flags: &ExecFlags) -> PathBuf {
-    match (&flags.session, &flags.resume) {
-        (Some(d), _) | (_, Some(d)) => d.clone(),
-        _ => {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            dirs_home().join("sessions").join(format!("{ts}"))
+/// Session directory + whether to resume it. Precedence: --resume >
+/// --continue (cwd-scoped) > --last > --session > fresh timestamped dir.
+fn resolve_session(flags: &ExecFlags) -> (PathBuf, bool) {
+    if let Some(d) = &flags.resume {
+        return (d.clone(), true);
+    }
+    let root = dirs_home().join("sessions");
+    let cwd = flags
+        .cwd
+        .canonicalize()
+        .unwrap_or_else(|_| flags.cwd.clone());
+    if flags.cont {
+        if let Some(d) = overseer_core::session::most_recent(&root, Some(&cwd)) {
+            return (d, true);
+        }
+        eprintln!(
+            "overseer: no earlier session for {} — starting fresh",
+            cwd.display()
+        );
+    }
+    if flags.last {
+        if let Some(d) = overseer_core::session::most_recent(&root, None) {
+            return (d, true);
         }
     }
+    if let Some(d) = &flags.session {
+        return (d.clone(), false);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    (dirs_home().join("sessions").join(format!("{ts}")), false)
 }
 
 fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
@@ -200,121 +221,32 @@ fn cmd_rewind(args: &[String]) -> i32 {
         return 2;
     };
 
-    // Checkpoint dirs are named e<user-input-event-id>.
-    let cp_root = dir.join("checkpoints");
-    let mut cps: Vec<u64> = std::fs::read_dir(&cp_root)
-        .map(|d| {
-            d.filter_map(|e| {
-                e.ok()?
-                    .file_name()
-                    .to_string_lossy()
-                    .strip_prefix('e')
-                    .and_then(|n| n.parse().ok())
-            })
-            .collect()
-        })
-        .unwrap_or_default();
-    cps.sort_unstable();
-    let boundary = match want_cp.or_else(|| cps.last().copied()) {
-        Some(b) if cps.contains(&b) => b,
-        Some(b) => {
-            eprintln!(
-                "overseer rewind: no checkpoint e{b} in {}",
-                cp_root.display()
-            );
-            return 1;
-        }
-        None => {
-            eprintln!("overseer rewind: no checkpoints in {}", cp_root.display());
-            return 1;
-        }
-    };
-    let cp_dir = cp_root.join(format!("e{boundary}"));
-
-    if mode == "code" || mode == "both" {
-        let mut restored = 0u32;
-        let mut deleted = 0u32;
-        if let Ok(manifest) = std::fs::read_to_string(cp_dir.join("manifest.jsonl")) {
-            for line in manifest.lines() {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                let (Some(path), Some(stored)) = (
-                    v.get("path").and_then(|p| p.as_str()),
-                    v.get("stored").and_then(|s| s.as_str()),
-                ) else {
-                    continue;
-                };
-                if v.get("existed").and_then(|e| e.as_bool()).unwrap_or(false) {
-                    let src = cp_dir.join("files").join(stored);
-                    let dst = PathBuf::from(path);
-                    if let Some(parent) = dst.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if std::fs::copy(&src, &dst).is_ok() {
-                        restored += 1;
-                    }
-                } else if std::fs::remove_file(path).is_ok() {
-                    deleted += 1;
-                }
+    use overseer_core::rewind::Mode;
+    let m = Mode::parse(&mode).unwrap_or(Mode::Both);
+    match overseer_core::rewind::restore(&dir, want_cp, m) {
+        Ok(r) => {
+            if matches!(m, Mode::Code | Mode::Both) {
+                println!(
+                    "code: restored {} file(s), removed {} created file(s)",
+                    r.restored, r.deleted
+                );
             }
-        }
-        println!("code: restored {restored} file(s), removed {deleted} created file(s)");
-    }
-
-    if mode != "code" {
-        // Truncate the log at the boundary (the user input that opened the
-        // checkpoint stays; everything the agent did for it goes).
-        let events_path = dir.join("events.jsonl");
-        let Ok(text) = std::fs::read_to_string(&events_path) else {
-            eprintln!("overseer rewind: cannot read {}", events_path.display());
-            return 1;
-        };
-        let kept: Vec<&str> = text
-            .lines()
-            .filter(|l| {
-                serde_json::from_str::<serde_json::Value>(l)
-                    .ok()
-                    .and_then(|v| v.get("id").and_then(|id| id.as_u64()))
-                    .map(|id| id <= boundary)
-                    .unwrap_or(true)
-            })
-            .collect();
-        let dropped = text.lines().count() - kept.len();
-        let tmp = events_path.with_extension("jsonl.tmp");
-        if std::fs::write(&tmp, kept.join("\n") + "\n").is_err()
-            || std::fs::rename(&tmp, &events_path).is_err()
-        {
-            eprintln!("overseer rewind: failed writing {}", events_path.display());
-            return 1;
-        }
-        println!("conversation: truncated {dropped} event(s) at boundary e{boundary}");
-
-        if mode == "summarize" {
-            use overseer_core::compact;
-            use overseer_core::event::{EventKind, EventLog};
-            let events = EventLog::replay(&events_path).unwrap_or_default();
-            if let Some(anchor) = compact::tail_anchor(&events, compact::TAIL_TURNS, 0) {
-                let summary = compact::summarize(&events, anchor);
-                match EventLog::open(&events_path) {
-                    Ok(mut log) => {
-                        if log
-                            .append(EventKind::Compaction {
-                                summary,
-                                tail_from: anchor,
-                            })
-                            .and_then(|_| log.flush())
-                            .is_ok()
-                        {
-                            println!("conversation: appended compaction summary at e{anchor}");
-                        }
-                    }
-                    Err(e) => eprintln!("overseer rewind: compaction append failed: {e}"),
-                }
+            if !matches!(m, Mode::Code) {
+                println!(
+                    "conversation: truncated {} event(s) at boundary e{}",
+                    r.truncated, r.boundary
+                );
             }
+            if let Some(a) = r.compaction_at {
+                println!("conversation: appended compaction summary at e{a}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("overseer rewind: {e}");
+            1
         }
     }
-    0
 }
 
 /// `overseer stats <session-dir>` — the cache-hit-rate dashboard
@@ -367,6 +299,8 @@ fn usage() {
          FLAGS (exec):\n\
          \x20 --json              Emit the event stream as JSONL on stdout\n\
          \x20 --resume <dir>      Resume an existing session directory\n\
+         \x20 --continue, -c      Resume the most recent session for this cwd\n\
+         \x20 --last              Resume the most recent session anywhere\n\
          \x20 --session <dir>     Session directory (default: ~/.overseer/sessions/<ts>)\n\
          \x20 --cwd <dir>         Working directory for tools (default: .)\n\
          \x20 --model <id>        Model id (default: claude-sonnet-5)\n\
@@ -402,6 +336,10 @@ struct ExecFlags {
     json: bool,
     resume: Option<PathBuf>,
     session: Option<PathBuf>,
+    /// `--continue`: resume the most recent session for the cwd.
+    cont: bool,
+    /// `--last`: resume the most recent session anywhere.
+    last: bool,
     cwd: PathBuf,
     model: String,
     provider: String,
@@ -426,6 +364,8 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         json: false,
         resume: None,
         session: None,
+        cont: false,
+        last: false,
         cwd: std::env::current_dir().map_err(|e| e.to_string())?,
         model: "claude-sonnet-5".into(),
         provider: "anthropic".into(),
@@ -455,6 +395,8 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         match a {
             "--json" => f.json = true,
             "--resume" => f.resume = Some(PathBuf::from(take(&mut i)?)),
+            "--continue" | "-c" => f.cont = true,
+            "--last" => f.last = true,
             "--session" => f.session = Some(PathBuf::from(take(&mut i)?)),
             "--cwd" => f.cwd = PathBuf::from(take(&mut i)?),
             "--model" => f.model = take(&mut i)?.clone(),
@@ -518,7 +460,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         }
     };
 
-    let session_dir = session_dir(&flags);
+    let (session_dir, resume) = resolve_session(&flags);
 
     let provider: Box<dyn Provider> = match build_provider(&flags) {
         Ok(p) => p,
@@ -529,7 +471,7 @@ fn cmd_exec(args: &[String]) -> i32 {
     };
     let config = agent_config(&flags);
 
-    let mut agent = if flags.resume.is_some() {
+    let mut agent = if resume {
         match Agent::resume(provider.as_ref(), config, session_dir.clone()) {
             Ok(a) => a,
             Err(e) => {
