@@ -177,7 +177,8 @@ pub fn help_panel() -> Vec<Line<'static>> {
         "ctrl+t       toggle plan    ctrl+x  cancel queued msg",
         "ctrl+s       stash draft    ctrl+_  undo    ctrl+w  del word",
         "up/down      history        ctrl+c  clear   ctrl+d  quit",
-        "/help /quit — /rewind /fork /sessions /diff land in later batches",
+        "ctrl+p       session picker",
+        "/sessions /fork /rewind /help /quit — /diff lands in a later batch",
     ];
     rows.iter()
         .map(|r| Line::from(Span::styled(r.to_string(), theme::DIM)))
