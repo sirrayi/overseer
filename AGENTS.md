@@ -8,7 +8,9 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
 - `crates/overseer-core` — engine: canonical turn IR (`ir.rs`), append-only
   JSONL event log (`event.rs`), usage ledger (`ledger.rs`), model profiles
   (`profile.rs`), tool registry + tools (`tools/`), provider trait +
-  Anthropic adapter (`provider/`), ReAct loop with budgets (`agent.rs`)
+  Anthropic + OpenAI-compatible adapters (`provider/`), ReAct loop with
+  budgets (`agent.rs`), stuck detector (`stuck.rs`), L4 permission gate
+  (`perm.rs`), deterministic compaction (`compact.rs`)
 - `crates/overseer-cli` — `overseer exec` headless/CI surface
 - `crates/overseer-proto` — wire protocol types (stub)
 - `crates/overseer-tui` — terminal frontend (stub)
@@ -24,6 +26,10 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
 5. Read-before-edit is enforced by the harness, not the prompt.
 6. Reasoning blocks are opaque — round-trip verbatim, never inspect/mutate.
 7. Raw provider `stop_reason` is preserved end-to-end.
+8. Compaction is a view over the event log, never a mutation; summaries are
+   derived mechanically from raw events (never re-summarized), and the
+   recency tail always starts on a ModelResponse boundary so tool pairing
+   survives the cut.
 
 ## Commands
 

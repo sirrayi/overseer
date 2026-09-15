@@ -72,6 +72,9 @@ fn usage() {
          \x20 --thinking <tok>    Enable extended thinking with token budget\n\
          \x20 --full-access       Disable the permission gate (benchmarks/\n\
          \x20                     sandboxed envs only)\n\
+         \x20 --compact-at <f>    Compaction trigger, fraction of context\n\
+         \x20                     window (default: model profile's)\n\
+         \x20 --no-compact        Disable context-engine compaction\n\
          \n\
          ENV:\n\
          \x20 OVERSEER_API_KEY    Provider key (preferred, any provider)\n\
@@ -93,6 +96,8 @@ struct ExecFlags {
     max_cost: f64,
     thinking: Option<u32>,
     full_access: bool,
+    auto_compact: bool,
+    compact_at: Option<f32>,
     prompt: Option<String>,
 }
 
@@ -109,6 +114,8 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         max_cost: 5.0,
         thinking: None,
         full_access: false,
+        auto_compact: true,
+        compact_at: None,
         prompt: None,
     };
     let mut i = 0;
@@ -131,6 +138,10 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
             "--max-cost" => f.max_cost = take(&mut i)?.parse().map_err(|_| "bad --max-cost")?,
             "--thinking" => f.thinking = Some(take(&mut i)?.parse().map_err(|_| "bad --thinking")?),
             "--full-access" => f.full_access = true,
+            "--compact-at" => {
+                f.compact_at = Some(take(&mut i)?.parse().map_err(|_| "bad --compact-at")?)
+            }
+            "--no-compact" => f.auto_compact = false,
             "-" => {
                 // Read the prompt from stdin (CI-friendly).
                 let mut buf = String::new();
@@ -188,6 +199,8 @@ fn cmd_exec(args: &[String]) -> i32 {
         thinking_budget: flags.thinking,
         cwd: flags.cwd.clone(),
         full_access: flags.full_access,
+        auto_compact: flags.auto_compact,
+        compact_at: flags.compact_at,
     };
 
     let mut agent = if flags.resume.is_some() {
