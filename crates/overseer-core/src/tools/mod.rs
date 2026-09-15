@@ -64,7 +64,19 @@ pub fn snapshot(ctx: &mut ToolCtx, path: &Path) {
     let Some(cp) = ctx.checkpoint.as_deref_mut() else {
         return;
     };
-    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Manifest paths must be absolute — rewind resolves them from a
+    // different cwd. Canonicalize handles existing files (and symlinks);
+    // for not-yet-created files (the `existed: false` case, where
+    // canonicalize fails) anchor relative paths at the tool cwd first.
+    let anchored = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        ctx.cwd.join(path)
+    };
+    // components() drops `.` and duplicate separators, so `a.txt` and
+    // `./a.txt` dedup to one manifest entry.
+    let anchored: PathBuf = anchored.components().collect();
+    let key = anchored.canonicalize().unwrap_or(anchored);
     if !cp.done.insert(key.clone()) {
         return;
     }
@@ -564,5 +576,15 @@ mod tests {
         assert_eq!(snap, "original");
         // A created file is recorded as not existing → rewind deletes it.
         assert_eq!(entries[1]["existed"], false);
+        // Regression (live-hammer find): manifest paths must be absolute
+        // even for not-yet-created files — canonicalize can't resolve a
+        // nonexistent path, so a raw relative path would make rewind
+        // delete nothing.
+        let rec = std::path::Path::new(entries[1]["path"].as_str().unwrap());
+        assert!(rec.is_absolute());
+        assert_eq!(
+            rec.canonicalize().unwrap(),
+            dir.join("new.txt").canonicalize().unwrap()
+        );
     }
 }
