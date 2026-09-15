@@ -40,6 +40,9 @@ pub enum AskDecision {
     /// Run this call and every later call with the same tool+resource
     /// key (exact bash command string, canonical file path).
     AllowSession,
+    /// Like AllowSession, but the key is also appended to the policy's
+    /// rules file — the allow survives restarts and other sessions.
+    AllowAlways,
     Deny,
 }
 
@@ -145,8 +148,15 @@ pub struct Policy {
     /// Headless frontends leave this `None` → Ask still fails closed.
     pub ask_handler: Option<AskHandler>,
     /// Tool+resource keys the human allowed for the session
-    /// (`AllowSession`). Interior-mutable: `check` takes `&self`.
+    /// (`AllowSession`) plus every key loaded from `rules_path`
+    /// (`AllowAlways` in a past session). Interior-mutable: `check`
+    /// takes `&self`.
     session_allow: Arc<Mutex<HashSet<String>>>,
+    /// Persisted-allow file — one `tool:resource` key per line. The
+    /// frontend supplies the path (`~/.overseer/rules` by convention);
+    /// None disables persistence while `AllowAlways` still works for
+    /// the session.
+    rules_path: Option<PathBuf>,
 }
 
 impl Policy {
@@ -159,6 +169,7 @@ impl Policy {
             allow_all: false,
             ask_handler: None,
             session_allow: Arc::new(Mutex::new(HashSet::new())),
+            rules_path: None,
         }
     }
 
@@ -170,6 +181,7 @@ impl Policy {
             allow_all: false,
             ask_handler: None,
             session_allow: Arc::new(Mutex::new(HashSet::new())),
+            rules_path: None,
         }
     }
 
@@ -182,6 +194,43 @@ impl Policy {
             allow_all: true,
             ask_handler: None,
             session_allow: Arc::new(Mutex::new(HashSet::new())),
+            rules_path: None,
+        }
+    }
+
+    /// Load a persisted-allow file: one `tool:resource` key per line,
+    /// `#` comments and blanks ignored. Keys land in the same set as
+    /// `AllowSession` — deny rules still trump them in `check`.
+    pub fn load_rules(&mut self, path: PathBuf) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(mut s) = self.session_allow.lock() {
+                for line in text.lines() {
+                    let k = line.trim();
+                    if !k.is_empty() && !k.starts_with('#') {
+                        s.insert(k.to_string());
+                    }
+                }
+            }
+        }
+        self.rules_path = Some(path);
+    }
+
+    /// Append a key to the rules file. Best-effort: a write failure
+    /// leaves the session-allow in place, it just doesn't persist.
+    fn persist_rule(&self, key: &str) {
+        let Some(path) = &self.rules_path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{key}");
         }
     }
 
@@ -227,8 +276,11 @@ impl Policy {
                 };
                 match handler.ask(&req) {
                     AskDecision::AllowOnce => Gate::Allow,
-                    AskDecision::AllowSession => {
+                    d @ (AskDecision::AllowSession | AskDecision::AllowAlways) => {
                         if let Some(key) = self.session_key(tool, input) {
+                            if d == AskDecision::AllowAlways {
+                                self.persist_rule(&key);
+                            }
                             if let Ok(mut s) = self.session_allow.lock() {
                                 s.insert(key);
                             }
@@ -580,5 +632,36 @@ mod tests {
             Gate::Deny(r) => assert!(r.contains("denied by user")),
             Gate::Allow => panic!("expected deny"),
         }
+    }
+
+    #[test]
+    fn allow_always_persists_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("overseer-always-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rules = dir.join("rules");
+
+        let mut p = Policy::preset(Preset::WorkspaceWrite, dir.clone());
+        p.load_rules(rules.clone());
+        p.ask_handler = Some(AskHandler(Arc::new(|_| AskDecision::AllowAlways)));
+        let cmd = json!({"command": "git push origin main"});
+        assert_eq!(p.gate("bash", &cmd), Gate::Allow);
+        // The key landed in the rules file.
+        let text = std::fs::read_to_string(&rules).unwrap();
+        assert_eq!(text.trim(), "bash:git push origin main");
+
+        // A fresh policy (new session, restart) pre-allows the command —
+        // no handler consulted, check never reaches the ask rules.
+        let mut p2 = Policy::preset(Preset::WorkspaceWrite, dir.clone());
+        p2.load_rules(rules);
+        assert_eq!(p2.check("bash", &cmd), Verdict::Allow);
+        // Deny rules still win over a persisted allow.
+        std::fs::write(dir.join("rules"), "bash:git push -f origin main\n").unwrap();
+        let mut p3 = Policy::preset(Preset::WorkspaceWrite, dir.clone());
+        p3.load_rules(dir.join("rules"));
+        assert!(matches!(
+            p3.check("bash", &json!({"command": "git push -f origin main"})),
+            Verdict::Deny { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

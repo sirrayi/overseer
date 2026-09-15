@@ -12,9 +12,9 @@ expression: picker
 
 
 
-sessions — type to filter · ↑↓ select · tab preview · enter
 > ▌
 › [ago] · s1 · fix the flaky test
   [ago] · s2 · add a parser
+type to filter · ↑↓ · tab preview · enter switch · esc
 ❯
  workspace  /repo                        test-model · $0.000

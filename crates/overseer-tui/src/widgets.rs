@@ -53,7 +53,7 @@ pub struct Dialog {
 
 impl Dialog {
     pub const GRACE_MS: u128 = 200;
-    const N_OPTS: usize = 3;
+    const N_OPTS: usize = 4;
 
     pub fn armed(&self) -> bool {
         self.opened.elapsed().as_millis() >= Self::GRACE_MS
@@ -69,6 +69,7 @@ impl Dialog {
         match self.selected {
             0 => D::AllowOnce,
             1 => D::AllowSession,
+            2 => D::AllowAlways,
             _ => D::Deny,
         }
     }
@@ -82,7 +83,8 @@ impl Dialog {
         match key {
             '1' => Some(D::AllowOnce),
             '2' => Some(D::AllowSession),
-            '3' => Some(D::Deny),
+            '3' => Some(D::AllowAlways),
+            '4' => Some(D::Deny),
             _ => None,
         }
     }
@@ -100,29 +102,76 @@ impl Dialog {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-        // Typed preview: the bash command is the deciding evidence.
-        if self.req.tool == "bash" {
-            if let Some(cmd) = self.req.input.get("command").and_then(|v| v.as_str()) {
-                for l in cmd.lines().take(3) {
+        // Typed preview: the deciding evidence differs per tool —
+        // bash wants the command line, edit wants the patch, write
+        // wants the target + head of content.
+        match self.req.tool.as_str() {
+            "bash" => {
+                if let Some(cmd) = self.req.input.get("command").and_then(|v| v.as_str()) {
+                    for l in cmd.lines().take(3) {
+                        out.extend(crate::cells::wrap_styled(
+                            vec![
+                                Span::styled("  $ ", theme::DIALOG_KEY),
+                                Span::styled(l.to_string(), theme::DIALOG),
+                            ],
+                            w,
+                        ));
+                    }
+                }
+            }
+            "edit" => {
+                if let Some(p) = self.req.input.get("path").and_then(|v| v.as_str()) {
+                    out.push(Line::from(Span::styled(
+                        format!("  {p}"),
+                        theme::DIALOG,
+                    )));
+                }
+                for (mark, key, style) in [
+                    ("- ", "old_string", theme::ERROR),
+                    ("+ ", "new_string", theme::META),
+                ] {
+                    if let Some(s) = self.req.input.get(key).and_then(|v| v.as_str()) {
+                        for l in s.lines().take(4) {
+                            out.extend(crate::cells::wrap_styled(
+                                vec![Span::styled(format!("  {mark}{l}"), style)],
+                                w,
+                            ));
+                        }
+                    }
+                }
+            }
+            "write" => {
+                if let Some(p) = self.req.input.get("path").and_then(|v| v.as_str()) {
+                    out.push(Line::from(Span::styled(
+                        format!("  {p}"),
+                        theme::DIALOG,
+                    )));
+                }
+                if let Some(c) = self.req.input.get("content").and_then(|v| v.as_str()) {
+                    for l in c.lines().take(4) {
+                        out.extend(crate::cells::wrap_styled(
+                            vec![
+                                Span::styled("  │ ", theme::DIALOG_KEY),
+                                Span::styled(l.to_string(), theme::DIALOG),
+                            ],
+                            w,
+                        ));
+                    }
+                }
+            }
+            _ => {
+                if let Some(p) = self.req.input.get("path").and_then(|v| v.as_str()) {
                     out.extend(crate::cells::wrap_styled(
                         vec![
-                            Span::styled("  $ ", theme::DIALOG_KEY),
-                            Span::styled(l.to_string(), theme::DIALOG),
+                            Span::styled("  ", theme::DIALOG),
+                            Span::styled(p.to_string(), theme::DIALOG),
                         ],
                         w,
                     ));
                 }
             }
-        } else if let Some(p) = self.req.input.get("path").and_then(|v| v.as_str()) {
-            out.extend(crate::cells::wrap_styled(
-                vec![
-                    Span::styled("  ", theme::DIALOG),
-                    Span::styled(p.to_string(), theme::DIALOG),
-                ],
-                w,
-            ));
         }
-        let labels = ["[1] allow once", "[2] allow session", "[3] deny"];
+        let labels = ["[1] once", "[2] session", "[3] always", "[4] deny"];
         if self.armed() {
             let mut spans = Vec::new();
             for (i, l) in labels.iter().enumerate() {

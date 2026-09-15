@@ -367,3 +367,83 @@ fn fork_creates_sibling_and_switches() {
     app.step(&mut term, &caps).unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── P2 Batch C: transcript search, /diff, typed previews ─────────────
+
+#[test]
+fn transcript_overlay_searches_history() {
+    let (mut app, etx, _w, mut term, caps, root) = session_harness();
+    for t in ["fix the flaky test", "add a parser"] {
+        etx.send(EngineMsg::Event(ev(EventKind::UserInput {
+            text: t.into(),
+        })))
+        .unwrap();
+    }
+    etx.send(EngineMsg::Event(model_response("I'll look at the test file.")))
+        .unwrap();
+    app.step(&mut term, &caps).unwrap();
+
+    // Ctrl+O opens the pager over flushed history.
+    app.key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('o'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("transcript_overlay", screen(&term));
+
+    // Typing filters to matching cells only.
+    for c in "parser".chars() {
+        app.key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char(c),
+        ));
+    }
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("transcript_filtered", screen(&term));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn diff_overlay_previews_and_reverts() {
+    let (mut app, _e, _w, mut term, caps, root) = session_harness();
+    // The agent "changed" this file after checkpoint e2 snapshotted it.
+    let target = root.join("app.txt");
+    let cp = root.join("s1/checkpoints/e2/files");
+    std::fs::create_dir_all(&cp).unwrap();
+    std::fs::write(cp.join("f0"), "line one\nline two\n").unwrap();
+    std::fs::write(
+        root.join("s1/checkpoints/e2/manifest.jsonl"),
+        format!(
+            "{{\"path\":\"{}\",\"stored\":\"f0\",\"existed\":true}}\n",
+            target.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(&target, "line one\nline CHANGED\nline three\n").unwrap();
+
+    app.submit_text("/diff");
+    app.step(&mut term, &caps).unwrap();
+    // Normalize the temp dir name out of path-bearing rows/toasts (the
+    // row shows a truncated tail — the dir name is the varying part).
+    let dirname = root.file_name().unwrap().to_str().unwrap().to_string();
+    let norm = move |t: &Terminal<TestBackend>| screen(t).replace(&dirname, "[root]");
+    insta::assert_snapshot!("diff_overlay", norm(&term));
+
+    // Tab shows the unified diff for the selected file.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Tab,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("diff_preview", norm(&term));
+
+    // Enter reverts to the snapshot; the file content proves it.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Enter,
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "line one\nline two\n"
+    );
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("diff_reverted_toast", norm(&term));
+    let _ = std::fs::remove_dir_all(&root);
+}

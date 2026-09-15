@@ -26,7 +26,7 @@ pub enum ToolStatus {
     Skipped,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Cell {
     User {
         text: String,
@@ -55,6 +55,23 @@ pub enum Cell {
 }
 
 impl Cell {
+    /// Unstyled searchable text — the transcript overlay's filter corpus.
+    pub fn plain(&self) -> String {
+        match self {
+            Cell::User { text } | Cell::Assistant { text } | Cell::Reasoning { text } => {
+                text.clone()
+            }
+            Cell::Tool {
+                name,
+                summary,
+                output,
+                ..
+            } => format!("{name} {summary} {}", output.as_deref().unwrap_or("")),
+            Cell::Plan { markdown } => markdown.clone(),
+            Cell::Meta { text, .. } => text.clone(),
+        }
+    }
+
     /// Render at `width` columns. Cells are height-cacheable per width —
     /// the transcript only ever appends.
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
