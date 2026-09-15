@@ -109,6 +109,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
         }
     }
 
+    super::snapshot(ctx, &path);
     if let Err(e) = std::fs::write(&path, &replaced) {
         return ToolOutput::err(format!("Cannot write {}: {e}", path.display()));
     }

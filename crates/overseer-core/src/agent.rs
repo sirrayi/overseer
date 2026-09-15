@@ -141,6 +141,9 @@ pub struct Agent<'a> {
     spill_seq: u64,
     /// Consecutive verification-gate blocks this session (P1.10).
     verify_blocks: u32,
+    /// Active checkpoint for the current user prompt (P1.9): created at
+    /// each `run_turn` boundary so file snapshots group per prompt.
+    checkpoint: Option<crate::tools::Checkpoint>,
 }
 
 impl<'a> Agent<'a> {
@@ -170,6 +173,7 @@ impl<'a> Agent<'a> {
             ctx_wall_stop: false,
             spill_seq: 0,
             verify_blocks: 0,
+            checkpoint: None,
         };
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
@@ -216,6 +220,7 @@ impl<'a> Agent<'a> {
             ctx_wall_stop: false,
             spill_seq,
             verify_blocks: 0,
+            checkpoint: None,
         })
     }
 
@@ -240,6 +245,19 @@ impl<'a> Agent<'a> {
     ) -> std::io::Result<RunOutcome> {
         self.messages.push(Message::user_text(input));
         self.emit(EventKind::UserInput { text: input.into() }, on_event)?;
+
+        // P1.9 checkpointing: open a fresh checkpoint per user prompt,
+        // named by the input's event id — that id is also the conversation
+        // boundary a rewind truncates to.
+        if let Some(boundary) = self.log.last().map(|e| e.id) {
+            self.checkpoint = Some(crate::tools::Checkpoint {
+                dir: self
+                    .session_dir
+                    .join("checkpoints")
+                    .join(format!("e{boundary}")),
+                done: Default::default(),
+            });
+        }
 
         let mut steps = 0u32;
         let profile = profile::lookup(&self.config.model);
@@ -449,6 +467,9 @@ impl<'a> Agent<'a> {
                 .observe_response(true, resp.stop_reason == StopReason::ContextWindowExceeded);
 
             // Execute tool calls; results merge into one user message.
+            // The checkpoint is taken out of self for the batch so ctx can
+            // borrow it while emit() still has &mut self.
+            let mut checkpoint = self.checkpoint.take();
             let mut ctx = ToolCtx {
                 cwd: self.config.cwd.clone(),
                 session_dir: self.session_dir.clone(),
@@ -456,6 +477,7 @@ impl<'a> Agent<'a> {
                 provider: Some(self.provider),
                 agent_config: Some(self.config.clone()),
                 subagent_seq: 0,
+                checkpoint: checkpoint.as_mut(),
             };
             let mut results = Vec::new();
             for (call_id, name, input) in calls {
@@ -495,8 +517,10 @@ impl<'a> Agent<'a> {
                 });
             }
             self.messages.push(Message::tool_results(results));
-            // Carry the session-monotonic spill counter forward.
+            // Carry the session-monotonic spill counter forward; hand the
+            // checkpoint back for the next iteration.
             self.spill_seq = ctx.spill_seq;
+            self.checkpoint = checkpoint;
 
             if let Some(pattern) = stuck_hit {
                 if let Some(outcome) = self.on_stuck(pattern, steps, on_event)? {

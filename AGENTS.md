@@ -30,6 +30,13 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
    derived mechanically from raw events (never re-summarized), and the
    recency tail always starts on a ModelResponse boundary so tool pairing
    survives the cut.
+9. Checkpoints live in `<session>/checkpoints/e<user-input-event-id>/` —
+   one per user prompt. `write`/`edit` snapshot each file BEFORE its
+   first touch into `files/` + `manifest.jsonl` (`existed:false` → rewind
+   deletes it). `overseer rewind <session-dir> [--checkpoint n]
+   [--mode code|conversation|both|summarize]` restores files and/or
+   truncates the log at the boundary. Blind spot: `bash` side effects
+   are NOT snapshotted — only write/edit paths are recorded.
 
 ## Commands
 
