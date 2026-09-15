@@ -113,6 +113,9 @@ fn usage() {
          \x20 --no-compact        Disable context-engine compaction\n\
          \x20 --keep-results <n>  Recent tool results kept verbatim (default: 5,\n\
          \x20                     0 disables stale-result clearing)\n\
+         \x20 --verify <cmd>      Definition-of-done check; blocks finish on\n\
+         \x20                     failure (stop-hook gate)\n\
+         \x20 --verify-cap <n>    Max consecutive verify blocks (default: 8)\n\
          \x20 --memory            Enable file memory at <cwd>/memory\n\
          \n\
          ENV:\n\
@@ -138,6 +141,8 @@ struct ExecFlags {
     auto_compact: bool,
     compact_at: Option<f32>,
     keep_results: usize,
+    verify: Option<String>,
+    verify_cap: u32,
     memory: bool,
     prompt: Option<String>,
 }
@@ -158,6 +163,8 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         auto_compact: true,
         compact_at: None,
         keep_results: 5,
+        verify: None,
+        verify_cap: 8,
         memory: false,
         prompt: None,
     };
@@ -187,6 +194,10 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
             "--no-compact" => f.auto_compact = false,
             "--keep-results" => {
                 f.keep_results = take(&mut i)?.parse().map_err(|_| "bad --keep-results")?
+            }
+            "--verify" => f.verify = Some(take(&mut i)?.clone()),
+            "--verify-cap" => {
+                f.verify_cap = take(&mut i)?.parse().map_err(|_| "bad --verify-cap")?
             }
             "--memory" => f.memory = true,
             "-" => {
@@ -250,6 +261,8 @@ fn cmd_exec(args: &[String]) -> i32 {
         compact_at: flags.compact_at,
         memory_dir: flags.memory.then(|| flags.cwd.join("memory")),
         keep_tool_results: flags.keep_results,
+        verify_cmd: flags.verify.clone(),
+        verify_block_cap: flags.verify_cap,
     };
 
     let mut agent = if flags.resume.is_some() {
@@ -313,6 +326,12 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(RunOutcome::EmptyResponse { steps, .. }) => {
             eprintln!("run terminated — model produced empty responses ({steps} steps)");
             6
+        }
+        Ok(RunOutcome::VerifyFailed { steps, .. }) => {
+            eprintln!(
+                "run terminated — verification still failing after block cap ({steps} steps)"
+            );
+            7
         }
         Ok(RunOutcome::Provider(msg)) => {
             eprintln!("provider error: {msg}");
