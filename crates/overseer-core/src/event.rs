@@ -263,6 +263,43 @@ pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
     messages
 }
 
+/// Placeholder that replaces a cleared tool result's content. Fixed text so
+/// the transform is idempotent — re-clearing an already-cleared result is a
+/// no-op byte-wise.
+pub const CLEARED_RESULT: &str = "[tool result cleared — re-read the file if needed]";
+
+/// P1.2 stale tool-result clearing: keep the last `keep` `ToolResult` blocks
+/// verbatim; replace older ones' content with `CLEARED_RESULT`. The block
+/// itself (and its `tool_use_id`) survives so tool_use/tool_result pairing
+/// stays valid for the provider.
+///
+/// Pure view transform over the message view — events on disk are never
+/// touched, so a cleared session rehydrates the full history and re-clears
+/// deterministically. Returns how many results were (re)written.
+pub fn clear_stale_tool_results(messages: &mut [crate::ir::Message], keep: usize) -> usize {
+    let total = messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter(|b| matches!(b, crate::ir::Block::ToolResult { .. }))
+        .count();
+    let stale = total.saturating_sub(keep);
+    if stale == 0 {
+        return 0;
+    }
+    let mut seen = 0usize;
+    for m in messages.iter_mut() {
+        for b in m.content.iter_mut() {
+            if let crate::ir::Block::ToolResult { content, .. } = b {
+                if seen < stale {
+                    *content = CLEARED_RESULT.to_string();
+                }
+                seen += 1;
+            }
+        }
+    }
+    stale
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +375,64 @@ mod tests {
         assert_eq!(msgs[1].role, Role::Assistant);
         assert_eq!(msgs[2].role, Role::User);
         assert!(matches!(msgs[2].content[0], Block::ToolResult { .. }));
+    }
+
+    #[test]
+    fn clear_stale_tool_results_keeps_recent_tail() {
+        let result = |id: &str, text: &str| Block::ToolResult {
+            tool_use_id: id.into(),
+            content: text.into(),
+            is_error: false,
+        };
+        let mut msgs = vec![
+            crate::ir::Message::tool_results(vec![result("a", "old-1"), result("b", "old-2")]),
+            crate::ir::Message::user_text("middle"),
+            crate::ir::Message::tool_results(vec![
+                result("c", "recent-1"),
+                result("d", "recent-2"),
+            ]),
+        ];
+        let cleared = clear_stale_tool_results(&mut msgs, 2);
+        assert_eq!(cleared, 2);
+        // Older two cleared but blocks/tool_use_ids survive (pairing intact).
+        match &msgs[0].content[0] {
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "a");
+                assert_eq!(content, CLEARED_RESULT);
+            }
+            _ => panic!("expected ToolResult"),
+        }
+        match &msgs[0].content[1] {
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "b");
+                assert_eq!(content, CLEARED_RESULT);
+            }
+            _ => panic!("expected ToolResult"),
+        }
+        // Recent tail untouched.
+        match &msgs[2].content[0] {
+            Block::ToolResult { content, .. } => assert_eq!(content, "recent-1"),
+            _ => panic!("expected ToolResult"),
+        }
+        // Idempotent: a second pass changes nothing.
+        let snapshot = msgs.clone();
+        clear_stale_tool_results(&mut msgs, 2);
+        assert_eq!(msgs, snapshot);
+        // Under the cap → no-op.
+        let mut small = vec![crate::ir::Message::tool_results(vec![result("x", "keep")])];
+        assert_eq!(clear_stale_tool_results(&mut small, 2), 0);
+        match &small[0].content[0] {
+            Block::ToolResult { content, .. } => assert_eq!(content, "keep"),
+            _ => panic!("expected ToolResult"),
+        }
     }
 
     #[test]
