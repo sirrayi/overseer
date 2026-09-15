@@ -39,6 +39,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
             return ToolOutput::err(format!("Cannot create {}: {e}", parent.display()));
         }
     }
+    super::snapshot(ctx, &path);
     match std::fs::write(&path, content) {
         Ok(()) => {
             reg.mark_read(&path); // writer knows the contents — editing is grounded
