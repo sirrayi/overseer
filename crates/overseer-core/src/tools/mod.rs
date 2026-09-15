@@ -17,6 +17,7 @@ pub mod bash;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod plan;
 pub mod read;
 pub mod task;
 pub mod write;
@@ -115,6 +116,7 @@ impl ToolRegistry {
             edit::spec(),
             grep::spec(),
             glob::spec(),
+            plan::spec(),
             task::spec(),
         ];
         specs.sort_by(|a, b| a.name.cmp(&b.name));
@@ -214,9 +216,10 @@ impl ToolRegistry {
             "edit" => edit::run(input, ctx, self),
             "grep" => grep::run(input, ctx),
             "glob" => glob::run(input, ctx),
+            "plan" => plan::run(input, ctx),
             "task" => task::run(input, ctx),
             other => ToolOutput::err(format!(
-                "Unknown tool '{other}'. Available tools: bash, read, write, edit, grep, glob, task."
+                "Unknown tool '{other}'. Available tools: bash, read, write, edit, grep, glob, plan, task."
             )),
         };
         enforce_budget(out, ctx)
@@ -362,5 +365,40 @@ mod tests {
             .text
             .contains("[file modified since your previous read]"));
         assert!(third.text.contains("TWO"));
+    }
+
+    #[test]
+    fn plan_persists_checklist_to_session_dir() {
+        let dir = tmpdir();
+        let mut reg = ToolRegistry::core(crate::perm::Policy::headless(dir.clone()));
+        let mut c = ctx(&dir);
+
+        let out = reg.call(
+            "plan",
+            &json!({"items": [
+                {"content": "explore", "status": "completed"},
+                {"content": "implement", "status": "in_progress"},
+                {"content": "verify", "status": "pending"}
+            ]}),
+            &mut c,
+        );
+        assert!(!out.is_error);
+        assert!(out.text.contains("1 in progress"));
+
+        // Persisted + resumable: the artifact lives in the session dir.
+        let md = std::fs::read_to_string(c.session_dir.join("plan.md")).unwrap();
+        assert!(md.contains("- [x] explore"));
+        assert!(md.contains("- [~] implement"));
+        assert!(md.contains("- [ ] verify"));
+        assert!(c.session_dir.join("plan.json").exists());
+
+        // Bad status is rejected with a repair hint.
+        let bad = reg.call(
+            "plan",
+            &json!({"items": [{"content": "x", "status": "done"}]}),
+            &mut c,
+        );
+        assert!(bad.is_error);
+        assert!(bad.text.contains("pending|in_progress|completed"));
     }
 }
