@@ -19,6 +19,8 @@ pub mod glob;
 pub mod grep;
 pub mod plan;
 pub mod read;
+pub mod repomap;
+pub mod skill;
 pub mod task;
 pub mod write;
 
@@ -181,6 +183,9 @@ impl ToolRegistry {
             glob::spec(),
             plan::spec(),
             task::spec(),
+            skill::spec(),
+            repomap::spec_map(),
+            repomap::spec_symbol(),
         ];
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         ToolRegistry {
@@ -298,8 +303,11 @@ impl ToolRegistry {
             "glob" => glob::run(input, ctx),
             "plan" => plan::run(input, ctx),
             "task" => task::run(input, ctx),
+            "skill" => skill::run(input, ctx),
+            "repo_map" => repomap::run_map(input, ctx),
+            "symbol" => repomap::run_symbol(input, ctx),
             other => ToolOutput::err(format!(
-                "Unknown tool '{other}'. Available tools: bash, read, write, edit, grep, glob, plan, task."
+                "Unknown tool '{other}'. Available tools: bash, read, write, edit, grep, glob, plan, task, skill, repo_map, symbol."
             )),
         };
         enforce_budget(out, ctx)
