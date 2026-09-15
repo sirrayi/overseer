@@ -4,6 +4,7 @@
 //! every later subsystem must earn its tokens over this floor.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::control::Control;
 use crate::event::{rehydrate_messages, Event, EventKind, EventLog};
@@ -148,8 +149,8 @@ pub enum RunOutcome {
 
 /// A running agent: owns the event log, ledger, tool registry, and the
 /// message view rehydrated from the log.
-pub struct Agent<'a> {
-    provider: &'a dyn Provider,
+pub struct Agent {
+    provider: Arc<dyn Provider>,
     config: AgentConfig,
     log: EventLog,
     ledger: Ledger,
@@ -164,6 +165,8 @@ pub struct Agent<'a> {
     /// Adaptive-effort escalations (P3.2): each stuck trip bumps the
     /// request effort one notch for the rest of the run.
     effort_boost: u8,
+    /// Background subagent ids already noticed this run (P3.4).
+    bg_noticed: std::collections::HashSet<String>,
     /// Compact at the next loop boundary (set by the context-budget trigger
     /// or a provider context-window stop).
     pending_compact: bool,
@@ -184,10 +187,10 @@ pub struct Agent<'a> {
     control: Control,
 }
 
-impl<'a> Agent<'a> {
+impl Agent {
     /// Start a fresh session in `session_dir` (must exist / be creatable).
     pub fn start(
-        provider: &'a dyn Provider,
+        provider: Arc<dyn Provider>,
         config: AgentConfig,
         session_dir: PathBuf,
         session_id: String,
@@ -208,6 +211,7 @@ impl<'a> Agent<'a> {
             stuck_nudged: false,
             empty_responses: 0,
             effort_boost: 0,
+            bg_noticed: std::collections::HashSet::new(),
             pending_compact: false,
             ctx_wall_stop: false,
             spill_seq: 0,
@@ -232,7 +236,7 @@ impl<'a> Agent<'a> {
 
     /// Resume an existing session dir: replay events, rebuild the message view.
     pub fn resume(
-        provider: &'a dyn Provider,
+        provider: Arc<dyn Provider>,
         config: AgentConfig,
         session_dir: PathBuf,
     ) -> std::io::Result<Self> {
@@ -258,6 +262,7 @@ impl<'a> Agent<'a> {
             stuck_nudged: false,
             empty_responses: 0,
             effort_boost: 0,
+            bg_noticed: std::collections::HashSet::new(),
             pending_compact: false,
             ctx_wall_stop: false,
             spill_seq,
@@ -341,6 +346,7 @@ impl<'a> Agent<'a> {
                 self.messages.push(Message::user_text(text.clone()));
                 self.emit(EventKind::UserInput { text }, on_event)?;
             }
+            self.drain_bg_notices(on_event)?;
 
             if steps >= self.config.max_steps {
                 let out = RunOutcome::StepBudgetExceeded {
@@ -554,7 +560,7 @@ impl<'a> Agent<'a> {
                 cwd: self.config.cwd.clone(),
                 session_dir: self.session_dir.clone(),
                 spill_seq: self.spill_seq,
-                provider: Some(self.provider),
+                provider: Some(self.provider.clone()),
                 agent_config: Some(self.config.clone()),
                 subagent_seq: 0,
                 checkpoint: checkpoint.as_mut(),
@@ -723,6 +729,50 @@ impl<'a> Agent<'a> {
                 _ => None,
             })
             .collect())
+    }
+
+    /// Fire-and-notify delivery (P3.4): scan subagents/bg-*/ for newly
+    /// written done.txt markers; each becomes a user message + a
+    /// SubagentDone event so resumes replay it identically.
+    fn drain_bg_notices(
+        &mut self,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<()> {
+        let dir = self.session_dir.join("subagents");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(());
+        };
+        let mut done: Vec<(String, PathBuf)> = entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("bg-"))
+            .filter_map(|e| {
+                let p = e.path();
+                p.join("done.txt").exists().then(|| {
+                    (
+                        e.file_name().to_string_lossy().to_string(),
+                        p,
+                    )
+                })
+            })
+            .collect();
+        done.sort(); // deterministic injection order
+        for (id, path) in done {
+            if !self.bg_noticed.insert(id.clone()) {
+                continue;
+            }
+            let digest = std::fs::read_to_string(path.join("done.txt"))
+                .unwrap_or_else(|_| "(digest missing)".into());
+            let text = format!("[subagent {id} finished]\n{digest}");
+            self.messages.push(Message::user_text(text));
+            self.emit(
+                EventKind::SubagentDone {
+                    task_id: id,
+                    trace: path.display().to_string(),
+                },
+                on_event,
+            )?;
+        }
+        Ok(())
     }
 
     /// Handle a detector trip: log it, inject one course-correction nudge,
@@ -1050,7 +1100,7 @@ mod tests {
             tool_turn(5),
             done(),
         ]);
-        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
         let mut sink = |_: &Event| {};
         let out = agent.run_turn("do the thing", &mut sink).unwrap();
         assert!(matches!(out, RunOutcome::Completed { .. }));
@@ -1091,7 +1141,7 @@ mod tests {
         });
         responses.push(done());
         let provider = Mock::new(responses);
-        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
         let mut sink = |_: &Event| {};
         let out = agent.run_turn("work", &mut sink).unwrap();
         assert!(matches!(out, RunOutcome::Completed { steps: 6, .. }));
@@ -1117,8 +1167,8 @@ mod tests {
             memory_dir: Some(memdir.clone()),
             ..AgentConfig::default()
         };
-        let provider = Mock::new(vec![tool_turn(1), done()]);
-        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let provider = Arc::new(Mock::new(vec![tool_turn(1), done()]));
+        let mut agent = Agent::start(provider.clone(), cfg, dir.clone(), "s".into()).unwrap();
         let mut sink = |_: &Event| {};
         agent.run_turn("hi", &mut sink).unwrap();
 
@@ -1183,7 +1233,7 @@ mod tests {
             },
             done(),
         ]);
-        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
         let mut sink = |_: &Event| {};
         let out = agent.run_turn("use a subagent", &mut sink).unwrap();
         assert!(matches!(out, RunOutcome::Completed { .. }));
@@ -1230,7 +1280,7 @@ mod tests {
             ..AgentConfig::default()
         };
         let provider = Mock::new(vec![done()]);
-        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
         let mut sink = |_: &Event| {};
         let out = agent.run_turn("finish fast", &mut sink).unwrap();
         assert!(matches!(out, RunOutcome::VerifyFailed { steps: 3, .. }));
@@ -1256,7 +1306,7 @@ mod tests {
             ..AgentConfig::default()
         };
         let provider2 = Mock::new(vec![done()]);
-        let mut agent2 = Agent::start(&provider2, cfg2, dir2.clone(), "s".into()).unwrap();
+        let mut agent2 = Agent::start(Arc::new(provider2), cfg2, dir2.clone(), "s".into()).unwrap();
         let mut sink2 = |_: &Event| {};
         let out2 = agent2.run_turn("finish", &mut sink2).unwrap();
         assert!(matches!(out2, RunOutcome::Completed { steps: 1, .. }));
@@ -1297,7 +1347,7 @@ mod tests {
             bash_call("c2", "echo two"),
             bash_call("c3", "echo three"),
         ])]);
-        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
         let control = crate::control::Control::default();
         agent.set_control(control.clone());
         // Deterministic mid-batch trigger: the sink runs on the agent
@@ -1352,7 +1402,7 @@ mod tests {
             resp(vec![bash_call("c1", "echo one"), bash_call("c2", "echo two")]),
             done(),
         ]);
-        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
         let control = crate::control::Control::default();
         agent.set_control(control.clone());
         let mut sink = |e: &Event| {
@@ -1399,7 +1449,7 @@ mod tests {
             resp(vec![bash_call("c1", "git push origin main")]),
             done(),
         ]);
-        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
         let mut sink = |_: &Event| {};
         let out = agent.run_turn("ship it", &mut sink).unwrap();
         assert!(matches!(out, RunOutcome::Completed { .. }));
@@ -1421,8 +1471,8 @@ mod tests {
             small_model: Some("tiny-1".into()),
             ..AgentConfig::default()
         };
-        let provider = Mock::new(vec![done()]);
-        let agent = Agent::start(&provider, cfg, dir, "s".into()).unwrap();
+        let provider = Arc::new(Mock::new(vec![done()]));
+        let agent = Agent::start(provider.clone(), cfg, dir, "s".into()).unwrap();
         let out = agent.aux_call("title this").unwrap();
         assert_eq!(out.trim(), "all done");
         let models = provider.seen_models.lock().unwrap();
@@ -1439,12 +1489,48 @@ mod tests {
             small_model: Some("tiny-1".into()),
             ..AgentConfig::default()
         };
-        let provider = Mock::failing_on(&["tiny-1"], vec![done()]);
-        let agent = Agent::start(&provider, cfg, dir, "s".into()).unwrap();
+        let provider = Arc::new(Mock::failing_on(&["tiny-1"], vec![done()]));
+        let agent = Agent::start(provider.clone(), cfg, dir, "s".into()).unwrap();
         let out = agent.aux_call("title this").unwrap();
         assert_eq!(out.trim(), "all done");
         let models = provider.seen_models.lock().unwrap();
         assert_eq!(models.as_slice(), &["tiny-1", "claude-sonnet-5"]);
+    }
+
+    /// P3.4: a finished background subagent lands as a SubagentDone
+    /// event + a user message at the next step boundary.
+    #[test]
+    fn bg_notice_drains_into_context() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        let provider = Arc::new(Mock::new(vec![tool_turn(1), done()]));
+        let mut agent = Agent::start(provider.clone(), cfg, dir.clone(), "s".into()).unwrap();
+        // Pre-seed a finished bg task before the turn.
+        let bg = dir.join("subagents/bg-7");
+        std::fs::create_dir_all(&bg).unwrap();
+        std::fs::write(bg.join("done.txt"), "bg digest here").unwrap();
+
+        let mut events = Vec::new();
+        let mut sink = |e: &Event| events.push(e.kind.clone());
+        let out = agent.run_turn("go", &mut sink).unwrap();
+        assert!(matches!(out, RunOutcome::Completed { .. }));
+        assert!(events.iter().any(|k| matches!(
+            k,
+            EventKind::SubagentDone { task_id, .. } if task_id == "bg-7"
+        )));
+        assert!(agent
+            .messages()
+            .iter()
+            .any(|m| m.text().contains("bg digest here")));
+
+        // Resume replays the notice identically from the event log.
+        let events2 = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        let msgs = rehydrate_messages(&events2);
+        assert!(msgs.iter().any(|m| m.text().contains("bg digest here")));
     }
 
     /// P3.2: effort bumps one notch per stuck-detector trip.

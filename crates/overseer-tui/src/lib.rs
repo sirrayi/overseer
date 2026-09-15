@@ -35,7 +35,7 @@ use app::{App, EngineMsg, WorkerCmd};
 
 /// Everything a TUI session needs — the CLI resolves flags/env into this.
 pub struct TuiConfig {
-    pub provider: Box<dyn Provider>,
+    pub provider: std::sync::Arc<dyn Provider>,
     pub agent: AgentConfig,
     pub session_dir: PathBuf,
     /// Resume an existing session directory (replays history into the
@@ -263,14 +263,14 @@ fn spawn_worker(
         let provider = cfg.provider;
         let agent_cfg = cfg.agent.clone();
         let agent = if cfg.resume {
-            Agent::resume(provider.as_ref(), cfg.agent, cfg.session_dir.clone())
+            Agent::resume(provider.clone(), cfg.agent, cfg.session_dir.clone())
         } else {
             let id = cfg
                 .session_dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "session".into());
-            Agent::start(provider.as_ref(), cfg.agent, cfg.session_dir.clone(), id)
+            Agent::start(provider.clone(), cfg.agent, cfg.session_dir.clone(), id)
         };
         let mut agent = match agent {
             Ok(a) => a,
@@ -288,7 +288,7 @@ fn spawn_worker(
                 WorkerCmd::SwitchSession { dir } => {
                     // Rebuild the agent on another log — session switch,
                     // post-fork, and post-rewind all rebuild context here.
-                    match Agent::resume(provider.as_ref(), agent_cfg.clone(), dir.clone()) {
+                    match Agent::resume(provider.clone(), agent_cfg.clone(), dir.clone()) {
                         Ok(a) => {
                             agent = a;
                             let _ = engine_tx.send(EngineMsg::SessionSwitched { dir });
