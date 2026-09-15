@@ -10,7 +10,13 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   (`profile.rs`), tool registry + tools (`tools/`), provider trait +
   Anthropic + OpenAI-compatible adapters (`provider/`), ReAct loop with
   budgets (`agent.rs`), stuck detector (`stuck.rs`), L4 permission gate
-  (`perm.rs`), deterministic compaction (`compact.rs`)
+  (`perm.rs`), deterministic compaction (`compact.rs`). Bash calls run
+  under a platform sandbox by default (macOS `sandbox-exec`, Linux
+  `bwrap`): deny-by-default network, writes confined to the workspace +
+  temp dirs, common secret dirs (`~/.ssh` etc.) read-denied. Falls back
+  to unsandboxed exec with a visible warning when no backend exists;
+  `--no-sandbox` disables. A loopback egress proxy with domain
+  allowlists is still open — v1 denies all egress.
 - `crates/overseer-cli` — `overseer exec` headless/CI surface
 - `crates/overseer-proto` — wire protocol types (stub)
 - `crates/overseer-tui` — terminal frontend (stub)

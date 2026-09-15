@@ -291,6 +291,8 @@ fn usage() {
          \x20 --verify <cmd>      Definition-of-done check; blocks finish on\n\
          \x20                     failure (stop-hook gate)\n\
          \x20 --verify-cap <n>    Max consecutive verify blocks (default: 8)\n\
+         \x20 --no-sandbox        Run bash unsandboxed (default: sandbox-exec/\n\
+         \x20                     bwrap wrapper when available)\n\
          \x20 --memory            Enable file memory at <cwd>/memory\n\
          \n\
          ENV:\n\
@@ -319,6 +321,7 @@ struct ExecFlags {
     keep_results: usize,
     verify: Option<String>,
     verify_cap: u32,
+    sandbox: bool,
     memory: bool,
     prompt: Option<String>,
 }
@@ -342,6 +345,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         keep_results: 5,
         verify: None,
         verify_cap: 8,
+        sandbox: true,
         memory: false,
         prompt: None,
     };
@@ -386,6 +390,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
             "--verify-cap" => {
                 f.verify_cap = take(&mut i)?.parse().map_err(|_| "bad --verify-cap")?
             }
+            "--no-sandbox" => f.sandbox = false,
             "--memory" => f.memory = true,
             "-" => {
                 // Read the prompt from stdin (CI-friendly).
@@ -451,6 +456,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         keep_tool_results: flags.keep_results,
         verify_cmd: flags.verify.clone(),
         verify_block_cap: flags.verify_cap,
+        sandbox_bash: flags.sandbox,
     };
 
     let mut agent = if flags.resume.is_some() {
