@@ -274,16 +274,19 @@ impl ToolRegistry {
         self.mark_read(path);
     }
 
-    /// Dispatch a tool call. The permission gate runs first — Deny and
-    /// (headless) Ask both return a denied ToolOutput; the call never runs.
-    /// Never panics: unknown names and bad inputs become error ToolOutputs
-    /// that teach the model the contract.
+    /// The permission policy (live mode badges read the preset from here).
+    pub fn policy(&self) -> &crate::perm::Policy {
+        &self.policy
+    }
+
+    /// Dispatch a tool call. The permission gate runs first — a `Gate::Deny`
+    /// (rule-denied, human-denied, or headless Ask) returns a denied
+    /// ToolOutput; the call never runs. Never panics: unknown names and bad
+    /// inputs become error ToolOutputs that teach the model the contract.
     pub fn call(&mut self, name: &str, input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
-        match self.policy.check(name, input) {
-            crate::perm::Verdict::Allow => {}
-            crate::perm::Verdict::Ask { reason } | crate::perm::Verdict::Deny { reason } => {
-                return ToolOutput::denied(reason);
-            }
+        match self.policy.gate(name, input) {
+            crate::perm::Gate::Allow => {}
+            crate::perm::Gate::Deny(reason) => return ToolOutput::denied(reason),
         }
         let out = match name {
             "bash" => bash::run(input, ctx),

@@ -24,6 +24,25 @@ pub enum Request {
     /// Interrupt the current turn (maps to SIGINT semantics of the tool set).
     #[serde(rename = "turn.interrupt")]
     TurnInterrupt,
+    /// Steer mid-run: injected as a user message at the next tool-launch
+    /// boundary — skipped calls get synthetic results (P2.4).
+    #[serde(rename = "turn.steer")]
+    TurnSteer { text: String },
+    /// Queue a message for delivery when the run goes idle (queued ≠ sent).
+    #[serde(rename = "turn.queue")]
+    TurnQueue { text: String },
+    /// Cancel one queued message by index (queue-strip per-item cancel).
+    #[serde(rename = "turn.queue_cancel")]
+    TurnQueueCancel { index: usize },
+    /// Branch the session at an event boundary into a new session dir.
+    #[serde(rename = "session.fork")]
+    SessionFork {
+        /// Fork point; `None` = current head.
+        at_event: Option<u64>,
+    },
+    /// Swap the permission preset (mode badge): workspace | readonly | plan.
+    #[serde(rename = "session.set_preset")]
+    SessionSetPreset { preset: String },
 }
 
 /// Engine → client notifications beyond raw events (permissions, status).
