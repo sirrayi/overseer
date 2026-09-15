@@ -1,0 +1,18 @@
+---
+source: crates/overseer-tui/tests/snapshots.rs
+expression: screen(&term)
+---
+
+
+
+
+
+
+
+
+
+
+── session s2 ──
+❯ add a parser
+❯
+ workspace  /repo                        test-model · $0.000

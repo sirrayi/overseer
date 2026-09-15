@@ -1,0 +1,18 @@
+---
+source: crates/overseer-tui/tests/snapshots.rs
+expression: screen(&term)
+---
+
+
+
+
+
+
+
+
+
+
+rewound to e2 — 1 file(s) restored, 0 removed, 0 event(s) dr
+opped
+❯
+ workspace  /repo                        test-model · $0.000

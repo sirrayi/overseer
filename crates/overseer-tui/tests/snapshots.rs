@@ -185,3 +185,185 @@ fn composer_multiline_and_history() {
     app.step(&mut term, &caps).unwrap();
     insta::assert_snapshot!("composer_typed", screen(&term));
 }
+
+// ── P2 Batch B: sessions, picker, rewind, fork, switch ──────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn temp_root() -> PathBuf {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "overseer-tui-snap-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// A session dir under `root` with a SessionStart + one user prompt.
+fn mk_session(root: &std::path::Path, name: &str, cwd: &str, prompt: &str) -> PathBuf {
+    use overseer_core::event::EventLog;
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut log = EventLog::create(dir.join("events.jsonl")).unwrap();
+    log.append(EventKind::SessionStart {
+        session_id: name.into(),
+        cwd: cwd.into(),
+        model: "test-model".into(),
+        harness_version: "0".into(),
+    })
+    .unwrap();
+    log.append(EventKind::UserInput {
+        text: prompt.into(),
+    })
+    .unwrap();
+    log.flush().unwrap();
+    dir
+}
+
+/// Harness whose session_dir lives inside a real session root — the
+/// picker enumerates siblings of `session_dir`.
+fn session_harness() -> (
+    App,
+    mpsc::Sender<EngineMsg>,
+    mpsc::Receiver<WorkerCmd>,
+    Terminal<TestBackend>,
+    Caps,
+    PathBuf,
+) {
+    let root = temp_root();
+    let s1 = mk_session(&root, "s1", "/repo", "fix the flaky test");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let _s2 = mk_session(&root, "s2", "/other", "add a parser");
+    let (etx, erx) = mpsc::channel();
+    let (wtx, wrx) = mpsc::channel();
+    let app = App::new(
+        erx,
+        wtx,
+        Preset::WorkspaceWrite,
+        "/repo".into(),
+        "test-model".into(),
+        s1,
+    );
+    let mut backend = TestBackend::new(60, 20);
+    backend.set_cursor_position((0, 10)).unwrap();
+    let term = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(6),
+        },
+    )
+    .unwrap();
+    (app, etx, wrx, term, Caps::default(), root)
+}
+
+#[test]
+fn session_picker_filters_and_switches() {
+    let (mut app, _e, wrx, mut term, caps, root) = session_harness();
+    app.submit_text("/sessions");
+    app.step(&mut term, &caps).unwrap();
+    // Normalize the relative-time column — it races the wall clock.
+    let picker = screen(&term).replace("0s ·", "[ago] ·").replace("1s ·", "[ago] ·");
+    insta::assert_snapshot!("session_picker", picker);
+
+    // Fuzzy filter: 'par' matches only s2's "add a parser".
+    for c in "par".chars() {
+        app.key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char(c),
+        ));
+    }
+    app.step(&mut term, &caps).unwrap();
+    let filtered = screen(&term).replace("0s ·", "[ago] ·").replace("1s ·", "[ago] ·");
+    insta::assert_snapshot!("session_picker_filtered", filtered);
+
+    // Enter switches: the worker gets the command.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Enter,
+    ));
+    match wrx.recv_timeout(std::time::Duration::from_secs(1)) {
+        Ok(WorkerCmd::SwitchSession { dir }) => {
+            assert_eq!(dir, root.join("s2"));
+        }
+        Ok(_) => panic!("expected SwitchSession, got another command"),
+        Err(e) => panic!("expected SwitchSession, got {e}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn session_switch_reseeds_transcript() {
+    let (mut app, etx, _w, mut term, caps, root) = session_harness();
+    etx.send(EngineMsg::SessionSwitched {
+        dir: root.join("s2"),
+    })
+    .unwrap();
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("session_switched", screen(&term));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn slash_commands_guarded_during_run() {
+    let (mut app, _e, wrx, mut term, caps, root) = session_harness();
+    app.submit_text("do the thing");
+    let _submit = wrx.recv().unwrap(); // the run's Submit
+    app.submit_text("/fork");
+    app.submit_text("/sessions");
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("guarded_during_run", screen(&term));
+    // No session commands leaked to the worker mid-run.
+    assert!(wrx.try_recv().is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rewind_picker_lists_checkpoints() {
+    let (mut app, _e, wrx, mut term, caps, root) = session_harness();
+    // A checkpoint on e2 (the user input in s1's log); the tracked file
+    // lives inside the temp root so the restore is self-contained.
+    let cp = root.join("s1/checkpoints/e2/files");
+    std::fs::create_dir_all(&cp).unwrap();
+    std::fs::write(cp.join("f0"), "snapshot").unwrap();
+    std::fs::write(
+        root.join("s1/checkpoints/e2/manifest.jsonl"),
+        format!(
+            "{{\"path\":\"{}\",\"stored\":\"f0\",\"existed\":true}}\n",
+            root.join("x.txt").display()
+        ),
+    )
+    .unwrap();
+    app.submit_text("/rewind");
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("rewind_picker", screen(&term));
+
+    // Enter performs the rewind: log truncated + worker told to rebuild.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Enter,
+    ));
+    match wrx.recv_timeout(std::time::Duration::from_secs(1)) {
+        Ok(WorkerCmd::SwitchSession { dir }) => assert_eq!(dir, root.join("s1")),
+        Ok(_) => panic!("expected SwitchSession rebuild after rewind"),
+        Err(e) => panic!("expected SwitchSession rebuild, got {e}"),
+    }
+    // The rewind report flushed to the transcript.
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("rewind_done", screen(&term));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fork_creates_sibling_and_switches() {
+    let (mut app, _e, wrx, mut term, caps, root) = session_harness();
+    app.submit_text("/fork");
+    match wrx.recv_timeout(std::time::Duration::from_secs(1)) {
+        Ok(WorkerCmd::SwitchSession { dir }) => {
+            assert!(dir.join("events.jsonl").exists(), "fork copied the log");
+            assert_eq!(dir.parent().unwrap(), root.as_path());
+        }
+        Ok(_) => panic!("expected SwitchSession to the fork"),
+        Err(e) => panic!("expected SwitchSession to the fork, got {e}"),
+    }
+    app.step(&mut term, &caps).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
