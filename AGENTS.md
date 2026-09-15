@@ -26,6 +26,9 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   `overseer` / `overseer tui` launches the interactive TUI (same flags).
   `--continue`/`-c` resumes the newest session recorded for the cwd,
   `--last` the newest anywhere; both fall back to a fresh session.
+  `--bare` is hermetic CI mode: implies `--json`, throwaway session in
+  the temp dir (never `~/.overseer`), no persisted rules, and rejects
+  combination with `--resume`/`--continue`/`--last`/`--session`.
 - `crates/overseer-proto` — wire protocol types (request/notification)
 - `crates/overseer-tui` — ratatui/crossterm TUI (library). Agent runs on a
   worker thread; UI renders `Event`s over a channel. Fixed-height
@@ -43,7 +46,14 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   del-word, Ctrl+P sessions, Ctrl+O search, Ctrl+Y copy last reply
   (OSC 52), Alt+E/`/edit` $EDITOR draft, Tab completes `/cmd` or
   `@path`, `!cmd` runs shell locally (never sent to the model),
-  ? help, /help /quit /sessions /fork /rewind /diff /approve /search.
+  ? help, /help /quit /sessions /tree /fork /rewind /diff /approve
+  /search. `/tree` renders the fork forest (SessionStart.parent edges)
+  DFS parents-first; the picker shows ⤶ forks and git-branch metadata
+  (computed once at open, wide mode). `/diff` rows carry +/− counts and
+  structured hunks — Tab previews, ←→ selects a hunk, space marks it
+  rejected, Enter applies marked rejects (partial revert) or the whole
+  snapshot; transcript overlay Tab expands collapsed tool blocks
+  (16-line cap). `/` menu + completion use subsequence fuzzy match.
   Session switches and rewinds rebuild the agent via
   `WorkerCmd::SwitchSession` → `Agent::resume` (never mid-run); the
   transcript reseeds from the new log. Modal overlays

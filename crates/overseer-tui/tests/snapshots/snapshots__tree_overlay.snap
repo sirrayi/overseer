@@ -1,0 +1,20 @@
+---
+source: crates/overseer-tui/tests/snapshots.rs
+expression: norm
+---
+
+
+
+
+
+
+
+
+
+
+  s2 · [ago] · add a parser
+› s1 · [ago] · fix the flaky test · (current)
+    ↳ s3 · [ago] · fix the flaky test
+↑↓ · enter switch · esc
+❯
+ workspace  /repo                        test-model · $0.000

@@ -212,6 +212,7 @@ fn mk_session(root: &std::path::Path, name: &str, cwd: &str, prompt: &str) -> Pa
         cwd: cwd.into(),
         model: "test-model".into(),
         harness_version: "0".into(),
+        parent: None,
     })
     .unwrap();
     log.append(EventKind::UserInput {
@@ -476,6 +477,132 @@ fn slash_menu_and_tab_complete() {
     ));
     app.step(&mut term, &caps).unwrap();
     insta::assert_snapshot!("slash_completed", screen(&term));
+}
+
+// ── P2 gap audit: /tree, fuzzy / menu, hunk review, tool expansion ──
+
+/// `/tree` lists the fork forest parents-first with ↳ children.
+#[test]
+fn tree_overlay_shows_fork_hierarchy() {
+    let (mut app, _e, _w, mut term, caps, root) = session_harness();
+    // s2 forks from s1 → /tree must nest it under s1.
+    overseer_core::session::fork(&root.join("s1"), None, &root.join("s3")).unwrap();
+    app.submit_text("/tree");
+    app.step(&mut term, &caps).unwrap();
+    let norm = screen(&term).replace("0s ·", "[ago] ·").replace("1s ·", "[ago] ·");
+    insta::assert_snapshot!("tree_overlay", norm);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Fuzzy `/` menu: "tr" is a subsequence of tree/transcript — both
+/// listed even though neither starts with it.
+#[test]
+fn slash_menu_matches_fuzzy() {
+    let (mut app, _etx, _wrx, mut term, caps) = harness();
+    for c in "/tr".chars() {
+        app.key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char(c),
+        ));
+    }
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("tree"), "fuzzy /tr should list /tree:\n{s}");
+    assert!(s.contains("transcript"), "fuzzy /tr should list /transcript:\n{s}");
+}
+
+/// Transcript overlay: Tab expands completed tool blocks (their
+/// captured output renders under the summary line).
+#[test]
+fn transcript_tab_expands_tool_output() {
+    let (mut app, etx, _w, mut term, caps, root) = session_harness();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolCallStart {
+        call_id: "c1".into(),
+        name: "bash".into(),
+        input: serde_json::json!({"command": "make test"}),
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolResult {
+        call_id: "c1".into(),
+        name: "bash".into(),
+        content: "42 tests passed\n0 failed".into(),
+        is_error: false,
+        raw_bytes: 25,
+        spilled_to: None,
+        denied: false,
+    })))
+    .unwrap();
+    app.step(&mut term, &caps).unwrap();
+
+    app.key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('o'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    // Collapsed: output is not visible.
+    assert!(!screen(&term).contains("42 tests passed"));
+
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Tab,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("42 tests passed"), "expanded tool output:\n{s}");
+    insta::assert_snapshot!("transcript_expanded", s);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Per-hunk reject: mark the second of two hunks, Enter applies only
+/// that revert — the first change survives.
+#[test]
+fn diff_rejects_single_hunk() {
+    let (mut app, _e, _w, mut term, caps, root) = session_harness();
+    let target = root.join("multi.txt");
+    // Snapshot: 10 lines; current changes line 2 AND line 9 (far
+    // enough apart to form two hunks at ctx=3... b/c gap > 2*3).
+    let snap: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+    let cur = snap
+        .replace("line 2", "TWO changed")
+        .replace("line 9", "NINE changed");
+    let cp = root.join("s1/checkpoints/e2/files");
+    std::fs::create_dir_all(&cp).unwrap();
+    std::fs::write(cp.join("f0"), &snap).unwrap();
+    std::fs::write(
+        root.join("s1/checkpoints/e2/manifest.jsonl"),
+        format!(
+            "{{\"path\":\"{}\",\"stored\":\"f0\",\"existed\":true}}\n",
+            target.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(&target, &cur).unwrap();
+
+    app.submit_text("/diff");
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Tab,
+    )); // preview
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Right,
+    )); // hunk 2
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Char(' '),
+    )); // reject it
+    app.step(&mut term, &caps).unwrap();
+    let dirname = root.file_name().unwrap().to_str().unwrap().to_string();
+    insta::assert_snapshot!("diff_hunk_marked", screen(&term).replace(&dirname, "[root]"));
+
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Enter,
+    ));
+    let after = std::fs::read_to_string(&target).unwrap();
+    assert!(
+        after.contains("TWO changed"),
+        "hunk 1 must survive:\n{after}"
+    );
+    assert!(
+        after.contains("line 9"),
+        "hunk 2 must be reverted:\n{after}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// `!cmd` runs locally — output lands in scrollback and NOTHING is

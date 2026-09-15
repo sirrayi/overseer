@@ -162,6 +162,39 @@ impl Cell {
                 .collect(),
         }
     }
+
+    /// Like `lines` but tool cells render their captured output too —
+    /// the transcript overlay's expand toggle (collapsible tool blocks,
+    /// P2.9). Capped at 16 output lines per call: a spilled `read` of a
+    /// huge file stays browseable without flooding the pager.
+    pub fn lines_expanded(&self, width: u16) -> Vec<Line<'static>> {
+        let mut out = self.lines(width);
+        if let Cell::Tool {
+            status,
+            output: Some(output),
+            ..
+        } = self
+        {
+            // Err/Denied cells already print a 6-line tail in `lines`;
+            // expansion is only additive for the other statuses.
+            if !matches!(status, ToolStatus::Err | ToolStatus::Denied) {
+                let w = (width.max(8)) as usize;
+                for l in output.lines().take(16) {
+                    out.extend(wrap_styled(
+                        vec![Span::styled(format!("    {l}"), theme::dim())],
+                        w,
+                    ));
+                }
+                if output.lines().count() > 16 {
+                    out.push(Line::from(Span::styled(
+                        "    … (truncated)".to_string(),
+                        theme::dim(),
+                    )));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// One-line summary of a tool call's input — what the collapsed row shows.

@@ -1,6 +1,6 @@
 ---
 source: crates/overseer-tui/tests/snapshots.rs
-expression: screen(&term)
+expression: s
 ---
 
 
@@ -12,12 +12,10 @@ expression: screen(&term)
 
 
 
-❯ fix the flaky test
-❯ add a parser
-I'll look at the test file.
-❯ fix the flaky test
-❯ add a parser
-I'll look at the test file.
+✓ bash make test
+✓ bash make test
+    42 tests passed
+    0 failed
 3 lines · type to filter · ↑↓/pgdn · tab expand tools · esc
 ❯
  workspace  /repo                        test-model · $0.000
