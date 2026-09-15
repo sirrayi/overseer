@@ -645,7 +645,7 @@ impl Agent {
                 });
 
                 // Rule-of-Two latch flips are auditable events (P3.10).
-                let notices: Vec<String> = self.tools.taint_notices.drain(..).collect();
+                let notices: Vec<String> = std::mem::take(&mut self.tools.taint_notices);
                 for notice in notices {
                     self.emit(EventKind::Tainted { detail: notice }, on_event)?;
                 }
