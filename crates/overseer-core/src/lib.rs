@@ -8,6 +8,7 @@ pub mod agent;
 pub mod event;
 pub mod ir;
 pub mod ledger;
+pub mod perm;
 pub mod profile;
 pub mod provider;
 pub mod stuck;
