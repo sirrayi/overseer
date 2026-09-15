@@ -11,4 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 overseer-core = { path = "../overseer-core" }
+overseer-tui = { path = "../overseer-tui" }
 serde_json = "1"

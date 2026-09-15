@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use crate::control::Control;
 use crate::event::{rehydrate_messages, Event, EventKind, EventLog};
 use crate::ir::{Block, Message};
 use crate::ledger::{Ledger, UsageRecord};
@@ -62,6 +63,11 @@ pub struct AgentConfig {
     /// to the workspace. Falls back to unsandboxed exec with a warning
     /// when no backend exists.
     pub sandbox_bash: bool,
+    /// P2.5 human-verdict channel: consulted when the permission gate
+    /// returns Ask. `None` (headless) collapses Ask to Deny — fail-closed.
+    /// The handler runs on the agent thread; frontends block it on a UI
+    /// response channel.
+    pub ask_handler: Option<crate::perm::AskHandler>,
 }
 
 impl Default for AgentConfig {
@@ -82,6 +88,7 @@ impl Default for AgentConfig {
             verify_cmd: None,
             verify_block_cap: 8,
             sandbox_bash: true,
+            ask_handler: None,
         }
     }
 }
@@ -114,6 +121,12 @@ pub enum RunOutcome {
     /// Verification gate blocked the finish `verify_block_cap` times and
     /// the check was still failing — the run ends without a clean bill.
     VerifyFailed {
+        steps: u32,
+        cost_usd: f64,
+    },
+    /// The user interrupted the run (Esc). Lands at a tool-launch
+    /// boundary — a tool already executing is never killed mid-flight.
+    Interrupted {
         steps: u32,
         cost_usd: f64,
     },
@@ -150,6 +163,9 @@ pub struct Agent<'a> {
     /// Active checkpoint for the current user prompt (P1.9): created at
     /// each `run_turn` boundary so file snapshots group per prompt.
     checkpoint: Option<crate::tools::Checkpoint>,
+    /// Frontend steering handle (P2.4): interrupt + queued input, checked
+    /// at safe boundaries only. Default = headless, never fires.
+    control: Control,
 }
 
 impl<'a> Agent<'a> {
@@ -180,6 +196,7 @@ impl<'a> Agent<'a> {
             spill_seq: 0,
             verify_blocks: 0,
             checkpoint: None,
+            control: Control::default(),
         };
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
@@ -227,6 +244,7 @@ impl<'a> Agent<'a> {
             spill_seq,
             verify_blocks: 0,
             checkpoint: None,
+            control: Control::default(),
         })
     }
 
@@ -235,6 +253,27 @@ impl<'a> Agent<'a> {
     pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = tools;
         self
+    }
+
+    /// Attach a frontend steering handle (P2.4). Frontends mint a fresh
+    /// `Control` per run so a consumed interrupt can't leak into the next
+    /// turn; queued steering survives an interrupt (stop ≠ clear-queue).
+    pub fn set_control(&mut self, control: Control) {
+        self.control = control;
+    }
+
+    /// The current steering handle (queue-strip introspection).
+    pub fn control(&self) -> &Control {
+        &self.control
+    }
+
+    /// Swap the permission preset live (TUI mode badge, P2.7). Rebuilds
+    /// the registry — plan mode removes mutating tools from the spec list
+    /// (capability removal). Session-scoped approvals reset with the new
+    /// policy: changing modes is a trust-boundary change.
+    pub fn set_preset(&mut self, preset: crate::perm::Preset) {
+        self.config.policy_preset = preset;
+        self.tools = Self::registry(&self.config);
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -269,6 +308,21 @@ impl<'a> Agent<'a> {
         let profile = profile::lookup(&self.config.model);
 
         loop {
+            // Steering boundary (P2.4): interrupt ends the run; queued
+            // user input lands here as ordinary user messages — after the
+            // previous batch's tool_results, so provider pairing holds.
+            if self.control.interrupted() {
+                self.end_run("interrupted", steps, on_event)?;
+                return Ok(RunOutcome::Interrupted {
+                    steps,
+                    cost_usd: self.ledger.total_cost_usd,
+                });
+            }
+            for text in self.control.take_steer() {
+                self.messages.push(Message::user_text(text.clone()));
+                self.emit(EventKind::UserInput { text }, on_event)?;
+            }
+
             if steps >= self.config.max_steps {
                 let out = RunOutcome::StepBudgetExceeded {
                     steps,
@@ -487,7 +541,48 @@ impl<'a> Agent<'a> {
                 sandbox: self.config.sandbox_bash,
             };
             let mut results = Vec::new();
-            for (call_id, name, input) in calls {
+            for (idx, (call_id, name, input)) in calls.iter().enumerate() {
+                // Tool-launch boundary (P2.4): an interrupt or a queued
+                // steer skips every remaining call with a synthetic
+                // result — every tool_use still gets its tool_result, so
+                // the provider pairing rule survives the truncation.
+                // The loop-top check then ends the run or injects input.
+                if self.control.interrupted() || self.control.steer_pending() {
+                    let skipped = if self.control.interrupted() {
+                        "[skipped: interrupted by user]"
+                    } else {
+                        "[skipped: new user input arrived]"
+                    };
+                    for (call_id, name, _) in &calls[idx..] {
+                        self.emit(
+                            EventKind::ToolCallStart {
+                                call_id: call_id.clone(),
+                                name: name.clone(),
+                                input: serde_json::Value::Null,
+                            },
+                            on_event,
+                        )?;
+                        self.emit(
+                            EventKind::ToolResult {
+                                call_id: call_id.clone(),
+                                name: name.clone(),
+                                content: skipped.to_string(),
+                                is_error: true,
+                                raw_bytes: skipped.len() as u64,
+                                spilled_to: None,
+                                denied: false,
+                            },
+                            on_event,
+                        )?;
+                        results.push(Block::ToolResult {
+                            tool_use_id: call_id.clone(),
+                            content: skipped.to_string(),
+                            is_error: true,
+                        });
+                    }
+                    break;
+                }
+
                 self.emit(
                     EventKind::ToolCallStart {
                         call_id: call_id.clone(),
@@ -497,7 +592,7 @@ impl<'a> Agent<'a> {
                     on_event,
                 )?;
 
-                let out = self.tools.call(&name, &input, &mut ctx);
+                let out = self.tools.call(name, input, &mut ctx);
                 self.emit(
                     EventKind::ToolResult {
                         call_id: call_id.clone(),
@@ -514,11 +609,11 @@ impl<'a> Agent<'a> {
                 if stuck_hit.is_none() {
                     stuck_hit = self
                         .stuck
-                        .observe_step(&name, &input, out.is_error, &out.text);
+                        .observe_step(name, input, out.is_error, &out.text);
                 }
 
                 results.push(Block::ToolResult {
-                    tool_use_id: call_id,
+                    tool_use_id: call_id.clone(),
                     content: out.text,
                     is_error: out.is_error,
                 });
@@ -622,7 +717,9 @@ impl<'a> Agent<'a> {
         if config.full_access {
             crate::perm::Policy::allow_all()
         } else {
-            crate::perm::Policy::preset(config.policy_preset, config.cwd.clone())
+            let mut p = crate::perm::Policy::preset(config.policy_preset, config.cwd.clone());
+            p.ask_handler = config.ask_handler.clone();
+            p
         }
     }
 
@@ -1054,5 +1151,154 @@ mod tests {
         let mut sink2 = |_: &Event| {};
         let out2 = agent2.run_turn("finish", &mut sink2).unwrap();
         assert!(matches!(out2, RunOutcome::Completed { steps: 1, .. }));
+    }
+
+    fn bash_call(id: &str, cmd: &str) -> Block {
+        Block::ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": cmd}),
+        }
+    }
+
+    fn resp(blocks: Vec<Block>) -> Response {
+        Response {
+            blocks,
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        }
+    }
+
+    /// P2.4 interrupt: Esc lands at a tool-launch boundary. The call
+    /// already launched completes; every remaining call gets a synthetic
+    /// result so tool_use/tool_result pairing survives the truncation.
+    #[test]
+    fn interrupt_skips_remaining_calls_with_synthetic_results() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            sandbox_bash: false,
+            ..AgentConfig::default()
+        };
+        let provider = Mock::new(vec![resp(vec![
+            bash_call("c1", "echo one"),
+            bash_call("c2", "echo two"),
+            bash_call("c3", "echo three"),
+        ])]);
+        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let control = crate::control::Control::default();
+        agent.set_control(control.clone());
+        // Deterministic mid-batch trigger: the sink runs on the agent
+        // thread — the first launched call trips the flag; the boundary
+        // check then skips the rest.
+        let mut sink = |e: &Event| {
+            if matches!(e.kind, EventKind::ToolCallStart { .. }) {
+                control.interrupt();
+            }
+        };
+        let out = agent.run_turn("go", &mut sink).unwrap();
+        assert!(matches!(out, RunOutcome::Interrupted { steps: 1, .. }));
+
+        // Pairing: the tool_results message answers all three calls —
+        // one real result, two synthetic skips.
+        let last = agent.messages().last().unwrap();
+        assert_eq!(last.content.len(), 3);
+        for (i, b) in last.content.iter().enumerate() {
+            match b {
+                Block::ToolResult {
+                    content, is_error, ..
+                } => {
+                    if i == 0 {
+                        assert!(!is_error);
+                    } else {
+                        assert!(*is_error && content.contains("interrupted"));
+                    }
+                }
+                _ => panic!("expected ToolResult"),
+            }
+        }
+        // The log tells the same story — interrupted run end.
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        assert!(events.iter().any(
+            |e| matches!(&e.kind, EventKind::RunEnd { stop_reason, .. } if stop_reason == "interrupted")
+        ));
+    }
+
+    /// P2.4 steering: input queued mid-run truncates the batch at the
+    /// next launch boundary and lands as a user message before the next
+    /// provider call.
+    #[test]
+    fn steer_injects_at_boundary_and_continues() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            sandbox_bash: false,
+            ..AgentConfig::default()
+        };
+        let provider = Mock::new(vec![
+            resp(vec![bash_call("c1", "echo one"), bash_call("c2", "echo two")]),
+            done(),
+        ]);
+        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let control = crate::control::Control::default();
+        agent.set_control(control.clone());
+        let mut sink = |e: &Event| {
+            if matches!(e.kind, EventKind::ToolCallStart { .. }) {
+                control.steer("stop and report instead");
+            }
+        };
+        let out = agent.run_turn("go", &mut sink).unwrap();
+        assert!(matches!(out, RunOutcome::Completed { steps: 2, .. }));
+
+        // The steer landed as a user message after the truncated batch's
+        // tool_results — ordering the provider can accept.
+        let msgs = agent.messages();
+        let pos = msgs
+            .iter()
+            .position(|m| m.text().contains("stop and report instead"))
+            .expect("steer message in view");
+        let results = &msgs[pos - 1];
+        assert!(results
+            .content
+            .iter()
+            .all(|b| matches!(b, Block::ToolResult { .. })));
+        // Event stream shows it too (audit trail).
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        assert!(events.iter().any(
+            |e| matches!(&e.kind, EventKind::UserInput { text } if text.contains("report instead"))
+        ));
+    }
+
+    /// P2.5 ask channel: a human Deny through the handler surfaces as a
+    /// denied ToolResult — the call never executes.
+    #[test]
+    fn ask_deny_denies_the_call() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            sandbox_bash: false,
+            ask_handler: Some(crate::perm::AskHandler(std::sync::Arc::new(
+                |_| crate::perm::AskDecision::Deny,
+            ))),
+            ..AgentConfig::default()
+        };
+        let provider = Mock::new(vec![
+            resp(vec![bash_call("c1", "git push origin main")]),
+            done(),
+        ]);
+        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        let out = agent.run_turn("ship it", &mut sink).unwrap();
+        assert!(matches!(out, RunOutcome::Completed { .. }));
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        let denied = events.iter().any(|e| {
+            matches!(&e.kind, EventKind::ToolResult { denied, content, .. }
+                if *denied && content.contains("denied by user"))
+        });
+        assert!(denied, "expected a denied ToolResult event");
     }
 }
