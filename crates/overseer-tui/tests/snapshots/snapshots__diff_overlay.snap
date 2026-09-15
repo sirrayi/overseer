@@ -12,7 +12,7 @@ expression: norm(&term)
 
 
 
-› modified …/[root]/app.txt
-↑↓ · tab diff · enter revert to snapshot · esc
+› modified +2 -1 …/[root]/app.txt
+↑↓ file · tab diff · enter revert · esc
 ❯
  workspace  /repo                        test-model · $0.000

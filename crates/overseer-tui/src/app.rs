@@ -67,10 +67,18 @@ pub struct RewindRow {
 pub enum Overlay {
     Sessions {
         rows: Vec<overseer_core::session::SessionInfo>,
+        /// Git branch per row's cwd (computed once at open — spawning
+        /// `git` per frame would stall the picker).
+        branches: Vec<Option<String>>,
         sel: usize,
         filter: String,
         /// false = one line per session; true = adds a preview line.
         wide: bool,
+    },
+    /// `/tree`: the fork forest — parents above children, indented.
+    Tree {
+        rows: Vec<(overseer_core::session::SessionInfo, usize)>,
+        sel: usize,
     },
     Rewind {
         rows: Vec<RewindRow>,
@@ -81,6 +89,8 @@ pub enum Overlay {
         query: String,
         /// First visible flattened line.
         scroll: usize,
+        /// `x`-key toggle: render tool output under each tool cell.
+        expand_tools: bool,
     },
     /// `/diff`: files touched by write/edit since their first checkpoint.
     Diff {
@@ -88,6 +98,8 @@ pub enum Overlay {
         sel: usize,
         /// Show the selected row's diff inline.
         preview: bool,
+        /// Selected hunk within `rows[sel]` (preview mode only).
+        hunk_sel: usize,
     },
 }
 
@@ -98,8 +110,12 @@ pub struct DiffRow {
     pub status: &'static str,
     /// Earliest checkpoint content (None = the file is agent-created).
     pub snapshot: Option<String>,
-    /// `snapshot`→current unified-diff body lines.
-    pub diff: Vec<String>,
+    /// Structured diff — drives the preview AND per-hunk reject.
+    pub hunks: Vec<crate::diff::Hunk>,
+    /// rejected[i] = restore hunk i's old lines on Enter.
+    pub rejected: Vec<bool>,
+    pub added: usize,
+    pub deleted: usize,
 }
 
 pub struct App {
@@ -141,6 +157,9 @@ pub struct App {
     show_plan: bool,
     tick: usize,
     dirty: bool,
+    /// Engine channel hit the per-frame drain cap — zero-wait polling
+    /// until cleared so input echo stays under 50 ms during bursts.
+    backlogged: bool,
     pub quit: bool,
 }
 
@@ -181,6 +200,7 @@ impl App {
             show_plan: false,
             tick: 0,
             dirty: true,
+            backlogged: false,
             quit: false,
         }
     }
@@ -258,10 +278,25 @@ impl App {
         self.on_key(key);
     }
 
+    /// Test/debug hook: synthesize a bracketed paste.
+    pub fn paste(&mut self, text: &str) {
+        self.composer.paste(text);
+    }
+
     // ── engine messages ──────────────────────────────────────────────
 
     fn drain_engine(&mut self) {
-        while let Ok(msg) = self.engine_rx.try_recv() {
+        // Bound per-frame drain: a 500-event burst must not starve the
+        // input loop for a whole frame batch (echo <50 ms invariant).
+        // Leftovers stay queued — dirty stays set so the next frame
+        // continues the drain immediately.
+        const DRAIN_CAP: usize = 128;
+        let mut n = 0;
+        for _ in 0..DRAIN_CAP {
+            let Ok(msg) = self.engine_rx.try_recv() else {
+                break;
+            };
+            n += 1;
             self.dirty = true;
             match msg {
                 EngineMsg::Event(ev) => self.on_event(&ev),
@@ -291,6 +326,15 @@ impl App {
                 }
             }
         }
+        // Hit the cap → more is probably queued (one false positive at
+        // exactly DRAIN_CAP costs one zero-wait poll — harmless).
+        self.backlogged = n == DRAIN_CAP;
+    }
+
+    /// True while engine messages remain undrained — the event loop
+    /// skips the poll sleep so backpressure drains at full rate.
+    pub fn engine_backlog(&self) -> bool {
+        self.backlogged
     }
 
     fn on_event(&mut self, ev: &Event) {
@@ -430,8 +474,13 @@ impl App {
     // ── input ────────────────────────────────────────────────────────
 
     fn poll_input(&mut self) -> std::io::Result<()> {
-        // Spinner cadence ~10 fps while running; near-idle otherwise.
-        let wait = if self.running() || self.dialog.is_some() || self.toast.is_some() {
+        // Backlogged engine events never wait on the keyboard — drain
+        // at full rate (the DRAIN_CAP keeps each frame bounded so input
+        // still interleaves). Otherwise spinner cadence ~10 fps while
+        // running; near-idle otherwise.
+        let wait = if self.engine_backlog() {
+            Duration::ZERO
+        } else if self.running() || self.dialog.is_some() || self.toast.is_some() {
             Duration::from_millis(100)
         } else {
             Duration::from_millis(250)
@@ -633,16 +682,61 @@ impl App {
             }
             (KeyCode::Tab, _) => match &mut self.overlay {
                 Some(Overlay::Sessions { wide, .. }) => *wide = !*wide,
-                Some(Overlay::Diff { preview, .. }) => *preview = !*preview,
+                Some(Overlay::Diff {
+                    preview, hunk_sel, ..
+                }) => {
+                    *preview = !*preview;
+                    *hunk_sel = 0;
+                }
+                Some(Overlay::Transcript { expand_tools, .. }) => {
+                    *expand_tools = !*expand_tools;
+                }
                 _ => {}
             },
+            (KeyCode::Left, _) | (KeyCode::Right, _) => {
+                if let Some(Overlay::Diff {
+                    rows,
+                    sel,
+                    preview,
+                    hunk_sel,
+                }) = &mut self.overlay
+                {
+                    if *preview {
+                        let n = rows.get(*sel).map(|r| r.hunks.len()).unwrap_or(0);
+                        if n > 0 {
+                            if key.code == KeyCode::Left {
+                                *hunk_sel = hunk_sel.saturating_sub(1);
+                            } else {
+                                *hunk_sel = (*hunk_sel + 1).min(n - 1);
+                            }
+                        }
+                    }
+                }
+            }
+            (KeyCode::Char(' '), _) => {
+                if let Some(Overlay::Diff {
+                    rows,
+                    sel,
+                    preview,
+                    hunk_sel,
+                }) = &mut self.overlay
+                {
+                    if *preview {
+                        if let Some(r) = rows.get_mut(*sel) {
+                            if let Some(flag) = r.rejected.get_mut(*hunk_sel) {
+                                *flag = !*flag;
+                            }
+                        }
+                    }
+                }
+            }
             (KeyCode::Enter, _) => self.overlay_confirm(),
             (KeyCode::Backspace, _) => match &mut self.overlay {
                 Some(Overlay::Sessions { filter, sel, .. }) => {
                     filter.pop();
                     *sel = 0;
                 }
-                Some(Overlay::Transcript { query, scroll }) => {
+                Some(Overlay::Transcript { query, scroll, .. }) => {
                     query.pop();
                     *scroll = 0;
                 }
@@ -654,7 +748,7 @@ impl App {
                     filter.push(c);
                     *sel = 0;
                 }
-                Some(Overlay::Transcript { query, scroll }) => {
+                Some(Overlay::Transcript { query, scroll, .. }) => {
                     query.push(c);
                     *scroll = 0;
                 }
@@ -667,7 +761,8 @@ impl App {
     fn overlay_confirm(&mut self) {
         match self.overlay.take() {
             Some(Overlay::Sessions { rows, sel, filter, .. }) => {
-                if let Some(info) = filtered_sessions(&rows, &filter).get(sel).cloned() {
+                if let Some((_, info)) = filtered_sessions(&rows, &filter).get(sel) {
+                    let info = (*info).clone();
                     if info.dir != self.session_dir {
                         let _ = self.worker_tx.send(WorkerCmd::SwitchSession {
                             dir: info.dir.clone(),
@@ -678,6 +773,15 @@ impl App {
             Some(Overlay::Rewind { rows, sel }) => {
                 if let Some(row) = rows.get(sel) {
                     self.do_rewind(row.boundary);
+                }
+            }
+            Some(Overlay::Tree { rows, sel }) => {
+                if let Some((info, _)) = rows.get(sel) {
+                    if info.dir != self.session_dir {
+                        let _ = self.worker_tx.send(WorkerCmd::SwitchSession {
+                            dir: info.dir.clone(),
+                        });
+                    }
                 }
             }
             Some(Overlay::Diff { rows, sel, .. }) => {
@@ -707,12 +811,38 @@ impl App {
         // convention, like --continue).
         let cwd = self.cwd.clone();
         rows.sort_by_key(|s| std::cmp::Reverse(s.cwd == cwd));
+        let branches = rows.iter().map(|s| git_branch(&s.cwd)).collect();
         self.overlay = Some(Overlay::Sessions {
             rows,
+            branches,
             sel: 0,
             filter: String::new(),
             wide: false,
         });
+    }
+
+    /// `/tree`: the fork forest — sessions ordered parents-first.
+    fn open_tree(&mut self) {
+        if self.running() {
+            self.pending.push(Cell::Meta {
+                style: crate::theme::error(),
+                text: "finish or interrupt the run first".into(),
+            });
+            return;
+        }
+        let Some(root) = self.session_dir.parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        let rows = overseer_core::session::tree(&root);
+        if rows.is_empty() {
+            return;
+        }
+        // Preselect the current session so the user sees where they are.
+        let sel = rows
+            .iter()
+            .position(|(s, _)| s.dir == self.session_dir)
+            .unwrap_or(0);
+        self.overlay = Some(Overlay::Tree { rows, sel });
     }
 
     /// `/rewind`: checkpoints of the current session with their labels.
@@ -776,6 +906,7 @@ impl App {
         self.overlay = Some(Overlay::Transcript {
             query: String::new(),
             scroll: usize::MAX, // clamped to the tail on first render
+            expand_tools: false,
         });
     }
 
@@ -802,10 +933,12 @@ impl App {
             rows,
             sel: 0,
             preview: false,
+            hunk_sel: 0,
         });
     }
 
-    /// Revert one `/diff` row: the earliest checkpoint snapshot wins.
+    /// Revert one `/diff` row: marked hunks (rejects) restore just their
+    /// old lines; no marks = whole file back to its earliest snapshot.
     /// Current content is stashed under checkpoints/revert-stash first —
     /// a revert is itself recoverable.
     fn revert_file(&mut self, row: &DiffRow) {
@@ -819,14 +952,28 @@ impl App {
             }
             let _ = std::fs::write(&stash, cur);
         }
-        let ok = match &row.snapshot {
-            Some(snap) => {
-                if let Some(p) = row.path.parent() {
-                    let _ = std::fs::create_dir_all(p);
+        let nrej = row.rejected.iter().filter(|x| **x).count();
+        // Partial revert needs the file to exist now; a "created" row's
+        // reject-all collapses to the full revert (delete) anyway.
+        let partial = nrej > 0 && row.snapshot.is_some();
+        let ok = if partial {
+            match std::fs::read_to_string(&row.path) {
+                Ok(cur) => {
+                    let out = crate::diff::apply_rejects(&cur, &row.hunks, &row.rejected);
+                    std::fs::write(&row.path, out).is_ok()
                 }
-                std::fs::write(&row.path, snap).is_ok()
+                Err(_) => false,
             }
-            None => std::fs::remove_file(&row.path).is_ok(),
+        } else {
+            match &row.snapshot {
+                Some(snap) => {
+                    if let Some(p) = row.path.parent() {
+                        let _ = std::fs::create_dir_all(p);
+                    }
+                    std::fs::write(&row.path, snap).is_ok()
+                }
+                None => std::fs::remove_file(&row.path).is_ok(),
+            }
         };
         // Basename only — the diff row above already carries the path.
         let shown = row
@@ -835,7 +982,12 @@ impl App {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| display_path(&self.cwd, &row.path));
         if ok {
-            self.set_toast(format!("reverted {shown} (stash in revert-stash)"));
+            let what = if partial {
+                format!("rejected {nrej} hunk(s) in {shown}")
+            } else {
+                format!("reverted {shown}")
+            };
+            self.set_toast(format!("{what} (stash in revert-stash)"));
         } else {
             self.set_toast(format!("revert failed for {shown}"));
         }
@@ -969,7 +1121,7 @@ impl App {
                 frag.to_string(),
                 COMMANDS
                     .iter()
-                    .filter(|(n, _)| n.starts_with(frag))
+                    .filter(|(n, _)| subseq_match(n, frag))
                     .map(|(n, _)| n.to_string())
                     .collect::<Vec<_>>(),
             )
@@ -1113,6 +1265,7 @@ impl App {
             "quit" | "exit" | "q" => self.quit = true,
             "clear" => self.composer.clear(),
             "sessions" | "resume" => self.open_sessions(),
+            "tree" => self.open_tree(),
             "rewind" => self.open_rewind(),
             "fork" => self.do_fork(),
             "diff" => self.open_diff(),
@@ -1283,7 +1436,7 @@ impl App {
             }
             COMMANDS
                 .iter()
-                .filter(|(n, _)| n.starts_with(frag))
+                .filter(|(n, _)| subseq_match(n, frag))
                 .take(4)
                 .map(|(n, d)| format!("/{n} — {d}"))
                 .collect()
@@ -1369,6 +1522,7 @@ fn overlay_sel(o: &mut Overlay) -> (&mut usize, usize) {
             filtered_sessions(rows, filter).len().saturating_sub(1),
         ),
         Overlay::Rewind { rows, sel } => (sel, rows.len().saturating_sub(1)),
+        Overlay::Tree { rows, sel } => (sel, rows.len().saturating_sub(1)),
         Overlay::Diff { rows, sel, .. } => (sel, rows.len().saturating_sub(1)),
         // Transcript scrolls lines, not rows — handled by its own arms.
         Overlay::Transcript { scroll, .. } => (scroll, usize::MAX),
@@ -1376,12 +1530,15 @@ fn overlay_sel(o: &mut Overlay) -> (&mut usize, usize) {
 }
 
 /// Fuzzy filter: subsequence match over id + cwd + preview text.
+/// Returns (row-index, session) pairs so parallel metadata (branches)
+/// still lines up after filtering.
 fn filtered_sessions<'a>(
     rows: &'a [overseer_core::session::SessionInfo],
     filter: &str,
-) -> Vec<&'a overseer_core::session::SessionInfo> {
+) -> Vec<(usize, &'a overseer_core::session::SessionInfo)> {
     rows.iter()
-        .filter(|s| {
+        .enumerate()
+        .filter(|(_, s)| {
             let hay = format!(
                 "{} {} {}",
                 s.id,
@@ -1391,6 +1548,25 @@ fn filtered_sessions<'a>(
             subseq_match(&hay, filter)
         })
         .collect()
+}
+
+/// Current branch of a session's recorded cwd — `git branch
+/// --show-current`, None outside a repo or on any failure. Computed
+/// once per picker open, never per frame.
+fn git_branch(cwd: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", cwd, "branch", "--show-current"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if b.is_empty() {
+        None
+    } else {
+        Some(b)
+    }
 }
 
 fn subseq_match(hay: &str, needle: &str) -> bool {
@@ -1413,6 +1589,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("help", "keys & commands"),
     ("quit", "exit"),
     ("sessions", "pick a session to resume"),
+    ("tree", "session fork tree"),
     ("rewind", "restore a checkpoint"),
     ("fork", "branch this session"),
     ("diff", "changed files vs checkpoints"),
@@ -1497,13 +1674,24 @@ fn shell_capture(cmd: &str, cwd: &str) -> std::io::Result<(i32, String)> {
 
 /// Filtered transcript lines (history + in-flight live cells), used by
 /// both the overlay's height math and its render window.
-fn transcript_lines(app: &App, query: &str, width: u16) -> Vec<Line<'static>> {
+fn transcript_lines(
+    app: &App,
+    query: &str,
+    width: u16,
+    expand_tools: bool,
+) -> Vec<Line<'static>> {
     let q = query.to_lowercase();
     app.history
         .iter()
         .chain(app.live.iter())
         .filter(|c| q.is_empty() || c.plain().to_lowercase().contains(&q))
-        .flat_map(|c| c.lines(width))
+        .flat_map(|c| {
+            if expand_tools {
+                c.lines_expanded(width)
+            } else {
+                c.lines(width)
+            }
+        })
         .collect()
 }
 
@@ -1549,19 +1737,25 @@ fn collect_diff_rows(session_dir: &std::path::Path) -> Vec<DiffRow> {
             (false, false) => continue, // created then removed — no change
         };
         let old: String = snapshot.clone().unwrap_or_default();
-        let diff = crate::diff::unified(
+        let hs = crate::diff::hunks(
             &old.lines().take(CAP).collect::<Vec<_>>().join("\n"),
             &current.lines().take(CAP).collect::<Vec<_>>().join("\n"),
             3,
         );
-        if diff.is_empty() {
+        if hs.is_empty() {
             continue;
         }
+        let added = hs.iter().map(|h| h.added).sum();
+        let deleted = hs.iter().map(|h| h.deleted).sum();
+        let rejected = vec![false; hs.len()];
         rows.push(DiffRow {
             path,
             status,
             snapshot,
-            diff,
+            hunks: hs,
+            rejected,
+            added,
+            deleted,
         });
     }
     rows.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1575,6 +1769,7 @@ impl App {
         match o {
         Overlay::Sessions {
             rows,
+            branches,
             sel,
             filter,
             wide,
@@ -1592,12 +1787,15 @@ impl App {
                     theme::dim(),
                 )));
             }
-            for (i, s) in shown.iter().take(6).enumerate() {
+            for (i, (idx, s)) in shown.iter().take(6).enumerate() {
                 let cur = i == *sel;
                 let mark = if cur { "›" } else { " " };
                 let when = rel_time(s.last_ms);
+                // ⤶ marks a fork (SessionStart.parent set).
+                let fork = if s.parent.is_some() { "⤶ " } else { "" };
                 let head = format!(
-                    "{mark} {when} · {} · {}",
+                    "{mark} {when} · {}{} · {}",
+                    fork,
                     short_id(&s.id),
                     s.first_user.as_deref().unwrap_or("(no prompt)")
                 );
@@ -1606,11 +1804,16 @@ impl App {
                     if cur { theme::dialog_sel() } else { theme::dialog() },
                 )));
                 if *wide {
+                    let branch = branches
+                        .get(*idx)
+                        .and_then(|b| b.as_deref())
+                        .unwrap_or("-");
                     out.push(Line::from(Span::styled(
                         format!(
-                            "    {} · {} · {} events · {} checkpoint(s)",
+                            "    {} · {} · ⎇ {} · {} events · {} checkpoint(s)",
                             s.cwd,
                             s.model,
+                            branch,
                             s.events,
                             s.checkpoints.len()
                         ),
@@ -1620,6 +1823,35 @@ impl App {
             }
             out.push(Line::from(Span::styled(
                 "type to filter · ↑↓ · tab preview · enter switch · esc",
+                theme::dim(),
+            )));
+            out
+        }
+        Overlay::Tree { rows, sel } => {
+            let mut out = Vec::new();
+            for (i, (s, depth)) in rows.iter().take(6).enumerate() {
+                let cur = i == *sel;
+                let mark = if cur { "›" } else { " " };
+                let indent = "  ".repeat((*depth).min(4));
+                let fork_mark = if *depth > 0 { "↳ " } else { "" };
+                let here = if s.dir == self.session_dir {
+                    " · (current)"
+                } else {
+                    ""
+                };
+                out.push(Line::from(Span::styled(
+                    format!(
+                        "{mark} {indent}{fork_mark}{} · {} · {}{}",
+                        short_id(&s.id),
+                        rel_time(s.last_ms),
+                        s.first_user.as_deref().unwrap_or("(no prompt)"),
+                        here
+                    ),
+                    if cur { theme::dialog_sel() } else { theme::dialog() },
+                )));
+            }
+            out.push(Line::from(Span::styled(
+                "↑↓ · enter switch · esc",
                 theme::dim(),
             )));
             out
@@ -1649,8 +1881,12 @@ impl App {
             )));
             out
         }
-        Overlay::Transcript { query, scroll } => {
-            let all = transcript_lines(self, query, width);
+        Overlay::Transcript {
+            query,
+            scroll,
+            expand_tools,
+        } => {
+            let all = transcript_lines(self, query, width, *expand_tools);
             let n = all.len();
             let mut out = vec![Line::from(vec![
                 Span::styled("/ ", theme::dialog_key()),
@@ -1661,7 +1897,7 @@ impl App {
             let start = (*scroll).min(max);
             out.extend(all.into_iter().skip(start).take(4));
             out.push(Line::from(Span::styled(
-                format!("{n} lines · type to filter · ↑↓/pgdn · esc"),
+                format!("{n} lines · type to filter · ↑↓/pgdn · tab expand tools · esc"),
                 theme::dim(),
             )));
             out
@@ -1670,30 +1906,70 @@ impl App {
             rows,
             sel,
             preview,
+            hunk_sel,
         } => {
             let mut out = Vec::new();
             for (i, r) in rows.iter().take(4).enumerate() {
                 let cur = i == *sel;
                 let mark = if cur { "›" } else { " " };
+                let nrej = r.rejected.iter().filter(|x| **x).count();
+                let rej = if nrej > 0 {
+                    format!(" · {nrej} marked reject")
+                } else {
+                    String::new()
+                };
                 out.push(Line::from(Span::styled(
-                    format!("{mark} {} {}", r.status, display_path(&self.cwd, &r.path)),
+                    format!(
+                        "{mark} {} +{} -{} {}{}",
+                        r.status,
+                        r.added,
+                        r.deleted,
+                        display_path(&self.cwd, &r.path),
+                        rej
+                    ),
                     if cur { theme::dialog_sel() } else { theme::dialog() },
                 )));
                 if *preview && cur {
-                    for l in r.diff.iter().take(4) {
-                        let style = if l.starts_with('-') {
-                            theme::error()
-                        } else if l.starts_with('+') {
-                            theme::meta()
-                        } else {
-                            theme::dim()
-                        };
-                        out.push(Line::from(Span::styled(format!("  {l}"), style)));
+                    for (hi, h) in r.hunks.iter().take(3).enumerate() {
+                        let hcur = hi == *hunk_sel;
+                        out.push(Line::from(Span::styled(
+                            format!(
+                                "  {} {} hunk {} (+{} -{})",
+                                if hcur { "›" } else { " " },
+                                if r.rejected[hi] { "[x]" } else { "[ ]" },
+                                hi + 1,
+                                h.added,
+                                h.deleted
+                            ),
+                            if hcur { theme::dialog_sel() } else { theme::dialog() },
+                        )));
+                        if hcur {
+                            for l in h.lines.iter().skip(1).take(4) {
+                                let style = if l.starts_with('-') {
+                                    theme::error()
+                                } else if l.starts_with('+') {
+                                    theme::meta()
+                                } else {
+                                    theme::dim()
+                                };
+                                out.push(Line::from(Span::styled(format!("    {l}"), style)));
+                            }
+                        }
+                    }
+                    if r.hunks.len() > 3 {
+                        out.push(Line::from(Span::styled(
+                            format!("    … {} more hunk(s)", r.hunks.len() - 3),
+                            theme::dim(),
+                        )));
                     }
                 }
             }
             out.push(Line::from(Span::styled(
-                "↑↓ · tab diff · enter revert to snapshot · esc",
+                if *preview {
+                    "↑↓ file · ←→ hunk · space reject · enter revert · esc"
+                } else {
+                    "↑↓ file · tab diff · enter revert · esc"
+                },
                 theme::dim(),
             )));
             out
