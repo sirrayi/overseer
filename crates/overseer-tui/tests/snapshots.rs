@@ -447,3 +447,111 @@ fn diff_overlay_previews_and_reverts() {
     insta::assert_snapshot!("diff_reverted_toast", norm(&term));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `/` menu + Tab completion: `/s` narrows to sessions/search, Tab
+/// completes to the longest common prefix, then a single candidate
+/// completes fully.
+#[test]
+fn slash_menu_and_tab_complete() {
+    let (mut app, _etx, _wrx, mut term, caps) = harness();
+    for c in "/s".chars() {
+        app.key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char(c),
+        ));
+    }
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("slash_menu", screen(&term));
+
+    // Two candidates → Tab lands on the common prefix "/se".
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Tab,
+    ));
+    for c in "arch".chars() {
+        app.key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char(c),
+        ));
+    }
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Tab,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("slash_completed", screen(&term));
+}
+
+/// `!cmd` runs locally — output lands in scrollback and NOTHING is
+/// submitted to the worker.
+#[test]
+fn bang_shell_is_local_only() {
+    let (mut app, _etx, wrx, mut term, caps) = harness();
+    app.submit_text("!echo hello-from-shell");
+    app.step(&mut term, &caps).unwrap();
+    assert!(
+        wrx.try_recv().is_err(),
+        "! must never reach the worker"
+    );
+    insta::assert_snapshot!("bang_shell", screen(&term));
+}
+
+/// `@` completion: workspace files fuzzy-match the fragment; Tab
+/// completes the path into the composer.
+#[test]
+fn at_mention_completes_paths() {
+    let root = std::env::temp_dir().join(format!(
+        "overseer-tui-at-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(root.join("README.md"), "x\n").unwrap();
+
+    let (etx, erx) = mpsc::channel();
+    let (wtx, _wrx) = mpsc::channel();
+    let mut app = App::new(
+        erx,
+        wtx,
+        Preset::WorkspaceWrite,
+        root.display().to_string(),
+        "test-model".into(),
+        root.join("session"),
+    );
+    let _ = etx;
+    let mut backend = TestBackend::new(60, 20);
+    backend.set_cursor_position((0, 10)).unwrap();
+    let mut term = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(6),
+        },
+    )
+    .unwrap();
+    let caps = Caps::default();
+
+    // The status line truncates the workspace cwd — normalize the
+    // temp-dir prefix and the pid-bearing dirname separately.
+    let tmp = std::env::temp_dir()
+        .display()
+        .to_string()
+        .trim_end_matches('/')
+        .to_string();
+    let dirname = root.file_name().unwrap().to_str().unwrap().to_string();
+    let norm = move |t: &Terminal<TestBackend>| {
+        screen(t)
+            .replace(&tmp, "[tmp]")
+            .replace(&dirname, "[root]")
+    };
+
+    for c in "@mai".chars() {
+        app.key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char(c),
+        ));
+    }
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("at_menu", norm(&term));
+
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Tab,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    insta::assert_snapshot!("at_completed", norm(&term));
+    let _ = std::fs::remove_dir_all(&root);
+}

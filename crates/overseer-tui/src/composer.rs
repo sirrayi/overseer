@@ -308,6 +308,18 @@ impl Composer {
         }
     }
 
+    /// Replace the whole buffer (completion, editor round-trip) — one
+    /// undo step.
+    pub fn set_text(&mut self, s: &str) {
+        self.snapshot();
+        self.lines = vec![Vec::new()];
+        self.row = 0;
+        self.col = 0;
+        self.pastes.clear();
+        self.insert_str_raw(s);
+        self.hist_idx = None;
+    }
+
     /// Ctrl+S: park the whole buffer for later recall.
     pub fn stash(&mut self) {
         let t = self.text();
@@ -429,7 +441,7 @@ impl Composer {
         for (i, line) in self.lines.iter().enumerate() {
             let prefix = if i == 0 { "❯ " } else { "  " };
             // Build visual rows for this logical line, tracking cursor.
-            let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, theme::PROMPT)];
+            let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, theme::prompt())];
             let mut col_px = 2usize; // prefix width
             let mut elem_x_positions: Vec<usize> = Vec::with_capacity(line.len());
             for e in line {
@@ -442,7 +454,7 @@ impl Composer {
                     Elem::Chip(id) => {
                         let label = format!("[Pasted #{id}]");
                         col_px += label.len();
-                        spans.push(Span::styled(label, theme::META));
+                        spans.push(Span::styled(label, theme::meta()));
                     }
                 }
             }

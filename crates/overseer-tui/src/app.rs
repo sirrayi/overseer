@@ -121,6 +121,16 @@ pub struct App {
     /// Transient notice row (rule saved, file reverted, …); expires in
     /// `step` after a few seconds.
     toast: Option<(String, std::time::Instant)>,
+    /// DECSET-1004 focus state — notifications only fire unfocused.
+    focused: bool,
+    /// Emit OSC sequences (8/52/133) — set from `caps.osc` by `run`.
+    pub osc: bool,
+    /// REDUCE_MOTION: static indicator glyph, no spinner animation.
+    reduce_motion: bool,
+    /// `/edit` / Alt+E: draft handed to `drive` for an $EDITOR round.
+    want_editor: Option<String>,
+    /// Workspace file list for `@` completion — built lazily, capped.
+    file_index: std::cell::OnceCell<Vec<String>>,
     preset: Preset,
     cwd: String,
     model: String,
@@ -155,6 +165,12 @@ impl App {
             overlay: None,
             history: Vec::new(),
             toast: None,
+            focused: true,
+            osc: false,
+            reduce_motion: std::env::var_os("REDUCE_MOTION").is_some()
+                || std::env::var_os("OVERSEER_REDUCED_MOTION").is_some(),
+            want_editor: None,
+            file_index: std::cell::OnceCell::new(),
             preset,
             cwd,
             model,
@@ -250,6 +266,10 @@ impl App {
             match msg {
                 EngineMsg::Event(ev) => self.on_event(&ev),
                 EngineMsg::Ask(req, tx) => {
+                    self.notify(
+                        "overseer: permission",
+                        &format!("{} needs approval", req.tool),
+                    );
                     self.dialog = Some((
                         Dialog {
                             req,
@@ -265,7 +285,7 @@ impl App {
                     self.restore_queue_to_composer();
                     self.run = RunState::Idle;
                     self.pending.push(Cell::Meta {
-                        style: crate::theme::ERROR,
+                        style: crate::theme::error(),
                         text: format!("engine error: {e}"),
                     });
                 }
@@ -330,9 +350,15 @@ impl App {
         use overseer_core::agent::RunOutcome as O;
         let interrupted = matches!(out, O::Interrupted { .. });
         let provider_err = matches!(out, O::Provider(_));
+        let done_kind = match &out {
+            O::Interrupted { .. } => "interrupted",
+            O::Provider(_) => "provider error",
+            _ => "done",
+        };
+        self.notify("overseer", &format!("run {done_kind}"));
         if let O::Provider(msg) = &out {
             self.pending.push(Cell::Meta {
-                style: crate::theme::ERROR,
+                style: crate::theme::error(),
                 text: format!("provider error: {msg}"),
             });
         }
@@ -363,12 +389,13 @@ impl App {
         self.live.clear();
         self.history.clear();
         self.tokens = 0;
+        self.file_index = std::cell::OnceCell::new();
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.display().to_string());
         self.pending.push(Cell::Meta {
-            style: crate::theme::META,
+            style: crate::theme::meta(),
             text: format!("── session {name} ──"),
         });
         if let Ok(events) = overseer_core::event::EventLog::replay(dir.join("events.jsonl")) {
@@ -421,6 +448,8 @@ impl App {
                 self.composer.paste(&text);
                 self.dirty = true;
             }
+            CtEvent::FocusGained => self.focused = true,
+            CtEvent::FocusLost => self.focused = false,
             CtEvent::Resize(_, _) => self.dirty = true,
             _ => {}
         }
@@ -520,6 +549,11 @@ impl App {
             (KeyCode::Char('o'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.open_transcript();
             }
+            (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => self.copy_last(),
+            (KeyCode::Char('e'), m) if m.contains(KeyModifiers::ALT) => {
+                self.want_editor = Some(self.composer.text());
+            }
+            (KeyCode::Tab, _) => self.complete(),
             (KeyCode::Char('x'), m) if m.contains(KeyModifiers::CONTROL) => {
                 // Cancel the newest undelivered queue entry.
                 if let RunState::Running { control, .. } = &self.run {
@@ -660,7 +694,7 @@ impl App {
     fn open_sessions(&mut self) {
         if self.running() {
             self.pending.push(Cell::Meta {
-                style: crate::theme::ERROR,
+                style: crate::theme::error(),
                 text: "finish or interrupt the run first".into(),
             });
             return;
@@ -685,7 +719,7 @@ impl App {
     fn open_rewind(&mut self) {
         if self.running() {
             self.pending.push(Cell::Meta {
-                style: crate::theme::ERROR,
+                style: crate::theme::error(),
                 text: "finish or interrupt the run first".into(),
             });
             return;
@@ -702,7 +736,7 @@ impl App {
             .collect();
         if rows.is_empty() {
             self.pending.push(Cell::Meta {
-                style: crate::theme::DIM,
+                style: crate::theme::dim(),
                 text: "no checkpoints yet — checkpoints open on each prompt".into(),
             });
             return;
@@ -718,7 +752,7 @@ impl App {
         ) {
             Ok(rep) => {
                 self.pending.push(Cell::Meta {
-                    style: crate::theme::META,
+                    style: crate::theme::meta(),
                     text: format!(
                         "rewound to e{} — {} file(s) restored, {} removed, {} event(s) dropped",
                         rep.boundary, rep.restored, rep.deleted, rep.truncated
@@ -730,7 +764,7 @@ impl App {
                 });
             }
             Err(e) => self.pending.push(Cell::Meta {
-                style: crate::theme::ERROR,
+                style: crate::theme::error(),
                 text: format!("rewind failed: {e}"),
             }),
         }
@@ -751,7 +785,7 @@ impl App {
     fn open_diff(&mut self) {
         if self.running() {
             self.pending.push(Cell::Meta {
-                style: crate::theme::ERROR,
+                style: crate::theme::error(),
                 text: "finish or interrupt the run first".into(),
             });
             return;
@@ -759,7 +793,7 @@ impl App {
         let rows = collect_diff_rows(&self.session_dir);
         if rows.is_empty() {
             self.pending.push(Cell::Meta {
-                style: crate::theme::DIM,
+                style: crate::theme::dim(),
                 text: "no tracked changes — checkpoints record write/edit only".into(),
             });
             return;
@@ -794,7 +828,12 @@ impl App {
             }
             None => std::fs::remove_file(&row.path).is_ok(),
         };
-        let shown = display_path(&self.cwd, &row.path);
+        // Basename only — the diff row above already carries the path.
+        let shown = row
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| display_path(&self.cwd, &row.path));
         if ok {
             self.set_toast(format!("reverted {shown} (stash in revert-stash)"));
         } else {
@@ -806,21 +845,21 @@ impl App {
     fn approve_plan(&mut self) {
         if self.preset != Preset::Plan {
             self.pending.push(Cell::Meta {
-                style: crate::theme::ERROR,
+                style: crate::theme::error(),
                 text: "not in plan mode (shift+tab to cycle)".into(),
             });
             return;
         }
         if self.running() {
             self.pending.push(Cell::Meta {
-                style: crate::theme::ERROR,
+                style: crate::theme::error(),
                 text: "finish or interrupt the run first".into(),
             });
             return;
         }
         if !self.session_dir.join("plan.md").exists() {
             self.pending.push(Cell::Meta {
-                style: crate::theme::DIM,
+                style: crate::theme::dim(),
                 text: "no plan yet — ask the agent for one first".into(),
             });
             return;
@@ -828,7 +867,7 @@ impl App {
         self.preset = Preset::WorkspaceWrite;
         let _ = self.worker_tx.send(WorkerCmd::SetPreset(self.preset));
         self.pending.push(Cell::Meta {
-            style: crate::theme::META,
+            style: crate::theme::meta(),
             text: "plan approved — switching to workspace mode".into(),
         });
         self.submit("The plan is approved — implement it.".to_string());
@@ -842,7 +881,7 @@ impl App {
     fn do_fork(&mut self) {
         if self.running() {
             self.pending.push(Cell::Meta {
-                style: crate::theme::ERROR,
+                style: crate::theme::error(),
                 text: "finish or interrupt the run first".into(),
             });
             return;
@@ -858,7 +897,7 @@ impl App {
         match overseer_core::session::fork(&self.session_dir, None, &new_dir) {
             Ok(()) => {
                 self.pending.push(Cell::Meta {
-                    style: crate::theme::META,
+                    style: crate::theme::meta(),
                     text: format!("forked → {}", new_dir.display()),
                 });
                 let _ = self
@@ -866,7 +905,7 @@ impl App {
                     .send(WorkerCmd::SwitchSession { dir: new_dir });
             }
             Err(e) => self.pending.push(Cell::Meta {
-                style: crate::theme::ERROR,
+                style: crate::theme::error(),
                 text: format!("fork failed: {e}"),
             }),
         }
@@ -884,9 +923,169 @@ impl App {
         let _ = self.worker_tx.send(WorkerCmd::SetPreset(self.preset));
     }
 
+    /// OSC notification — focus-gated: only fires while the terminal
+    /// doesn't have focus (DECSET 1004). No-op in tests (osc off).
+    fn notify(&self, title: &str, body: &str) {
+        if self.osc && !self.focused {
+            crate::notify::emit(&mut std::io::stdout(), title, body);
+        }
+    }
+
+    /// Ctrl+Y: copy the most recent assistant text via OSC 52.
+    fn copy_last(&mut self) {
+        let text = self
+            .history
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                Cell::Assistant { text } => Some(text.clone()),
+                _ => None,
+            });
+        match text {
+            Some(t) if self.osc => {
+                let n = t.chars().count();
+                let mut out = std::io::stdout();
+                let _ = out.write_all(crate::notify::osc52(&t).as_bytes());
+                let _ = out.flush();
+                self.set_toast(format!("copied {n} chars"));
+            }
+            Some(_) => self.set_toast("clipboard needs OSC support".into()),
+            None => self.set_toast("nothing to copy yet".into()),
+        }
+    }
+
+    /// Tab: complete `/command` or `@path` from the current token.
+    /// One match completes fully (with trailing space); several complete
+    /// to their longest common prefix — the suggestion strip shows the
+    /// menu meanwhile.
+    fn complete(&mut self) {
+        let text = self.composer.text();
+        let (stem, frag, candidates) = if let Some(frag) = text.strip_prefix('/') {
+            if frag.contains(char::is_whitespace) {
+                return;
+            }
+            (
+                "/".to_string(),
+                frag.to_string(),
+                COMMANDS
+                    .iter()
+                    .filter(|(n, _)| n.starts_with(frag))
+                    .map(|(n, _)| n.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        } else if let Some(frag) = at_fragment(&text) {
+            (
+                text[..text.len() - frag.len()].to_string(),
+                frag.to_string(),
+                self.file_index()
+                    .iter()
+                    .filter(|p| subseq_match(p, frag))
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            return;
+        };
+        match candidates.len() {
+            0 => {}
+            1 => self
+                .composer
+                .set_text(&format!("{stem}{} ", candidates[0])),
+            _ => {
+                let lcp = candidates
+                    .iter()
+                    .skip(1)
+                    .fold(candidates[0].clone(), |acc, c| common_prefix(&acc, c));
+                if lcp.len() > frag.len() {
+                    self.composer.set_text(&format!("{stem}{lcp}"));
+                }
+            }
+        }
+    }
+
+    /// Workspace files for `@` completion — recursive, skips heavy
+    /// dirs, capped. Built lazily on first use (switches reset it).
+    fn file_index(&self) -> &[String] {
+        self.file_index.get_or_init(|| self.build_index()).as_slice()
+    }
+
+    fn build_index(&self) -> Vec<String> {
+        const SKIP: &[&str] = &[".git", "target", "node_modules", ".overseer"];
+        let mut out = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(&self.cwd)];
+        while let Some(d) = stack.pop() {
+            if out.len() >= 4000 {
+                break;
+            }
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let p = e.path();
+                if p.is_dir() {
+                    if !SKIP.contains(&name.as_str()) && !name.starts_with('.') {
+                        stack.push(p);
+                    }
+                } else if let Ok(rel) = p.strip_prefix(&self.cwd) {
+                    out.push(rel.display().to_string());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// `drive` polls this: the draft to round-trip through $EDITOR.
+    pub fn take_editor_request(&mut self) -> Option<String> {
+        self.want_editor.take()
+    }
+
+    /// `drive` installs the edited draft back into the composer.
+    pub fn set_composer_text(&mut self, text: String) {
+        self.composer.set_text(&text);
+        self.dirty = true;
+    }
+
+    /// `!cmd`: run in the workspace shell, output lands in the
+    /// transcript — never sent to the model. 10 s cap, 8 KiB output.
+    fn run_shell(&mut self, cmd: &str) {
+        self.pending.push(Cell::Meta {
+            style: crate::theme::meta(),
+            text: format!("$ {cmd}"),
+        });
+        match shell_capture(cmd, &self.cwd) {
+            Ok((code, out)) => {
+                let tail: String = out
+                    .lines()
+                    .take(24)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let suffix = if out.len() > 8192 { "…" } else { "" };
+                self.pending.push(Cell::Meta {
+                    style: if code == 0 {
+                        crate::theme::dim()
+                    } else {
+                        crate::theme::error()
+                    },
+                    text: format!("{tail}{suffix}\n(exit {code})"),
+                });
+            }
+            Err(e) => self.pending.push(Cell::Meta {
+                style: crate::theme::error(),
+                text: format!("shell failed: {e}"),
+            }),
+        }
+    }
+
     fn on_submit(&mut self, text: String) {
         if let Some(cmd) = text.strip_prefix('/') {
             self.slash(cmd.trim());
+            return;
+        }
+        if let Some(cmd) = text.strip_prefix('!') {
+            self.run_shell(cmd.trim());
             return;
         }
         match &self.run {
@@ -919,8 +1118,9 @@ impl App {
             "diff" => self.open_diff(),
             "approve" => self.approve_plan(),
             "search" | "transcript" => self.open_transcript(),
+            "edit" | "editor" => self.want_editor = Some(self.composer.text()),
             other => self.pending.push(Cell::Meta {
-                style: crate::theme::ERROR,
+                style: crate::theme::error(),
                 text: format!("unknown command /{other} — try /help"),
             }),
         }
@@ -945,23 +1145,67 @@ impl App {
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .width
             .max(1);
-        for cell in self.pending.drain(..) {
+        for cell in std::mem::take(&mut self.pending) {
             self.history.push(cell.clone());
             let lines = cell.lines(width);
             let h = lines.len() as u16;
             if h == 0 {
                 continue;
             }
+            // OSC 133 marks ride the scrollback stream: A/B bracket the
+            // user prompt, C/D bracket finished tool output — terminal
+            // "jump to prompt" and output-select features work on the
+            // transcript. Emitted raw; the live region can't carry OSC.
+            let (pre, post) = Self::osc133_marks(self.osc, &cell);
             sync_wrap(caps, || {
+                if let Some(m) = pre {
+                    let _ = std::io::stdout().write_all(m.as_bytes());
+                }
                 term.insert_before(h, |buf| {
                     for (y, line) in lines.iter().enumerate() {
                         buf.set_line(0, y as u16, line, width);
                     }
                 })
-                .map_err(|e| std::io::Error::other(e.to_string()))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                if let Some(m) = post {
+                    let _ = std::io::stdout().write_all(m.as_bytes());
+                }
+                Ok(())
             })?;
+            // OSC 8: a clickable file:// link line under the cell —
+            // styled paths can't ride the ratatui buffer, so the link
+            // is its own line.
+            if self.osc {
+                if let Some(p) = cell.link_path() {
+                    let shown = display_path(&self.cwd, p);
+                    let url = format!("file://{}", p.display());
+                    let mut out = std::io::stdout();
+                    let _ = out
+                        .write_all(format!("  ⤷ {}\n", crate::notify::osc8(&url, &shown)).as_bytes());
+                    let _ = out.flush();
+                }
+            }
         }
         Ok(())
+    }
+
+    /// (pre, post) OSC 133 mark for a cell — None when OSC is off.
+    fn osc133_marks(osc: bool, cell: &Cell) -> (Option<String>, Option<String>) {
+        if !osc {
+            return (None, None);
+        }
+        use crate::notify::osc133;
+        match cell {
+            Cell::User { .. } => (Some(osc133("A")), Some(osc133("B"))),
+            Cell::Tool { status, .. } => {
+                let code = match status {
+                    ToolStatus::Ok => 0,
+                    _ => 1,
+                };
+                (Some(osc133("C")), Some(osc133(&format!("D;{code}"))))
+            }
+            _ => (None, None),
+        }
     }
 
     fn live_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -975,7 +1219,7 @@ impl App {
                 if let Some((text, _)) = &self.toast {
                     out.push(Line::from(Span::styled(
                         format!("◆ {text}"),
-                        crate::theme::META,
+                        crate::theme::meta(),
                     )));
                 }
                 return out;
@@ -994,35 +1238,76 @@ impl App {
         };
         out.extend(widgets::queue_strip(&queued));
         out.extend(widgets::queue_strip(&self.pending_queue));
+        // `/` and `@` completion strip — visible while a fragment is
+        // being typed, completed by Tab.
+        out.extend(self.suggestion_lines());
         if let RunState::Running { started, phase, .. } = &self.run {
             out.push(widgets::indicator(
                 phase,
                 started.elapsed().as_secs(),
                 self.tokens,
                 self.tick,
+                self.reduce_motion,
             ));
         }
         if let Some((text, _)) = &self.toast {
             out.push(Line::from(Span::styled(
                 format!("◆ {text}"),
-                crate::theme::META,
+                crate::theme::meta(),
             )));
         }
         if self.show_plan {
             if let Ok(md) = std::fs::read_to_string(self.session_dir.join("plan.md")) {
                 for l in md.lines().take(8) {
-                    out.push(Line::from(Span::styled(l.to_string(), crate::theme::META)));
+                    out.push(Line::from(Span::styled(l.to_string(), crate::theme::meta())));
                 }
             } else {
                 out.push(Line::from(Span::styled(
                     "no plan yet".to_string(),
-                    crate::theme::DIM,
+                    crate::theme::dim(),
                 )));
             }
         }
         if self.show_help {
             out.extend(widgets::help_panel());
         }
+        out
+    }
+
+    /// Completion menu above the composer: `/cmd` or `@path` fragment.
+    fn suggestion_lines(&self) -> Vec<Line<'static>> {
+        let text = self.composer.text();
+        let rows: Vec<String> = if let Some(frag) = text.strip_prefix('/') {
+            if frag.contains(char::is_whitespace) {
+                return Vec::new();
+            }
+            COMMANDS
+                .iter()
+                .filter(|(n, _)| n.starts_with(frag))
+                .take(4)
+                .map(|(n, d)| format!("/{n} — {d}"))
+                .collect()
+        } else if let Some(frag) = at_fragment(&text) {
+            self.file_index()
+                .iter()
+                .filter(|p| subseq_match(p, frag))
+                .take(4)
+                .map(|p| format!("@{p}"))
+                .collect()
+        } else {
+            return Vec::new();
+        };
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<Line<'static>> = rows
+            .into_iter()
+            .map(|r| Line::from(Span::styled(r, crate::theme::dim())))
+            .collect();
+        out.push(Line::from(Span::styled(
+            "tab to complete",
+            crate::theme::dim(),
+        )));
         out
     }
 
@@ -1122,6 +1407,94 @@ fn subseq_match(hay: &str, needle: &str) -> bool {
     true
 }
 
+/// `/` menu entries — canonical names + one-line docs (the help panel
+/// and the completion strip share this list).
+const COMMANDS: &[(&str, &str)] = &[
+    ("help", "keys & commands"),
+    ("quit", "exit"),
+    ("sessions", "pick a session to resume"),
+    ("rewind", "restore a checkpoint"),
+    ("fork", "branch this session"),
+    ("diff", "changed files vs checkpoints"),
+    ("approve", "accept the plan, switch to workspace mode"),
+    ("search", "transcript search"),
+    ("transcript", "transcript search"),
+    ("edit", "draft in $EDITOR"),
+    ("clear", "clear the composer"),
+];
+
+/// The `@`-fragment the cursor sits on: the tail after the last `@`,
+/// only when that `@` starts a token and the tail has no whitespace.
+fn at_fragment(text: &str) -> Option<&str> {
+    let pos = text.rfind('@')?;
+    if pos > 0 && !text[..pos].ends_with(char::is_whitespace) {
+        return None; // '@' mid-token — an email or literal, not a mention
+    }
+    let frag = &text[pos + 1..];
+    if frag.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(frag)
+}
+
+fn common_prefix(a: &str, b: &str) -> String {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(x, y)| x == y)
+        .map(|(x, _)| x)
+        .collect()
+}
+
+/// `!` in line mode (`run_line`) — `shell_capture` against the cwd.
+pub fn line_shell(cmd: &str) -> (i32, String) {
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".into());
+    shell_capture(cmd, &cwd).unwrap_or((-1, "shell failed\n".to_string()))
+}
+
+/// Run `sh -c cmd` in `cwd` with a 10 s cap; returns (exit, capped
+/// output). The `!` composer prefix is a local escape hatch — its
+/// output is transcript-only, never submitted to the model.
+fn shell_capture(cmd: &str, cwd: &str) -> std::io::Result<(i32, String)> {
+    // A stale cwd (deleted checkout) must not kill the shell escape —
+    // fall back to the process cwd.
+    let dir = if std::path::Path::new(cwd).is_dir() {
+        cwd
+    } else {
+        "."
+    };
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(out)) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
+            if !err.trim().is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&err);
+            }
+            Ok((
+                out.status.code().unwrap_or(-1),
+                text.chars().take(8192).collect(),
+            ))
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok((-1, "(timed out after 10s)".to_string())),
+    }
+}
+
 /// Filtered transcript lines (history + in-flight live cells), used by
 /// both the overlay's height math and its render window.
 fn transcript_lines(app: &App, query: &str, width: u16) -> Vec<Line<'static>> {
@@ -1209,14 +1582,14 @@ impl App {
             // Hint goes LAST — the region clips from the top, so the
             // key hints survive regardless of viewport height.
             let mut out = vec![Line::from(vec![
-                Span::styled("> ", theme::DIALOG_KEY),
-                Span::styled(format!("{filter}▌"), theme::DIALOG),
+                Span::styled("> ", theme::dialog_key()),
+                Span::styled(format!("{filter}▌"), theme::dialog()),
             ])];
             let shown = filtered_sessions(rows, filter);
             if shown.is_empty() {
                 out.push(Line::from(Span::styled(
                     "  no matching sessions".to_string(),
-                    theme::DIM,
+                    theme::dim(),
                 )));
             }
             for (i, s) in shown.iter().take(6).enumerate() {
@@ -1230,7 +1603,7 @@ impl App {
                 );
                 out.push(Line::from(Span::styled(
                     head,
-                    if cur { theme::DIALOG_SEL } else { theme::DIALOG },
+                    if cur { theme::dialog_sel() } else { theme::dialog() },
                 )));
                 if *wide {
                     out.push(Line::from(Span::styled(
@@ -1241,13 +1614,13 @@ impl App {
                             s.events,
                             s.checkpoints.len()
                         ),
-                        theme::DIM,
+                        theme::dim(),
                     )));
                 }
             }
             out.push(Line::from(Span::styled(
                 "type to filter · ↑↓ · tab preview · enter switch · esc",
-                theme::DIM,
+                theme::dim(),
             )));
             out
         }
@@ -1266,13 +1639,13 @@ impl App {
                             r.files,
                             r.label
                         ),
-                        if cur { theme::DIALOG_SEL } else { theme::DIALOG },
+                        if cur { theme::dialog_sel() } else { theme::dialog() },
                     ))
                 })
                 .collect();
             out.push(Line::from(Span::styled(
                 "↑↓ · enter restore files+conversation · esc",
-                theme::DIM,
+                theme::dim(),
             )));
             out
         }
@@ -1280,8 +1653,8 @@ impl App {
             let all = transcript_lines(self, query, width);
             let n = all.len();
             let mut out = vec![Line::from(vec![
-                Span::styled("/ ", theme::DIALOG_KEY),
-                Span::styled(format!("{query}▌"), theme::DIALOG),
+                Span::styled("/ ", theme::dialog_key()),
+                Span::styled(format!("{query}▌"), theme::dialog()),
             ])];
             // Scroll is a line offset; usize::MAX (fresh open) means tail.
             let max = n.saturating_sub(4);
@@ -1289,7 +1662,7 @@ impl App {
             out.extend(all.into_iter().skip(start).take(4));
             out.push(Line::from(Span::styled(
                 format!("{n} lines · type to filter · ↑↓/pgdn · esc"),
-                theme::DIM,
+                theme::dim(),
             )));
             out
         }
@@ -1304,16 +1677,16 @@ impl App {
                 let mark = if cur { "›" } else { " " };
                 out.push(Line::from(Span::styled(
                     format!("{mark} {} {}", r.status, display_path(&self.cwd, &r.path)),
-                    if cur { theme::DIALOG_SEL } else { theme::DIALOG },
+                    if cur { theme::dialog_sel() } else { theme::dialog() },
                 )));
                 if *preview && cur {
                     for l in r.diff.iter().take(4) {
                         let style = if l.starts_with('-') {
-                            theme::ERROR
+                            theme::error()
                         } else if l.starts_with('+') {
-                            theme::META
+                            theme::meta()
                         } else {
-                            theme::DIM
+                            theme::dim()
                         };
                         out.push(Line::from(Span::styled(format!("  {l}"), style)));
                     }
@@ -1321,7 +1694,7 @@ impl App {
             }
             out.push(Line::from(Span::styled(
                 "↑↓ · tab diff · enter revert to snapshot · esc",
-                theme::DIM,
+                theme::dim(),
             )));
             out
         }

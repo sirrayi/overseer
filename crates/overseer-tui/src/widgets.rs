@@ -12,14 +12,26 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 /// One-row working indicator: spinner + phase + elapsed + token count +
 /// an *accurate* interrupt hint — it's only drawn while the engine is
 /// truly interruptible (a run is live on the worker thread).
-pub fn indicator(phase: &str, elapsed_s: u64, tokens: u64, tick: usize) -> Line<'static> {
-    let glyph = SPINNER[tick % SPINNER.len()];
+pub fn indicator(
+    phase: &str,
+    elapsed_s: u64,
+    tokens: u64,
+    tick: usize,
+    reduce_motion: bool,
+) -> Line<'static> {
+    // REDUCE_MOTION: a static glyph — the elapsed counter still ticks
+    // (information, not decoration).
+    let glyph = if reduce_motion {
+        "●"
+    } else {
+        SPINNER[tick % SPINNER.len()]
+    };
     Line::from(vec![
-        Span::styled(format!("{glyph} "), theme::SPINNER),
-        Span::styled(phase.to_string(), theme::DIM),
-        Span::styled(format!("  {elapsed_s}s  "), theme::DIM),
-        Span::styled(format!("{tokens} tok"), theme::DIM),
-        Span::styled("  (esc to interrupt)", theme::DIM),
+        Span::styled(format!("{glyph} "), theme::spinner()),
+        Span::styled(phase.to_string(), theme::dim()),
+        Span::styled(format!("  {elapsed_s}s  "), theme::dim()),
+        Span::styled(format!("{tokens} tok"), theme::dim()),
+        Span::styled("  (esc to interrupt)", theme::dim()),
     ])
 }
 
@@ -31,8 +43,8 @@ pub fn queue_strip(queued: &[String]) -> Vec<Line<'static>> {
         .enumerate()
         .map(|(i, q)| {
             Line::from(vec![
-                Span::styled(format!("  queued[{i}] "), theme::QUEUE),
-                Span::styled(truncate(q, 60), theme::QUEUE),
+                Span::styled(format!("  queued[{i}] "), theme::queue()),
+                Span::styled(truncate(q, 60), theme::queue()),
             ])
         })
         .collect()
@@ -93,9 +105,9 @@ impl Dialog {
         let w = width.max(8) as usize;
         let mut out = vec![crate::cells::wrap_styled(
             vec![
-                Span::styled("permission: ", theme::DIALOG_KEY),
-                Span::styled(self.req.tool.clone(), theme::DIALOG),
-                Span::styled(format!(" — {}", self.req.reason), theme::DIM),
+                Span::styled("permission: ", theme::dialog_key()),
+                Span::styled(self.req.tool.clone(), theme::dialog()),
+                Span::styled(format!(" — {}", self.req.reason), theme::dim()),
             ],
             w,
         )]
@@ -111,8 +123,8 @@ impl Dialog {
                     for l in cmd.lines().take(3) {
                         out.extend(crate::cells::wrap_styled(
                             vec![
-                                Span::styled("  $ ", theme::DIALOG_KEY),
-                                Span::styled(l.to_string(), theme::DIALOG),
+                                Span::styled("  $ ", theme::dialog_key()),
+                                Span::styled(l.to_string(), theme::dialog()),
                             ],
                             w,
                         ));
@@ -123,12 +135,12 @@ impl Dialog {
                 if let Some(p) = self.req.input.get("path").and_then(|v| v.as_str()) {
                     out.push(Line::from(Span::styled(
                         format!("  {p}"),
-                        theme::DIALOG,
+                        theme::dialog(),
                     )));
                 }
                 for (mark, key, style) in [
-                    ("- ", "old_string", theme::ERROR),
-                    ("+ ", "new_string", theme::META),
+                    ("- ", "old_string", theme::error()),
+                    ("+ ", "new_string", theme::meta()),
                 ] {
                     if let Some(s) = self.req.input.get(key).and_then(|v| v.as_str()) {
                         for l in s.lines().take(4) {
@@ -144,15 +156,15 @@ impl Dialog {
                 if let Some(p) = self.req.input.get("path").and_then(|v| v.as_str()) {
                     out.push(Line::from(Span::styled(
                         format!("  {p}"),
-                        theme::DIALOG,
+                        theme::dialog(),
                     )));
                 }
                 if let Some(c) = self.req.input.get("content").and_then(|v| v.as_str()) {
                     for l in c.lines().take(4) {
                         out.extend(crate::cells::wrap_styled(
                             vec![
-                                Span::styled("  │ ", theme::DIALOG_KEY),
-                                Span::styled(l.to_string(), theme::DIALOG),
+                                Span::styled("  │ ", theme::dialog_key()),
+                                Span::styled(l.to_string(), theme::dialog()),
                             ],
                             w,
                         ));
@@ -163,8 +175,8 @@ impl Dialog {
                 if let Some(p) = self.req.input.get("path").and_then(|v| v.as_str()) {
                     out.extend(crate::cells::wrap_styled(
                         vec![
-                            Span::styled("  ", theme::DIALOG),
-                            Span::styled(p.to_string(), theme::DIALOG),
+                            Span::styled("  ", theme::dialog()),
+                            Span::styled(p.to_string(), theme::dialog()),
                         ],
                         w,
                     ));
@@ -176,18 +188,18 @@ impl Dialog {
             let mut spans = Vec::new();
             for (i, l) in labels.iter().enumerate() {
                 if i == self.selected {
-                    spans.push(Span::styled(format!(" {l} "), theme::DIALOG_SEL));
+                    spans.push(Span::styled(format!(" {l} "), theme::dialog_sel()));
                 } else {
-                    spans.push(Span::styled(format!(" {l} "), theme::DIALOG_KEY));
+                    spans.push(Span::styled(format!(" {l} "), theme::dialog_key()));
                 }
                 if i + 1 < labels.len() {
                     spans.push(Span::raw("  "));
                 }
             }
-            spans.push(Span::styled("  (←→ ⏎)".to_string(), theme::DIM));
+            spans.push(Span::styled("  (←→ ⏎)".to_string(), theme::dim()));
             out.push(Line::from(spans));
         } else {
-            out.push(Line::from(Span::styled("…".to_string(), theme::DIALOG_KEY)));
+            out.push(Line::from(Span::styled("…".to_string(), theme::dialog_key())));
         }
         out
     }
@@ -202,18 +214,18 @@ pub fn status_line(
     width: u16,
 ) -> Line<'static> {
     let (label, badge) = match preset {
-        Preset::WorkspaceWrite => (" workspace ", theme::BADGE),
-        Preset::ReadOnly => (" read-only ", theme::BADGE_RO),
-        Preset::Plan => (" plan ", theme::BADGE_PLAN),
+        Preset::WorkspaceWrite => (" workspace ", theme::badge()),
+        Preset::ReadOnly => (" read-only ", theme::badge_ro()),
+        Preset::Plan => (" plan ", theme::badge_plan()),
     };
     let right = format!("{model} · ${:.4}", cost);
     let left_w = 10 + cwd.len();
     let pad = (width as usize).saturating_sub(left_w + right.len()).max(1);
     Line::from(vec![
         Span::styled(label, badge),
-        Span::styled(format!(" {cwd}"), theme::STATUS),
+        Span::styled(format!(" {cwd}"), theme::status()),
         Span::raw(" ".repeat(pad)),
-        Span::styled(right, theme::STATUS),
+        Span::styled(right, theme::status()),
     ])
 }
 
@@ -226,11 +238,13 @@ pub fn help_panel() -> Vec<Line<'static>> {
         "ctrl+t       toggle plan    ctrl+x  cancel queued msg",
         "ctrl+s       stash draft    ctrl+_  undo    ctrl+w  del word",
         "up/down      history        ctrl+c  clear   ctrl+d  quit",
-        "ctrl+p       session picker",
-        "/sessions /fork /rewind /help /quit — /diff lands in a later batch",
+        "ctrl+p       sessions       ctrl+o  search  ctrl+y  copy reply",
+        "alt+e / /edit               draft in $EDITOR",
+        "tab          complete /cmd or @path    !cmd   run shell locally",
+        "/sessions /fork /rewind /diff /approve /search /help /quit",
     ];
     rows.iter()
-        .map(|r| Line::from(Span::styled(r.to_string(), theme::DIM)))
+        .map(|r| Line::from(Span::styled(r.to_string(), theme::dim())))
         .collect()
 }
 
@@ -241,5 +255,19 @@ fn truncate(s: &str, n: usize) -> String {
         format!("{taken}…")
     } else {
         taken
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduced_motion_uses_static_glyph() {
+        let animated = indicator("working", 1, 10, 0, false);
+        let still = indicator("working", 1, 10, 0, true);
+        let first = |l: &Line| l.spans[0].content.to_string();
+        assert_eq!(first(&still), "● ");
+        assert!(SPINNER.contains(&first(&animated).trim()));
     }
 }
