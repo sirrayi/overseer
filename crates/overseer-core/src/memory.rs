@@ -97,6 +97,95 @@ pub fn commit(dir: &Path, msg: &str) {
     ]);
 }
 
+/// Sleep-time consolidation (P3.8): a small-tier call that dedupes and
+/// tightens `INDEX.md`, then a git commit. Topic files are read for
+/// context but only the index is rewritten — merging topic bodies is the
+/// model's job through ordinary edits, not a bulk engine rewrite.
+///
+/// The model returns the new index between `---INDEX---` markers; the
+/// engine writes it (hard-capped) and reports what changed. Deterministic
+/// fallback: a parse failure leaves the index untouched.
+pub fn consolidate(
+    provider: &dyn crate::provider::Provider,
+    model: &str,
+    dir: &Path,
+) -> Result<String, String> {
+    let idx = ensure(dir).map_err(|e| e.to_string())?;
+    let old_index = std::fs::read_to_string(&idx).unwrap_or_default();
+
+    // Topic files: bounded context for the dedupe pass.
+    let mut topics = String::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "md")
+                && e.file_name() != INDEX_NAME
+            {
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    let head: String = t.chars().take(2_000).collect();
+                    topics.push_str(&format!("\n### {}\n{head}\n", e.file_name().to_string_lossy()));
+                }
+            }
+        }
+    }
+
+    let prompt = format!(
+        "You are consolidating an agent's file-based memory. Below is \
+         INDEX.md (one-line pointers) and the heads of the topic files.\n\
+         Rewrite INDEX.md only: dedupe pointers, drop stale entries whose \
+         topic file is gone, keep one line per topic in the form \
+         `name.md — what it's about`. Validity: if a topic's content says \
+         it expired or was superseded, drop its pointer.\n\
+         Reply with the full new index between ---INDEX--- markers.\n\n\
+         == CURRENT INDEX.md ==\n{old_index}\n== TOPIC HEADS =={topics}"
+    );
+    let msgs = [crate::ir::Message::user_text(prompt)];
+    let req = crate::provider::Request {
+        model,
+        system: &[],
+        tools: &[],
+        messages: &msgs,
+        max_tokens: 4_096,
+        thinking_budget: None,
+        effort: Some(crate::provider::Effort::Min),
+        cache_breakpoints: false,
+    };
+    let resp = provider
+        .complete(&req)
+        .map_err(|e| format!("consolidate: {e}"))?;
+    let text: String = resp
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            crate::ir::Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let new_index = text
+        .split("---INDEX---")
+        .nth(1)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "consolidate: model reply had no ---INDEX--- section".to_string()
+        })?;
+    let capped: String = new_index.chars().take(INDEX_CAP).collect();
+    std::fs::write(&idx, format!("{capped}\n")).map_err(|e| e.to_string())?;
+    commit(dir, "consolidate");
+
+    let dropped = old_index
+        .lines()
+        .filter(|l| l.contains(".md"))
+        .filter(|l| !new_index.contains(l.trim()))
+        .count();
+    Ok(format!(
+        "consolidated: {} → {} index lines, {dropped} pointers dropped",
+        old_index.lines().count(),
+        capped.lines().count()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +239,58 @@ mod tests {
             .unwrap();
         let log = String::from_utf8_lossy(&out.stdout);
         assert_eq!(log.lines().count(), 2);
+    }
+
+    struct FixedProvider {
+        reply: String,
+    }
+    impl crate::provider::Provider for FixedProvider {
+        fn complete(
+            &self,
+            req: &crate::provider::Request,
+        ) -> Result<crate::provider::Response, crate::provider::ProviderError> {
+            assert_eq!(req.effort, Some(crate::provider::Effort::Min));
+            Ok(crate::provider::Response {
+                blocks: vec![crate::ir::Block::Text {
+                    text: self.reply.clone(),
+                }],
+                stop_reason: crate::provider::StopReason::EndTurn,
+                usage: crate::ir::Usage::default(),
+                request_bytes: 0,
+                latency_ms: 0,
+            })
+        }
+        fn name(&self) -> &'static str {
+            "fixed"
+        }
+    }
+
+    #[test]
+    fn consolidate_rewrites_index_and_commits() {
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(&idx, "# Memory Index\n\nfacts.md — old\ndupe.md — old\n").unwrap();
+        std::fs::write(dir.join("facts.md"), "data").unwrap();
+        let p = FixedProvider {
+            reply: "---INDEX---\n# Memory Index\n\nfacts.md — user facts\n---INDEX---".into(),
+        };
+        let msg = consolidate(&p, "tiny", &dir).unwrap();
+        assert!(msg.contains("consolidated"));
+        let new = std::fs::read_to_string(&idx).unwrap();
+        assert!(new.contains("facts.md — user facts"));
+        assert!(!new.contains("dupe.md"), "stale pointer dropped");
+        assert!(dir.join(".git").exists(), "consolidate commits");
+    }
+
+    #[test]
+    fn consolidate_parse_failure_leaves_index() {
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(&idx, "original\n").unwrap();
+        let p = FixedProvider {
+            reply: "no markers here".into(),
+        };
+        assert!(consolidate(&p, "tiny", &dir).is_err());
+        assert_eq!(std::fs::read_to_string(&idx).unwrap(), "original\n");
     }
 }
