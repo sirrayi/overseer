@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::ir::{Message, Usage};
 
 pub mod anthropic;
+pub mod openai;
 
 /// A tool definition as sent to the provider.
 #[derive(Debug, Clone)]

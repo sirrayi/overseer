@@ -128,6 +128,100 @@ static PROFILES: &[ModelProfile] = &[
             output: 15.0,
         },
     },
+    // --- LegionEdge fleet (inference.legionedge.ai, vLLM-served, Sept 2026) ---
+    // Context windows + pricing unpublished → conservative defaults, $0 cost.
+    // Re-verify when LegionEdge publishes limits; ledger cost stays honest
+    // (zero, flagged) rather than invented.
+    ModelProfile {
+        id: "glm-5-3",
+        match_prefixes: &["glm-5-3", "zai-org/GLM-5.3"],
+        context_in: 131_072,
+        max_output: 8_192,
+        vision: false,
+        parallel_calls: true,
+        reasoning: ReasoningSpec {
+            supported: true,
+            min_budget: 0,
+        },
+        price: PriceTable {
+            input: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            output: 0.0,
+        },
+    },
+    ModelProfile {
+        id: "glm-5-2",
+        match_prefixes: &["glm-5-2", "zai-org/GLM-5.2"],
+        context_in: 131_072,
+        max_output: 8_192,
+        vision: false,
+        parallel_calls: true,
+        reasoning: ReasoningSpec {
+            supported: true,
+            min_budget: 0,
+        },
+        price: PriceTable {
+            input: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            output: 0.0,
+        },
+    },
+    ModelProfile {
+        id: "kimi-k3-turbo",
+        match_prefixes: &["kimi-k3-turbo"],
+        context_in: 131_072,
+        max_output: 8_192,
+        vision: false,
+        parallel_calls: true,
+        reasoning: ReasoningSpec {
+            supported: true,
+            min_budget: 0,
+        },
+        price: PriceTable {
+            input: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            output: 0.0,
+        },
+    },
+    ModelProfile {
+        id: "kimi-k3",
+        match_prefixes: &["kimi-k3", "moonshotai/Kimi-K3"],
+        context_in: 131_072,
+        max_output: 8_192,
+        vision: false,
+        parallel_calls: true,
+        reasoning: ReasoningSpec {
+            supported: true,
+            min_budget: 0,
+        },
+        price: PriceTable {
+            input: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            output: 0.0,
+        },
+    },
+    ModelProfile {
+        id: "qwen3-8-27b",
+        match_prefixes: &["qwen3-8-27b", "Qwen/Qwen3.8-27B"],
+        context_in: 131_072,
+        max_output: 8_192,
+        vision: false,
+        parallel_calls: true,
+        reasoning: ReasoningSpec {
+            supported: true,
+            min_budget: 0,
+        },
+        price: PriceTable {
+            input: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            output: 0.0,
+        },
+    },
     ModelProfile {
         id: "claude-haiku-4-5",
         match_prefixes: &["claude-haiku-4-5"],
