@@ -8,6 +8,7 @@
 pub mod app;
 pub mod cells;
 pub mod composer;
+pub mod diff;
 pub mod markdown;
 pub mod probe;
 pub mod theme;

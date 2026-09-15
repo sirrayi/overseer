@@ -68,6 +68,10 @@ pub struct AgentConfig {
     /// The handler runs on the agent thread; frontends block it on a UI
     /// response channel.
     pub ask_handler: Option<crate::perm::AskHandler>,
+    /// Persisted-allow rules file (`~/.overseer/rules` by convention).
+    /// `AllowAlways` decisions append keys here; every new Policy loads
+    /// them. None disables persistence.
+    pub rules_path: Option<PathBuf>,
 }
 
 impl Default for AgentConfig {
@@ -89,6 +93,7 @@ impl Default for AgentConfig {
             verify_block_cap: 8,
             sandbox_bash: true,
             ask_handler: None,
+            rules_path: None,
         }
     }
 }
@@ -719,6 +724,9 @@ impl<'a> Agent<'a> {
         } else {
             let mut p = crate::perm::Policy::preset(config.policy_preset, config.cwd.clone());
             p.ask_handler = config.ask_handler.clone();
+            if let Some(path) = &config.rules_path {
+                p.load_rules(path.clone());
+            }
             p
         }
     }

@@ -35,13 +35,22 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   interrupt + steer queue (checked at tool-launch boundaries only —
   skipped calls get synthetic results so tool pairing survives);
   `Policy::gate` routes Ask verdicts to a human dialog (200 ms
-  anti-misclick, arrows/Enter, never steals text keys). Keys: Esc
-  interrupt, Shift+Tab mode cycle, Ctrl+T plan, Ctrl+X cancel queued,
-  Ctrl+S stash, Ctrl+_ undo, Ctrl+W del-word, Ctrl+P session picker,
-  ? help, /help /quit /sessions /fork /rewind. Session switches and
-  rewinds rebuild the agent via `WorkerCmd::SwitchSession` →
-  `Agent::resume` (never mid-run); the transcript reseeds from the new
-  log.
+  anti-misclick, arrows/Enter, never steals text keys) with typed
+  previews (bash cmd / edit diff / write head); "always" persists a
+  rule to `~/.overseer/rules` (deny rules still win; headless stays
+  fail-closed). Keys: Esc interrupt, Shift+Tab mode cycle, Ctrl+T
+  plan, Ctrl+X cancel queued, Ctrl+S stash, Ctrl+_ undo, Ctrl+W
+  del-word, Ctrl+P session picker, Ctrl+O transcript search, ? help,
+  /help /quit /sessions /fork /rewind /diff /approve. Session
+  switches and rewinds rebuild the agent via `WorkerCmd::SwitchSession`
+  → `Agent::resume` (never mid-run); the transcript reseeds from the
+  new log. Modal overlays (sessions/rewind/transcript/diff) own the
+  live region while open — key hints render last so top-clipping
+  can't hide them. `/diff` reads checkpoint manifests (earliest
+  snapshot per path), Enter reverts a file after stashing the current
+  content into `checkpoints/revert-stash`. `/approve` exits plan mode
+  and submits "implement the plan". Toasts self-expire in the status
+  area.
 - `eval/` — Inspect AI evaluation rig (scaffold)
 
 ## Invariants (do not violate)
