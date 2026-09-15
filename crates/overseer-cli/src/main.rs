@@ -165,6 +165,7 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
         verify_block_cap: flags.verify_cap,
         sandbox_bash: flags.sandbox,
         ask_handler: None,
+        rules_path: Some(dirs_home().join("rules")),
     }
 }
 

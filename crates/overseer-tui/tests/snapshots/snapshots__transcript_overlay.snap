@@ -1,0 +1,23 @@
+---
+source: crates/overseer-tui/tests/snapshots.rs
+expression: screen(&term)
+---
+
+
+
+
+
+
+
+
+
+
+❯ fix the flaky test
+❯ add a parser
+I'll look at the test file.
+❯ fix the flaky test
+❯ add a parser
+I'll look at the test file.
+3 lines · type to filter · ↑↓/pgdn · esc
+❯
+ workspace  /repo                        test-model · $0.000
