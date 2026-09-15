@@ -9,18 +9,13 @@ use crate::event::{rehydrate_messages, Event, EventKind, EventLog};
 use crate::ir::{Block, Message};
 use crate::ledger::{Ledger, UsageRecord};
 use crate::profile;
-use crate::provider::{Provider, Request, StopReason, SystemSegment};
+use crate::provider::{Provider, Request, StopReason};
 use crate::stuck::StuckDetector;
 use crate::tools::{ToolCtx, ToolRegistry};
 
-/// Static system prompt — kept minimal and byte-stable (Invariant 2:
-/// nothing volatile lives here; per-session data goes below the boundary
-/// once the prompt assembler lands in Phase 1).
-const SYSTEM_PROMPT: &str = "\
-You are Overseer, an agentic coding engine running as a CLI on the user's machine.\n\
-Use the tools to accomplish the task. Prefer dedicated tools over bash for file operations.\n\
-Keep prose between tool calls under 25 words. Verify work with builds/tests when available.\n\
-Large tool outputs are spilled to files — read or grep them by path for more.";
+/// Static system prompt — assembled per turn by `prompt::assemble` as an
+/// ordered section pipeline with an explicit STATIC/DYNAMIC boundary
+/// (Invariant 2: nothing volatile lives above it).
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -254,20 +249,11 @@ impl<'a> Agent<'a> {
                 }
             }
 
-            // System segments assemble per turn: the static prompt is
-            // byte-stable; the memory index sits at the end of the static
-            // region (playbook Ch.3 §9.3) so an edit only invalidates cache
-            // from that segment onward — tools+prompt stay warm.
-            let mut system = vec![SystemSegment {
-                text: SYSTEM_PROMPT.into(),
-                cacheable: true,
-            }];
-            if let Some(dir) = &self.config.memory_dir {
-                system.push(SystemSegment {
-                    text: crate::memory::index_segment(dir),
-                    cacheable: true,
-                });
-            }
+            // System segments assemble per turn via the section pipeline:
+            // the static sections are byte-stable; the memory index sits in
+            // the last static slot so an edit only invalidates cache from
+            // that segment onward — tools+prompt stay warm.
+            let system = crate::prompt::assemble(&self.config);
 
             let req = Request {
                 model: &self.config.model,
@@ -746,10 +732,11 @@ mod tests {
         agent.run_turn("hi", &mut sink).unwrap();
 
         let seen = provider.seen_systems.lock().unwrap();
-        assert_eq!(seen[0].len(), 2);
-        assert!(seen[0][1].contains("## Memory index"));
-        assert!(seen[0][1].contains("facts.md — user facts"));
-        // Static prompt segment stays first and byte-stable.
+        // identity + contract + safety + memory index (last static slot).
+        assert_eq!(seen[0].len(), 4);
+        assert!(seen[0][3].contains("## Memory index"));
+        assert!(seen[0][3].contains("facts.md — user facts"));
+        // Static sections stay first and byte-stable.
         assert!(seen[0][0].contains("Overseer"));
         // Git-versioned: a commit landed at the turn boundary.
         assert!(memdir.join(".git").exists());

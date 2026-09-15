@@ -95,16 +95,20 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn core(policy: crate::perm::Policy) -> Self {
+        // Sorted by name — the tool list serializes deterministically
+        // regardless of registration order (Invariant 2: stable prefix).
+        let mut specs = vec![
+            bash::spec(),
+            read::spec(),
+            write::spec(),
+            edit::spec(),
+            grep::spec(),
+            glob::spec(),
+            task::spec(),
+        ];
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
         ToolRegistry {
-            specs: vec![
-                bash::spec(),
-                read::spec(),
-                write::spec(),
-                edit::spec(),
-                grep::spec(),
-                glob::spec(),
-                task::spec(),
-            ],
+            specs,
             read_paths: HashSet::new(),
             policy,
         }

@@ -43,6 +43,7 @@ fn real_main() -> i32 {
 
     match args[0].as_str() {
         "exec" => cmd_exec(&args[1..]),
+        "stats" => cmd_stats(&args[1..]),
         other => {
             eprintln!("overseer: unknown command '{other}'");
             usage();
@@ -51,12 +52,47 @@ fn real_main() -> i32 {
     }
 }
 
+/// `overseer stats <session-dir>` — the cache-hit-rate dashboard
+/// (playbook P1.1: ≥90% in-session is the SEV target).
+fn cmd_stats(args: &[String]) -> i32 {
+    let Some(dir) = args.first() else {
+        eprintln!("overseer stats: session dir required");
+        return 2;
+    };
+    let records = overseer_core::ledger::Ledger::read_all(PathBuf::from(dir).join("ledger.jsonl"));
+    if records.is_empty() {
+        eprintln!("overseer stats: no ledger records in {dir}");
+        return 1;
+    }
+    let s = overseer_core::ledger::Ledger::summarize(&records);
+    println!("session: {dir}");
+    println!("calls:        {}", s.calls);
+    println!(
+        "input tokens: {} (cache-read {})",
+        s.input_tokens, s.cache_read_tokens
+    );
+    println!("output tokens:{}", s.output_tokens);
+    println!(
+        "cache hit:    {:.1}%{}",
+        s.cache_hit_rate * 100.0,
+        if s.cache_hit_rate >= 0.9 {
+            "  (≥90% SEV target met)"
+        } else {
+            ""
+        }
+    );
+    println!("cost:         ${:.4}", s.total_cost_usd);
+    println!("latency:      {}ms total", s.latency_ms);
+    0
+}
+
 fn usage() {
     eprintln!(
         "overseer {VERSION} — agentic coding engine\n\
          \n\
          USAGE:\n\
          \x20 overseer exec [FLAGS] <prompt>\n\
+         \x20 overseer stats <session-dir>   ledger dashboard (tokens, cache-hit, cost)\n\
          \x20 overseer --version\n\
          \n\
          FLAGS (exec):\n\
