@@ -17,9 +17,20 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   to unsandboxed exec with a visible warning when no backend exists;
   `--no-sandbox` disables. A loopback egress proxy with domain
   allowlists is still open — v1 denies all egress.
-- `crates/overseer-cli` — `overseer exec` headless/CI surface
-- `crates/overseer-proto` — wire protocol types (stub)
-- `crates/overseer-tui` — terminal frontend (stub)
+- `crates/overseer-cli` — `overseer exec` headless/CI surface; bare
+  `overseer` / `overseer tui` launches the interactive TUI (same flags)
+- `crates/overseer-proto` — wire protocol types (request/notification)
+- `crates/overseer-tui` — ratatui/crossterm TUI (library). Agent runs on a
+  worker thread; UI renders `Event`s over a channel. Fixed-height
+  `Viewport::Inline` region (ratatui inline height is init-only) +
+  `insert_before` for scrollback handoff; DECRQM/XTVERSION probe; BSU/ESU
+  frame batching when sync output probes positive. `Control` =
+  interrupt + steer queue (checked at tool-launch boundaries only —
+  skipped calls get synthetic results so tool pairing survives);
+  `Policy::gate` routes Ask verdicts to a human dialog (200 ms
+  anti-misclick, arrows/Enter, never steals text keys). Keys: Esc
+  interrupt, Shift+Tab mode cycle, Ctrl+T plan, Ctrl+X cancel queued,
+  Ctrl+S stash, Ctrl+_ undo, Ctrl+W del-word, ? help, /help /quit.
 - `eval/` — Inspect AI evaluation rig (scaffold)
 
 ## Invariants (do not violate)
@@ -47,8 +58,10 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
 ## Commands
 
 - Build: `cargo build` (or `cargo build -p overseer-cli`)
-- Test: `cargo test`
+- Test: `cargo test` (TUI snapshots: `cargo test -p overseer-tui`;
+  regenerate with `INSTA_UPDATE=always`)
 - Run: `ANTHROPIC_API_KEY=... cargo run -p overseer-cli -- exec "task"`
+- TUI: `cargo run -p overseer-cli` (bare) or `-- tui [exec flags]`
 - JSONL event stream: add `--json`; resume: `--resume <session-dir>`
 
 ## Git workflow (github.com/sirrayi/overseer, private)

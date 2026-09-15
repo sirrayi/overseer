@@ -91,7 +91,9 @@ pub enum ProviderError {
     Malformed(String),
 }
 
-pub trait Provider {
+/// Providers must be safe to share with a worker thread: frontends (TUI)
+/// run the agent loop off the UI thread and stream events over a channel.
+pub trait Provider: Send + Sync {
     fn complete(&self, req: &Request) -> Result<Response, ProviderError>;
     fn name(&self) -> &'static str;
 }

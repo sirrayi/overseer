@@ -1,0 +1,16 @@
+---
+source: crates/overseer-tui/tests/snapshots.rs
+expression: screen(&term)
+---
+
+
+
+
+
+
+
+
+
+
+❯ first line
+ workspace  /repo                        test-model · $0.000
