@@ -1,0 +1,9 @@
+{
+  "id": "search-code",
+  "version": 1,
+  "tags": ["smoke", "search"],
+  "instruction": "Somewhere in this directory is a file containing the token SECRET_PLAN_7749. Find which file it's in and write the filename (basename only) into answer.txt.",
+  "setup": "mkdir -p a b c && echo 'nothing here' > a/notes.md && echo 'SECRET_PLAN_7749 lives here' > b/hidden.txt && echo 'also nothing' > c/other.py",
+  "grader": {"type": "bash_assert", "script": "test -f answer.txt && grep -qx 'hidden.txt' answer.txt"},
+  "limits": {"max_steps": 15}
+}
