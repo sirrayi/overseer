@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use overseer_core::agent::{Agent, AgentConfig, RunOutcome};
 use overseer_core::event::{Event, EventKind};
 use overseer_core::provider::anthropic::Anthropic;
+use overseer_core::provider::openai::OpenAiCompatible;
+use overseer_core::provider::Provider;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -63,12 +65,17 @@ fn usage() {
          \x20 --session <dir>     Session directory (default: ~/.overseer/sessions/<ts>)\n\
          \x20 --cwd <dir>         Working directory for tools (default: .)\n\
          \x20 --model <id>        Model id (default: claude-sonnet-5)\n\
+         \x20 --provider <name>   anthropic | openai | fleet (default: anthropic)\n\
+         \x20 --base-url <url>    API base URL for openai-compatible providers\n\
          \x20 --max-steps <n>     Step budget (default: 100)\n\
          \x20 --max-cost <usd>    Cost budget in USD (default: 5.0)\n\
          \x20 --thinking <tok>    Enable extended thinking with token budget\n\
          \n\
          ENV:\n\
-         \x20 ANTHROPIC_API_KEY   Required for model calls"
+         \x20 OVERSEER_API_KEY    Provider key (preferred, any provider)\n\
+         \x20 ANTHROPIC_API_KEY   Anthropic key\n\
+         \x20 OPENAI_API_KEY      OpenAI-compatible key\n\
+         \x20 OVERSEER_API_KEY         Fleet key (fallback)"
     );
 }
 
@@ -78,6 +85,8 @@ struct ExecFlags {
     session: Option<PathBuf>,
     cwd: PathBuf,
     model: String,
+    provider: String,
+    base_url: Option<String>,
     max_steps: u32,
     max_cost: f64,
     thinking: Option<u32>,
@@ -91,6 +100,8 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         session: None,
         cwd: std::env::current_dir().map_err(|e| e.to_string())?,
         model: "claude-sonnet-5".into(),
+        provider: "anthropic".into(),
+        base_url: None,
         max_steps: 100,
         max_cost: 5.0,
         thinking: None,
@@ -110,6 +121,8 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
             "--session" => f.session = Some(PathBuf::from(take(&mut i)?)),
             "--cwd" => f.cwd = PathBuf::from(take(&mut i)?),
             "--model" => f.model = take(&mut i)?.clone(),
+            "--provider" => f.provider = take(&mut i)?.clone(),
+            "--base-url" => f.base_url = Some(take(&mut i)?.clone()),
             "--max-steps" => f.max_steps = take(&mut i)?.parse().map_err(|_| "bad --max-steps")?,
             "--max-cost" => f.max_cost = take(&mut i)?.parse().map_err(|_| "bad --max-cost")?,
             "--thinking" => f.thinking = Some(take(&mut i)?.parse().map_err(|_| "bad --thinking")?),
@@ -155,14 +168,13 @@ fn cmd_exec(args: &[String]) -> i32 {
         }
     };
 
-    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => {
-            eprintln!("overseer exec: ANTHROPIC_API_KEY is not set");
+    let provider: Box<dyn Provider> = match build_provider(&flags) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("overseer exec: {msg}");
             return 2;
         }
     };
-    let provider = Anthropic::new(api_key);
     let config = AgentConfig {
         model: flags.model.clone(),
         max_steps: flags.max_steps,
@@ -173,7 +185,7 @@ fn cmd_exec(args: &[String]) -> i32 {
     };
 
     let mut agent = if flags.resume.is_some() {
-        match Agent::resume(&provider, config, session_dir.clone()) {
+        match Agent::resume(provider.as_ref(), config, session_dir.clone()) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!(
@@ -188,7 +200,7 @@ fn cmd_exec(args: &[String]) -> i32 {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "session".into());
-        match Agent::start(&provider, config, session_dir.clone(), session_id) {
+        match Agent::start(provider.as_ref(), config, session_dir.clone(), session_id) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("overseer exec: cannot start session: {e}");
@@ -259,6 +271,49 @@ fn render_human(e: &Event) {
         }
         _ => {}
     }
+}
+
+const FLEET_URL: &str = "https://inference.fleet.ai/v1";
+
+/// Build the provider from flags + env. Key resolution order:
+/// OVERSEER_API_KEY → provider-specific env → OVERSEER_API_KEY.
+fn build_provider(flags: &ExecFlags) -> Result<Box<dyn Provider>, String> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let key = env("OVERSEER_API_KEY")
+        .or_else(|| match flags.provider.as_str() {
+            "anthropic" => env("ANTHROPIC_API_KEY"),
+            _ => env("OPENAI_API_KEY"),
+        })
+        .or_else(|| env("OVERSEER_API_KEY"))
+        .ok_or_else(|| {
+            format!(
+                "no API key for provider '{}' — set OVERSEER_API_KEY \
+                 (or ANTHROPIC_API_KEY / OPENAI_API_KEY / OVERSEER_API_KEY)",
+                flags.provider
+            )
+        })?;
+    Ok(match flags.provider.as_str() {
+        "anthropic" => Box::new(Anthropic::new(key)),
+        "openai" => Box::new(OpenAiCompatible::new(
+            key,
+            flags
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+        )),
+        "fleet" => Box::new(OpenAiCompatible::new(
+            key,
+            flags
+                .base_url
+                .clone()
+                .unwrap_or_else(|| FLEET_URL.into()),
+        )),
+        other => {
+            return Err(format!(
+                "unknown provider '{other}' (anthropic|openai|fleet)"
+            ))
+        }
+    })
 }
 
 fn dirs_home() -> PathBuf {
