@@ -79,6 +79,14 @@ pub enum EventKind {
     Nudge {
         text: String,
     },
+    /// Compaction boundary (playbook Ch.3 §9.5): a view marker, not a
+    /// mutation. Events with `id < tail_from` are represented by `summary`;
+    /// `id >= tail_from` replay verbatim (the recency tail). `tail_from`
+    /// always points at a ModelResponse so tool pairing survives the cut.
+    Compaction {
+        summary: String,
+        tail_from: u64,
+    },
     Error {
         message: String,
     },
@@ -197,9 +205,21 @@ impl EventLog {
 /// UserInput → user message; ModelResponse → assistant message; consecutive
 /// ToolResult events merge into one user message (Anthropic's rule: all results
 /// for a tool_use batch live in a single user turn).
+///
+/// Compaction is honored as a view marker: only the latest `Compaction`
+/// matters — its summary becomes a user message and verbatim replay resumes
+/// at `tail_from`. Everything older folds into the summary and is skipped.
 pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
     use crate::ir::{Message, Role};
+
+    let (summary, tail_from) = crate::compact::latest(events)
+        .map(|(s, t)| (Some(s), t))
+        .unwrap_or((None, 0));
+
     let mut messages: Vec<Message> = Vec::new();
+    if let Some(s) = summary {
+        messages.push(Message::user_text(s));
+    }
     let mut pending_results: Vec<Block> = Vec::new();
 
     let flush_results = |pending: &mut Vec<Block>, msgs: &mut Vec<Message>| {
@@ -209,6 +229,9 @@ pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
     };
 
     for ev in events {
+        if ev.id < tail_from {
+            continue;
+        }
         match &ev.kind {
             EventKind::UserInput { text } | EventKind::Nudge { text } => {
                 flush_results(&mut pending_results, &mut messages);

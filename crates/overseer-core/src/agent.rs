@@ -36,6 +36,12 @@ pub struct AgentConfig {
     /// Benchmark mode: disable the permission gate entirely. Only valid when
     /// the environment itself is the sandbox (per-task container).
     pub full_access: bool,
+    /// Context-engine master switch (benchmark/debug escape hatch).
+    pub auto_compact: bool,
+    /// Compaction trigger as a fraction of the model's context window
+    /// (playbook Ch.3 §9.2: budget to the *effective* window, not the
+    /// advertised one). `None` → the model profile's `compact_at` default.
+    pub compact_at: Option<f32>,
 }
 
 impl Default for AgentConfig {
@@ -48,6 +54,8 @@ impl Default for AgentConfig {
             thinking_budget: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             full_access: false,
+            auto_compact: true,
+            compact_at: None,
         }
     }
 }
@@ -94,6 +102,12 @@ pub struct Agent<'a> {
     stuck_nudged: bool,
     /// Consecutive responses with no text and no tool calls (silent-END).
     empty_responses: u8,
+    /// Compact at the next loop boundary (set by the context-budget trigger
+    /// or a provider context-window stop).
+    pending_compact: bool,
+    /// Last response hit the provider's context wall — if compaction can't
+    /// shrink the view further, the run ends rather than looping forever.
+    ctx_wall_stop: bool,
 }
 
 impl<'a> Agent<'a> {
@@ -119,6 +133,8 @@ impl<'a> Agent<'a> {
             stuck: StuckDetector::new(),
             stuck_nudged: false,
             empty_responses: 0,
+            pending_compact: false,
+            ctx_wall_stop: false,
         };
         let cwd = agent.config.cwd.display().to_string();
         agent.log.append(EventKind::SessionStart {
@@ -153,6 +169,8 @@ impl<'a> Agent<'a> {
             stuck: StuckDetector::new(),
             stuck_nudged: false,
             empty_responses: 0,
+            pending_compact: false,
+            ctx_wall_stop: false,
         })
     }
 
@@ -196,6 +214,23 @@ impl<'a> Agent<'a> {
                 return Ok(out);
             }
 
+            // Compaction boundary: the loop only ever compacts here — after a
+            // complete tool-result batch (or a nudge), never mid-batch, so
+            // the Anthropic pairing rule survives the cut.
+            if self.pending_compact {
+                self.pending_compact = false;
+                let shrunk = self.compact(on_event)?;
+                if !shrunk && self.ctx_wall_stop {
+                    // Provider already refuses this context and there's
+                    // nothing left to drop — end cleanly, don't spin.
+                    self.end_run("context_window", steps, on_event)?;
+                    return Ok(RunOutcome::Completed {
+                        steps,
+                        cost_usd: self.ledger.total_cost_usd,
+                    });
+                }
+            }
+
             let req = Request {
                 model: &self.config.model,
                 system: &system,
@@ -231,6 +266,18 @@ impl<'a> Agent<'a> {
                 count_tool_calls(&resp.blocks) as u32,
                 cost,
             ))?;
+
+            // Effective-window budget (playbook Ch.3 §9.2): trigger on the
+            // *measured* prompt size from the last call, not an estimate.
+            // A provider context-window stop also forces compaction.
+            self.ctx_wall_stop = resp.stop_reason == StopReason::ContextWindowExceeded;
+            if self.config.auto_compact {
+                let frac = self.config.compact_at.unwrap_or(profile.compact_at);
+                let budget = frac as f64 * f64::from(profile.context_in);
+                if self.ctx_wall_stop || resp.usage.total_input() as f64 > budget {
+                    self.pending_compact = true;
+                }
+            }
 
             self.messages.push(Message {
                 role: crate::ir::Role::Assistant,
@@ -291,6 +338,13 @@ impl<'a> Agent<'a> {
                     continue;
                 }
                 self.empty_responses = 0;
+                // A context-window stop isn't a finish — the model was cut
+                // off mid-generation. Compact and let it continue (the loop
+                // exits via ctx_wall_stop if nothing can be dropped).
+                if resp.stop_reason == StopReason::ContextWindowExceeded {
+                    self.pending_compact = true;
+                    continue;
+                }
                 self.end_run(resp.stop_reason.as_str(), steps, on_event)?;
                 return Ok(RunOutcome::Completed {
                     steps,
@@ -396,6 +450,34 @@ impl<'a> Agent<'a> {
         Ok(None)
     }
 
+    /// Compact the message view (playbook Ch.3 §9.5): derive a fixed-schema
+    /// summary from the raw event log, record a `Compaction` boundary event,
+    /// then rebuild the view by replaying the log — so the live context is
+    /// byte-identical to what `--resume` would produce. Returns false when
+    /// there was nothing droppable (caller decides what that means).
+    fn compact(&mut self, on_event: &mut dyn FnMut(&Event)) -> std::io::Result<bool> {
+        let events = EventLog::replay(self.log.path())?;
+        let floor = crate::compact::latest(&events).map(|(_, t)| t).unwrap_or(0);
+        let Some(anchor) = crate::compact::tail_anchor(&events, crate::compact::TAIL_TURNS, floor)
+        else {
+            return Ok(false);
+        };
+        let summary = crate::compact::summarize(&events, anchor);
+        self.emit(
+            EventKind::Compaction {
+                summary,
+                tail_from: anchor,
+            },
+            on_event,
+        )?;
+        self.log.flush()?;
+        // Rebuild the view from the durable log — the summary + recency
+        // tail now in effect are exactly what resume replays.
+        let events = EventLog::replay(self.log.path())?;
+        self.messages = rehydrate_messages(&events);
+        Ok(true)
+    }
+
     fn policy(config: &AgentConfig) -> crate::perm::Policy {
         if config.full_access {
             crate::perm::Policy::allow_all()
@@ -436,4 +518,156 @@ fn count_tool_calls(blocks: &[Block]) -> usize {
         .iter()
         .filter(|b| matches!(b, Block::ToolCall { .. }))
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::EventLog;
+    use crate::ir::Usage;
+    use crate::provider::{ProviderError, Response};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// Scripted provider: pops one response per call, then keeps returning
+    /// the last one forever.
+    struct Mock {
+        responses: Mutex<VecDeque<Response>>,
+    }
+
+    impl Mock {
+        fn new(responses: Vec<Response>) -> Self {
+            Mock {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    impl Provider for Mock {
+        fn complete(&self, _req: &Request) -> Result<Response, ProviderError> {
+            let mut q = self.responses.lock().unwrap();
+            if q.len() > 1 {
+                Ok(q.pop_front().unwrap())
+            } else {
+                Ok(q.front().unwrap().clone())
+            }
+        }
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    fn tool_turn(n: usize) -> Response {
+        Response {
+            blocks: vec![Block::ToolCall {
+                id: format!("c{n}"),
+                name: "bash".into(),
+                // Distinct input + output per turn so the stuck detector's
+                // identical-loop pattern stays quiet.
+                input: serde_json::json!({"command": format!("echo turn{n}")}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage {
+                fresh_input: 20_000,
+                ..Usage::default()
+            },
+            request_bytes: 0,
+            latency_ms: 0,
+        }
+    }
+
+    fn done() -> Response {
+        Response {
+            blocks: vec![Block::Text {
+                text: "all done".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                fresh_input: 20_000,
+                ..Usage::default()
+            },
+            request_bytes: 0,
+            latency_ms: 0,
+        }
+    }
+
+    fn tmpdir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("overseer-agent-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 5 tool turns with usage far above a tiny compact threshold → the
+    /// engine must compact mid-run, record the boundary event, and the
+    /// live view must equal the resume view (playbook Ch.3 §9.1 invariant).
+    #[test]
+    fn compacts_when_context_budget_trips() {
+        let dir = tmpdir();
+        let mut cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            // FALLBACK profile: 200K window × 0.05 = 10K → 10,001 trips it.
+            compact_at: Some(0.05),
+            ..AgentConfig::default()
+        };
+        cfg.max_steps = 50;
+        let provider = Mock::new(vec![
+            tool_turn(1),
+            tool_turn(2),
+            tool_turn(3),
+            tool_turn(4),
+            tool_turn(5),
+            done(),
+        ]);
+        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        let out = agent.run_turn("do the thing", &mut sink).unwrap();
+        assert!(matches!(out, RunOutcome::Completed { .. }));
+
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Compaction { .. })));
+
+        // Live view == resume view, and it opens with the summary message.
+        let resumed = rehydrate_messages(&events);
+        assert_eq!(agent.messages(), resumed.as_slice());
+        assert!(resumed[0].text().contains("compaction v1"));
+        // The verbatim tail starts on an assistant boundary — never an
+        // orphan tool_result user message (pairing invariant).
+        assert!(matches!(resumed[1].role, crate::ir::Role::Assistant));
+    }
+
+    /// A context-window stop is not a finish: the loop compacts and
+    /// continues instead of returning Completed mid-thought.
+    #[test]
+    fn context_window_stop_retries_after_compaction() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        let mut responses: Vec<Response> = (0..4).map(tool_turn).collect();
+        responses.push(Response {
+            blocks: vec![Block::Text {
+                text: "truncated mid-th".into(),
+            }],
+            stop_reason: StopReason::ContextWindowExceeded,
+            usage: Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        });
+        responses.push(done());
+        let provider = Mock::new(responses);
+        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        let out = agent.run_turn("work", &mut sink).unwrap();
+        assert!(matches!(out, RunOutcome::Completed { steps: 6, .. }));
+
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Compaction { .. })));
+    }
 }

@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn reasoning_block_passthrough() {
         let thinking = json!({"type": "thinking", "thinking": "hmm", "signature": "S"});
-        let msgs = vec![Message {
+        let msgs = [Message {
             role: Role::Assistant,
             content: vec![Block::Reasoning {
                 raw: thinking.clone(),
@@ -322,6 +322,50 @@ mod tests {
         }];
         let wire = ir_message_to_wire(&msgs[0]);
         assert_eq!(wire["content"][0], thinking);
+    }
+
+    /// Stable-prefix lint (Invariant 2, playbook Ch.3 §9.3): the serialized
+    /// tools + system prefix must be byte-identical across turns — anything
+    /// volatile above the last breakpoint silently kills the cache. If this
+    /// test trips, a change leaked per-request state into the static region.
+    #[test]
+    fn prefix_stable_across_turns() {
+        let system = vec![SystemSegment {
+            text: "static system".into(),
+            cacheable: true,
+        }];
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let turn1 = vec![Message::user_text("first")];
+        let turn2 = vec![
+            Message::user_text("first"),
+            Message {
+                role: Role::Assistant,
+                content: vec![Block::Text { text: "ok".into() }],
+            },
+            Message::user_text("second"),
+        ];
+        let b1 = Anthropic::build_body(&sample_req(&system, &tools, &turn1));
+        let b2 = Anthropic::build_body(&sample_req(&system, &tools, &turn2));
+        assert_eq!(
+            serde_json::to_string(&b1["tools"]).unwrap(),
+            serde_json::to_string(&b2["tools"]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&b1["system"]).unwrap(),
+            serde_json::to_string(&b2["system"]).unwrap()
+        );
+        // Nothing volatile may appear anywhere in the prefix.
+        let prefix = format!("{}{}", b1["system"], b1["tools"]);
+        for volatile in ["ts_ms", "timestamp", "session_id", "uuid", "created_at"] {
+            assert!(
+                !prefix.contains(volatile),
+                "volatile key '{volatile}' in prefix"
+            );
+        }
     }
 
     #[test]
