@@ -248,6 +248,10 @@ fn cmd_exec(args: &[String]) -> i32 {
             eprintln!("run terminated — stuck: {pattern} ({steps} steps)");
             5
         }
+        Ok(RunOutcome::EmptyResponse { steps, .. }) => {
+            eprintln!("run terminated — model produced empty responses ({steps} steps)");
+            6
+        }
         Ok(RunOutcome::Provider(msg)) => {
             eprintln!("provider error: {msg}");
             4
