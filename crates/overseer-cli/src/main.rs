@@ -108,6 +108,7 @@ fn usage() {
          \x20 --thinking <tok>    Enable extended thinking with token budget\n\
          \x20 --full-access       Disable the permission gate (benchmarks/\n\
          \x20                     sandboxed envs only)\n\
+         \x20 --policy <preset>   workspace (default) | readonly | plan\n\
          \x20 --compact-at <f>    Compaction trigger, fraction of context\n\
          \x20                     window (default: model profile's)\n\
          \x20 --no-compact        Disable context-engine compaction\n\
@@ -138,6 +139,7 @@ struct ExecFlags {
     max_cost: f64,
     thinking: Option<u32>,
     full_access: bool,
+    policy: overseer_core::perm::Preset,
     auto_compact: bool,
     compact_at: Option<f32>,
     keep_results: usize,
@@ -160,6 +162,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         max_cost: 5.0,
         thinking: None,
         full_access: false,
+        policy: overseer_core::perm::Preset::WorkspaceWrite,
         auto_compact: true,
         compact_at: None,
         keep_results: 5,
@@ -188,6 +191,16 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
             "--max-cost" => f.max_cost = take(&mut i)?.parse().map_err(|_| "bad --max-cost")?,
             "--thinking" => f.thinking = Some(take(&mut i)?.parse().map_err(|_| "bad --thinking")?),
             "--full-access" => f.full_access = true,
+            "--policy" => {
+                f.policy = match take(&mut i)?.as_str() {
+                    "workspace" => overseer_core::perm::Preset::WorkspaceWrite,
+                    "readonly" => overseer_core::perm::Preset::ReadOnly,
+                    "plan" => overseer_core::perm::Preset::Plan,
+                    other => {
+                        return Err(format!("bad --policy '{other}' (workspace|readonly|plan)"))
+                    }
+                }
+            }
             "--compact-at" => {
                 f.compact_at = Some(take(&mut i)?.parse().map_err(|_| "bad --compact-at")?)
             }
@@ -257,6 +270,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         thinking_budget: flags.thinking,
         cwd: flags.cwd.clone(),
         full_access: flags.full_access,
+        policy_preset: flags.policy,
         auto_compact: flags.auto_compact,
         compact_at: flags.compact_at,
         memory_dir: flags.memory.then(|| flags.cwd.join("memory")),

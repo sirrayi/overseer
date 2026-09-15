@@ -77,7 +77,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     let policy = if sub_cfg.full_access {
         crate::perm::Policy::allow_all()
     } else {
-        crate::perm::Policy::headless(ctx.cwd.clone())
+        crate::perm::Policy::preset(sub_cfg.policy_preset, ctx.cwd.clone())
     };
 
     let mut sub = match crate::agent::Agent::start(

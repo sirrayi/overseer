@@ -31,6 +31,10 @@ pub struct AgentConfig {
     /// Benchmark mode: disable the permission gate entirely. Only valid when
     /// the environment itself is the sandbox (per-task container).
     pub full_access: bool,
+    /// Permission preset (P1.4): workspace-write is the default; read-only
+    /// denies all side effects; plan additionally removes mutating tools
+    /// from the spec list (capability removal). Ignored under full_access.
+    pub policy_preset: crate::perm::Preset,
     /// Context-engine master switch (benchmark/debug escape hatch).
     pub auto_compact: bool,
     /// Compaction trigger as a fraction of the model's context window
@@ -65,6 +69,7 @@ impl Default for AgentConfig {
             thinking_budget: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             full_access: false,
+            policy_preset: crate::perm::Preset::WorkspaceWrite,
             auto_compact: true,
             compact_at: None,
             memory_dir: None,
@@ -149,7 +154,7 @@ impl<'a> Agent<'a> {
         std::fs::create_dir_all(&session_dir)?;
         let log = EventLog::create(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::create(session_dir.join("ledger.jsonl"))?;
-        let tools = ToolRegistry::core(Self::policy(&config));
+        let tools = Self::registry(&config);
         let mut agent = Agent {
             provider,
             config,
@@ -190,7 +195,7 @@ impl<'a> Agent<'a> {
         let messages = rehydrate_messages(&events);
         let log = EventLog::open(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::open(session_dir.join("ledger.jsonl"))?;
-        let tools = ToolRegistry::core(Self::policy(&config));
+        let tools = Self::registry(&config);
         // Seed the spill counter past existing files so resume can't
         // overwrite earlier spilled output.
         let spill_seq = std::fs::read_dir(session_dir.join("tool-outputs"))
@@ -571,11 +576,22 @@ impl<'a> Agent<'a> {
         Ok(true)
     }
 
+    /// Registry for the configured preset — plan mode removes mutating
+    /// tools from the spec list entirely (capability removal, P1.4).
+    fn registry(config: &AgentConfig) -> ToolRegistry {
+        let policy = Self::policy(config);
+        if !config.full_access && config.policy_preset == crate::perm::Preset::Plan {
+            ToolRegistry::plan_mode(policy)
+        } else {
+            ToolRegistry::core(policy)
+        }
+    }
+
     fn policy(config: &AgentConfig) -> crate::perm::Policy {
         if config.full_access {
             crate::perm::Policy::allow_all()
         } else {
-            crate::perm::Policy::headless(config.cwd.clone())
+            crate::perm::Policy::preset(config.policy_preset, config.cwd.clone())
         }
     }
 
