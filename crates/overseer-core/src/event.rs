@@ -84,6 +84,12 @@ pub enum EventKind {
         task_id: String,
         trace: String,
     },
+    /// A Rule-of-Two taint latch flipped (P3.10): untrusted content or
+    /// sensitive data entered context. Audit-only — does not rehydrate
+    /// into messages.
+    Tainted {
+        detail: String,
+    },
     /// Stuck detector tripped — records which of the five patterns fired.
     StuckDetected {
         pattern: String,
@@ -272,13 +278,16 @@ pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
             }
             EventKind::ToolResult {
                 call_id,
+                name,
                 content,
                 is_error,
                 ..
             } => {
                 pending_results.push(Block::ToolResult {
                     tool_use_id: call_id.clone(),
-                    content: content.clone(),
+                    // Re-wrap on replay — the live view wraps at push
+                    // time, so both paths produce identical bytes.
+                    content: crate::tools::provenance_wrap(name, content),
                     is_error: *is_error,
                 });
             }
