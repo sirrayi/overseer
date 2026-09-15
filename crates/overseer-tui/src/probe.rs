@@ -34,6 +34,10 @@ pub struct Caps {
     pub term_version: Option<String>,
     /// Inside tmux/screen — sync output stays off (re-chunking).
     pub mux: bool,
+    /// OSC sequences (8 links, 52 clipboard, 133 marks) are safe to
+    /// emit. Muxes re-chunk the stream — an OSC split mid-sequence
+    /// renders as garbage, so mux ⇒ off. `OVERSEER_OSC=0` forces off.
+    pub osc: bool,
 }
 
 /// Query the terminal. Call with raw mode already enabled and before the
@@ -46,6 +50,7 @@ pub fn probe(timeout: Duration) -> Caps {
         color: color_depth(),
         term_version: None,
         mux,
+        osc: false,
     };
 
     // DECRQM: report mode 2026. XTVERSION. DA1 (liveness + feature bits).
@@ -87,6 +92,9 @@ pub fn probe(timeout: Duration) -> Caps {
 
     caps.sync_output = !mux && matches!(sync_reported(&acc), Some(true));
     caps.term_version = xtversion(&acc);
+    caps.osc = !mux
+        && caps.color != ColorDepth::Mono
+        && std::env::var("OVERSEER_OSC").as_deref() != Ok("0");
     caps
 }
 

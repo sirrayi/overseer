@@ -1,6 +1,6 @@
 ---
 source: crates/overseer-tui/tests/snapshots.rs
-expression: norm(&term)
+expression: screen(&term)
 ---
 
 
@@ -12,6 +12,8 @@ expression: norm(&term)
 
 
 
-◆ reverted app.txt (stash in revert-stash)
-❯
+/sessions — pick a session to resume
+/search — transcript search
+tab to complete
+❯ /s
  workspace  /repo                        test-model · $0.000
