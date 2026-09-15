@@ -45,6 +45,14 @@ pub struct AgentConfig {
     /// blocks stay verbatim; older ones render as a placeholder in the view
     /// (events untouched). 0 disables clearing.
     pub keep_tool_results: usize,
+    /// P1.10 verification gate: a runnable definition-of-done check (e.g.
+    /// `cargo test`). When the model tries to finish, the engine runs it —
+    /// a failure blocks the stop and the failing output goes back into
+    /// context. None disables the gate.
+    pub verify_cmd: Option<String>,
+    /// Consecutive verify-block cap before the run ends anyway (~8 per
+    /// the playbook). Counted per session, not reset between blocks.
+    pub verify_block_cap: u32,
 }
 
 impl Default for AgentConfig {
@@ -61,6 +69,8 @@ impl Default for AgentConfig {
             compact_at: None,
             memory_dir: None,
             keep_tool_results: 5,
+            verify_cmd: None,
+            verify_block_cap: 8,
         }
     }
 }
@@ -87,6 +97,12 @@ pub enum RunOutcome {
     },
     /// Three consecutive responses with no text and no tool calls.
     EmptyResponse {
+        steps: u32,
+        cost_usd: f64,
+    },
+    /// Verification gate blocked the finish `verify_block_cap` times and
+    /// the check was still failing — the run ends without a clean bill.
+    VerifyFailed {
         steps: u32,
         cost_usd: f64,
     },
@@ -118,6 +134,8 @@ pub struct Agent<'a> {
     /// agent (not per-turn ToolCtx) so output-N.txt names never collide
     /// across turns.
     spill_seq: u64,
+    /// Consecutive verification-gate blocks this session (P1.10).
+    verify_blocks: u32,
 }
 
 impl<'a> Agent<'a> {
@@ -146,6 +164,7 @@ impl<'a> Agent<'a> {
             pending_compact: false,
             ctx_wall_stop: false,
             spill_seq: 0,
+            verify_blocks: 0,
         };
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
@@ -191,6 +210,7 @@ impl<'a> Agent<'a> {
             pending_compact: false,
             ctx_wall_stop: false,
             spill_seq,
+            verify_blocks: 0,
         })
     }
 
@@ -384,6 +404,30 @@ impl<'a> Agent<'a> {
                     self.pending_compact = true;
                     continue;
                 }
+                // P1.10 verification gate: the model wants to stop — run the
+                // definition-of-done check first. A failure blocks the stop;
+                // the failing output goes back into context as a nudge.
+                if let Some(cmd) = self.config.verify_cmd.clone() {
+                    if let Err(tail) = run_verify(&cmd, &self.config.cwd) {
+                        self.verify_blocks += 1;
+                        if self.verify_blocks >= self.config.verify_block_cap {
+                            self.end_run("verify_failed", steps, on_event)?;
+                            return Ok(RunOutcome::VerifyFailed {
+                                steps,
+                                cost_usd: self.ledger.total_cost_usd,
+                            });
+                        }
+                        let text = format!(
+                            "[overseer] Verification failed — `{cmd}` did not pass \
+                             (block {}/{}). Output:\n{tail}\nFix the failures, \
+                             then finish.",
+                            self.verify_blocks, self.config.verify_block_cap
+                        );
+                        self.messages.push(Message::user_text(text.clone()));
+                        self.emit(EventKind::Nudge { text }, on_event)?;
+                        continue;
+                    }
+                }
                 self.end_run(resp.stop_reason.as_str(), steps, on_event)?;
                 return Ok(RunOutcome::Completed {
                     steps,
@@ -567,6 +611,85 @@ fn count_tool_calls(blocks: &[Block]) -> usize {
         .iter()
         .filter(|b| matches!(b, Block::ToolCall { .. }))
         .count()
+}
+
+/// P1.10 verification gate runner: execute the definition-of-done command
+/// in the session cwd via `sh -c`. Output goes to a temp file (not a pipe)
+/// so a verbose suite can't deadlock on a full buffer; a 120s watchdog
+/// kills runaway checks. `Ok(())` = exit 0; `Err(tail)` = nonzero exit,
+/// spawn failure, or timeout — the tail keeps the last ~6K chars of output
+/// so the failure stays reviewable when injected back into context.
+fn run_verify(cmd: &str, cwd: &std::path::Path) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let log_path =
+        std::env::temp_dir().join(format!("overseer-verify-{}.log", uuid::Uuid::now_v7()));
+    let file =
+        std::fs::File::create(&log_path).map_err(|e| format!("cannot create verify log: {e}"))?;
+    let err_file = file
+        .try_clone()
+        .map_err(|e| format!("cannot clone verify log handle: {e}"))?;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(file)
+        .stderr(err_file)
+        .spawn()
+        .map_err(|e| format!("cannot run `{cmd}`: {e}"))?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) => break None,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&log_path);
+                return Err(format!("verify wait failed: {e}"));
+            }
+        }
+    };
+    let tail = read_tail(&log_path, 6_000);
+    let _ = std::fs::remove_file(&log_path);
+
+    match status {
+        Some(s) if s.success() => Ok(()),
+        Some(s) => Err(format!("exit {s}\n{tail}")),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!("timed out after 120s\n{tail}"))
+        }
+    }
+}
+
+/// Last `cap` chars of a file — best-effort, char-boundary safe.
+fn read_tail(path: &std::path::Path, cap: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(cap as u64 * 2);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let s = String::from_utf8_lossy(&buf);
+    s.chars()
+        .skip(s.chars().count().saturating_sub(cap))
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -838,5 +961,51 @@ mod tests {
         let ro = crate::tools::ToolRegistry::readonly(crate::perm::Policy::allow_all());
         let names: Vec<&str> = ro.specs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["read", "grep", "glob"]);
+    }
+
+    /// P1.10 verification gate: a failing DoD check blocks the finish and
+    /// the output goes back into context; the run ends `VerifyFailed` at
+    /// the block cap. A passing check lets the finish through.
+    #[test]
+    fn verify_gate_blocks_then_caps() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            verify_cmd: Some("false".into()),
+            verify_block_cap: 3,
+            ..AgentConfig::default()
+        };
+        let provider = Mock::new(vec![done()]);
+        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        let out = agent.run_turn("finish fast", &mut sink).unwrap();
+        assert!(matches!(out, RunOutcome::VerifyFailed { steps: 3, .. }));
+
+        // Each block left a nudge carrying the failure in context.
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        let nudges = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::Nudge { text } if text.contains("Verification failed")))
+            .count();
+        assert_eq!(nudges, 2); // cap-1 nudges, the last block ends the run
+        assert!(agent
+            .messages()
+            .iter()
+            .any(|m| m.text().contains("Verification failed")));
+
+        // A passing check completes on the first attempt.
+        let dir2 = tmpdir();
+        let cfg2 = AgentConfig {
+            cwd: dir2.clone(),
+            full_access: true,
+            verify_cmd: Some("true".into()),
+            ..AgentConfig::default()
+        };
+        let provider2 = Mock::new(vec![done()]);
+        let mut agent2 = Agent::start(&provider2, cfg2, dir2.clone(), "s".into()).unwrap();
+        let mut sink2 = |_: &Event| {};
+        let out2 = agent2.run_turn("finish", &mut sink2).unwrap();
+        assert!(matches!(out2, RunOutcome::Completed { steps: 1, .. }));
     }
 }
