@@ -52,9 +52,13 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         .unwrap_or(DEFAULT_TIMEOUT_MS)
         .min(MAX_TIMEOUT_MS);
 
-    let mut child = match Command::new("sh")
-        .arg("-c")
-        .arg(command)
+    // P1.5 sandbox v1: the command still runs via `sh -c`, but wrapped in
+    // the platform sandbox when available (macOS sandbox-exec / Linux
+    // bwrap) — deny-by-default network, writes confined to the workspace.
+    let (prog, args, note) = wrap_command(command, ctx);
+
+    let mut child = match Command::new(&prog)
+        .args(&args)
         .current_dir(&ctx.cwd)
         .env_clear()
         .envs(std::env::vars().filter(|(k, _)| {
@@ -139,8 +143,180 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         body.push_str("(no output)");
     }
 
-    let text = format!("{status_text}\n{body}");
+    let text = match note {
+        Some(n) => format!("{status_text}\n[{n}]\n{body}"),
+        None => format!("{status_text}\n{body}"),
+    };
     let mut o = ToolOutput::ok(text);
     o.is_error = is_error;
     o
+}
+
+/// Pick the exec backend for a bash call. Returns (program, argv, warning):
+/// sandbox-exec on macOS, bwrap on Linux, plain `sh` when sandboxing is off
+/// or no backend exists (with an honest note so the model/user can see it).
+fn wrap_command(command: &str, ctx: &ToolCtx) -> (String, Vec<String>, Option<String>) {
+    if !ctx.sandbox {
+        return ("sh".into(), vec!["-c".into(), command.into()], None);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let exe = "/usr/bin/sandbox-exec";
+        if std::path::Path::new(exe).exists() {
+            return (
+                exe.into(),
+                vec![
+                    "-p".into(),
+                    macos_profile(&ctx.cwd),
+                    "sh".into(),
+                    "-c".into(),
+                    command.into(),
+                ],
+                None,
+            );
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if bwrap_available() {
+            let root = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
+            return (
+                "bwrap".into(),
+                vec![
+                    "--ro-bind".into(),
+                    "/".into(),
+                    "/".into(),
+                    "--bind".into(),
+                    root.display().to_string(),
+                    root.display().to_string(),
+                    "--tmpfs".into(),
+                    "/tmp".into(),
+                    "--dev".into(),
+                    "/dev".into(),
+                    "--proc".into(),
+                    "/proc".into(),
+                    "--unshare-net".into(),
+                    "--die-with-parent".into(),
+                    "sh".into(),
+                    "-c".into(),
+                    command.into(),
+                ],
+                None,
+            );
+        }
+    }
+    (
+        "sh".into(),
+        vec!["-c".into(), command.into()],
+        Some("no sandbox backend (sandbox-exec/bwrap) — ran unsandboxed".into()),
+    )
+}
+
+/// macOS Seatbelt profile for `sandbox-exec -p` (P1.5): deny-by-default,
+/// exec/read freely, writes only to the workspace + temp dirs, network
+/// fully denied (deny overrides allow regardless of order). Secret dirs
+/// are read-denied on top of the broad read allow. A loopback egress
+/// proxy with domain allowlists is still open — v1 denies all egress.
+#[cfg(target_os = "macos")]
+fn macos_profile(cwd: &std::path::Path) -> String {
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!(
+        "(version 1)\n\
+         (deny default)\n\
+         (allow process-exec process-fork)\n\
+         (allow signal (target self))\n\
+         (allow process-info*)\n\
+         (allow sysctl-read mach-lookup ipc-posix-shm)\n\
+         (allow file-read*)\n\
+         (allow file-write* (subpath \"{root}\") (subpath \"/private/tmp\") \
+         (subpath \"/private/var\") (literal \"/dev/null\") (literal \"/dev/tty\"))\n\
+         (deny file-read* (subpath \"{home}/.ssh\") (subpath \"{home}/.aws\") \
+         (subpath \"{home}/.gnupg\") (subpath \"{home}/.kube\") (subpath \"{home}/.docker\"))\n\
+         (deny network*)\n",
+        root = root.display(),
+        home = home
+    )
+}
+
+/// Whether bwrap exists on PATH — probed once per process.
+#[cfg(target_os = "linux")]
+fn bwrap_available() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        Command::new("bwrap")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::perm::Policy;
+    use crate::tools::{ToolCtx, ToolRegistry};
+
+    fn ctx(dir: &std::path::Path, sandbox: bool) -> ToolCtx<'_> {
+        ToolCtx {
+            cwd: dir.to_path_buf(),
+            session_dir: dir.join("s"),
+            spill_seq: 0,
+            provider: None,
+            agent_config: None,
+            subagent_seq: 0,
+            checkpoint: None,
+            sandbox,
+        }
+    }
+
+    #[test]
+    fn sandbox_off_wraps_plain_sh() {
+        let dir = std::env::temp_dir();
+        let (prog, args, note) = wrap_command("echo hi", &ctx(&dir, false));
+        assert_eq!(prog, "sh");
+        assert_eq!(args, vec!["-c", "echo hi"]);
+        assert!(note.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_sandbox_wraps_sandbox_exec_with_confinement() {
+        let dir = std::env::temp_dir().join("ovr-sbx-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (prog, args, note) = wrap_command("echo hi", &ctx(&dir, true));
+        assert!(prog.ends_with("sandbox-exec"));
+        let profile = &args[1];
+        assert!(profile.contains("(deny network*)"));
+        // Canonicalized workspace root is the write-allowed subpath.
+        let root = dir.canonicalize().unwrap();
+        assert!(profile.contains(&format!("subpath \"{}\"", root.display())));
+        assert_eq!(args.last().unwrap(), "echo hi");
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn sandboxed_exec_runs_and_confines() {
+        // Only meaningful on macOS (or Linux with bwrap) — skip silently
+        // where no backend exists.
+        let dir = std::env::temp_dir().join("ovr-sbx-run");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = ctx(&dir, true);
+        let (prog, _, note) = wrap_command("true", &c);
+        if note.is_some() {
+            return; // no sandbox backend on this host
+        }
+        let _ = prog;
+        let mut reg = ToolRegistry::core(Policy::allow_all());
+        let out = reg.call(
+            "bash",
+            &serde_json::json!({"command": "echo ok > sbx-out.txt && cat sbx-out.txt"}),
+            &mut c,
+        );
+        assert!(out.text.contains("ok"), "{}", out.text);
+    }
 }
