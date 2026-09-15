@@ -17,8 +17,15 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   to unsandboxed exec with a visible warning when no backend exists;
   `--no-sandbox` disables. A loopback egress proxy with domain
   allowlists is still open — v1 denies all egress.
+  `session.rs` enumerates sessions (SessionStart id/cwd/model, recency,
+  previews, checkpoint lists) and implements `fork` (copied log cut at a
+  boundary + surviving checkpoints + fresh SessionStart); `rewind.rs` is
+  the shared restore implementation used by `overseer rewind` and the
+  TUI's `/rewind`.
 - `crates/overseer-cli` — `overseer exec` headless/CI surface; bare
-  `overseer` / `overseer tui` launches the interactive TUI (same flags)
+  `overseer` / `overseer tui` launches the interactive TUI (same flags).
+  `--continue`/`-c` resumes the newest session recorded for the cwd,
+  `--last` the newest anywhere; both fall back to a fresh session.
 - `crates/overseer-proto` — wire protocol types (request/notification)
 - `crates/overseer-tui` — ratatui/crossterm TUI (library). Agent runs on a
   worker thread; UI renders `Event`s over a channel. Fixed-height
@@ -30,7 +37,11 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   `Policy::gate` routes Ask verdicts to a human dialog (200 ms
   anti-misclick, arrows/Enter, never steals text keys). Keys: Esc
   interrupt, Shift+Tab mode cycle, Ctrl+T plan, Ctrl+X cancel queued,
-  Ctrl+S stash, Ctrl+_ undo, Ctrl+W del-word, ? help, /help /quit.
+  Ctrl+S stash, Ctrl+_ undo, Ctrl+W del-word, Ctrl+P session picker,
+  ? help, /help /quit /sessions /fork /rewind. Session switches and
+  rewinds rebuild the agent via `WorkerCmd::SwitchSession` →
+  `Agent::resume` (never mid-run); the transcript reseeds from the new
+  log.
 - `eval/` — Inspect AI evaluation rig (scaffold)
 
 ## Invariants (do not violate)

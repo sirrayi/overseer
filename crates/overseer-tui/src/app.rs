@@ -31,12 +31,18 @@ pub enum EngineMsg {
     Ask(AskRequest, mpsc::Sender<AskDecision>),
     RunDone(overseer_core::agent::RunOutcome),
     RunError(String),
+    /// The worker rebuilt its agent on a different session directory —
+    /// the UI reseeds the transcript from that log.
+    SessionSwitched { dir: std::path::PathBuf },
 }
 
 /// UI → worker commands.
 pub enum WorkerCmd {
     Submit { text: String, control: Control },
     SetPreset(Preset),
+    /// Drop the current agent and `Agent::resume` on `dir` — session
+    /// switch, post-fork, and post-rewind rebuild all share this path.
+    SwitchSession { dir: std::path::PathBuf },
     Shutdown,
 }
 
@@ -46,6 +52,29 @@ enum RunState {
         control: Control,
         started: Instant,
         phase: String,
+    },
+}
+
+/// One row in the `/rewind` picker: a checkpoint boundary + label.
+pub struct RewindRow {
+    pub boundary: u64,
+    pub files: u32,
+    pub label: String,
+}
+
+/// Modal overlay pickers (P2.6). Unlike the permission dialog these own
+/// the keyboard — the sessions filter IS a text input by design.
+pub enum Overlay {
+    Sessions {
+        rows: Vec<overseer_core::session::SessionInfo>,
+        sel: usize,
+        filter: String,
+        /// false = one line per session; true = adds a preview line.
+        wide: bool,
+    },
+    Rewind {
+        rows: Vec<RewindRow>,
+        sel: usize,
     },
 }
 
@@ -61,6 +90,7 @@ pub struct App {
     pending_queue: Vec<String>,
     composer: Composer,
     dialog: Option<(Dialog, mpsc::Sender<AskDecision>)>,
+    overlay: Option<Overlay>,
     preset: Preset,
     cwd: String,
     model: String,
@@ -92,6 +122,7 @@ impl App {
             pending_queue: Vec::new(),
             composer: Composer::new(),
             dialog: None,
+            overlay: None,
             preset,
             cwd,
             model,
@@ -187,6 +218,7 @@ impl App {
                     ));
                 }
                 EngineMsg::RunDone(out) => self.on_run_done(out),
+                EngineMsg::SessionSwitched { dir } => self.on_switched(dir),
                 EngineMsg::RunError(e) => {
                     self.restore_queue_to_composer();
                     self.run = RunState::Idle;
@@ -282,6 +314,27 @@ impl App {
         }
     }
 
+    /// The worker switched sessions: divider into scrollback, then the
+    /// new log replays into the transcript (same seeding as --resume).
+    fn on_switched(&mut self, dir: std::path::PathBuf) {
+        self.session_dir = dir.clone();
+        self.live.clear();
+        self.tokens = 0;
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        self.pending.push(Cell::Meta {
+            style: crate::theme::META,
+            text: format!("── session {name} ──"),
+        });
+        if let Ok(events) = overseer_core::event::EventLog::replay(dir.join("events.jsonl")) {
+            for ev in &events {
+                self.seed(ev);
+            }
+        }
+    }
+
     /// Interrupt/error cleanup: undelivered steers return to the
     /// composer for editing — nothing fires unattended after a stop.
     fn restore_queue_to_composer(&mut self) {
@@ -332,6 +385,13 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        // Modal pickers own the keyboard entirely (the sessions filter
+        // is a text input by design). Esc always closes first.
+        if self.overlay.is_some() {
+            self.on_overlay_key(key);
+            self.dirty = true;
+            return;
+        }
         // Dialog claims only its own keys — arrows/Enter/digits/Esc.
         // Everything else keeps flowing to the composer (no focus theft;
         // you can keep typing while a permission prompt waits).
@@ -408,6 +468,9 @@ impl App {
             (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.show_plan = !self.show_plan;
             }
+            (KeyCode::Char('p'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.open_sessions();
+            }
             (KeyCode::Char('x'), m) if m.contains(KeyModifiers::CONTROL) => {
                 // Cancel the newest undelivered queue entry.
                 if let RunState::Running { control, .. } = &self.run {
@@ -448,6 +511,180 @@ impl App {
             _ => return,
         }
         self.dirty = true;
+    }
+
+    fn on_overlay_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.overlay = None;
+            }
+            (KeyCode::Up, _) => {
+                if let Some(o) = &mut self.overlay {
+                    let (sel, len) = overlay_sel(o);
+                    *sel = sel.saturating_sub(1).min(len);
+                }
+            }
+            (KeyCode::Down, _) => {
+                if let Some(o) = &mut self.overlay {
+                    let (sel, len) = overlay_sel(o);
+                    *sel = (*sel + 1).min(len);
+                }
+            }
+            (KeyCode::Tab, _) => {
+                if let Some(Overlay::Sessions { wide, .. }) = &mut self.overlay {
+                    *wide = !*wide;
+                }
+            }
+            (KeyCode::Enter, _) => self.overlay_confirm(),
+            (KeyCode::Backspace, _) => {
+                if let Some(Overlay::Sessions { filter, sel, .. }) = &mut self.overlay {
+                    filter.pop();
+                    *sel = 0;
+                }
+            }
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                if let Some(Overlay::Sessions { filter, sel, .. }) = &mut self.overlay {
+                    filter.push(c);
+                    *sel = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn overlay_confirm(&mut self) {
+        match self.overlay.take() {
+            Some(Overlay::Sessions { rows, sel, filter, .. }) => {
+                if let Some(info) = filtered_sessions(&rows, &filter).get(sel).cloned() {
+                    if info.dir != self.session_dir {
+                        let _ = self.worker_tx.send(WorkerCmd::SwitchSession {
+                            dir: info.dir.clone(),
+                        });
+                    }
+                }
+            }
+            Some(Overlay::Rewind { rows, sel }) => {
+                if let Some(row) = rows.get(sel) {
+                    self.do_rewind(row.boundary);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// `/sessions` (or Ctrl+P): the picker only opens between runs —
+    /// switching mid-run would orphan its control/ask state.
+    fn open_sessions(&mut self) {
+        if self.running() {
+            self.pending.push(Cell::Meta {
+                style: crate::theme::ERROR,
+                text: "finish or interrupt the run first".into(),
+            });
+            return;
+        }
+        let Some(root) = self.session_dir.parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        let mut rows = overseer_core::session::list(&root);
+        // Current-cwd sessions first (the picker is cwd-scoped by
+        // convention, like --continue).
+        let cwd = self.cwd.clone();
+        rows.sort_by_key(|s| std::cmp::Reverse(s.cwd == cwd));
+        self.overlay = Some(Overlay::Sessions {
+            rows,
+            sel: 0,
+            filter: String::new(),
+            wide: false,
+        });
+    }
+
+    /// `/rewind`: checkpoints of the current session with their labels.
+    fn open_rewind(&mut self) {
+        if self.running() {
+            self.pending.push(Cell::Meta {
+                style: crate::theme::ERROR,
+                text: "finish or interrupt the run first".into(),
+            });
+            return;
+        }
+        let rows: Vec<RewindRow> = overseer_core::session::checkpoints(&self.session_dir)
+            .into_iter()
+            .rev()
+            .map(|b| RewindRow {
+                boundary: b,
+                files: manifest_files(&self.session_dir, b),
+                label: overseer_core::session::checkpoint_label(&self.session_dir, b)
+                    .unwrap_or_else(|| "(no prompt text)".into()),
+            })
+            .collect();
+        if rows.is_empty() {
+            self.pending.push(Cell::Meta {
+                style: crate::theme::DIM,
+                text: "no checkpoints yet — checkpoints open on each prompt".into(),
+            });
+            return;
+        }
+        self.overlay = Some(Overlay::Rewind { rows, sel: 0 });
+    }
+
+    fn do_rewind(&mut self, boundary: u64) {
+        match overseer_core::rewind::restore(
+            &self.session_dir,
+            Some(boundary),
+            overseer_core::rewind::Mode::Both,
+        ) {
+            Ok(rep) => {
+                self.pending.push(Cell::Meta {
+                    style: crate::theme::META,
+                    text: format!(
+                        "rewound to e{} — {} file(s) restored, {} removed, {} event(s) dropped",
+                        rep.boundary, rep.restored, rep.deleted, rep.truncated
+                    ),
+                });
+                // The log changed — rebuild the agent's context too.
+                let _ = self.worker_tx.send(WorkerCmd::SwitchSession {
+                    dir: self.session_dir.clone(),
+                });
+            }
+            Err(e) => self.pending.push(Cell::Meta {
+                style: crate::theme::ERROR,
+                text: format!("rewind failed: {e}"),
+            }),
+        }
+    }
+
+    /// `/fork`: branch the session at head into a sibling dir and switch.
+    fn do_fork(&mut self) {
+        if self.running() {
+            self.pending.push(Cell::Meta {
+                style: crate::theme::ERROR,
+                text: "finish or interrupt the run first".into(),
+            });
+            return;
+        }
+        let Some(root) = self.session_dir.parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let new_dir = root.join(format!("{ts}"));
+        match overseer_core::session::fork(&self.session_dir, None, &new_dir) {
+            Ok(()) => {
+                self.pending.push(Cell::Meta {
+                    style: crate::theme::META,
+                    text: format!("forked → {}", new_dir.display()),
+                });
+                let _ = self
+                    .worker_tx
+                    .send(WorkerCmd::SwitchSession { dir: new_dir });
+            }
+            Err(e) => self.pending.push(Cell::Meta {
+                style: crate::theme::ERROR,
+                text: format!("fork failed: {e}"),
+            }),
+        }
     }
 
     fn cycle_mode(&mut self) {
@@ -491,11 +728,12 @@ impl App {
             "help" | "?" => self.show_help = !self.show_help,
             "quit" | "exit" | "q" => self.quit = true,
             "clear" => self.composer.clear(),
+            "sessions" | "resume" => self.open_sessions(),
+            "rewind" => self.open_rewind(),
+            "fork" => self.do_fork(),
             other => self.pending.push(Cell::Meta {
                 style: crate::theme::ERROR,
-                text: format!(
-                    "unknown command /{other} — /help /quit now; /rewind /fork /sessions /diff land in later P2 batches"
-                ),
+                text: format!("unknown command /{other} — try /help"),
             }),
         }
     }
@@ -559,6 +797,9 @@ impl App {
                 self.tokens,
                 self.tick,
             ));
+        }
+        if let Some(o) = &self.overlay {
+            out.extend(overlay_lines(o, width));
         }
         if self.show_plan {
             if let Ok(md) = std::fs::read_to_string(self.session_dir.join("plan.md")) {
@@ -624,6 +865,160 @@ impl App {
         self.dirty = false;
         Ok(())
     }
+}
+
+/// (selection index, last valid index) for the open overlay.
+fn overlay_sel(o: &mut Overlay) -> (&mut usize, usize) {
+    match o {
+        Overlay::Sessions {
+            rows, sel, filter, ..
+        } => (
+            sel,
+            filtered_sessions(rows, filter).len().saturating_sub(1),
+        ),
+        Overlay::Rewind { rows, sel } => (sel, rows.len().saturating_sub(1)),
+    }
+}
+
+/// Fuzzy filter: subsequence match over id + cwd + preview text.
+fn filtered_sessions<'a>(
+    rows: &'a [overseer_core::session::SessionInfo],
+    filter: &str,
+) -> Vec<&'a overseer_core::session::SessionInfo> {
+    rows.iter()
+        .filter(|s| {
+            let hay = format!(
+                "{} {} {}",
+                s.id,
+                s.cwd,
+                s.first_user.as_deref().unwrap_or("")
+            );
+            subseq_match(&hay, filter)
+        })
+        .collect()
+}
+
+fn subseq_match(hay: &str, needle: &str) -> bool {
+    let mut it = hay.chars().flat_map(char::to_lowercase);
+    for nc in needle.chars().flat_map(char::to_lowercase) {
+        loop {
+            match it.next() {
+                Some(hc) if hc == nc => break,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Render an open overlay picker into live-region lines.
+fn overlay_lines(o: &Overlay, _width: u16) -> Vec<Line<'static>> {
+    use crate::theme;
+    match o {
+        Overlay::Sessions {
+            rows,
+            sel,
+            filter,
+            wide,
+        } => {
+            let mut out = vec![
+                Line::from(Span::styled(
+                    "sessions — type to filter · ↑↓ select · tab preview · enter switch · esc close",
+                    theme::DIM,
+                )),
+                Line::from(vec![
+                    Span::styled("> ", theme::DIALOG_KEY),
+                    Span::styled(format!("{filter}▌"), theme::DIALOG),
+                ]),
+            ];
+            let shown = filtered_sessions(rows, filter);
+            if shown.is_empty() {
+                out.push(Line::from(Span::styled(
+                    "  no matching sessions".to_string(),
+                    theme::DIM,
+                )));
+            }
+            for (i, s) in shown.iter().take(6).enumerate() {
+                let cur = i == *sel;
+                let mark = if cur { "›" } else { " " };
+                let when = rel_time(s.last_ms);
+                let head = format!(
+                    "{mark} {when} · {} · {}",
+                    short_id(&s.id),
+                    s.first_user.as_deref().unwrap_or("(no prompt)")
+                );
+                out.push(Line::from(Span::styled(
+                    head,
+                    if cur { theme::DIALOG_SEL } else { theme::DIALOG },
+                )));
+                if *wide {
+                    out.push(Line::from(Span::styled(
+                        format!(
+                            "    {} · {} · {} events · {} checkpoint(s)",
+                            s.cwd,
+                            s.model,
+                            s.events,
+                            s.checkpoints.len()
+                        ),
+                        theme::DIM,
+                    )));
+                }
+            }
+            out
+        }
+        Overlay::Rewind { rows, sel } => {
+            let mut out = vec![Line::from(Span::styled(
+                "rewind — ↑↓ select · enter restore files+conversation · esc close",
+                theme::DIM,
+            ))];
+            for (i, r) in rows.iter().take(6).enumerate() {
+                let cur = i == *sel;
+                let mark = if cur { "›" } else { " " };
+                out.push(Line::from(Span::styled(
+                    format!("{mark} e{} · {} file(s) · {}", r.boundary, r.files, r.label),
+                    if cur { theme::DIALOG_SEL } else { theme::DIALOG },
+                )));
+            }
+            out
+        }
+    }
+}
+
+fn short_id(id: &str) -> String {
+    if id.len() > 12 {
+        format!("…{}", &id[id.len() - 10..])
+    } else {
+        id.to_string()
+    }
+}
+
+fn rel_time(ts_ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let ago = now.saturating_sub(ts_ms) / 1000;
+    if ago < 60 {
+        format!("{ago}s")
+    } else if ago < 3600 {
+        format!("{}m", ago / 60)
+    } else if ago < 86400 {
+        format!("{}h", ago / 3600)
+    } else {
+        format!("{}d", ago / 86400)
+    }
+}
+
+/// Files recorded in checkpoint e<N>'s manifest (the picker's count).
+fn manifest_files(session_dir: &std::path::Path, boundary: u64) -> u32 {
+    let p = session_dir
+        .join("checkpoints")
+        .join(format!("e{boundary}"))
+        .join("manifest.jsonl");
+    std::fs::read_to_string(p)
+        .map(|m| m.lines().count() as u32)
+        .unwrap_or(0)
 }
 
 /// Wrap a draw/insert in synchronized-update markers when probed —

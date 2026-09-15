@@ -15,5 +15,7 @@ pub mod perm;
 pub mod profile;
 pub mod prompt;
 pub mod provider;
+pub mod rewind;
+pub mod session;
 pub mod stuck;
 pub mod tools;
