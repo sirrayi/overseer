@@ -42,6 +42,10 @@ pub struct AgentConfig {
     /// (playbook Ch.3 §9.2: budget to the *effective* window, not the
     /// advertised one). `None` → the model profile's `compact_at` default.
     pub compact_at: Option<f32>,
+    /// File-based memory dir (playbook Ch.3 §9.4): INDEX.md is injected at
+    /// the end of the static prompt region each turn. None = memory off.
+    /// Must sit under `cwd` for the permission gate to allow writes.
+    pub memory_dir: Option<PathBuf>,
 }
 
 impl Default for AgentConfig {
@@ -56,6 +60,7 @@ impl Default for AgentConfig {
             full_access: false,
             auto_compact: true,
             compact_at: None,
+            memory_dir: None,
         }
     }
 }
@@ -136,6 +141,9 @@ impl<'a> Agent<'a> {
             pending_compact: false,
             ctx_wall_stop: false,
         };
+        if let Some(dir) = agent.config.memory_dir.clone() {
+            crate::memory::ensure(&dir)?;
+        }
         let cwd = agent.config.cwd.display().to_string();
         agent.log.append(EventKind::SessionStart {
             session_id,
@@ -190,10 +198,6 @@ impl<'a> Agent<'a> {
         self.emit(EventKind::UserInput { text: input.into() }, on_event)?;
 
         let mut steps = 0u32;
-        let system = [SystemSegment {
-            text: SYSTEM_PROMPT.into(),
-            cacheable: true,
-        }];
         let profile = profile::lookup(&self.config.model);
 
         loop {
@@ -229,6 +233,21 @@ impl<'a> Agent<'a> {
                         cost_usd: self.ledger.total_cost_usd,
                     });
                 }
+            }
+
+            // System segments assemble per turn: the static prompt is
+            // byte-stable; the memory index sits at the end of the static
+            // region (playbook Ch.3 §9.3) so an edit only invalidates cache
+            // from that segment onward — tools+prompt stay warm.
+            let mut system = vec![SystemSegment {
+                text: SYSTEM_PROMPT.into(),
+                cacheable: true,
+            }];
+            if let Some(dir) = &self.config.memory_dir {
+                system.push(SystemSegment {
+                    text: crate::memory::index_segment(dir),
+                    cacheable: true,
+                });
             }
 
             let req = Request {
@@ -413,6 +432,11 @@ impl<'a> Agent<'a> {
 
             self.emit(EventKind::TurnEnd { step: steps }, on_event)?;
             self.log.flush()?;
+            // Git-version memory at the durable-tail point (playbook: free
+            // history/diff/rollback). Engine-made commit, best-effort.
+            if let Some(dir) = &self.config.memory_dir {
+                crate::memory::commit(dir, &format!("turn {steps}"));
+            }
         }
     }
 
@@ -530,21 +554,27 @@ mod tests {
     use std::sync::Mutex;
 
     /// Scripted provider: pops one response per call, then keeps returning
-    /// the last one forever.
+    /// the last one forever. Records the system segments it was shown.
     struct Mock {
         responses: Mutex<VecDeque<Response>>,
+        seen_systems: Mutex<Vec<Vec<String>>>,
     }
 
     impl Mock {
         fn new(responses: Vec<Response>) -> Self {
             Mock {
                 responses: Mutex::new(VecDeque::from(responses)),
+                seen_systems: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl Provider for Mock {
-        fn complete(&self, _req: &Request) -> Result<Response, ProviderError> {
+        fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
+            self.seen_systems
+                .lock()
+                .unwrap()
+                .push(req.system.iter().map(|s| s.text.clone()).collect());
             let mut q = self.responses.lock().unwrap();
             if q.len() > 1 {
                 Ok(q.pop_front().unwrap())
@@ -669,5 +699,35 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e.kind, EventKind::Compaction { .. })));
+    }
+
+    /// With memory enabled, the provider sees a second system segment
+    /// carrying INDEX.md — appended *after* the static prompt (end of the
+    /// static region), updated across turns, and git-versioned.
+    #[test]
+    fn memory_index_reaches_provider() {
+        let dir = tmpdir();
+        let memdir = dir.join("memory");
+        std::fs::create_dir_all(&memdir).unwrap();
+        std::fs::write(memdir.join("INDEX.md"), "facts.md — user facts\n").unwrap();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            memory_dir: Some(memdir.clone()),
+            ..AgentConfig::default()
+        };
+        let provider = Mock::new(vec![tool_turn(1), done()]);
+        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        agent.run_turn("hi", &mut sink).unwrap();
+
+        let seen = provider.seen_systems.lock().unwrap();
+        assert_eq!(seen[0].len(), 2);
+        assert!(seen[0][1].contains("## Memory index"));
+        assert!(seen[0][1].contains("facts.md — user facts"));
+        // Static prompt segment stays first and byte-stable.
+        assert!(seen[0][0].contains("Overseer"));
+        // Git-versioned: a commit landed at the turn boundary.
+        assert!(memdir.join(".git").exists());
     }
 }
