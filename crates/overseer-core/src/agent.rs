@@ -10,6 +10,7 @@ use crate::ir::{Block, Message};
 use crate::ledger::{Ledger, UsageRecord};
 use crate::profile;
 use crate::provider::{Provider, Request, StopReason, SystemSegment};
+use crate::stuck::StuckDetector;
 use crate::tools::{ToolCtx, ToolRegistry};
 
 /// Static system prompt — kept minimal and byte-stable (Invariant 2:
@@ -48,9 +49,24 @@ impl Default for AgentConfig {
 }
 
 pub enum RunOutcome {
-    Completed { steps: u32, cost_usd: f64 },
-    StepBudgetExceeded { steps: u32, cost_usd: f64 },
-    CostBudgetExceeded { steps: u32, cost_usd: f64 },
+    Completed {
+        steps: u32,
+        cost_usd: f64,
+    },
+    StepBudgetExceeded {
+        steps: u32,
+        cost_usd: f64,
+    },
+    CostBudgetExceeded {
+        steps: u32,
+        cost_usd: f64,
+    },
+    /// Stuck detector tripped twice (nudge once, then terminate).
+    Stuck {
+        pattern: String,
+        steps: u32,
+        cost_usd: f64,
+    },
     Provider(String),
 }
 
@@ -64,6 +80,9 @@ pub struct Agent<'a, P: Provider> {
     tools: ToolRegistry,
     messages: Vec<Message>,
     session_dir: PathBuf,
+    stuck: StuckDetector,
+    /// One free course-correction per run; second trip terminates.
+    stuck_nudged: bool,
 }
 
 impl<'a, P: Provider> Agent<'a, P> {
@@ -85,6 +104,8 @@ impl<'a, P: Provider> Agent<'a, P> {
             tools: ToolRegistry::core(),
             messages: Vec::new(),
             session_dir,
+            stuck: StuckDetector::new(),
+            stuck_nudged: false,
         };
         let cwd = agent.config.cwd.display().to_string();
         agent.log.append(EventKind::SessionStart {
@@ -115,6 +136,8 @@ impl<'a, P: Provider> Agent<'a, P> {
             tools: ToolRegistry::core(),
             messages,
             session_dir,
+            stuck: StuckDetector::new(),
+            stuck_nudged: false,
         })
     }
 
@@ -229,6 +252,13 @@ impl<'a, P: Provider> Agent<'a, P> {
                 });
             }
 
+            // Stuck check on the response itself (context-window errors);
+            // any trip is handled AFTER the tool batch so every tool_use
+            // still gets its tool_result (Anthropic's pairing rule).
+            let mut stuck_hit = self
+                .stuck
+                .observe_response(true, resp.stop_reason == StopReason::ContextWindowExceeded);
+
             // Execute tool calls; results merge into one user message.
             let mut ctx = ToolCtx {
                 cwd: self.config.cwd.clone(),
@@ -259,6 +289,12 @@ impl<'a, P: Provider> Agent<'a, P> {
                     on_event,
                 )?;
 
+                if stuck_hit.is_none() {
+                    stuck_hit = self
+                        .stuck
+                        .observe_step(&name, &input, out.is_error, &out.text);
+                }
+
                 results.push(Block::ToolResult {
                     tool_use_id: call_id,
                     content: out.text,
@@ -266,9 +302,50 @@ impl<'a, P: Provider> Agent<'a, P> {
                 });
             }
             self.messages.push(Message::tool_results(results));
+
+            if let Some(pattern) = stuck_hit {
+                if let Some(outcome) = self.on_stuck(pattern, steps, on_event)? {
+                    return Ok(outcome);
+                }
+            }
+
             self.emit(EventKind::TurnEnd { step: steps }, on_event)?;
             self.log.flush()?;
         }
+    }
+
+    /// Handle a detector trip: log it, inject one course-correction nudge,
+    /// terminate on the second trip. Never leaves a partial tool batch.
+    fn on_stuck(
+        &mut self,
+        pattern: crate::stuck::StuckPattern,
+        steps: u32,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<Option<RunOutcome>> {
+        self.emit(
+            EventKind::StuckDetected {
+                pattern: pattern.describe().to_string(),
+            },
+            on_event,
+        )?;
+        if self.stuck_nudged {
+            self.end_run("stuck", steps, on_event)?;
+            return Ok(Some(RunOutcome::Stuck {
+                pattern: pattern.describe().to_string(),
+                steps,
+                cost_usd: self.ledger.total_cost_usd,
+            }));
+        }
+        self.stuck_nudged = true;
+        let text = format!(
+            "[overseer] Stuck detector: {}. Change approach — re-read the actual \
+             error output, inspect real state with a different tool, or stop and \
+             report what's blocking. Repeating this pattern will end the run.",
+            pattern.describe()
+        );
+        self.messages.push(Message::user_text(text.clone()));
+        self.emit(EventKind::Nudge { text }, on_event)?;
+        Ok(None)
     }
 
     /// Append an event and hand it to the sink.

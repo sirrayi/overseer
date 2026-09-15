@@ -10,4 +10,5 @@ pub mod ir;
 pub mod ledger;
 pub mod profile;
 pub mod provider;
+pub mod stuck;
 pub mod tools;
