@@ -47,13 +47,20 @@ def run_one(task: dict, solver_name: str, args) -> dict:
     ws = REPO / "eval" / "workspaces" / task["id"] / solver_name
     sess = REPO / "eval" / "results" / task["id"] / solver_name
     shutil.rmtree(ws, ignore_errors=True)
+    shutil.rmtree(sess, ignore_errors=True)
     ws.mkdir(parents=True)
     sess.mkdir(parents=True, exist_ok=True)
+
+    # Prefer Homebrew's python3 over the Xcode CLT shim — graders run
+    # `python3` and the shim exits 69 when the Xcode licence is unaccepted.
+    env = dict(os.environ)
+    if os.path.isdir("/opt/homebrew/bin"):
+        env["PATH"] = "/opt/homebrew/bin:" + env["PATH"]
 
     setup = task.get("setup")
     if setup:
         subprocess.run(["sh", "-c", setup], cwd=ws, check=True,
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=env)
 
     solver = load_solver(solver_name)
     if solver_name == "overseer":
@@ -67,7 +74,7 @@ def run_one(task: dict, solver_name: str, args) -> dict:
 
     grader = task["grader"]["script"]
     g = subprocess.run(["sh", "-c", grader], cwd=ws,
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=env)
     passed = g.returncode == 0 and result.get("done", False)
     return {
         "task": task["id"], "task_version": task["version"],
