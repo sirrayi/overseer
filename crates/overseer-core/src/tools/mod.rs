@@ -41,6 +41,54 @@ pub struct ToolCtx<'a> {
     pub agent_config: Option<crate::agent::AgentConfig>,
     /// Subagent spawn counter for session-dir naming.
     pub subagent_seq: u64,
+    /// Active checkpoint for this user prompt (P1.9): write/edit snapshot
+    /// files here before touching them. None = checkpointing off.
+    pub checkpoint: Option<&'a mut Checkpoint>,
+}
+
+/// A per-user-prompt checkpoint (P1.9): `dir` holds file snapshots +
+/// `manifest.jsonl`; `done` is the canonical-path set already captured,
+/// so each file is snapshotted once — before its first write.
+pub struct Checkpoint {
+    pub dir: PathBuf,
+    pub done: HashSet<PathBuf>,
+}
+
+/// Snapshot `path` into the active checkpoint before a write/edit touches
+/// it. First-touch only per checkpoint; files that don't exist yet are
+/// recorded with `existed: false` so rewind deletes them. Best-effort —
+/// a snapshot failure never blocks the write itself.
+pub fn snapshot(ctx: &mut ToolCtx, path: &Path) {
+    let Some(cp) = ctx.checkpoint.as_deref_mut() else {
+        return;
+    };
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !cp.done.insert(key.clone()) {
+        return;
+    }
+    let stored = key
+        .to_string_lossy()
+        .replace('/', "%2F")
+        .replace('\\', "%5C");
+    let files_dir = cp.dir.join("files");
+    let _ = std::fs::create_dir_all(&files_dir);
+    let existed = key.exists();
+    if existed {
+        let _ = std::fs::copy(&key, files_dir.join(&stored));
+    }
+    let line = json!({
+        "path": key.to_string_lossy(),
+        "stored": stored,
+        "existed": existed,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cp.dir.join("manifest.jsonl"))
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 /// What a tool produced. `text` is what enters context.
@@ -347,6 +395,7 @@ mod tests {
             provider: None,
             agent_config: None,
             subagent_seq: 0,
+            checkpoint: None,
         }
     }
 
@@ -456,5 +505,60 @@ mod tests {
             std::fs::read_to_string(dir.join("c.json")).unwrap(),
             "{\"a\": 1}"
         );
+    }
+
+    #[test]
+    fn checkpoint_snapshots_before_first_write() {
+        let dir = tmpdir();
+        std::fs::write(dir.join("old.txt"), "original").unwrap();
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut cp = Checkpoint {
+            dir: dir.join("cp/e5"),
+            done: HashSet::new(),
+        };
+        let mut c = ToolCtx {
+            cwd: dir.clone(),
+            session_dir: dir.join("session"),
+            spill_seq: 0,
+            provider: None,
+            agent_config: None,
+            subagent_seq: 0,
+            checkpoint: Some(&mut cp),
+        };
+
+        reg.call(
+            "write",
+            &json!({"path": "old.txt", "content": "v1"}),
+            &mut c,
+        );
+        reg.call(
+            "write",
+            &json!({"path": "old.txt", "content": "v2"}),
+            &mut c,
+        );
+        reg.call(
+            "write",
+            &json!({"path": "new.txt", "content": "fresh"}),
+            &mut c,
+        );
+
+        // One manifest entry per file — the second write didn't re-snapshot.
+        let manifest = std::fs::read_to_string(dir.join("cp/e5/manifest.jsonl")).unwrap();
+        assert_eq!(manifest.lines().count(), 2);
+        let entries: Vec<Value> = manifest
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let old_e = &entries[0];
+        assert_eq!(old_e["existed"], true);
+        // The snapshot holds the PRE-write content.
+        let snap = std::fs::read_to_string(
+            dir.join("cp/e5/files")
+                .join(old_e["stored"].as_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(snap, "original");
+        // A created file is recorded as not existing → rewind deletes it.
+        assert_eq!(entries[1]["existed"], false);
     }
 }
