@@ -65,6 +65,7 @@ impl Default for AgentConfig {
     }
 }
 
+#[derive(Debug)]
 pub enum RunOutcome {
     Completed {
         steps: u32,
@@ -113,6 +114,10 @@ pub struct Agent<'a> {
     /// Last response hit the provider's context wall — if compaction can't
     /// shrink the view further, the run ends rather than looping forever.
     ctx_wall_stop: bool,
+    /// Monotonic spill-file counter for the whole session — kept on the
+    /// agent (not per-turn ToolCtx) so output-N.txt names never collide
+    /// across turns.
+    spill_seq: u64,
 }
 
 impl<'a> Agent<'a> {
@@ -140,6 +145,7 @@ impl<'a> Agent<'a> {
             empty_responses: 0,
             pending_compact: false,
             ctx_wall_stop: false,
+            spill_seq: 0,
         };
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
@@ -166,6 +172,11 @@ impl<'a> Agent<'a> {
         let log = EventLog::open(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::open(session_dir.join("ledger.jsonl"))?;
         let tools = ToolRegistry::core(Self::policy(&config));
+        // Seed the spill counter past existing files so resume can't
+        // overwrite earlier spilled output.
+        let spill_seq = std::fs::read_dir(session_dir.join("tool-outputs"))
+            .map(|d| d.count() as u64)
+            .unwrap_or(0);
         Ok(Agent {
             provider,
             config,
@@ -179,7 +190,15 @@ impl<'a> Agent<'a> {
             empty_responses: 0,
             pending_compact: false,
             ctx_wall_stop: false,
+            spill_seq,
         })
+    }
+
+    /// Swap the tool registry — used to spawn read-only subagents with a
+    /// quarantined toolset (playbook Ch.3 §9.6).
+    pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
+        self.tools = tools;
+        self
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -383,7 +402,10 @@ impl<'a> Agent<'a> {
             let mut ctx = ToolCtx {
                 cwd: self.config.cwd.clone(),
                 session_dir: self.session_dir.clone(),
-                spill_seq: 0,
+                spill_seq: self.spill_seq,
+                provider: Some(self.provider),
+                agent_config: Some(self.config.clone()),
+                subagent_seq: 0,
             };
             let mut results = Vec::new();
             for (call_id, name, input) in calls {
@@ -423,6 +445,8 @@ impl<'a> Agent<'a> {
                 });
             }
             self.messages.push(Message::tool_results(results));
+            // Carry the session-monotonic spill counter forward.
+            self.spill_seq = ctx.spill_seq;
 
             if let Some(pattern) = stuck_hit {
                 if let Some(outcome) = self.on_stuck(pattern, steps, on_event)? {
@@ -729,5 +753,88 @@ mod tests {
         assert!(seen[0][0].contains("Overseer"));
         // Git-versioned: a commit landed at the turn boundary.
         assert!(memdir.join(".git").exists());
+    }
+
+    /// The `task` tool spawns a read-only subagent in an isolated context:
+    /// the parent receives a bounded digest + trace path, the subagent gets
+    /// its own event log under <session>/subagents/, and it cannot write.
+    #[test]
+    fn task_tool_spawns_quarantined_subagent() {
+        let dir = tmpdir();
+        std::fs::write(dir.join("target.txt"), "needle-data").unwrap();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        // Queue order: parent's task call → sub's read call → sub's answer
+        // → parent's final answer (one provider feeds both agents).
+        let task_call = Response {
+            blocks: vec![Block::ToolCall {
+                id: "t1".into(),
+                name: "task".into(),
+                input: serde_json::json!({"prompt": "find the needle in target.txt"}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        };
+        let sub_read = Response {
+            blocks: vec![Block::ToolCall {
+                id: "s1".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "target.txt"}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        };
+        let provider = Mock::new(vec![
+            task_call,
+            sub_read,
+            Response {
+                blocks: vec![Block::Text {
+                    text: "the needle is needle-data".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+                request_bytes: 0,
+                latency_ms: 0,
+            },
+            done(),
+        ]);
+        let mut agent = Agent::start(&provider, cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        let out = agent.run_turn("use a subagent", &mut sink).unwrap();
+        assert!(matches!(out, RunOutcome::Completed { .. }));
+
+        // Parent got the digest + trace pointer, not the raw transcript.
+        // (The digest rides in a ToolResult block, not Text.)
+        let result_text: String = agent.messages()[2]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(result_text.contains("the needle is needle-data"));
+        assert!(result_text.contains("full trace:"));
+
+        // The subagent's isolated session log exists and is self-contained.
+        let sub_log = dir.join("subagents/task-1/events.jsonl");
+        assert!(sub_log.exists());
+        let sub_events = EventLog::replay(&sub_log).unwrap();
+        assert!(sub_events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::UserInput { text } if text.contains("needle"))));
+
+        // Quarantine: the read-only registry has exactly the read tools —
+        // no write/bash/task, so a subagent can neither mutate nor recurse.
+        let ro = crate::tools::ToolRegistry::readonly(crate::perm::Policy::allow_all());
+        let names: Vec<&str> = ro.specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["read", "grep", "glob"]);
     }
 }
