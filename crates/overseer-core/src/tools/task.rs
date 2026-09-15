@@ -238,11 +238,16 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     };
 
     if background {
+        // Claim the slot in the parent before spawning — the in-flight
+        // count is derived from these dirs, so a burst of spawns would
+        // otherwise all pass the bound before any thread started.
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return ToolOutput::err(format!("task: cannot create subagent dir — {e}"));
+        }
         let dir2 = dir.clone();
         let prompt = prompt.to_string();
         let id2 = id.clone();
         std::thread::spawn(move || {
-            let _ = std::fs::create_dir_all(&dir2);
             let (digest, outcome) =
                 run_subagent(provider, cfg, registry, &dir2, &id2, &prompt);
             // Marker last: done.txt is the parent loop's notification.
