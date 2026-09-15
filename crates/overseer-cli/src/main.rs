@@ -441,18 +441,26 @@ fn cmd_exec(args: &[String]) -> i32 {
             return 2;
         }
     };
+    let cwd_canonical = flags
+        .cwd
+        .canonicalize()
+        .unwrap_or_else(|_| flags.cwd.clone());
     let config = AgentConfig {
         model: flags.model.clone(),
         max_steps: flags.max_steps,
         max_cost_usd: flags.max_cost,
         max_output_tokens: 16_384,
         thinking_budget: flags.thinking,
-        cwd: flags.cwd.clone(),
+        // Canonicalize once: every subsystem (snapshots, read dedup, the
+        // permission gate's containment check) assumes an absolute root —
+        // a relative --cwd like "." would silently leak relative paths
+        // into checkpoint manifests and policy checks.
+        cwd: cwd_canonical.clone(),
         full_access: flags.full_access,
         policy_preset: flags.policy,
         auto_compact: flags.auto_compact,
         compact_at: flags.compact_at,
-        memory_dir: flags.memory.then(|| flags.cwd.join("memory")),
+        memory_dir: flags.memory.then(|| cwd_canonical.join("memory")),
         keep_tool_results: flags.keep_results,
         verify_cmd: flags.verify.clone(),
         verify_block_cap: flags.verify_cap,
