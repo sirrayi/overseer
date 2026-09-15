@@ -66,7 +66,11 @@ fn real_main() -> i32 {
 /// terminal frontend. Same engine, same event stream, same flags as
 /// `exec` (minus --json and the positional prompt).
 fn cmd_tui(args: &[String]) -> i32 {
-    let flags = match parse_exec(args) {
+    // --no-tui: line mode — same session plumbing, plain-text REPL
+    // (screen readers, terminals the inline viewport can't drive).
+    let line_mode = args.iter().any(|a| a == "--no-tui");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--no-tui").cloned().collect();
+    let flags = match parse_exec(&args) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("overseer tui: {e}");
@@ -77,7 +81,7 @@ fn cmd_tui(args: &[String]) -> i32 {
         eprintln!("overseer tui: no positional prompt — type inside the session");
         return 2;
     }
-    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    if !line_mode && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         eprintln!("overseer: stdout is not a terminal — use `overseer exec` for pipes/CI");
         return 2;
     }
@@ -90,12 +94,17 @@ fn cmd_tui(args: &[String]) -> i32 {
     };
     let (session_dir, resume) = resolve_session(&flags);
     let config = agent_config(&flags);
-    match overseer_tui::run(overseer_tui::TuiConfig {
+    let cfg = overseer_tui::TuiConfig {
         provider,
         agent: config,
         session_dir,
         resume,
-    }) {
+    };
+    match if line_mode {
+        overseer_tui::run_line(cfg)
+    } else {
+        overseer_tui::run(cfg)
+    } {
         Ok(code) => code,
         Err(e) => {
             eprintln!("overseer tui: {e}");
@@ -290,6 +299,7 @@ fn usage() {
          \n\
          USAGE:\n\
          \x20 overseer [tui] [FLAGS]          interactive TUI (bare `overseer`)\n\
+         \x20 overseer tui --no-tui           line mode (screen readers, plain REPL)\n\
          \x20 overseer exec [FLAGS] <prompt>\n\
          \x20 overseer stats <session-dir>   ledger dashboard (tokens, cache-hit, cost)\n\
          \x20 overseer rewind <session-dir> [--checkpoint <n>] [--mode <m>]\n\

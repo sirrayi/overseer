@@ -1,0 +1,18 @@
+---
+source: crates/overseer-tui/tests/snapshots.rs
+expression: norm(&term)
+---
+
+
+
+
+
+
+
+
+
+
+@src/main.rs
+tab to complete
+❯ @mai
+ workspace  [tmp]

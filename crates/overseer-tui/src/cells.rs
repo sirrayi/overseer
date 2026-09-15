@@ -43,6 +43,9 @@ pub enum Cell {
         summary: String,
         status: ToolStatus,
         output: Option<String>,
+        /// File the call touched — emitted as an OSC 8 link line when
+        /// the cell flushes to scrollback.
+        link: Option<std::path::PathBuf>,
     },
     /// Plan artifact (P1.7 stays user-visible): markdown checklist.
     Plan {
@@ -72,6 +75,14 @@ impl Cell {
         }
     }
 
+    /// A file path worth hyperlinking when this cell flushes (OSC 8).
+    pub fn link_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Cell::Tool { link, .. } => link.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Render at `width` columns. Cells are height-cacheable per width —
     /// the transcript only ever appends.
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -83,8 +94,8 @@ impl Cell {
                     let prefix = if i == 0 { "❯ " } else { "  " };
                     out.extend(wrap_styled(
                         vec![
-                            Span::styled(prefix, theme::PROMPT),
-                            Span::styled(l.to_string(), theme::USER),
+                            Span::styled(prefix, theme::prompt()),
+                            Span::styled(l.to_string(), theme::user()),
                         ],
                         w,
                     ));
@@ -96,10 +107,10 @@ impl Cell {
                 .flat_map(|l| wrap_line(l, w))
                 .collect(),
             Cell::Reasoning { text } => {
-                let mut out = vec![Line::from(Span::styled("thinking", theme::DIM))];
+                let mut out = vec![Line::from(Span::styled("thinking", theme::dim()))];
                 for l in text.lines().take(6) {
                     out.extend(wrap_styled(
-                        vec![Span::styled(format!("  {l}"), theme::REASONING)],
+                        vec![Span::styled(format!("  {l}"), theme::reasoning())],
                         w,
                     ));
                 }
@@ -108,7 +119,7 @@ impl Cell {
             Cell::Plan { markdown } => {
                 let mut out = Vec::new();
                 for l in markdown.lines() {
-                    out.extend(wrap_styled(vec![Span::styled(l.to_string(), theme::META)], w));
+                    out.extend(wrap_styled(vec![Span::styled(l.to_string(), theme::meta())], w));
                 }
                 out
             }
@@ -120,15 +131,15 @@ impl Cell {
                 ..
             } => {
                 let (glyph, st) = match status {
-                    ToolStatus::Running => ("◌", theme::TOOL),
-                    ToolStatus::Ok => ("✓", theme::TOOL_OK),
-                    ToolStatus::Err | ToolStatus::Skipped => ("✗", theme::TOOL_ERR),
-                    ToolStatus::Denied => ("⊘", theme::TOOL_ERR),
+                    ToolStatus::Running => ("◌", theme::tool()),
+                    ToolStatus::Ok => ("✓", theme::tool_ok()),
+                    ToolStatus::Err | ToolStatus::Skipped => ("✗", theme::tool_err()),
+                    ToolStatus::Denied => ("⊘", theme::tool_err()),
                 };
                 let head = vec![
                     Span::styled(format!("{glyph} "), st),
-                    Span::styled(name.clone(), theme::TOOL),
-                    Span::styled(format!(" {summary}"), theme::DIM),
+                    Span::styled(name.clone(), theme::tool()),
+                    Span::styled(format!(" {summary}"), theme::dim()),
                 ];
                 let mut out = wrap_styled(head, w);
                 // Errors stay legible in scrollback: a short tail of the
@@ -137,7 +148,7 @@ impl Cell {
                     if let Some(o) = output {
                         for l in o.lines().take(6) {
                             out.extend(wrap_styled(
-                                vec![Span::styled(format!("    {l}"), theme::DIM)],
+                                vec![Span::styled(format!("    {l}"), theme::dim())],
                                 w,
                             ));
                         }
@@ -244,6 +255,10 @@ pub fn feed(ev: &Event) -> Feed {
             summary: tool_summary(name, input),
             status: ToolStatus::Running,
             output: None,
+            link: input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from),
         }]),
         EventKind::ToolResult {
             call_id,
@@ -276,19 +291,19 @@ pub fn feed(ev: &Event) -> Feed {
             }
         }
         EventKind::Nudge { text } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::META,
+            style: theme::meta(),
             text: format!("⟲ {text}"),
         }]),
         EventKind::StuckDetected { pattern } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::ERROR,
+            style: theme::error(),
             text: format!("⚠ stuck: {pattern}"),
         }]),
         EventKind::Compaction { tail_from, .. } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::DIM,
+            style: theme::dim(),
             text: format!("⧉ context compacted — events before e{tail_from} summarized"),
         }]),
         EventKind::Error { message } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::ERROR,
+            style: theme::error(),
             text: format!("error: {message}"),
         }]),
         EventKind::RunEnd {
@@ -296,7 +311,7 @@ pub fn feed(ev: &Event) -> Feed {
             steps,
             total_cost_usd,
         } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::DIM,
+            style: theme::dim(),
             text: format!("— {stop_reason} · {steps} step(s) · ${total_cost_usd:.4}"),
         }]),
         EventKind::TurnEnd { .. } => Feed::Ignore,
@@ -305,7 +320,7 @@ pub fn feed(ev: &Event) -> Feed {
 
 fn plan_marker() -> Cell {
     Cell::Meta {
-        style: theme::META,
+        style: theme::meta(),
         text: "plan".to_string(),
     }
 }
