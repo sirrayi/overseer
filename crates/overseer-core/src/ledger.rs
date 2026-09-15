@@ -116,4 +116,44 @@ impl Ledger {
         self.calls += 1;
         Ok(())
     }
+
+    /// Read every record in a ledger file (for the stats/dashboard path —
+    /// tolerates a torn tail like the event log).
+    pub fn read_all(path: impl AsRef<Path>) -> Vec<UsageRecord> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<UsageRecord>(l).ok())
+            .collect()
+    }
+
+    /// Session-level aggregates: the cache-hit-rate KPI (Σcache_read /
+    /// Σtotal_input — the SEV metric, target ≥0.90 in-session).
+    pub fn summarize(records: &[UsageRecord]) -> Summary {
+        let mut s = Summary::default();
+        for r in records {
+            s.calls += 1;
+            s.input_tokens += r.fresh_input + r.cache_write + r.cache_read;
+            s.cache_read_tokens += r.cache_read;
+            s.output_tokens += r.output + r.reasoning;
+            s.total_cost_usd += r.cost_usd;
+            s.latency_ms += r.latency_ms;
+        }
+        if s.input_tokens > 0 {
+            s.cache_hit_rate = s.cache_read_tokens as f64 / s.input_tokens as f64;
+        }
+        s
+    }
+}
+
+/// Aggregates over a ledger file — the session's efficiency dashboard.
+#[derive(Debug, Default)]
+pub struct Summary {
+    pub calls: usize,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub output_tokens: u64,
+    pub total_cost_usd: f64,
+    /// Σcache_read / Σtotal_input — the SEV metric (target ≥0.90).
+    pub cache_hit_rate: f64,
+    pub latency_ms: u64,
 }

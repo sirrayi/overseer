@@ -12,6 +12,7 @@ pub mod ledger;
 pub mod memory;
 pub mod perm;
 pub mod profile;
+pub mod prompt;
 pub mod provider;
 pub mod stuck;
 pub mod tools;
