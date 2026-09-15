@@ -56,6 +56,9 @@ pub enum EventKind {
         raw_bytes: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         spilled_to: Option<String>,
+        /// True when the permission gate denied the call (never executed).
+        #[serde(default)]
+        denied: bool,
     },
     /// Turn boundary — fsync point, durable-tail marker.
     TurnEnd {
@@ -301,6 +304,7 @@ mod tests {
                 is_error: false,
                 raw_bytes: 4,
                 spilled_to: None,
+                denied: false,
             })
             .unwrap();
         }

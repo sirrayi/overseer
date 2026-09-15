@@ -40,6 +40,8 @@ pub struct ToolOutput {
     /// Bytes of the raw result before truncation/spill.
     pub raw_bytes: u64,
     pub spilled_to: Option<String>,
+    /// True when the permission gate denied the call (it never ran).
+    pub denied: bool,
 }
 
 impl ToolOutput {
@@ -50,6 +52,7 @@ impl ToolOutput {
             is_error: false,
             raw_bytes: raw,
             spilled_to: None,
+            denied: false,
         }
     }
     pub fn err(msg: impl Into<String>) -> Self {
@@ -60,20 +63,30 @@ impl ToolOutput {
             is_error: true,
             raw_bytes: raw,
             spilled_to: None,
+            denied: false,
         }
+    }
+    /// The gate denied the call — never executed, auditable via `denied`.
+    pub fn denied(reason: String) -> Self {
+        let mut o = Self::err(format!("Permission denied: {reason}"));
+        o.denied = true;
+        o
     }
 }
 
 /// The resident tool registry + per-session tool state (e.g. the read-before-
 /// edit tracker — a harness-enforced anti-hallucination invariant, Ch.4 §2.3).
+/// Owns the permission policy: the gate lives at the dispatch boundary so no
+/// caller path can skip it (Invariant 3).
 pub struct ToolRegistry {
     pub specs: Vec<crate::provider::ToolSpec>,
     /// Paths the agent has read this session (canonicalized).
     read_paths: HashSet<PathBuf>,
+    policy: crate::perm::Policy,
 }
 
 impl ToolRegistry {
-    pub fn core() -> Self {
+    pub fn core(policy: crate::perm::Policy) -> Self {
         ToolRegistry {
             specs: vec![
                 bash::spec(),
@@ -84,6 +97,7 @@ impl ToolRegistry {
                 glob::spec(),
             ],
             read_paths: HashSet::new(),
+            policy,
         }
     }
 
@@ -99,9 +113,17 @@ impl ToolRegistry {
             .unwrap_or(false)
     }
 
-    /// Dispatch a tool call. Never panics: unknown names and bad inputs become
-    /// error ToolOutputs that teach the model the contract.
+    /// Dispatch a tool call. The permission gate runs first — Deny and
+    /// (headless) Ask both return a denied ToolOutput; the call never runs.
+    /// Never panics: unknown names and bad inputs become error ToolOutputs
+    /// that teach the model the contract.
     pub fn call(&mut self, name: &str, input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
+        match self.policy.check(name, input) {
+            crate::perm::Verdict::Allow => {}
+            crate::perm::Verdict::Ask { reason } | crate::perm::Verdict::Deny { reason } => {
+                return ToolOutput::denied(reason);
+            }
+        }
         let out = match name {
             "bash" => bash::run(input, ctx),
             "read" => read::run(input, ctx, self),
@@ -141,6 +163,7 @@ pub fn enforce_budget(out: ToolOutput, ctx: &mut ToolCtx) -> ToolOutput {
             is_error: out.is_error,
             raw_bytes: out.raw_bytes.max(size as u64),
             spilled_to: Some(path.display().to_string()),
+            denied: out.denied,
         },
         Err(e) => {
             // Fall back to middle-truncation if the spill write failed.
@@ -154,6 +177,7 @@ pub fn enforce_budget(out: ToolOutput, ctx: &mut ToolCtx) -> ToolOutput {
                 is_error: true,
                 raw_bytes: out.raw_bytes.max(size as u64),
                 spilled_to: None,
+                denied: out.denied,
             }
         }
     }
