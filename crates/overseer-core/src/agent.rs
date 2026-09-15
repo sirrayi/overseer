@@ -71,6 +71,11 @@ pub enum RunOutcome {
         steps: u32,
         cost_usd: f64,
     },
+    /// Three consecutive responses with no text and no tool calls.
+    EmptyResponse {
+        steps: u32,
+        cost_usd: f64,
+    },
     Provider(String),
 }
 
@@ -87,6 +92,8 @@ pub struct Agent<'a> {
     stuck: StuckDetector,
     /// One free course-correction per run; second trip terminates.
     stuck_nudged: bool,
+    /// Consecutive responses with no text and no tool calls (silent-END).
+    empty_responses: u8,
 }
 
 impl<'a> Agent<'a> {
@@ -111,6 +118,7 @@ impl<'a> Agent<'a> {
             session_dir,
             stuck: StuckDetector::new(),
             stuck_nudged: false,
+            empty_responses: 0,
         };
         let cwd = agent.config.cwd.display().to_string();
         agent.log.append(EventKind::SessionStart {
@@ -144,6 +152,7 @@ impl<'a> Agent<'a> {
             session_dir,
             stuck: StuckDetector::new(),
             stuck_nudged: false,
+            empty_responses: 0,
         })
     }
 
@@ -250,13 +259,45 @@ impl<'a> Agent<'a> {
                 })
                 .unwrap_or_default();
 
-            if calls.is_empty() || resp.stop_reason == StopReason::EndTurn {
+            // Silent-END guard (playbook failure matrix): a response with no
+            // tool calls AND no visible text is a malformed finish — the model
+            // "thought" but produced nothing. Nudge and continue; three
+            // consecutive empties terminate the run.
+            if calls.is_empty() {
+                let has_text = self
+                    .messages
+                    .last()
+                    .map(|m| {
+                        m.content
+                            .iter()
+                            .any(|b| matches!(b, Block::Text { text } if !text.trim().is_empty()))
+                    })
+                    .unwrap_or(false);
+                if !has_text {
+                    self.empty_responses += 1;
+                    if self.empty_responses >= 3 {
+                        self.end_run("empty_response", steps, on_event)?;
+                        return Ok(RunOutcome::EmptyResponse {
+                            steps,
+                            cost_usd: self.ledger.total_cost_usd,
+                        });
+                    }
+                    let text = "[overseer] Your previous turn produced no visible \
+                                output and no tool calls. Continue working — act, \
+                                or explain what is blocking you."
+                        .to_string();
+                    self.messages.push(Message::user_text(text.clone()));
+                    self.emit(EventKind::Nudge { text }, on_event)?;
+                    continue;
+                }
+                self.empty_responses = 0;
                 self.end_run(resp.stop_reason.as_str(), steps, on_event)?;
                 return Ok(RunOutcome::Completed {
                     steps,
                     cost_usd: self.ledger.total_cost_usd,
                 });
             }
+            self.empty_responses = 0;
 
             // Stuck check on the response itself (context-window errors);
             // any trip is handled AFTER the tool batch so every tool_use
