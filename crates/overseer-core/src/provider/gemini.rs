@@ -79,11 +79,18 @@ impl Gemini {
             Vec::new()
         } else {
             vec![json!({
-                "function_declarations": req.tools.iter().map(|t| json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.input_schema,
-                })).collect::<Vec<_>>()
+                "function_declarations": req.tools.iter().map(|t| {
+                    // Gemini takes an OpenAPI-3 subset — full JSON-Schema
+                    // keys (additionalProperties, default, …) 400 the
+                    // whole request. Strip recursively.
+                    let mut schema = t.input_schema.clone();
+                    sanitize_schema(&mut schema);
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": schema,
+                    })
+                }).collect::<Vec<_>>()
             })]
         };
 
@@ -208,6 +215,38 @@ impl Gemini {
             request_bytes,
             latency_ms,
         })
+    }
+}
+
+/// Strip JSON-Schema keys the Gemini API rejects (verified live: a
+/// single `additionalProperties` anywhere in the tree → 400 on the whole
+/// request). Objects recurse, arrays recurse, scalars pass.
+fn sanitize_schema(v: &mut Value) {
+    const UNSUPPORTED: &[&str] = &[
+        "additionalProperties",
+        "default",
+        "propertyOrdering",
+        "minItems",
+        "maxItems",
+        "pattern",
+        "minLength",
+        "maxLength",
+    ];
+    match v {
+        Value::Object(m) => {
+            for k in UNSUPPORTED {
+                m.remove(*k);
+            }
+            for (_, child) in m.iter_mut() {
+                sanitize_schema(child);
+            }
+        }
+        Value::Array(a) => {
+            for child in a.iter_mut() {
+                sanitize_schema(child);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -441,6 +480,31 @@ mod tests {
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             777
         );
+    }
+
+    #[test]
+    fn schema_sanitizer_strips_recursively() {
+        let mut s = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {"x": {"type": "string", "default": "d"}}
+                    }
+                }
+            }
+        });
+        sanitize_schema(&mut s);
+        assert!(s.get("additionalProperties").is_none());
+        let nested = &s["properties"]["items"]["items"];
+        assert!(nested.get("additionalProperties").is_none());
+        assert!(nested["properties"]["x"].get("default").is_none());
+        // Supported keys survive.
+        assert_eq!(s["properties"]["items"]["type"], "array");
     }
 
     #[test]
