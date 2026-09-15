@@ -47,6 +47,14 @@ pub fn assemble(config: &AgentConfig) -> Vec<SystemSegment> {
             cacheable: true,
         });
     }
+    // Skill metadata (P3.5): resident pointer lines; bodies load on
+    // demand via the `skill` tool. Static tail — installs are rare.
+    if let Some(seg) = crate::skills::index_segment(&config.cwd) {
+        segments.push(SystemSegment {
+            text: seg,
+            cacheable: true,
+        });
+    }
     // --- DYNAMIC boundary: non-cacheable per-turn sections go below. ---
     segments
 }
