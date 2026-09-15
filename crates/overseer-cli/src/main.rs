@@ -226,6 +226,10 @@ fn cmd_exec(args: &[String]) -> i32 {
             eprintln!("cost budget exceeded at {steps} steps (${cost_usd:.4})");
             3
         }
+        Ok(RunOutcome::Stuck { pattern, steps, .. }) => {
+            eprintln!("run terminated — stuck: {pattern} ({steps} steps)");
+            5
+        }
         Ok(RunOutcome::Provider(msg)) => {
             eprintln!("provider error: {msg}");
             4

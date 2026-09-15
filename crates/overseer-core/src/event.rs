@@ -67,6 +67,15 @@ pub enum EventKind {
         steps: u32,
         total_cost_usd: f64,
     },
+    /// Stuck detector tripped — records which of the five patterns fired.
+    StuckDetected {
+        pattern: String,
+    },
+    /// Harness-injected course-correction, delivered as a user-role message.
+    /// Rehydrates into context like UserInput but is provably not user-typed.
+    Nudge {
+        text: String,
+    },
     Error {
         message: String,
     },
@@ -198,7 +207,7 @@ pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
 
     for ev in events {
         match &ev.kind {
-            EventKind::UserInput { text } => {
+            EventKind::UserInput { text } | EventKind::Nudge { text } => {
                 flush_results(&mut pending_results, &mut messages);
                 messages.push(Message::user_text(text.clone()));
             }
