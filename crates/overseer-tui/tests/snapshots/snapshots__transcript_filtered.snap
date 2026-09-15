@@ -17,6 +17,6 @@ expression: screen(&term)
 I'll look at the test file.
 / parser▌
 ❯ add a parser
-1 lines · type to filter · ↑↓/pgdn · esc
+1 lines · type to filter · ↑↓/pgdn · tab expand tools · esc
 ❯
  workspace  /repo                        test-model · $0.000

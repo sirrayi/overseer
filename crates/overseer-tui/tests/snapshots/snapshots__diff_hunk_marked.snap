@@ -1,6 +1,6 @@
 ---
 source: crates/overseer-tui/tests/snapshots.rs
-expression: norm(&term)
+expression: "screen(&term).replace(&dirname, \"[root]\")"
 ---
 
 
@@ -12,9 +12,9 @@ expression: norm(&term)
 
 
 
-    -line two
-    +line CHANGED
-    +line three
+     line 7
+     line 8
+    -line 9
 ↑↓ file · ←→ hunk · space reject · enter revert · esc
 ❯
  workspace  /repo                        test-model · $0.000

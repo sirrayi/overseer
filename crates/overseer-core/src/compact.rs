@@ -250,6 +250,7 @@ mod tests {
                     cwd: "/t".into(),
                     model: "m".into(),
                     harness_version: "0".into(),
+                    parent: None,
                 },
             ),
             ev(

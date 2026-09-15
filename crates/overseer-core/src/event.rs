@@ -29,6 +29,11 @@ pub enum EventKind {
         cwd: String,
         model: String,
         harness_version: String,
+        /// Session this one forked from (its session_id) — the JSONL
+        /// tree's cross-session edge. `#[serde(default)]` keeps
+        /// pre-fork logs loadable.
+        #[serde(default)]
+        parent: Option<String>,
     },
     UserInput {
         text: String,
@@ -322,6 +327,7 @@ mod tests {
                 cwd: "/tmp".into(),
                 model: "m".into(),
                 harness_version: "0.1.0".into(),
+                parent: None,
             })
             .unwrap();
             log.append(EventKind::UserInput {

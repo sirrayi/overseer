@@ -24,6 +24,9 @@ pub struct SessionInfo {
     pub first_user: Option<String>,
     /// Checkpoint boundaries (`e<N>` ids) present on disk.
     pub checkpoints: Vec<u64>,
+    /// Session this forked from (SessionStart.parent) — the `/tree`
+    /// navigator's edges. None for roots and pre-fork logs.
+    pub parent: Option<String>,
 }
 
 /// List sessions under `root` (e.g. `~/.overseer/sessions`), most recent
@@ -55,6 +58,42 @@ pub fn for_cwd(root: &Path, cwd: &Path) -> Vec<SessionInfo> {
         .into_iter()
         .filter(|s| s.cwd == want.as_ref())
         .collect()
+}
+
+/// The `/tree` navigator's ordering: DFS over the fork forest —
+/// (info, depth) pairs, parents before their children. Roots are
+/// sessions with `parent: None` or a parent that isn't listed (a fork
+/// whose origin was pruned still shows, as a root). Each sibling group
+/// sorts by recency. Deterministic; a session appears exactly once.
+pub fn tree(root: &Path) -> Vec<(SessionInfo, usize)> {
+    let all = list(root);
+    let known: std::collections::HashSet<String> =
+        all.iter().map(|s| s.id.clone()).collect();
+    let mut children: std::collections::HashMap<Option<String>, Vec<SessionInfo>> =
+        std::collections::HashMap::new();
+    for s in all {
+        let key = match &s.parent {
+            Some(p) if known.contains(p.as_str()) => Some(p.clone()),
+            _ => None,
+        };
+        children.entry(key).or_default().push(s);
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<SessionInfo> = children
+        .remove(&None)
+        .unwrap_or_default();
+    stack.sort_by_key(|s| s.last_ms); // pop() → most recent first
+    // Depth-first: each pop pushes its children so they render right
+    // under their parent. Depth tracked parallel to the stack.
+    let mut stack: Vec<(SessionInfo, usize)> =
+        stack.into_iter().map(|s| (s, 0)).collect();
+    while let Some((info, depth)) = stack.pop() {
+        let mut kids = children.remove(&Some(info.id.clone())).unwrap_or_default();
+        kids.sort_by_key(|s| s.last_ms);
+        stack.extend(kids.into_iter().map(|k| (k, depth + 1)));
+        out.push((info, depth));
+    }
+    out
 }
 
 /// The most recently active session dir — `--last` (any cwd) or
@@ -114,6 +153,7 @@ fn summarize(dir: &Path) -> Option<SessionInfo> {
         events: 0,
         first_user: None,
         checkpoints: checkpoints(dir),
+        parent: None,
     };
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -143,6 +183,11 @@ fn summarize(dir: &Path) -> Option<SessionInfo> {
                     .and_then(|s| s.as_str())
                     .unwrap_or_default()
                     .to_string();
+                // The LAST SessionStart carries fork provenance —
+                // earlier ones in a copied log are the parent's.
+                if let Some(p) = v.get("parent").and_then(|p| p.as_str()) {
+                    info.parent = Some(p.to_string());
+                }
             }
             Some("user_input") if info.first_user.is_none() => {
                 info.first_user = v
@@ -219,12 +264,20 @@ pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::i
     // stays in the copied history as provenance). The id comes from the
     // new dirname; cwd/model inherit the parent's last SessionStart.
     let events = EventLog::replay(new_dir.join("events.jsonl")).unwrap_or_default();
-    let parent_start = events.iter().find_map(|e| match &e.kind {
-        EventKind::SessionStart { cwd, model, .. } => Some((cwd.clone(), model.clone())),
+    // The parent's identity comes from ITS LAST SessionStart — in a
+    // previously-forked log, earlier starts belong to grandparents.
+    let parent_start = events.iter().rev().find_map(|e| match &e.kind {
+        EventKind::SessionStart {
+            session_id,
+            cwd,
+            model,
+            ..
+        } => Some((session_id.clone(), cwd.clone(), model.clone())),
         _ => None,
     });
     if let Ok(mut log) = EventLog::open(new_dir.join("events.jsonl")) {
-        let (cwd, model) = parent_start.unwrap_or_default();
+        let (parent_id, cwd, model) =
+            parent_start.unwrap_or_else(|| (String::new(), String::new(), String::new()));
         let id = new_dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -234,6 +287,11 @@ pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::i
             cwd,
             model,
             harness_version: env!("CARGO_PKG_VERSION").to_string(),
+            parent: if parent_id.is_empty() {
+                None
+            } else {
+                Some(parent_id)
+            },
         });
     }
     Ok(())
@@ -299,6 +357,7 @@ mod tests {
             cwd: cwd.into(),
             model: "test-model".into(),
             harness_version: "0".into(),
+            parent: None,
         })
         .unwrap();
         for text in inputs {
@@ -423,6 +482,104 @@ mod tests {
             Some("fix the flaky test")
         );
         assert_eq!(checkpoint_label(&dir, 3), None, "e3 is a ModelResponse");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fork_records_parentage() {
+        let root = tmpdir("parentage");
+        let src = mk_session(&root, "src", "/work", &["one"]);
+        let dst = root.join("child");
+        fork(&src, None, &dst).unwrap();
+
+        // The fork's own SessionStart names its parent.
+        let events = EventLog::replay(dst.join("events.jsonl")).unwrap();
+        match &events.last().unwrap().kind {
+            EventKind::SessionStart {
+                session_id, parent, ..
+            } => {
+                assert_eq!(session_id, "child");
+                assert_eq!(parent.as_deref(), Some("src"));
+            }
+            other => panic!("expected SessionStart, got {other:?}"),
+        }
+        // And it survives the summary path.
+        let info = list(&root)
+            .into_iter()
+            .find(|s| s.dir == dst)
+            .unwrap();
+        assert_eq!(info.parent.as_deref(), Some("src"));
+        // The source session stays a root.
+        let src_info = list(&root).into_iter().find(|s| s.dir == src).unwrap();
+        assert_eq!(src_info.parent, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn logs_without_parent_field_still_load() {
+        // A pre-fork-era SessionStart line has no `parent` key at all.
+        let root = tmpdir("legacy");
+        let dir = root.join("old");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("events.jsonl"),
+            "{\"id\":1,\"ts_ms\":1,\"type\":\"session_start\",\"session_id\":\"old\",\"cwd\":\"/w\",\"model\":\"m\",\"harness_version\":\"0\"}\n\
+             {\"id\":2,\"ts_ms\":2,\"type\":\"user_input\",\"text\":\"hi\"}\n",
+        )
+        .unwrap();
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        assert_eq!(events.len(), 2);
+        match &events[0].kind {
+            EventKind::SessionStart { parent, .. } => assert_eq!(parent, &None),
+            other => panic!("expected SessionStart, got {other:?}"),
+        }
+        let info = list(&root).into_iter().next().unwrap();
+        assert_eq!(info.parent, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tree_orders_parents_before_children() {
+        let root = tmpdir("tree");
+        let a = mk_session(&root, "root-a", "/w", &["a"]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let b = root.join("child-b");
+        fork(&a, None, &b).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let c = root.join("grandchild-c");
+        fork(&b, None, &c).unwrap();
+        let d = mk_session(&root, "root-d", "/w", &["d"]);
+
+        let t = tree(&root);
+        let order: Vec<(&str, usize)> = t
+            .iter()
+            .map(|(s, d)| (s.id.as_str(), *d))
+            .collect();
+        // DFS: each parent's subtree completes before the next root.
+        let pos = |id: &str| order.iter().position(|(s, _)| *s == id).unwrap();
+        assert!(pos("root-a") < pos("child-b"));
+        assert!(pos("child-b") < pos("grandchild-c"));
+        assert_eq!(order[pos("child-b")].1, 1);
+        assert_eq!(order[pos("grandchild-c")].1, 2);
+        assert_eq!(order[pos("root-d")].1, 0);
+        assert_eq!(t.len(), 4, "every session exactly once");
+        let _ = (a, b, c, d);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tree_treats_orphaned_parent_as_root() {
+        // Fork a session, then delete the parent's log — the fork lists
+        // as a root rather than disappearing.
+        let root = tmpdir("orphan");
+        let src = mk_session(&root, "gone", "/w", &["x"]);
+        let dst = root.join("kid");
+        fork(&src, None, &dst).unwrap();
+        std::fs::remove_dir_all(&src).unwrap();
+        let t = tree(&root);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].0.id, "kid");
+        assert_eq!(t[0].1, 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -185,6 +185,7 @@ mod tests {
             cwd: "/work".into(),
             model: "m".into(),
             harness_version: "0".into(),
+            parent: None,
         })
         .unwrap();
         for i in 0..turns {
