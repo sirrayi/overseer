@@ -79,9 +79,10 @@ impl Policy {
             return Verdict::Allow;
         }
         match tool {
-            // Read-only tools: allow. (Subagent read-quarantine is enforced
-            // separately — reads >threshold return stubs there.)
-            "read" | "grep" | "glob" => Verdict::Allow,
+            // Read-only tools: allow. `task` is allowed at the gate — its
+            // safety is the subagent's read-only registry + step ceiling,
+            // enforced inside the tool, not by this check.
+            "read" | "grep" | "glob" | "task" => Verdict::Allow,
 
             // Side-effecting file tools: must stay inside the root.
             "write" | "edit" => {
