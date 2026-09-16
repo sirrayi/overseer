@@ -1,0 +1,16 @@
+{
+  "id": "makefile-tabs",
+  "version": 1,
+  "tags": ["build", "fix"],
+  "difficulty": "med",
+  "instruction": "Makefile has a 'missing separator' error — recipes were indented with spaces. Fix it (tab-indented recipes) so `make greet` prints 'hello' and `make clean` removes out.txt.",
+  "setup": "cat > Makefile <<'EOF'\ngreet:\n    echo hello\n\nout.txt:\n    echo data > out.txt\n\nclean:\n    rm -f out.txt\nEOF",
+  "grader": {
+    "type": "bash_assert",
+    "script": "make greet | grep -qx hello && make out.txt && test -f out.txt && make clean && test ! -f out.txt"
+  },
+  "oracle": {
+    "script": "printf 'greet:\\n\\techo hello\\n\\nout.txt:\\n\\techo data > out.txt\\n\\nclean:\\n\\trm -f out.txt\\n' > Makefile"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}

@@ -1,0 +1,16 @@
+{
+  "id": "parallel-jobs",
+  "version": 1,
+  "tags": ["shell", "concurrency"],
+  "difficulty": "med",
+  "instruction": "run.sh runs three 1-second sleep jobs sequentially (takes ~3s). Rewrite it to run them in parallel (all three as background jobs + wait), so it finishes in ~1s and still writes done to done.txt when all complete.",
+  "setup": "cat > run.sh <<'EOF'\n#!/bin/bash\nsleep 1 && echo a >> jobs.txt\nsleep 1 && echo b >> jobs.txt\nsleep 1 && echo c >> jobs.txt\necho done > done.txt\nEOF\nchmod +x run.sh",
+  "grader": {
+    "type": "bash_assert",
+    "script": "rm -f jobs.txt done.txt && START=$(date +%s) && bash run.sh && END=$(date +%s) && [ $((END-START)) -le 2 ] && [ \"$(sort jobs.txt | tr -d '\\n')\" = abc ] && grep -qx done done.txt"
+  },
+  "oracle": {
+    "script": "cat > run.sh <<'EOF'\n#!/bin/bash\nsleep 1 && echo a >> jobs.txt &\nsleep 1 && echo b >> jobs.txt &\nsleep 1 && echo c >> jobs.txt &\nwait\necho done > done.txt\nEOF\nrm -f jobs.txt done.txt && bash run.sh"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}

@@ -1,0 +1,16 @@
+{
+  "id": "sqlite-top",
+  "version": 1,
+  "tags": ["script", "sql"],
+  "difficulty": "med",
+  "instruction": "app.db has a table orders(customer, amount). Write top.py printing the customer with the highest total amount and that total as 'name total' (integer). Run it.",
+  "setup": "python3 -c \"import sqlite3; c=sqlite3.connect('app.db'); c.execute('create table orders(customer text, amount int)'); c.executemany('insert into orders values (?,?)', [('ann',5),('bob',9),('ann',7),('bob',1)]); c.commit(); c.close()\"",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 top.py | grep -qx 'ann 12'"
+  },
+  "oracle": {
+    "script": "cat > top.py <<'EOF'\nimport sqlite3\nc = sqlite3.connect('app.db')\nrow = c.execute('select customer, sum(amount) t from orders group by customer order by t desc limit 1').fetchone()\nprint(row[0], row[1])\nEOF\npython3 top.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}
