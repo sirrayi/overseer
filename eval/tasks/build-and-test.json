@@ -1,9 +1,10 @@
 {
   "id": "build-and-test",
-  "version": 1,
+  "version": 3,
   "tags": ["smoke", "write", "verify"],
   "instruction": "Create wordcount.py with a function count_words(text) that returns the number of whitespace-separated words, and a test_wordcount.py with pytest-style test functions covering a normal case and an empty string. Run the tests to confirm they pass.",
   "setup": null,
-  "grader": {"type": "bash_assert", "script": "python3 -c \"from wordcount import count_words; assert count_words('a b c')==3; assert count_words('')==0\" && python3 -m pytest test_wordcount.py -q 2>/dev/null || python3 test_wordcount.py 2>/dev/null || python3 -c \"import test_wordcount\""},
+  "grader": {"type": "bash_assert", "script": "python3 -c \"from wordcount import count_words; assert count_words('a b c')==3; assert count_words('')==0\" && python3 -c \"import test_wordcount as t; fs=[f for n,f in vars(t).items() if n.startswith('test_') and callable(f)]; assert len(fs)>=2, 'need >=2 test functions'; [f() for f in fs]\""},
+  "oracle": {"script": "cat > wordcount.py <<'PY'\ndef count_words(text):\n    return len(text.split())\nPY\ncat > test_wordcount.py <<'PY'\nfrom wordcount import count_words\n\ndef test_normal():\n    assert count_words('a b c') == 3\n\ndef test_empty():\n    assert count_words('') == 0\nPY"},
   "limits": {"max_steps": 20}
 }

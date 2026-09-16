@@ -1,0 +1,23 @@
+[project]
+name = "overseer-eval"
+version = "0.2.0"
+description = "Overseer eval rig — paired harness benchmarking per the agent-harness-playbook Ch.12 §4"
+requires-python = ">=3.11"
+# Core rig is stdlib-only on purpose: the scoring path must be auditable.
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+# Relaxed with intent:
+#  PLW1510 — graders/adapters capture non-zero exit codes on purpose
+#  BLE001  — git/subprocess probes map any failure to "unknown"
+#  ISC004  — provenance lists use adjacent f-strings for readability
+ignore = ["PLW1510", "BLE001", "ISC004"]
