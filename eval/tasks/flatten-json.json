@@ -1,0 +1,16 @@
+{
+  "id": "flatten-json",
+  "version": 1,
+  "tags": ["script", "data"],
+  "difficulty": "med",
+  "instruction": "Write flatten.py: nested.json holds nested objects; emit flat.json mapping dotted paths to scalar values (arrays become index paths like 'a.0'). Run it.",
+  "setup": "printf '{\"a\":{\"b\":{\"c\":1}},\"d\":[2,3],\"e\":\"x\"}' > nested.json",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 flatten.py && python3 -c \"import json; f=json.load(open('flat.json')); assert f=={'a.b.c':1,'d.0':2,'d.1':3,'e':'x'}\""
+  },
+  "oracle": {
+    "script": "cat > flatten.py <<'EOF'\nimport json\n\ndef flat(o, prefix, out):\n    if isinstance(o, dict):\n        for k, v in o.items():\n            flat(v, f'{prefix}.{k}' if prefix else k, out)\n    elif isinstance(o, list):\n        for i, v in enumerate(o):\n            flat(v, f'{prefix}.{i}' if prefix else str(i), out)\n    else:\n        out[prefix] = o\n\nout = {}\nflat(json.load(open('nested.json')), '', out)\njson.dump(out, open('flat.json','w'), sort_keys=True)\nEOF\npython3 flatten.py"
+  },
+  "limits": {"max_steps": 12, "max_cost_usd": 0.4, "wall_s": 600}
+}

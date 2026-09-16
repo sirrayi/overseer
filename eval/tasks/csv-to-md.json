@@ -1,0 +1,16 @@
+{
+  "id": "csv-to-md",
+  "version": 1,
+  "tags": ["script", "text"],
+  "difficulty": "easy",
+  "instruction": "Write to_md.py converting data.csv to table.md as a GitHub-flavored markdown table: header row, |---|---| separator, data rows. Run it.",
+  "setup": "printf 'name,age\\nann,30\\nbob,25\\n' > data.csv",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 to_md.py && printf '| name | age |\\n|---|---|\\n| ann | 30 |\\n| bob | 25 |\\n' | diff - table.md"
+  },
+  "oracle": {
+    "script": "cat > to_md.py <<'EOF'\nimport csv\nrows = list(csv.reader(open('data.csv')))\nlines = ['| ' + ' | '.join(rows[0]) + ' |', '|' + '|'.join('---' for _ in rows[0]) + '|']\nfor r in rows[1:]:\n    lines.append('| ' + ' | '.join(r) + ' |')\nopen('table.md','w').write('\\n'.join(lines) + '\\n')\nEOF\npython3 to_md.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}
