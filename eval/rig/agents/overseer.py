@@ -104,11 +104,15 @@ def solve(
     traj.write_text("\n".join(json.dumps(e) for e in events))
 
     usage_events = [e for e in events if e.get("type") == "model_response"]
+
+    def _u(e, key):
+        return (e.get("usage") or {}).get(key, 0)
+
     total_in = sum(
-        e["usage"]["fresh_input"] + e["usage"]["cache_read"] + e["usage"]["cache_write"]
+        _u(e, "fresh_input") + _u(e, "cache_read") + _u(e, "cache_write")
         for e in usage_events
     )
-    cache_read = sum(e["usage"]["cache_read"] for e in usage_events)
+    cache_read = sum(_u(e, "cache_read") for e in usage_events)
     run_end = next((e for e in reversed(events) if e.get("type") == "run_end"), {})
 
     return {
@@ -119,7 +123,7 @@ def solve(
         "wall_s": round(wall_s, 1),
         "tokens_in": total_in,
         "tokens_out": sum(
-            e["usage"]["output"] + e["usage"].get("reasoning", 0) for e in usage_events
+            _u(e, "output") + _u(e, "reasoning") for e in usage_events
         ),  # billed as output+reasoning
         "cache_hit_rate": round(cache_read / total_in, 3) if total_in else 0.0,
         "cost_usd": sum(e.get("cost_usd", 0.0) for e in usage_events),

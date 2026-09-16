@@ -102,7 +102,7 @@ def run_matrix(
                         agent_name,
                         seed,
                         ws_root=ws_root,
-                        runs_root=results_root,
+                        runs_root=results_root / "runs",
                         run_id=run_id,
                     )
                 except (
@@ -111,6 +111,7 @@ def run_matrix(
                     subprocess.TimeoutExpired,
                     RuntimeError,
                     OSError,
+                    KeyError,
                 ) as e:
                     outcome = {
                         "done": False,
@@ -128,7 +129,7 @@ def run_matrix(
                             agent_name,
                             seed,
                             ws_root=ws_root,
-                            runs_root=results_root,
+                            runs_root=results_root / "runs",
                             run_id=run_id + "r",
                         )
                         # Either way the retry is the recorded attempt: its

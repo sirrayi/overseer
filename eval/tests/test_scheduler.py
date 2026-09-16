@@ -110,6 +110,45 @@ class TestOracle:
         finally:
             del agents.REGISTRY["flaky"]
 
+    def test_manifest_harvested_from_session_dir(self, tmp_path):
+        """A solver writing manifest.json into session_dir must land in the
+        record's provenance — verifies session_dir actually reaches solvers
+        (results/runs/<run_id>/), not a path that never exists."""
+        import json as _json
+
+        from rig import agents
+
+        def writes_manifest(
+            instruction, workdir, session_dir, *, limits=None, seed=0, task=None
+        ):
+            sd = Path(session_dir)
+            sd.mkdir(parents=True, exist_ok=True)
+            (sd / "manifest.json").write_text(
+                _json.dumps(
+                    {
+                        "schema": "m",
+                        "harness": {"version": "0.1", "commit": "abc"},
+                        "model": {"name": "kimi"},
+                        "tools": {"count": 11},
+                        "system_prompt": {"sha256": "x"},
+                    }
+                )
+            )
+            graders.run_script("echo done > done.txt", workdir)
+            return {"done": True, "model": "kimi", "ts": 0}
+
+        agents.REGISTRY["mw"] = type("M", (), {"solve": staticmethod(writes_manifest)})
+        try:
+            _, recs = _run([_task()], ["mw"], 1, tmp_path)
+            r = recs[0]
+            assert r["pass"] is True
+            assert r["provenance"] is not None, "manifest not harvested"
+            assert r["provenance"]["tools"]["count"] == 11
+            assert "/runs/" in r["session_dir"]
+            assert Path(r["session_dir"]).joinpath("manifest.json").exists()
+        finally:
+            del agents.REGISTRY["mw"]
+
     def test_done_gate(self, tmp_path):
         """Solver that does the work but never says done → fail."""
         from rig import agents

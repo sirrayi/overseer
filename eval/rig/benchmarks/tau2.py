@@ -148,6 +148,7 @@ class Tau2Adapter:
             key=lambda s: (str(s.get("task_id")), s.get("trial") or 0),
         )
         records = []
+        used_trials: dict = {}
         for sim in sims:
             reward_info = sim.get("reward_info") or {}
             reward = reward_info.get("reward")
@@ -155,12 +156,15 @@ class Tau2Adapter:
             messages = sim.get("messages") or []
             steps = sum(1 for m in messages if m.get("role") == "assistant")
             usage = sim.get("agent_usage") or {}
-            # trial is the seed axis; fall back to position within the task
-            # group so missing trials can't silently collapse to seed 0.
+            # trial is the seed axis; when absent, take the smallest unused
+            # index for the task so missing trials can't collapse to seed 0
+            # or collide with an explicit sibling trial.
+            tid = sim.get("task_id")
+            used = used_trials.setdefault(tid, set())
             trial = sim.get("trial")
-            if trial is None:
-                same_task = [s for s in sims if s.get("task_id") == sim.get("task_id")]
-                trial = same_task.index(sim) if len(same_task) > 1 else 0
+            if trial is None or trial in used:
+                trial = next(i for i in range(len(used) + 1) if i not in used)
+            used.add(trial)
             task = ExternalTask(
                 id=f"tau2-{domain}-{sim.get('task_id')}",
                 version=1,

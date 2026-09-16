@@ -31,15 +31,16 @@ deferred. Every claim below cites a check that actually ran.
 
 ## Verification actually run
 
-- `uv run pytest -q` — 64 tests green (Python 3.12 via uv).
+- `uv run pytest -q` — 68 tests green (Python 3.12 via uv).
 - `run.py --oracle-check` — 5/5 oracles pass (build-and-test grader
   hardened to v3 after review: test functions must execute, `||`
   import-fallback removed).
-- `run.py --agents oracle,fail --seeds 2 --noninferiority-pp 3` — 20
-  cells: oracle 10/10, fail 0/10; paired-delta section renders
-  (−100pp, McNemar p=0.002, non-inferiority NO).
-- `run.py --report` — renders from store without running; arms keyed by
-  run_set_id (no cross-matrix pooling); model=None arms don't crash.
+- `run.py --agents oracle,fail --seeds 3 --noninferiority-pp 3` — 30
+  cells: oracle 15/15, fail 0/15; paired-delta section renders
+  (−100pp, McNemar p<0.001, non-inferiority NO).
+- `run.py --report --k-report 3` — renders from store without running;
+  arms keyed by run_set_id (no cross-matrix pooling — two stored
+  matrices render as four rows); model=None arms don't crash.
 - Docker: `docker info` succeeds (OrbStack 2.2.3).
 - τ² results schema verified against cloned repo
   (`data_model/simulation.py`: SimulationRun.reward_info.reward,
@@ -74,6 +75,28 @@ deferred. Every claim below cites a check that actually ran.
 11. `mini` ran model-controlled bash with `LEK_API_KEY` in env. Fixed:
     LEK_* scrubbed from the task shell.
 12. Stale `eval/solvers/` + Inspect-AI-era README. Removed/rewritten.
+
+## Independent review — round 2 findings, all addressed
+
+1. `run_cell()` got `runs_root=results_root` so sessions/manifests
+   landed in `results/<run_id>` while `build_record` looked in
+   `results/runs/<run_id>` — provenance never harvested. Fixed: both
+   initial and retry calls pass `results_root/"runs"`; regression test
+   writes a manifest through a solver and asserts harvest + file path.
+2. Paired markdown table dropped a column when `--noninferiority-pp`
+   was omitted (header had one more cell than rows). Fixed: header/sep
+   built dynamically; Δ column labeled `Δ(A−B)` and verdict column
+   `A non-inf vs B`; column-count consistency covered by tests.
+3. Report provenance block assumed dict-shaped manifest fields; a
+   string-shaped `model`/`harness` would crash rendering. Fixed via
+   `_d()` coercion; covered by string-fields test.
+4. τ² trial fallback used `list.index(sim)` — could collide on
+   identical dicts or an explicit sibling trial. Fixed: smallest unused
+   index per task via a used-set.
+5. `model_response` usage keys were hard-indexed — a malformed event
+   aborted the whole matrix. Fixed: `.get`-defensive reads in the
+   overseer arm; scheduler records `KeyError` as infra failure.
+6. McNemar p printed as `0.000` for p<0.001. Fixed: `<0.001`.
 
 ## NOT yet verified (honest gaps)
 

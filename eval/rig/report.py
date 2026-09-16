@@ -132,38 +132,48 @@ def render(
         )
 
     # Paired per-task deltas — the A/B claim (paired_diff is authoritative;
-    # McNemar is reported alongside as a secondary heuristic).
+    # McNemar is reported alongside as a secondary heuristic). The delta is
+    # (A − B); the non-inferiority verdict tests whether A's CI lower bound
+    # stays above −delta vs B.
     paired = paired_sections(
         records, noninferiority_pp=noninferiority_pp, boot_seed=boot_seed, n_boot=n_boot
     )
     if paired:
-        ni_col = (
-            f" non-inf ≥−{noninferiority_pp:g}pp |"
-            if noninferiority_pp is not None
-            else " |"
-        )
+        has_ni = noninferiority_pp is not None
+        header = "| run set | A | B | tasks | Δ(A−B) pass@1 ±95%CI | McNemar p |"
+        sep = "|---|---|---|---|---|---|"
+        if has_ni:
+            header += f" A non-inf vs B ≥−{noninferiority_pp:g}pp |"
+            sep += "---|"
         lines += [
             "",
             "## Paired deltas (cluster bootstrap over tasks)",
             "",
-            "| run set | A | B | tasks | Δ pass@1 ±95%CI | McNemar p |" + ni_col,
+            header,
+            sep,
         ]
-        lines.append("|---|---|---|---|---|---|---|")
         for p in paired:
-            ni = ""
-            if noninferiority_pp is not None:
-                ok = p["noninferiority"]["pass"]
-                ni = f" {'yes' if ok else 'NO'} |"
-            lines.append(
+            pval = p["mcnemar"]["p"]
+            pstr = "<0.001" if pval < 0.001 else f"{pval:.3f}"
+            row = (
                 f"| {p['run_set_id'][:8]} | {p['a']} | {p['b']} "
                 f"| {p['tasks_common']} "
                 f"| {_fmt_pct(p['diff']['mean'])} "
                 f"[{_fmt_pct(p['diff']['ci95'][0])}–"
                 f"{_fmt_pct(p['diff']['ci95'][1])}] "
-                f"| {p['mcnemar']['p']:.3f} |{ni}"
+                f"| {pstr} |"
             )
+            if has_ni:
+                ok = p["noninferiority"]["pass"]
+                row += f" {'yes' if ok else 'NO'} |"
+            lines.append(row)
 
     # Provenance block — the §4.5 field set, from the overseer manifest.
+    def _d(x) -> dict:
+        # manifest fields may arrive as strings from external adapters —
+        # tolerate, never crash the report.
+        return x if isinstance(x, dict) else {}
+
     prov_rows = []
     for r in records:
         if r.get("provenance"):
@@ -171,24 +181,25 @@ def render(
             break
     if prov_rows:
         prov = prov_rows[0]["provenance"]
-        mp = prov.get("system_prompt") or {}
-        tl = prov.get("tools") or {}
-        mdl = prov.get("model") or {}
-        lim = prov.get("limits") or {}
+        mp = _d(prov.get("system_prompt"))
+        tl = _d(prov.get("tools"))
+        mdl = _d(prov.get("model"))
+        lim = _d(prov.get("limits"))
+        pol = _d(prov.get("policy"))
+        hrn = _d(prov.get("harness"))
         lines += [
             "",
             "## Provenance",
             "",
-            f"- harness: overseer {(prov.get('harness') or {}).get('version')} "
-            f"commit {(prov.get('harness') or {}).get('commit')}",
-            f"- model: {mdl.get('name')} via {mdl.get('provider')} "
+            f"- harness: overseer {hrn.get('version')} commit {hrn.get('commit')}",
+            f"- model: {mdl.get('name') or prov.get('model')} "
+            f"via {mdl.get('provider')} "
             f"(effort={mdl.get('effort')}, temp={mdl.get('temperature')})",
             f"- system prompt sha256: `{mp.get('sha256')}` (scope {mp.get('scope')})",
             f"- tools sha256: `{tl.get('sha256')}` — {tl.get('count')} tools",
             f"- limits: steps≤{lim.get('max_steps')} "
             f"cost≤${lim.get('max_cost_usd')} out≤{lim.get('max_output_tokens')} tok",
-            f"- policy: {(prov.get('policy') or {}).get('preset')} "
-            f"sandbox={(prov.get('policy') or {}).get('sandbox_bash')}",
+            f"- policy: {pol.get('preset')} sandbox={pol.get('sandbox_bash')}",
             f"- bootstrap: {n_boot} resamples, seed {boot_seed}",
             f"- contamination: {contamination_notes or 'none declared'}",
         ]

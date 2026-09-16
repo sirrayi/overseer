@@ -85,3 +85,33 @@ class TestPaired:
         md, js = report.render(recs, k=1, n_boot=50)
         assert "Paired deltas" not in md
         assert js["paired"] == []
+
+    def test_paired_table_columns_without_ni(self):
+        """Without --noninferiority-pp the table must still be well-formed:
+        header, separator and rows all carry the same column count."""
+        recs = [_rec("t1", 0, True, harness="a")] + [_rec("t1", 0, False, harness="b")]
+        md, _ = report.render(recs, k=1, n_boot=100)
+        paired_idx = next(
+            i for i, ln in enumerate(md.splitlines()) if "Paired deltas" in ln
+        )
+        section = [ln for ln in md.splitlines()[paired_idx:] if ln.startswith("|")]
+        assert section, "paired table missing"
+        cols = {ln.count("|") for ln in section}
+        assert len(cols) == 1, f"ragged table: {cols}"
+
+    def test_paired_table_columns_with_ni(self):
+        recs = [_rec("t1", 0, True, harness="a")] + [_rec("t1", 0, False, harness="b")]
+        md, _ = report.render(recs, k=1, n_boot=100, noninferiority_pp=3.0)
+        paired_idx = next(
+            i for i, ln in enumerate(md.splitlines()) if "Paired deltas" in ln
+        )
+        section = [ln for ln in md.splitlines()[paired_idx:] if ln.startswith("|")]
+        cols = {ln.count("|") for ln in section}
+        assert len(cols) == 1, f"ragged table: {cols}"
+
+    def test_string_manifest_fields_no_crash(self):
+        """A manifest with model/harness as plain strings must not crash
+        the provenance block."""
+        recs = [_rec("t1", 0, True, provenance={"model": "kimi", "harness": "x"})]
+        md, _ = report.render(recs, k=1, n_boot=50)
+        assert "Provenance" in md
