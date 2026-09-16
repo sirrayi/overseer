@@ -1,135 +1,183 @@
 #!/usr/bin/env python3
-"""eval/run.py — paired harness benchmark runner (playbook Ch.12 §0.6/0.7).
+"""eval/run.py — paired harness benchmark runner (playbook Ch.12 §4).
 
-For each task × solver: fresh workspace → setup → solver run → deterministic
-grader → trajectory + metrics keyed by {task_id, version, solver, model,
-harness_commit, env_digest, ts}. Report is pass@1 + cost + tokens + cache-hit
-+ wall time — the fields the public-reporting standard requires.
+Matrix: tasks × agents × k seeds → store → report. Overseer arm harvests
+the session manifest (P4.5 provenance). The mini arm is the frozen null
+scaffold; `oracle` verifies task solvability with zero spend; `fail`
+self-tests the rig.
 
-Usage:
-  LEK_API_KEY=... python3 eval/run.py [--solver overseer|mini|both]
-      [--tasks id1,id2|all] [--model kimi-k3-turbo] [--max-steps N]
+  uv run python run.py                          # overseer vs mini, 1 seed
+  uv run python run.py --seeds 3 --agents overseer,mini
+  uv run python run.py --agents oracle          # solvability check, no API
+  uv run python run.py --report                 # report card from store
+
+Env: LEK_API_KEY (required for overseer/mini), LEK_BASE_URL, LEK_MODEL,
+OVERSEER_BIN.
 """
+
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
-import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent
+sys.path.insert(0, str(ROOT))
 
+from rig import graders, report, scheduler, store, taskspec
 
-def load_solver(name: str):
-    path = ROOT / "solvers" / {"overseer": "overseer_exec.py",
-                               "mini": "mini_swe_agent.py"}[name]
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+RESULTS = ROOT / "results"
+WORKSPACES = ROOT / "workspaces"
 
 
 def harness_commit() -> str:
     try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                              cwd=REPO, capture_output=True, text=True).stdout.strip()
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
     except Exception:
         return "unknown"
 
 
-def run_one(task: dict, solver_name: str, args) -> dict:
-    ws = REPO / "eval" / "workspaces" / task["id"] / solver_name
-    sess = REPO / "eval" / "results" / task["id"] / solver_name
-    shutil.rmtree(ws, ignore_errors=True)
-    shutil.rmtree(sess, ignore_errors=True)
-    ws.mkdir(parents=True)
-    sess.mkdir(parents=True, exist_ok=True)
-
-    # Prefer Homebrew's python3 over the Xcode CLT shim — graders run
-    # `python3` and the shim exits 69 when the Xcode licence is unaccepted.
-    env = dict(os.environ)
-    if os.path.isdir("/opt/homebrew/bin"):
-        env["PATH"] = "/opt/homebrew/bin:" + env["PATH"]
-
-    setup = task.get("setup")
-    if setup:
-        subprocess.run(["sh", "-c", setup], cwd=ws, check=True,
-                       capture_output=True, text=True, env=env)
-
-    solver = load_solver(solver_name)
-    if solver_name == "overseer":
-        result = solver.solve(task["instruction"], str(ws), str(sess),
-                              max_steps=args.max_steps)
-    else:
-        os.environ["MAX_STEPS"] = str(args.max_steps)
-        result = solver.solve(task["instruction"], str(ws), str(sess))
-        (sess / "trajectory.json").write_text(
-            json.dumps(result.pop("trajectory"), indent=2))
-
-    grader = task["grader"]["script"]
-    g = subprocess.run(["sh", "-c", grader], cwd=ws,
-                       capture_output=True, text=True, env=env)
-    passed = g.returncode == 0 and result.get("done", False)
-    return {
-        "task": task["id"], "task_version": task["version"],
-        "solver": solver_name, "pass": passed,
-        "grader_exit": g.returncode, **result,
-        "harness_commit": harness_commit(), "model": os.environ.get("LEK_MODEL", "kimi-k3-turbo"),
-        "env_digest": task.get("env", {}).get("image_digest") or "local-sh",
-        "ts": int(time.time()),
-    }
+def progress(r: dict) -> None:
+    mark = "INFRA" if r.get("infra_error") else ("PASS" if r.get("pass") else "FAIL")
+    print(
+        f"  {mark} {r['task_id']} × {r['harness']} s{r['seed']} "
+        f"steps={r.get('steps', '?')} wall={r.get('wall_s', '?')}s "
+        f"in={r.get('tokens_in', '?')} cost={r.get('cost_usd', '?')}",
+        flush=True,
+    )
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--solver", default="both", choices=["overseer", "mini", "both"])
+    ap.add_argument("--agents", "--solver", default="overseer,mini")
     ap.add_argument("--tasks", default="all")
+    ap.add_argument("--seeds", "-k", type=int, default=1)
     ap.add_argument("--model", default=None)
-    ap.add_argument("--max-steps", type=int, default=30)
+    ap.add_argument(
+        "--benchmark",
+        default="local",
+        choices=["local", "tau2", "lcb", "swe_bench", "terminal_bench", "swe_rebench"],
+    )
+    ap.add_argument("--tau2-domain", default="airline", choices=["airline", "retail"])
+    ap.add_argument("--tau2-trials", type=int, default=8)
+    ap.add_argument(
+        "--tau2-user-llm",
+        default=None,
+        help="pinned user-simulator model (required for real tau2 runs)",
+    )
+    ap.add_argument(
+        "--release-version", default="v6", help="LiveCodeBench release window (e.g. v6)"
+    )
+    ap.add_argument("--scheduler-seed", type=int, default=0)
+    ap.add_argument(
+        "--oracle-check",
+        action="store_true",
+        help="verify every task's oracle passes; no agents run",
+    )
+    ap.add_argument(
+        "--report",
+        action="store_true",
+        help="render the report card from the store (no runs)",
+    )
+    ap.add_argument(
+        "--k-report",
+        type=int,
+        default=3,
+        help="reliability order k for pass@k/pass^k in the report",
+    )
+    ap.add_argument(
+        "--noninferiority-pp",
+        type=float,
+        default=None,
+        help="paired-diff non-inferiority bound in points (e.g. 3)",
+    )
     args = ap.parse_args()
 
     if args.model:
         os.environ["LEK_MODEL"] = args.model
-    if not os.environ.get("LEK_API_KEY") and not os.environ.get("OVERSEER_API_KEY"):
-        sys.exit("LEK_API_KEY (or OVERSEER_API_KEY) required")
 
-    task_files = sorted((ROOT / "tasks").glob("*.json"))
-    tasks = [json.loads(f.read_text()) for f in task_files]
+    st = store.Store(RESULTS / "store.jsonl")
+
+    if args.report:
+        records = st.runs()
+        md, js = report.render(records, k=args.k_report, contamination_notes=None)
+        print(md)
+        out = RESULTS / f"report-{int(__import__('time').time())}"
+        out.with_suffix(".md").write_text(md)
+        out.with_suffix(".json").write_text(json.dumps(js, indent=2))
+        print(f"wrote {out}.md / .json")
+        return 0
+
+    if args.benchmark != "local":
+        from rig.benchmarks import docker_gated, lcb, tau2
+
+        adapter = {
+            "tau2": tau2.Tau2Adapter,
+            "lcb": lcb.LcbAdapter,
+            "swe_bench": docker_gated.SweBenchAdapter,
+            "terminal_bench": docker_gated.TerminalBenchAdapter,
+            "swe_rebench": docker_gated.SweRebenchAdapter,
+        }[args.benchmark]()
+        if args.benchmark == "tau2":
+            return tau2.run_cli(adapter, args, st, harness_commit(), progress)
+        if args.benchmark == "lcb":
+            return lcb.run_cli(adapter, args, st, harness_commit(), progress)
+        try:
+            adapter.check_or_raise()
+        except Exception as e:
+            print(e)
+            return 2
+        print(
+            f"{args.benchmark}: docker present — adapter run not yet "
+            "implemented (tracked in LEDGER)."
+        )
+        return 2
+
+    tasks = taskspec.load_dir(ROOT / "tasks")
     if args.tasks != "all":
         keep = set(args.tasks.split(","))
-        tasks = [t for t in tasks if t["id"] in keep]
-    solvers = ["overseer", "mini"] if args.solver == "both" else [args.solver]
+        tasks = [t for t in tasks if t.id in keep]
 
-    results = []
-    for task in tasks:
-        for s in solvers:
-            print(f"▶ {task['id']} × {s} ...", flush=True)
-            try:
-                r = run_one(task, s, args)
-            except Exception as e:  # a crashed solver is a failed run, logged
-                r = {"task": task["id"], "solver": s, "pass": False,
-                     "error": str(e), "model": os.environ.get("LEK_MODEL")}
-            results.append(r)
-            print(f"  {'PASS' if r['pass'] else 'FAIL'} "
-                  f"steps={r.get('steps','?')} wall={r.get('wall_s','?')}s "
-                  f"in={r.get('tokens_in','?')} hit={r.get('cache_hit_rate','?')}")
+    if args.oracle_check:
+        bad = 0
+        for t in tasks:
+            ok, why = graders.oracle_check(t, WORKSPACES / "_oracle" / t.id)
+            print(f"  {'OK ' if ok else 'BAD'} {t.id}: {why}")
+            bad += 0 if ok else 1
+        print(f"{len(tasks) - bad}/{len(tasks)} oracles pass")
+        return 1 if bad else 0
 
-    out = REPO / "eval" / "results" / f"report-{int(time.time())}.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(results, indent=2))
+    agent_names = [a.strip() for a in args.agents.split(",")]
+    needs_key = [a for a in agent_names if a in ("overseer", "mini")]
+    if needs_key and not os.environ.get("LEK_API_KEY"):
+        sys.exit("LEK_API_KEY required for " + ",".join(needs_key))
 
-    print(f"\n{'task':<22} {'solver':<9} {'pass':<5} {'steps':>5} {'wall_s':>7} {'tok_in':>8} {'cache':>6}")
-    for r in results:
-        print(f"{r['task']:<22} {r['solver']:<9} {str(r['pass']):<5} "
-              f"{r.get('steps','-'):>5} {r.get('wall_s','-'):>7} "
-              f"{r.get('tokens_in','-'):>8} {r.get('cache_hit_rate','-'):>6}")
-    print(f"\nwrote {out}")
+    print(f"matrix: {len(tasks)} tasks × {agent_names} × {args.seeds} seeds")
+    scheduler.run_matrix(
+        tasks,
+        agent_names,
+        args.seeds,
+        results_root=RESULTS,
+        ws_root=WORKSPACES,
+        store=st,
+        benchmark="local",
+        scheduler_seed=args.scheduler_seed,
+        harness_commit=harness_commit(),
+        on_progress=progress,
+    )
+
+    # Post-run summary against just this matrix's records.
+    md, _ = report.render(st.load(), k=args.k_report)
+    print("\n" + md)
     return 0
 
 

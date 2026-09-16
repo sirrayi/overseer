@@ -31,6 +31,25 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace -- -D warnings
 
+  eval-rig:
+    # Offline rig self-tests only — no API keys, no paid runs. Proves the
+    # matrix/scheduler/stats/store path on every PR (playbook §4.6 seed).
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: rig tests
+        working-directory: eval
+        run: uv run pytest -q
+      - name: oracle check (task solvability)
+        working-directory: eval
+        run: uv run python run.py --oracle-check
+      - name: fail-arm self-test
+        working-directory: eval
+        run: |
+          uv run python run.py --agents fail --seeds 1 > out.txt 2>&1 || true
+          grep -q "FAIL" out.txt && grep -q "0.0%" out.txt
+
   budgets:
     runs-on: macos-15
     steps:

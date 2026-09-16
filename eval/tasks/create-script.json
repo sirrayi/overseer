@@ -1,9 +1,10 @@
 {
   "id": "create-script",
-  "version": 1,
+  "version": 2,
   "tags": ["smoke", "write"],
   "instruction": "Create a file hello.py containing a function hello() that returns the string \"hello world\", then run a quick python check to confirm it works.",
   "setup": null,
   "grader": {"type": "bash_assert", "script": "test -f hello.py && python3 -c \"from hello import hello; assert hello()=='hello world'\""},
+  "oracle": {"script": "cat > hello.py <<'PY'\ndef hello():\n    return 'hello world'\nPY"},
   "limits": {"max_steps": 15}
 }
