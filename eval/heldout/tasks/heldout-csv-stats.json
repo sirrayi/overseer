@@ -1,0 +1,17 @@
+{
+  "id": "heldout-csv-stats",
+  "version": 1,
+  "tags": ["heldout", "script", "data"],
+  "difficulty": "easy",
+  "canary": "OVR-CANARY-727305248fc649ee",
+  "instruction": "data.csv has columns name,score. Write stats.py that prints exactly three lines to stats.txt: mean=<2dp>, max=<int of top score>, count=<n>. Run it to produce stats.txt.",
+  "setup": "cat > data.csv <<'EOF'\nname,score\na,10\nb,20\nc,30\nd,40\nEOF\necho 'tracking-id: OVR-CANARY-727305248fc649ee' > NOTES.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "grep -qx 'mean=25.00' stats.txt && grep -qx 'max=40' stats.txt && grep -qx 'count=4' stats.txt && test $(wc -l < stats.txt) -eq 3"
+  },
+  "oracle": {
+    "script": "cat > stats.py <<'EOF'\nimport csv\nrows = list(csv.DictReader(open('data.csv')))\nscores = [int(r['score']) for r in rows]\nwith open('stats.txt','w') as f:\n    f.write(f'mean={sum(scores)/len(scores):.2f}\\nmax={max(scores)}\\ncount={len(scores)}\\n')\nEOF\npython3 stats.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 600}
+}

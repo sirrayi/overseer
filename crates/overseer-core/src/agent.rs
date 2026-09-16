@@ -857,12 +857,11 @@ impl Agent {
     /// tools from the spec list entirely (capability removal, P1.4).
     fn registry(config: &AgentConfig) -> ToolRegistry {
         let policy = Self::policy(config);
-        let mut reg =
-            if !config.full_access && config.policy_preset == crate::perm::Preset::Plan {
-                ToolRegistry::plan_mode(policy)
-            } else {
-                ToolRegistry::core(policy)
-            };
+        let mut reg = if !config.full_access && config.policy_preset == crate::perm::Preset::Plan {
+            ToolRegistry::plan_mode(policy)
+        } else {
+            ToolRegistry::core(policy)
+        };
         if !config.disabled_tools.is_empty() {
             reg.disable(&config.disabled_tools);
         }

@@ -1,0 +1,16 @@
+{
+  "id": "http-json-log",
+  "version": 1,
+  "tags": ["script", "io"],
+  "difficulty": "easy",
+  "instruction": "access.log has lines 'METHOD PATH STATUS'. Write summarize.py emitting status.json: {\"by_status\": {\"200\": n, ...}, \"top_path\": most frequent path}. Run it.",
+  "setup": "printf 'GET /a 200\\nGET /b 404\\nGET /a 200\\nPOST /c 500\\nGET /a 200\\n' > access.log",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 summarize.py && python3 -c \"import json; s=json.load(open('status.json')); assert s['by_status']=={'200':3,'404':1,'500':1} and s['top_path']=='/a'\""
+  },
+  "oracle": {
+    "script": "cat > summarize.py <<'EOF'\nimport json\nfrom collections import Counter\nstatus, paths = Counter(), Counter()\nfor ln in open('access.log'):\n    p = ln.split()\n    if len(p) == 3:\n        paths[p[1]] += 1\n        status[p[2]] += 1\njson.dump({'by_status': dict(status), 'top_path': paths.most_common(1)[0][0]}, open('status.json','w'))\nEOF\npython3 summarize.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 600}
+}

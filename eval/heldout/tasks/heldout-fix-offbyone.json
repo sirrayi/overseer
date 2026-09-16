@@ -1,0 +1,17 @@
+{
+  "id": "heldout-fix-offbyone",
+  "version": 1,
+  "tags": ["heldout", "bugfix"],
+  "difficulty": "med",
+  "canary": "OVR-CANARY-77fd200873c24747",
+  "instruction": "sum_pairs.py should print the sum of each adjacent pair in nums.txt, one per line (for [1,2,3,4] → 3,5,7). It currently misses the last pair and double-counts the first. Fix it.",
+  "setup": "cat > nums.txt <<'EOF'\n1\n2\n3\n4\n5\nEOF\ncat > sum_pairs.py <<'EOF'\nnums = [int(l) for l in open('nums.txt')]\nfor i in range(len(nums) - 2):\n    print(nums[i] + nums[min(i + 1, len(nums) - 1)] + (nums[0] if i == 0 else 0))\nEOF\necho 'tracking-id: OVR-CANARY-77fd200873c24747' > NOTES.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 sum_pairs.py > /tmp/sp_out.txt && printf '3\\n5\\n7\\n9\\n' | diff - /tmp/sp_out.txt"
+  },
+  "oracle": {
+    "script": "cat > sum_pairs.py <<'EOF'\nnums = [int(l) for l in open('nums.txt')]\nfor i in range(len(nums) - 1):\n    print(nums[i] + nums[i + 1])\nEOF"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 600}
+}

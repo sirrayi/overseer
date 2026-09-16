@@ -1,0 +1,17 @@
+{
+  "id": "heldout-json-merge",
+  "version": 1,
+  "tags": ["heldout", "edit", "json"],
+  "difficulty": "med",
+  "canary": "OVR-CANARY-1e1a16259d7d4945",
+  "instruction": "Write merge.py that deep-merges base.json and override.json into merged.json. Rules: nested dicts merge recursively; lists concatenate (base first); scalars in override win; keys absent from override are kept. Run it so merged.json exists.",
+  "setup": "cat > base.json <<'EOF'\n{\"server\": {\"host\": \"a\", \"port\": 80, \"opts\": {\"tls\": false}}, \"tags\": [\"x\"], \"name\": \"svc\"}\nEOF\ncat > override.json <<'EOF'\n{\"server\": {\"port\": 8080, \"opts\": {\"tls\": true}}, \"tags\": [\"y\"]}\nEOF\necho 'tracking-id: OVR-CANARY-1e1a16259d7d4945' > NOTES.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 -c \"import json; m=json.load(open('merged.json')); assert m['server']['host']=='a' and m['server']['port']==8080 and m['server']['opts']=={'tls':True} and m['tags']==['x','y'] and m['name']=='svc'\""
+  },
+  "oracle": {
+    "script": "cat > merge.py <<'EOF'\nimport json\n\ndef merge(a, b):\n    if isinstance(a, dict) and isinstance(b, dict):\n        out = dict(a)\n        for k, v in b.items():\n            out[k] = merge(a[k], v) if k in a else v\n        return out\n    if isinstance(a, list) and isinstance(b, list):\n        return a + b\n    return b\n\nbase = json.load(open('base.json'))\nover = json.load(open('override.json'))\njson.dump(merge(base, over), open('merged.json','w'))\nEOF\npython3 merge.py"
+  },
+  "limits": {"max_steps": 15, "max_cost_usd": 0.5, "wall_s": 600}
+}

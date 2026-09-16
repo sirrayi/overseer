@@ -164,8 +164,7 @@ struct ReadRecord {
 /// All tool names the core registry can emit — the validation set for
 /// `--no-tools` ablations (typo'd names fail fast, not silently no-op).
 pub const TOOL_NAMES: [&str; 11] = [
-    "bash", "read", "write", "edit", "grep", "glob", "plan", "task", "skill",
-    "repo_map", "symbol",
+    "bash", "read", "write", "edit", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol",
 ];
 
 pub struct ToolRegistry {
