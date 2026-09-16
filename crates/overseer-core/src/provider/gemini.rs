@@ -167,17 +167,17 @@ impl Gemini {
 
         // Gemini has no dedicated tool-call finish reason — a functionCall
         // in the turn means ToolUse regardless of finishReason.
-        let stop_reason = if blocks
-            .iter()
-            .any(|b| matches!(b, Block::ToolCall { .. }))
-        {
+        let stop_reason = if blocks.iter().any(|b| matches!(b, Block::ToolCall { .. })) {
             StopReason::ToolUse
         } else {
             match cand.get("finishReason").and_then(Value::as_str) {
                 Some("STOP") | Some("STOP_SEQUENCE") => StopReason::EndTurn,
                 Some("MAX_TOKENS") => StopReason::MaxTokens,
-                Some("SAFETY") | Some("PROHIBITED_CONTENT") | Some("RECITATION")
-                | Some("BLOCKLIST") | Some("SPII") => StopReason::Refusal,
+                Some("SAFETY")
+                | Some("PROHIBITED_CONTENT")
+                | Some("RECITATION")
+                | Some("BLOCKLIST")
+                | Some("SPII") => StopReason::Refusal,
                 Some(s) => StopReason::Other(s.to_string()),
                 None => StopReason::Other("missing".to_string()),
             }
@@ -381,10 +381,7 @@ mod tests {
         let body = Gemini::build_body(&sample_req(&system, &tools, &msgs));
         assert_eq!(body["system_instruction"]["parts"][0]["text"], "sys");
         assert_eq!(body["contents"][0]["role"], "user");
-        assert_eq!(
-            body["tools"][0]["function_declarations"][0]["name"],
-            "read"
-        );
+        assert_eq!(body["tools"][0]["function_declarations"][0]["name"], "read");
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
     }
 

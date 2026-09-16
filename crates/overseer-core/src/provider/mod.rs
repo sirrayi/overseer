@@ -15,7 +15,9 @@ pub mod openai;
 /// its native knob — Anthropic `thinking.budget_tokens`, OpenAI
 /// `reasoning_effort`, Gemini `thinkingConfig.thinkingBudget`. A raw
 /// `thinking_budget` on the request wins where the API takes tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
     Min,

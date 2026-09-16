@@ -79,11 +79,7 @@ impl Control {
     /// Remove one queued message by index (queue-strip cancel). Returns
     /// the removed text when the index was valid.
     pub fn cancel_queued(&self, idx: usize) -> Option<String> {
-        self.inner
-            .steer
-            .lock()
-            .ok()
-            .and_then(|mut q| q.remove(idx))
+        self.inner.steer.lock().ok().and_then(|mut q| q.remove(idx))
     }
 }
 

@@ -262,7 +262,10 @@ fn run_best_of(
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !repo {
-        eprintln!("overseer exec: --best-of needs a git repo at {}", flags.cwd.display());
+        eprintln!(
+            "overseer exec: --best-of needs a git repo at {}",
+            flags.cwd.display()
+        );
         return 2;
     }
 
@@ -345,7 +348,10 @@ fn run_best_of(
             println!("{note}");
             for (j, ok) in &notes {
                 if *j != i {
-                    eprintln!("  attempt {j}: {}", if *ok { "passed (not first)" } else { "failed" });
+                    eprintln!(
+                        "  attempt {j}: {}",
+                        if *ok { "passed (not first)" } else { "failed" }
+                    );
                 }
             }
             0
@@ -681,9 +687,7 @@ fn cmd_exec(args: &[String]) -> i32 {
     };
     if flags.bare && (flags.resume.is_some() || flags.cont || flags.last || flags.session.is_some())
     {
-        eprintln!(
-            "overseer exec: --bare is hermetic — drop --resume/--continue/--last/--session"
-        );
+        eprintln!("overseer exec: --bare is hermetic — drop --resume/--continue/--last/--session");
         return 2;
     }
 

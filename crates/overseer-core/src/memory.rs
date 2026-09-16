@@ -118,12 +118,13 @@ pub fn consolidate(
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().is_some_and(|x| x == "md")
-                && e.file_name() != INDEX_NAME
-            {
+            if p.extension().is_some_and(|x| x == "md") && e.file_name() != INDEX_NAME {
                 if let Ok(t) = std::fs::read_to_string(&p) {
                     let head: String = t.chars().take(2_000).collect();
-                    topics.push_str(&format!("\n### {}\n{head}\n", e.file_name().to_string_lossy()));
+                    topics.push_str(&format!(
+                        "\n### {}\n{head}\n",
+                        e.file_name().to_string_lossy()
+                    ));
                 }
             }
         }
@@ -167,9 +168,7 @@ pub fn consolidate(
         .nth(1)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            "consolidate: model reply had no ---INDEX--- section".to_string()
-        })?;
+        .ok_or_else(|| "consolidate: model reply had no ---INDEX--- section".to_string())?;
     let capped: String = new_index.chars().take(INDEX_CAP).collect();
     std::fs::write(&idx, format!("{capped}\n")).map_err(|e| e.to_string())?;
     commit(dir, "consolidate");

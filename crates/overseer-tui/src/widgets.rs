@@ -133,10 +133,7 @@ impl Dialog {
             }
             "edit" => {
                 if let Some(p) = self.req.input.get("path").and_then(|v| v.as_str()) {
-                    out.push(Line::from(Span::styled(
-                        format!("  {p}"),
-                        theme::dialog(),
-                    )));
+                    out.push(Line::from(Span::styled(format!("  {p}"), theme::dialog())));
                 }
                 for (mark, key, style) in [
                     ("- ", "old_string", theme::error()),
@@ -154,10 +151,7 @@ impl Dialog {
             }
             "write" => {
                 if let Some(p) = self.req.input.get("path").and_then(|v| v.as_str()) {
-                    out.push(Line::from(Span::styled(
-                        format!("  {p}"),
-                        theme::dialog(),
-                    )));
+                    out.push(Line::from(Span::styled(format!("  {p}"), theme::dialog())));
                 }
                 if let Some(c) = self.req.input.get("content").and_then(|v| v.as_str()) {
                     for l in c.lines().take(4) {
@@ -199,20 +193,17 @@ impl Dialog {
             spans.push(Span::styled("  (←→ ⏎)".to_string(), theme::dim()));
             out.push(Line::from(spans));
         } else {
-            out.push(Line::from(Span::styled("…".to_string(), theme::dialog_key())));
+            out.push(Line::from(Span::styled(
+                "…".to_string(),
+                theme::dialog_key(),
+            )));
         }
         out
     }
 }
 
 /// Bottom status line: mode badge + cwd + model + session cost.
-pub fn status_line(
-    preset: Preset,
-    cwd: &str,
-    model: &str,
-    cost: f64,
-    width: u16,
-) -> Line<'static> {
+pub fn status_line(preset: Preset, cwd: &str, model: &str, cost: f64, width: u16) -> Line<'static> {
     let (label, badge) = match preset {
         Preset::WorkspaceWrite => (" workspace ", theme::badge()),
         Preset::ReadOnly => (" read-only ", theme::badge_ro()),

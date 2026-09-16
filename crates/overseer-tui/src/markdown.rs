@@ -20,10 +20,7 @@ pub fn render(text: &str) -> Vec<Line<'static>> {
             continue; // the fence marker itself is never drawn
         }
         if in_fence {
-            out.push(Line::from(Span::styled(
-                format!("  {line}"),
-                theme::code(),
-            )));
+            out.push(Line::from(Span::styled(format!("  {line}"), theme::code())));
             continue;
         }
         out.push(render_line(line));
@@ -110,7 +107,12 @@ mod tests {
     fn plain(lines: &[Line<'static>]) -> String {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -135,9 +137,6 @@ mod tests {
     fn header_bolded() {
         let out = render("## Plan");
         assert_eq!(plain(&out), "Plan");
-        assert!(out[0].spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::BOLD));
+        assert!(out[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 }

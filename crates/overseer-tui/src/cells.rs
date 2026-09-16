@@ -119,7 +119,10 @@ impl Cell {
             Cell::Plan { markdown } => {
                 let mut out = Vec::new();
                 for l in markdown.lines() {
-                    out.extend(wrap_styled(vec![Span::styled(l.to_string(), theme::meta())], w));
+                    out.extend(wrap_styled(
+                        vec![Span::styled(l.to_string(), theme::meta())],
+                        w,
+                    ));
                 }
                 out
             }
@@ -462,7 +465,9 @@ mod tests {
             spilled_to: None,
             denied: false,
         })) {
-            Feed::ToolDone { call_id, status, .. } => {
+            Feed::ToolDone {
+                call_id, status, ..
+            } => {
                 assert_eq!(call_id, "c1");
                 assert_eq!(status, ToolStatus::Ok);
             }

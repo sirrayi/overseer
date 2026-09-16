@@ -133,14 +133,7 @@ const BASH_ASK: &[(&str, &str)] = &[
 
 /// Tools with no side effects — allowed under every preset.
 const READ_TOOLS: &[&str] = &[
-    "read",
-    "grep",
-    "glob",
-    "task",
-    "plan",
-    "skill",
-    "repo_map",
-    "symbol",
+    "read", "grep", "glob", "task", "plan", "skill", "repo_map", "symbol",
 ];
 
 /// Rule-of-Two state (P3.10): an agent holding (a) untrusted input,
@@ -334,18 +327,14 @@ impl Policy {
                 || INJECTION_MARKERS.iter().any(|m| lower.contains(m)))
         {
             t.untrusted = true;
-            notices.push(format!(
-                "untrusted content entered context (via {tool})"
-            ));
+            notices.push(format!("untrusted content entered context (via {tool})"));
         }
         if !t.sensitive
             && (SENSITIVE_PATHS.iter().any(|m| input_s.contains(m))
                 || SENSITIVE_CONTENT.iter().all(|m| lower.contains(m)))
         {
             t.sensitive = true;
-            notices.push(format!(
-                "sensitive data touched (via {tool})"
-            ));
+            notices.push(format!("sensitive data touched (via {tool})"));
         }
         if !notices.is_empty() {
             return Some(notices.join("; "));
@@ -840,7 +829,10 @@ mod tests {
         // Side effects now force Ask — headless collapses to Deny.
         let v = p.check("bash", &json!({"command": "ls"}));
         assert!(matches!(v, Verdict::Ask { .. }), "armed R2 must Ask");
-        assert!(matches!(p.gate("bash", &json!({"command": "ls"})), Gate::Deny(_)));
+        assert!(matches!(
+            p.gate("bash", &json!({"command": "ls"})),
+            Gate::Deny(_)
+        ));
         let v = p.check("write", &json!({"path": "x.txt", "content": "y"}));
         assert!(matches!(v, Verdict::Ask { .. }));
 
@@ -857,9 +849,7 @@ mod tests {
     #[test]
     fn taint_notice_fires_once() {
         let p = pol();
-        assert!(p
-            .note_result("task", &json!({}), "digest")
-            .is_some());
+        assert!(p.note_result("task", &json!({}), "digest").is_some());
         // Second task result: latch already set, no new notice.
         assert!(p.note_result("task", &json!({}), "more").is_none());
     }

@@ -29,8 +29,18 @@ const EXTENSIONS: &[&str] = &[
 
 /// Dirs never indexed — dependency trees, build output, VCS.
 const SKIP_DIRS: &[&str] = &[
-    "target", "node_modules", ".git", ".hg", ".svn", "dist", "build", "__pycache__",
-    ".overseer", "vendor", ".venv", "venv",
+    "target",
+    "node_modules",
+    ".git",
+    ".hg",
+    ".svn",
+    "dist",
+    "build",
+    "__pycache__",
+    ".overseer",
+    "vendor",
+    ".venv",
+    "venv",
 ];
 
 #[derive(Debug, Default, Clone)]
@@ -58,10 +68,13 @@ pub fn extract(path: &Path, text: &str) -> Vec<(usize, String)> {
         let t = line.trim_start();
         match ext {
             "rs" => {
-                for kw in ["fn ", "struct ", "enum ", "trait ", "const ", "type ", "impl "] {
-                    if let Some(rest) = t.strip_prefix(kw).or_else(|| {
-                        t.strip_prefix("pub ").and_then(|r| r.strip_prefix(kw))
-                    }) {
+                for kw in [
+                    "fn ", "struct ", "enum ", "trait ", "const ", "type ", "impl ",
+                ] {
+                    if let Some(rest) = t
+                        .strip_prefix(kw)
+                        .or_else(|| t.strip_prefix("pub ").and_then(|r| r.strip_prefix(kw)))
+                    {
                         if let Some(name) = ident_head(rest) {
                             out.push((l, name));
                         }
@@ -97,9 +110,10 @@ pub fn extract(path: &Path, text: &str) -> Vec<(usize, String)> {
                 }
                 // `const foo =` arrow/function bindings
                 for kw in ["const ", "let "] {
-                    if let Some(rest) = t.strip_prefix(kw).or_else(|| {
-                        t.strip_prefix("export ").and_then(|r| r.strip_prefix(kw))
-                    }) {
+                    if let Some(rest) = t
+                        .strip_prefix(kw)
+                        .or_else(|| t.strip_prefix("export ").and_then(|r| r.strip_prefix(kw)))
+                    {
                         if let Some((name, tail)) = rest.split_once('=') {
                             if let Some(name) = ident_head(name) {
                                 if tail.contains("=>") || tail.contains("function") {
@@ -175,16 +189,16 @@ pub fn build(root: &Path) -> Index {
             } else if EXTENSIONS
                 .iter()
                 .any(|x| p.extension().and_then(|e| e.to_str()) == Some(x))
-                && p.metadata().map(|m| m.len()) .unwrap_or(0) <= MAX_FILE_BYTES
+                && p.metadata().map(|m| m.len()).unwrap_or(0) <= MAX_FILE_BYTES
             {
                 files.push(p);
             }
         }
     }
     files.sort(); // deterministic
-    // One read pass: extract defs AND cache per-file identifier sets for
-    // the reference vote (identifier-set membership is O(1) per symbol —
-    // no rescanning the tree per symbol).
+                  // One read pass: extract defs AND cache per-file identifier sets for
+                  // the reference vote (identifier-set membership is O(1) per symbol —
+                  // no rescanning the tree per symbol).
     let mut file_idents: Vec<(PathBuf, std::collections::HashSet<String>)> = Vec::new();
     for f in files {
         let Ok(text) = std::fs::read_to_string(&f) else {
@@ -314,7 +328,11 @@ mod tests {
     #[test]
     fn extracts_py_and_go() {
         let dir = tmpdir();
-        std::fs::write(dir.join("a.py"), "def run():\n    pass\nclass C:\n    pass\n").unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def run():\n    pass\nclass C:\n    pass\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("b.go"), "func Run() {}\ntype T struct{}\n").unwrap();
         let idx = build(&dir);
         assert!(idx.symbols.contains_key("run"));

@@ -49,11 +49,7 @@ pub struct Report {
 /// `Conversation`/`Both`/`Summarize` truncate `events.jsonl` after the
 /// boundary (the boundary's user input survives); `Summarize` then
 /// appends a Compaction marker.
-pub fn restore(
-    session_dir: &Path,
-    boundary: Option<u64>,
-    mode: Mode,
-) -> std::io::Result<Report> {
+pub fn restore(session_dir: &Path, boundary: Option<u64>, mode: Mode) -> std::io::Result<Report> {
     let cps = crate::session::checkpoints(session_dir);
     let boundary = match boundary.or_else(|| cps.last().copied()) {
         Some(b) if cps.contains(&b) => b,
@@ -169,7 +165,8 @@ mod tests {
     use crate::ir::{Block, Usage};
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("overseer-rewind-{tag}-{}", uuid::Uuid::now_v7()));
+        let d =
+            std::env::temp_dir().join(format!("overseer-rewind-{tag}-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -265,7 +262,10 @@ mod tests {
         let r = restore(&dir, Some(2), Mode::Code).unwrap();
         assert_eq!(r.restored, 1);
         assert_eq!(r.deleted, 1);
-        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "snapshot-content");
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "snapshot-content"
+        );
         assert!(!created.exists());
         assert_eq!(ids(&dir).len(), 5, "conversation untouched");
         let _ = std::fs::remove_dir_all(&root);

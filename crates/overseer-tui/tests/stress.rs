@@ -147,7 +147,10 @@ fn input_echo_stays_fast_during_streaming() {
     for i in 0..50 {
         // Interleave typing with the engine still draining.
         let t = Instant::now();
-        key(&mut app, crossterm::event::KeyCode::Char(b"abc"[i % 3] as char));
+        key(
+            &mut app,
+            crossterm::event::KeyCode::Char(b"abc"[i % 3] as char),
+        );
         app.step(&mut term, &caps).unwrap();
         worst = worst.max(t.elapsed());
     }
@@ -353,7 +356,11 @@ fn diff_many_hunks() {
     }
     let t = Instant::now();
     let hs = overseer_tui::diff::hunks(&old, &new, 3);
-    eprintln!("[stress] 10k-line diff → {} hunks: {:?}", hs.len(), t.elapsed());
+    eprintln!(
+        "[stress] 10k-line diff → {} hunks: {:?}",
+        hs.len(),
+        t.elapsed()
+    );
     assert_eq!(hs.len(), 200);
     // Reject every other hunk — output must interleave correctly.
     let rejected: Vec<bool> = (0..hs.len()).map(|i| i % 2 == 0).collect();
