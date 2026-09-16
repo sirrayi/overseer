@@ -30,6 +30,21 @@ def _scan_text(path: Path) -> set[str]:
         return set()
 
 
+def _scan_streamed(path: Path) -> set[str]:
+    """Chunked scan so >5 MB trajectories/events don't get skipped — a
+    canary can span a chunk boundary, hence the overlap tail."""
+    found: set[str] = set()
+    tail = ""
+    try:
+        with open(path, errors="replace") as f:
+            while chunk := f.read(1 << 20):
+                found |= set(CANARY_RE.findall(tail + chunk))
+                tail = chunk[-64:]
+    except OSError:
+        pass
+    return found
+
+
 def audit_canaries(
     tasks,
     records: list[dict],
@@ -84,19 +99,26 @@ def audit_canaries(
         if r.get("kind") != "run":
             continue
         blobs = set()
+        files_read = 0
         for key in ("trajectory", "session_dir"):
             p = r.get(key)
-            if p:
-                path = Path(p)
-                if path.is_file():
-                    blobs |= _scan_text(path)
-                elif path.is_dir():
-                    for f in path.rglob("*"):
-                        if f.is_file() and f.stat().st_size < 5_000_000:
-                            blobs |= _scan_text(f)
-        if not blobs:
+            if not p:
+                continue
+            path = Path(p)
+            targets = (
+                [path]
+                if path.is_file()
+                else (
+                    [f for f in path.rglob("*") if f.is_file()] if path.is_dir() else []
+                )
+            )
+            for f in targets:
+                found = _scan_streamed(f)
+                files_read += 1
+                blobs |= found
+        if files_read == 0:
             continue
-        scanned += 1
+        scanned += 1  # a run counts as scanned iff we actually read a file
         run_task = r.get("task_id", "")
         for c in blobs:
             own = owner.get(c)

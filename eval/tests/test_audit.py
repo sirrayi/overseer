@@ -39,7 +39,6 @@ class TestCanaryAudit:
 
     def test_foreign_canary_flagged(self, tmp_path):
         a = _spec("held-a", "OVR-CANARY-aaaaaaaaaaaaaaaa")
-        _spec("held-b", "OVR-CANARY-bbbbbbbbbbbbbbbb")
         b = _spec("held-b", "OVR-CANARY-bbbbbbbbbbbbbbbb")
         traj = tmp_path / "traj.jsonl"
         # task-b's run contains task-a's canary → contamination
@@ -91,6 +90,30 @@ class TestCanaryAudit:
         rep = audit.audit_canaries([t], recs)
         types = [f["type"] for f in rep["findings"]]
         assert "canary_in_public_run" in types
+
+    def test_scanned_counts_runs_actually_read(self, tmp_path):
+        # a clean run with readable artifacts still counts as scanned —
+        # scanned_runs must reflect coverage, not sightings
+        t = _spec("held-x", "OVR-CANARY-aaaaaaaaaaaaaaaa")
+        traj = tmp_path / "traj.jsonl"
+        traj.write_text('{"msg": "nothing suspicious"}\n')
+        recs = [
+            {
+                "kind": "run",
+                "task_id": "held-x",
+                "run_id": "r1",
+                "trajectory": str(traj),
+            },
+            {
+                "kind": "run",
+                "task_id": "held-x",
+                "run_id": "r2",
+                "trajectory": str(tmp_path / "missing.jsonl"),
+            },
+        ]
+        rep = audit.audit_canaries([t], recs)
+        assert rep["scanned_runs"] == 1
+        assert rep["findings"] == []
 
     def test_heldout_tasks_all_have_valid_canaries(self):
         heldout = taskspec.load_dir(
