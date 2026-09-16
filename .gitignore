@@ -5,3 +5,7 @@ playbook.txt
 .DS_Store
 eval/results/
 eval/workspaces/
+eval/vendor/
+eval/.venv/
+__pycache__/
+*.pyc

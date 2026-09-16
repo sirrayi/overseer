@@ -1,9 +1,10 @@
 {
   "id": "multi-file-edit",
-  "version": 1,
+  "version": 2,
   "tags": ["smoke", "edit", "multi-file"],
   "instruction": "config.txt sets MODE=dev and retries=1. Update it to MODE=prod and retries=3, and create a summary.txt containing the single line 'prod/3'. Verify both files afterwards.",
   "setup": "printf 'MODE=dev\nretries=1\n' > config.txt",
   "grader": {"type": "bash_assert", "script": "grep -qx 'MODE=prod' config.txt && grep -qx 'retries=3' config.txt && grep -qx 'prod/3' summary.txt"},
+  "oracle": {"script": "printf 'MODE=prod\nretries=3\n' > config.txt && printf 'prod/3\n' > summary.txt"},
   "limits": {"max_steps": 15}
 }
