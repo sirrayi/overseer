@@ -1,0 +1,16 @@
+{
+  "id": "rot13-cli",
+  "version": 1,
+  "tags": ["script", "cli"],
+  "difficulty": "easy",
+  "instruction": "Write rot13.py: stdin → stdout rot13 transform, preserving case and non-letters. `echo 'Hello, World!' | python3 rot13.py` must print 'Uryyb, Jbeyq!'.",
+  "setup": "true",
+  "grader": {
+    "type": "bash_assert",
+    "script": "[ \"$(echo 'Hello, World!' | python3 rot13.py)\" = 'Uryyb, Jbeyq!' ] && [ \"$(echo 'Uryyb' | python3 rot13.py)\" = 'Hello' ]"
+  },
+  "oracle": {
+    "script": "cat > rot13.py <<'EOF'\nimport sys\nout = []\nfor ch in sys.stdin.read():\n    if 'a' <= ch <= 'z':\n        out.append(chr((ord(ch) - 97 + 13) % 26 + 97))\n    elif 'A' <= ch <= 'Z':\n        out.append(chr((ord(ch) - 65 + 13) % 26 + 65))\n    else:\n        out.append(ch)\nsys.stdout.write(''.join(out))\nEOF\necho 'Hello, World!' | python3 rot13.py"
+  },
+  "limits": {"max_steps": 8, "max_cost_usd": 0.2, "wall_s": 300}
+}
