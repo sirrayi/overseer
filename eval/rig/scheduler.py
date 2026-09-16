@@ -6,9 +6,10 @@ deterministic grader → RunRecord appended to the store.
 Failure discipline (playbook: "infra-failure vs agent-failure separated;
 retry infra, never retry-and-count agent failures"):
 - Agent failures (grader fail, solver said done=False) are pass=False rows.
-- Infra failures (missing binary, transport error, wall-timeout at the
-  runner level) are retried ONCE; if still failing the row is recorded
-  with infra_error=True and excluded from pass statistics.
+- Infra failures (missing binary, transport error) are retried ONCE; if
+  still failing the row is recorded with infra_error=True and excluded
+  from pass statistics. Wall-clock budget exhaustion is an agent
+  outcome (the run had its full budget), not infra.
 
 Cell order is fully deterministic: sorted(task.id) × sorted(agent) ×
 range(k) — the `scheduler_seed` is recorded for any ordering that later

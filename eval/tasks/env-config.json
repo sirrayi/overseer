@@ -1,0 +1,16 @@
+{
+  "id": "env-config",
+  "version": 1,
+  "tags": ["script", "config"],
+  "difficulty": "med",
+  "instruction": "settings.py must load config: defaults in defaults.env, overridden by .env file, overridden by real environment variables. Keys: PORT, HOST, DEBUG. Write resolved config to resolved.json. DEBUG parses 'true'/'false' to bool, PORT to int.",
+  "setup": "printf 'PORT=8000\\nHOST=internal\\nDEBUG=false\\n' > defaults.env\nprintf 'PORT=9000\\nDEBUG=true\\n' > .env",
+  "grader": {
+    "type": "bash_assert",
+    "script": "PORT=7000 python3 settings.py && python3 -c \"import json; c=json.load(open('resolved.json')); assert c=={'PORT':7000,'HOST':'internal','DEBUG':True}\" && python3 settings.py && python3 -c \"import json; c=json.load(open('resolved.json')); assert c['PORT']==9000\""
+  },
+  "oracle": {
+    "script": "cat > settings.py <<'EOF'\nimport json, os\n\ndef load(path):\n    out = {}\n    try:\n        for ln in open(path):\n            ln = ln.strip()\n            if ln and not ln.startswith('#') and '=' in ln:\n                k, v = ln.split('=', 1)\n                out[k.strip()] = v.strip()\n    except FileNotFoundError:\n        pass\n    return out\n\ncfg = {**load('defaults.env'), **load('.env')}\nfor k in ('PORT', 'HOST', 'DEBUG'):\n    if k in os.environ:\n        cfg[k] = os.environ[k]\nres = {'PORT': int(cfg['PORT']), 'HOST': cfg['HOST'], 'DEBUG': cfg['DEBUG'].lower() == 'true'}\njson.dump(res, open('resolved.json','w'))\nEOF\npython3 settings.py"
+  },
+  "limits": {"max_steps": 12, "max_cost_usd": 0.4, "wall_s": 600}
+}

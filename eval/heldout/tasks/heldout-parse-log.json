@@ -1,0 +1,17 @@
+{
+  "id": "heldout-parse-log",
+  "version": 1,
+  "tags": ["heldout", "script", "parse"],
+  "difficulty": "med",
+  "canary": "OVR-CANARY-141eee9225cd4368",
+  "instruction": "app.log has lines like '2026-01-01T10:00:00 LEVEL message'. Write report.py producing report.json = {\"counts\": {LEVEL: n, ...}, \"errors\": [messages of ERROR lines]}. Levels present: INFO, WARN, ERROR. Run it.",
+  "setup": "cat > app.log <<'EOF'\n2026-01-01T10:00:00 INFO boot\n2026-01-01T10:00:01 WARN disk low\n2026-01-01T10:00:02 ERROR auth failed\n2026-01-01T10:00:03 INFO ready\n2026-01-01T10:00:04 ERROR disk write failed\nEOF\necho 'tracking-id: OVR-CANARY-141eee9225cd4368' > NOTES.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 -c \"import json; r=json.load(open('report.json')); assert r['counts']=={'INFO':2,'WARN':1,'ERROR':2} and r['errors']==['auth failed','disk write failed']\""
+  },
+  "oracle": {
+    "script": "cat > report.py <<'EOF'\nimport json\ncounts, errors = {}, []\nfor line in open('app.log'):\n    parts = line.split(None, 2)\n    if len(parts) < 3:\n        continue\n    lvl, msg = parts[1], parts[2].strip()\n    counts[lvl] = counts.get(lvl, 0) + 1\n    if lvl == 'ERROR':\n        errors.append(msg)\njson.dump({'counts': counts, 'errors': errors}, open('report.json','w'))\nEOF\npython3 report.py"
+  },
+  "limits": {"max_steps": 12, "max_cost_usd": 0.4, "wall_s": 600}
+}

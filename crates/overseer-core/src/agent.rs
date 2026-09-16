@@ -79,6 +79,9 @@ pub struct AgentConfig {
     /// `AllowAlways` decisions append keys here; every new Policy loads
     /// them. None disables persistence.
     pub rules_path: Option<PathBuf>,
+    /// P4.3 ablation: tool names removed from the spec list and refused at
+    /// dispatch (`--no-tools`). Validated against tools::TOOL_NAMES.
+    pub disabled_tools: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -103,6 +106,7 @@ impl Default for AgentConfig {
             sandbox_bash: true,
             ask_handler: None,
             rules_path: None,
+            disabled_tools: Vec::new(),
         }
     }
 }
@@ -853,11 +857,15 @@ impl Agent {
     /// tools from the spec list entirely (capability removal, P1.4).
     fn registry(config: &AgentConfig) -> ToolRegistry {
         let policy = Self::policy(config);
-        if !config.full_access && config.policy_preset == crate::perm::Preset::Plan {
+        let mut reg = if !config.full_access && config.policy_preset == crate::perm::Preset::Plan {
             ToolRegistry::plan_mode(policy)
         } else {
             ToolRegistry::core(policy)
+        };
+        if !config.disabled_tools.is_empty() {
+            reg.disable(&config.disabled_tools);
         }
+        reg
     }
 
     fn policy(config: &AgentConfig) -> crate::perm::Policy {

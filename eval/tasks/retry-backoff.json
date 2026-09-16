@@ -1,0 +1,16 @@
+{
+  "id": "retry-backoff",
+  "version": 1,
+  "tags": ["script", "logic"],
+  "difficulty": "med",
+  "instruction": "Implement retry.py: a `with_retry(fn, tries=4, base=0.1)` helper that calls fn, on exception sleeps base*2**i seconds (i=0..), and returns fn()'s result on success or re-raises after the last try. flaky.py fails twice then succeeds — running retry.py must print 'ok' and log each sleep delay to sleeps.txt, one delay per line, truncating the file at the start of each run so it only holds the latest run's delays.",
+  "setup": "cat > flaky.py <<'EOF'\nstate = {'n': 0}\ndef work():\n    state['n'] += 1\n    if state['n'] < 3:\n        raise RuntimeError('fail')\n    return 'ok'\nEOF",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 retry.py | grep -qx ok && python3 -c \"d=[float(l) for l in open('sleeps.txt')]; assert len(d)==2 and abs(d[0]-0.1)<1e-6 and abs(d[1]-0.2)<1e-6\""
+  },
+  "oracle": {
+    "script": "cat > retry.py <<'EOF'\nimport time\nimport flaky\n\ndef with_retry(fn, tries=4, base=0.1):\n    for i in range(tries):\n        try:\n            return fn()\n        except Exception:\n            if i == tries - 1:\n                raise\n            d = base * 2 ** i\n            open('sleeps.txt','a').write(f'{d}\\n')\n            time.sleep(d)\n\nopen('sleeps.txt','w').close()\nprint(with_retry(flaky.work))\nEOF\nrm -f sleeps.txt && python3 retry.py"
+  },
+  "limits": {"max_steps": 12, "max_cost_usd": 0.4, "wall_s": 600}
+}

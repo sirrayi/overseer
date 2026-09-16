@@ -1,0 +1,16 @@
+{
+  "id": "dedupe-ordered",
+  "version": 1,
+  "tags": ["script", "data"],
+  "difficulty": "easy",
+  "instruction": "dedupe.py must read lines.txt and write unique lines to out.txt preserving first-seen order. The file is already written but buggy — it sorts the output. Fix it so order is preserved, then run it.",
+  "setup": "printf 'b\\na\\nc\\na\\nb\\n' > lines.txt\ncat > dedupe.py <<'EOF'\nlines = open('lines.txt').read().splitlines()\nseen = sorted(set(lines))\nopen('out.txt','w').write('\\n'.join(seen) + '\\n')\nEOF",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 dedupe.py && printf 'b\\na\\nc\\n' | diff - out.txt"
+  },
+  "oracle": {
+    "script": "cat > dedupe.py <<'EOF'\nseen = set()\nout = []\nfor ln in open('lines.txt').read().splitlines():\n    if ln not in seen:\n        seen.add(ln)\n        out.append(ln)\nopen('out.txt','w').write('\\n'.join(out) + '\\n')\nEOF\npython3 dedupe.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 600}
+}

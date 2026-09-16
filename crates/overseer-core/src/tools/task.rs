@@ -229,11 +229,14 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     } else {
         crate::perm::Policy::preset(cfg.policy_preset, sub_cwd.clone())
     };
-    let registry = if write_mode {
+    let mut registry = if write_mode {
         ToolRegistry::core(policy)
     } else {
         ToolRegistry::readonly(policy)
     };
+    // Ablation propagates: a component disabled for the parent is
+    // disabled for every subagent too.
+    registry.disable(&cfg.disabled_tools);
 
     if background {
         // Claim the slot in the parent before spawning — the in-flight

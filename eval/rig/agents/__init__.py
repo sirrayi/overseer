@@ -26,8 +26,48 @@ REGISTRY = {
     "fail": fail,  # always fails — rig self-test
 }
 
+# P4.3 ablation arms: `overseer@<preset>` runs the overseer arm with
+# component-removal flags — e.g. `--agents overseer,overseer@no-compact`
+# A/Bs the context engine. The arm name lands in records verbatim, so
+# paired deltas read `overseer@no-compact − overseer`.
+ABLATIONS = {
+    "no-compact": ["--no-compact"],
+    "no-keep": ["--keep-results", "0"],
+    "no-subagents": ["--no-tools", "task"],
+    "no-skills": ["--no-tools", "skill"],
+    "no-repomap": ["--no-tools", "repo_map,symbol"],
+    "no-plan": ["--no-tools", "plan"],
+    "minimal": [
+        "--no-compact",
+        "--keep-results",
+        "0",
+        "--no-tools",
+        "task,skill,repo_map,symbol,plan",
+    ],
+}
+
+
+class _Ablation:
+    def __init__(self, flags):
+        self._flags = flags
+
+    def solve(self, instruction, workdir, session_dir, **kw):
+        return overseer.solve(
+            instruction, workdir, session_dir, extra_flags=self._flags, **kw
+        )
+
 
 def get(name: str):
+    if name.startswith("overseer@"):
+        preset = name.split("@", 1)[1]
+        if preset not in ABLATIONS:
+            raise KeyError(
+                f"unknown ablation {preset!r}; available: {sorted(ABLATIONS)}"
+            )
+        return _Ablation(ABLATIONS[preset])
     if name not in REGISTRY:
-        raise KeyError(f"unknown agent {name!r}; available: {sorted(REGISTRY)}")
+        raise KeyError(
+            f"unknown agent {name!r}; available: {sorted(REGISTRY)} "
+            f"or overseer@<ablation> {sorted(ABLATIONS)}"
+        )
     return REGISTRY[name]

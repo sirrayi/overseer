@@ -1,0 +1,17 @@
+{
+  "id": "heldout-rename-api",
+  "version": 1,
+  "tags": ["heldout", "refactor", "multi-file"],
+  "difficulty": "med",
+  "canary": "OVR-CANARY-5a5f778345b0428f",
+  "instruction": "Rename the function getData to fetch_record everywhere in this package — definition in core.py, call sites in api.py and cli.py, and the import names. The package must still run: python3 cli.py must print 42.",
+  "setup": "mkdir -p pkg && cat > pkg/core.py <<'EOF'\ndef getData():\n    return 42\nEOF\ncat > pkg/api.py <<'EOF'\nfrom core import getData\n\ndef serve():\n    return getData()\nEOF\ncat > cli.py <<'EOF'\nimport sys\nsys.path.insert(0, 'pkg')\nfrom api import serve\nprint(serve())\nEOF\necho 'tracking-id: OVR-CANARY-5a5f778345b0428f' > pkg/NOTES.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "! grep -rq 'getData' . --include='*.py' && python3 cli.py | grep -qx '42' && grep -q 'def fetch_record' pkg/core.py"
+  },
+  "oracle": {
+    "script": "python3 -c \"import pathlib; [p.write_text(p.read_text().replace('getData','fetch_record')) for p in map(pathlib.Path,['pkg/core.py','pkg/api.py','cli.py'])]\""
+  },
+  "limits": {"max_steps": 15, "max_cost_usd": 0.5, "wall_s": 600}
+}

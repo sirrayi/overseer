@@ -1,0 +1,16 @@
+{
+  "id": "csv-pivot",
+  "version": 1,
+  "tags": ["script", "data"],
+  "difficulty": "med",
+  "instruction": "sales.csv has columns: region,product,qty. Write pivot.py producing pivot.csv: rows=region (sorted), columns=product (sorted), cells=total qty. Header: region,<products...>. Run it.",
+  "setup": "printf 'region,product,qty\\nnorth,A,3\\nsouth,B,2\\nnorth,B,1\\nsouth,A,4\\nnorth,A,2\\n' > sales.csv",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 pivot.py && printf 'region,A,B\\nnorth,5,1\\nsouth,4,2\\n' | diff - pivot.csv"
+  },
+  "oracle": {
+    "script": "cat > pivot.py <<'EOF'\nimport csv\nfrom collections import defaultdict\nrows = list(csv.DictReader(open('sales.csv')))\nproducts = sorted({r['product'] for r in rows})\npivot = defaultdict(lambda: defaultdict(int))\nfor r in rows:\n    pivot[r['region']][r['product']] += int(r['qty'])\nwith open('pivot.csv','w') as f:\n    f.write('region,' + ','.join(products) + '\\n')\n    for reg in sorted(pivot):\n        f.write(reg + ',' + ','.join(str(pivot[reg][p]) for p in products) + '\\n')\nEOF\npython3 pivot.py"
+  },
+  "limits": {"max_steps": 12, "max_cost_usd": 0.4, "wall_s": 600}
+}

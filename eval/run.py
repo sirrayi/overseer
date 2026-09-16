@@ -61,6 +61,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--agents", "--solver", default="overseer,mini")
     ap.add_argument("--tasks", default="all")
+    ap.add_argument(
+        "--task-dir",
+        default=None,
+        help="task dir override — e.g. heldout/tasks for the private suite",
+    )
     ap.add_argument("--seeds", "-k", type=int, default=1)
     ap.add_argument("--model", default=None)
     ap.add_argument(
@@ -77,6 +82,29 @@ def main() -> int:
     )
     ap.add_argument(
         "--release-version", default="v6", help="LiveCodeBench release window (e.g. v6)"
+    )
+    ap.add_argument(
+        "--predictions-path",
+        default=None,
+        help="swe_bench eval-only: predictions JSONL, or 'gold' for oracle patches",
+    )
+    ap.add_argument(
+        "--swebench-ids",
+        default=None,
+        help="comma-separated SWE-bench instance_ids to run",
+    )
+    ap.add_argument(
+        "--swebench-limit",
+        type=int,
+        default=None,
+        help="cap the number of SWE-bench instances (first N, deterministic order)",
+    )
+    ap.add_argument("--swebench-max-workers", type=int, default=4)
+    ap.add_argument(
+        "--n-tasks",
+        type=int,
+        default=None,
+        help="task cap for harbor benchmarks (terminal_bench, swe_rebench)",
     )
     ap.add_argument("--scheduler-seed", type=int, default=0)
     ap.add_argument(
@@ -101,12 +129,25 @@ def main() -> int:
         default=None,
         help="paired-diff non-inferiority bound in points (e.g. 3)",
     )
+    ap.add_argument(
+        "--audit",
+        action="store_true",
+        help="canary audit over the store — held-out leak/contamination check",
+    )
     args = ap.parse_args()
 
     if args.model:
         os.environ["OVERSEER_MODEL"] = args.model
 
     st = store.Store(RESULTS / "store.jsonl")
+
+    if args.audit:
+        from rig import audit
+
+        heldout = taskspec.load_dir(ROOT / "heldout" / "tasks")
+        rep = audit.audit_canaries(heldout, st.load(), public_dirs=[ROOT / "tasks"])
+        print(audit.render_md(rep))
+        return 1 if rep["findings"] else 0
 
     if args.report:
         records = st.runs()
@@ -124,31 +165,41 @@ def main() -> int:
         return 0
 
     if args.benchmark != "local":
-        from rig.benchmarks import docker_gated, lcb, tau2
+        from rig.benchmarks import harbor, lcb, swebench, tau2
 
-        adapter = {
-            "tau2": tau2.Tau2Adapter,
-            "lcb": lcb.LcbAdapter,
-            "swe_bench": docker_gated.SweBenchAdapter,
-            "terminal_bench": docker_gated.TerminalBenchAdapter,
-            "swe_rebench": docker_gated.SweRebenchAdapter,
-        }[args.benchmark]()
         if args.benchmark == "tau2":
-            return tau2.run_cli(adapter, args, st, harness_commit(), progress)
+            return tau2.run_cli(
+                tau2.Tau2Adapter(), args, st, harness_commit(), progress
+            )
         if args.benchmark == "lcb":
-            return lcb.run_cli(adapter, args, st, harness_commit(), progress)
-        try:
-            adapter.check_or_raise()
-        except Exception as e:
-            print(e)
-            return 2
-        print(
-            f"{args.benchmark}: docker present — adapter run not yet "
-            "implemented (tracked in LEDGER)."
-        )
+            return lcb.run_cli(lcb.LcbAdapter(), args, st, harness_commit(), progress)
+        if args.benchmark == "swe_bench":
+            return swebench.run_cli(
+                swebench.SweBenchAdapter(logs_root=RESULTS / "swebench"),
+                args,
+                st,
+                harness_commit(),
+                progress,
+            )
+        if args.benchmark == "terminal_bench":
+            return harbor.run_cli(
+                harbor.TerminalBenchAdapter(jobs_root=RESULTS / "harbor"),
+                args,
+                st,
+                harness_commit(),
+                progress,
+            )
+        if args.benchmark == "swe_rebench":
+            return harbor.run_cli(
+                harbor.SweRebenchAdapter(jobs_root=RESULTS / "harbor"),
+                args,
+                st,
+                harness_commit(),
+                progress,
+            )
         return 2
 
-    tasks = taskspec.load_dir(ROOT / "tasks")
+    tasks = taskspec.load_dir(ROOT / (args.task_dir or "tasks"))
     if args.tasks != "all":
         keep = set(args.tasks.split(","))
         tasks = [t for t in tasks if t.id in keep]
@@ -163,7 +214,11 @@ def main() -> int:
         return 1 if bad else 0
 
     agent_names = [a.strip() for a in args.agents.split(",")]
-    needs_key = [a for a in agent_names if a in ("overseer", "mini")]
+    needs_key = [
+        a
+        for a in agent_names
+        if a == "mini" or a == "overseer" or a.startswith("overseer@")
+    ]
     if needs_key and not os.environ.get("OVERSEER_API_KEY"):
         sys.exit("OVERSEER_API_KEY required for " + ",".join(needs_key))
 
