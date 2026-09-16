@@ -166,10 +166,7 @@ fn steering_mid_run_queues_at_boundary() {
     };
     app.step(&mut term, &caps).unwrap();
     app.submit_text("also rename the helper");
-    assert_eq!(
-        control.queued(),
-        vec!["also rename the helper".to_string()]
-    );
+    assert_eq!(control.queued(), vec!["also rename the helper".to_string()]);
     app.step(&mut term, &caps).unwrap();
     insta::assert_snapshot!("queued_steer", screen(&term));
 }
@@ -265,7 +262,9 @@ fn session_picker_filters_and_switches() {
     app.submit_text("/sessions");
     app.step(&mut term, &caps).unwrap();
     // Normalize the relative-time column — it races the wall clock.
-    let picker = screen(&term).replace("0s ·", "[ago] ·").replace("1s ·", "[ago] ·");
+    let picker = screen(&term)
+        .replace("0s ·", "[ago] ·")
+        .replace("1s ·", "[ago] ·");
     insta::assert_snapshot!("session_picker", picker);
 
     // Fuzzy filter: 'par' matches only s2's "add a parser".
@@ -275,7 +274,9 @@ fn session_picker_filters_and_switches() {
         ));
     }
     app.step(&mut term, &caps).unwrap();
-    let filtered = screen(&term).replace("0s ·", "[ago] ·").replace("1s ·", "[ago] ·");
+    let filtered = screen(&term)
+        .replace("0s ·", "[ago] ·")
+        .replace("1s ·", "[ago] ·");
     insta::assert_snapshot!("session_picker_filtered", filtered);
 
     // Enter switches: the worker gets the command.
@@ -380,8 +381,10 @@ fn transcript_overlay_searches_history() {
         })))
         .unwrap();
     }
-    etx.send(EngineMsg::Event(model_response("I'll look at the test file.")))
-        .unwrap();
+    etx.send(EngineMsg::Event(model_response(
+        "I'll look at the test file.",
+    )))
+    .unwrap();
     app.step(&mut term, &caps).unwrap();
 
     // Ctrl+O opens the pager over flushed history.
@@ -489,7 +492,9 @@ fn tree_overlay_shows_fork_hierarchy() {
     overseer_core::session::fork(&root.join("s1"), None, &root.join("s3")).unwrap();
     app.submit_text("/tree");
     app.step(&mut term, &caps).unwrap();
-    let norm = screen(&term).replace("0s ·", "[ago] ·").replace("1s ·", "[ago] ·");
+    let norm = screen(&term)
+        .replace("0s ·", "[ago] ·")
+        .replace("1s ·", "[ago] ·");
     insta::assert_snapshot!("tree_overlay", norm);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -507,7 +512,10 @@ fn slash_menu_matches_fuzzy() {
     app.step(&mut term, &caps).unwrap();
     let s = screen(&term);
     assert!(s.contains("tree"), "fuzzy /tr should list /tree:\n{s}");
-    assert!(s.contains("transcript"), "fuzzy /tr should list /transcript:\n{s}");
+    assert!(
+        s.contains("transcript"),
+        "fuzzy /tr should list /transcript:\n{s}"
+    );
 }
 
 /// Transcript overlay: Tab expands completed tool blocks (their
@@ -588,7 +596,10 @@ fn diff_rejects_single_hunk() {
     )); // reject it
     app.step(&mut term, &caps).unwrap();
     let dirname = root.file_name().unwrap().to_str().unwrap().to_string();
-    insta::assert_snapshot!("diff_hunk_marked", screen(&term).replace(&dirname, "[root]"));
+    insta::assert_snapshot!(
+        "diff_hunk_marked",
+        screen(&term).replace(&dirname, "[root]")
+    );
 
     app.key(crossterm::event::KeyEvent::from(
         crossterm::event::KeyCode::Enter,
@@ -612,10 +623,7 @@ fn bang_shell_is_local_only() {
     let (mut app, _etx, wrx, mut term, caps) = harness();
     app.submit_text("!echo hello-from-shell");
     app.step(&mut term, &caps).unwrap();
-    assert!(
-        wrx.try_recv().is_err(),
-        "! must never reach the worker"
-    );
+    assert!(wrx.try_recv().is_err(), "! must never reach the worker");
     insta::assert_snapshot!("bang_shell", screen(&term));
 }
 
@@ -623,10 +631,7 @@ fn bang_shell_is_local_only() {
 /// completes the path into the composer.
 #[test]
 fn at_mention_completes_paths() {
-    let root = std::env::temp_dir().join(format!(
-        "overseer-tui-at-{}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("overseer-tui-at-{}", std::process::id()));
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(root.join("README.md"), "x\n").unwrap();
@@ -662,9 +667,7 @@ fn at_mention_completes_paths() {
         .to_string();
     let dirname = root.file_name().unwrap().to_str().unwrap().to_string();
     let norm = move |t: &Terminal<TestBackend>| {
-        screen(t)
-            .replace(&tmp, "[tmp]")
-            .replace(&dirname, "[root]")
+        screen(t).replace(&tmp, "[tmp]").replace(&dirname, "[root]")
     };
 
     for c in "@mai".chars() {

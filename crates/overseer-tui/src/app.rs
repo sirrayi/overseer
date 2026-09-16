@@ -33,16 +33,23 @@ pub enum EngineMsg {
     RunError(String),
     /// The worker rebuilt its agent on a different session directory —
     /// the UI reseeds the transcript from that log.
-    SessionSwitched { dir: std::path::PathBuf },
+    SessionSwitched {
+        dir: std::path::PathBuf,
+    },
 }
 
 /// UI → worker commands.
 pub enum WorkerCmd {
-    Submit { text: String, control: Control },
+    Submit {
+        text: String,
+        control: Control,
+    },
     SetPreset(Preset),
     /// Drop the current agent and `Agent::resume` on `dir` — session
     /// switch, post-fork, and post-rewind rebuild all share this path.
-    SwitchSession { dir: std::path::PathBuf },
+    SwitchSession {
+        dir: std::path::PathBuf,
+    },
     Shutdown,
 }
 
@@ -533,9 +540,7 @@ impl App {
                     }
                     Some(None)
                 }
-                (KeyCode::Char(c), m)
-                    if m.is_empty() && matches!(c, '1' | '2' | '3' | '4') =>
-                {
+                (KeyCode::Char(c), m) if m.is_empty() && matches!(c, '1' | '2' | '3' | '4') => {
                     let (dlg, _) = self.dialog.as_ref().unwrap();
                     match dlg.resolve(c) {
                         Some(d) => Some(Some(d)),
@@ -585,9 +590,7 @@ impl App {
                     self.show_help = false;
                 }
             }
-            (KeyCode::Char('j'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.composer.newline()
-            }
+            (KeyCode::Char('j'), m) if m.contains(KeyModifiers::CONTROL) => self.composer.newline(),
             (KeyCode::BackTab, m) if m.contains(KeyModifiers::SHIFT) => self.cycle_mode(),
             (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.show_plan = !self.show_plan;
@@ -742,25 +745,28 @@ impl App {
                 }
                 _ => {}
             },
-            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => match &mut self.overlay
-            {
-                Some(Overlay::Sessions { filter, sel, .. }) => {
-                    filter.push(c);
-                    *sel = 0;
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                match &mut self.overlay {
+                    Some(Overlay::Sessions { filter, sel, .. }) => {
+                        filter.push(c);
+                        *sel = 0;
+                    }
+                    Some(Overlay::Transcript { query, scroll, .. }) => {
+                        query.push(c);
+                        *scroll = 0;
+                    }
+                    _ => {}
                 }
-                Some(Overlay::Transcript { query, scroll, .. }) => {
-                    query.push(c);
-                    *scroll = 0;
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
 
     fn overlay_confirm(&mut self) {
         match self.overlay.take() {
-            Some(Overlay::Sessions { rows, sel, filter, .. }) => {
+            Some(Overlay::Sessions {
+                rows, sel, filter, ..
+            }) => {
                 if let Some((_, info)) = filtered_sessions(&rows, &filter).get(sel) {
                     let info = (*info).clone();
                     if info.dir != self.session_dir {
@@ -1085,14 +1091,10 @@ impl App {
 
     /// Ctrl+Y: copy the most recent assistant text via OSC 52.
     fn copy_last(&mut self) {
-        let text = self
-            .history
-            .iter()
-            .rev()
-            .find_map(|c| match c {
-                Cell::Assistant { text } => Some(text.clone()),
-                _ => None,
-            });
+        let text = self.history.iter().rev().find_map(|c| match c {
+            Cell::Assistant { text } => Some(text.clone()),
+            _ => None,
+        });
         match text {
             Some(t) if self.osc => {
                 let n = t.chars().count();
@@ -1141,9 +1143,7 @@ impl App {
         };
         match candidates.len() {
             0 => {}
-            1 => self
-                .composer
-                .set_text(&format!("{stem}{} ", candidates[0])),
+            1 => self.composer.set_text(&format!("{stem}{} ", candidates[0])),
             _ => {
                 let lcp = candidates
                     .iter()
@@ -1159,7 +1159,9 @@ impl App {
     /// Workspace files for `@` completion — recursive, skips heavy
     /// dirs, capped. Built lazily on first use (switches reset it).
     fn file_index(&self) -> &[String] {
-        self.file_index.get_or_init(|| self.build_index()).as_slice()
+        self.file_index
+            .get_or_init(|| self.build_index())
+            .as_slice()
     }
 
     fn build_index(&self) -> Vec<String> {
@@ -1209,11 +1211,7 @@ impl App {
         });
         match shell_capture(cmd, &self.cwd) {
             Ok((code, out)) => {
-                let tail: String = out
-                    .lines()
-                    .take(24)
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let tail: String = out.lines().take(24).collect::<Vec<_>>().join("\n");
                 let suffix = if out.len() > 8192 { "…" } else { "" };
                 self.pending.push(Cell::Meta {
                     style: if code == 0 {
@@ -1333,8 +1331,9 @@ impl App {
                     let shown = display_path(&self.cwd, p);
                     let url = format!("file://{}", p.display());
                     let mut out = std::io::stdout();
-                    let _ = out
-                        .write_all(format!("  ⤷ {}\n", crate::notify::osc8(&url, &shown)).as_bytes());
+                    let _ = out.write_all(
+                        format!("  ⤷ {}\n", crate::notify::osc8(&url, &shown)).as_bytes(),
+                    );
                     let _ = out.flush();
                 }
             }
@@ -1412,7 +1411,10 @@ impl App {
         if self.show_plan {
             if let Ok(md) = std::fs::read_to_string(self.session_dir.join("plan.md")) {
                 for l in md.lines().take(8) {
-                    out.push(Line::from(Span::styled(l.to_string(), crate::theme::meta())));
+                    out.push(Line::from(Span::styled(
+                        l.to_string(),
+                        crate::theme::meta(),
+                    )));
                 }
             } else {
                 out.push(Line::from(Span::styled(
@@ -1488,16 +1490,14 @@ impl App {
                 let area = f.area();
                 let composer_rows = composer_lines.len().clamp(1, 4);
                 let composer_clip = composer_lines.len().saturating_sub(composer_rows);
-                let live_shown =
-                    (area.height as usize).saturating_sub(composer_rows + 1);
+                let live_shown = (area.height as usize).saturating_sub(composer_rows + 1);
                 let live_start = live.len().saturating_sub(live_shown);
                 let composer_top = live_shown as u16;
                 let cy_screen = composer_top
                     + cy.saturating_sub(composer_clip as u16)
                         .min(composer_rows as u16 - 1);
 
-                let mut lines: Vec<Line<'static>> =
-                    Vec::with_capacity(area.height as usize);
+                let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
                 lines.extend(live[live_start..].iter().cloned());
                 lines.extend(composer_lines[composer_clip..].iter().cloned());
                 lines.push(status.clone());
@@ -1517,10 +1517,7 @@ fn overlay_sel(o: &mut Overlay) -> (&mut usize, usize) {
     match o {
         Overlay::Sessions {
             rows, sel, filter, ..
-        } => (
-            sel,
-            filtered_sessions(rows, filter).len().saturating_sub(1),
-        ),
+        } => (sel, filtered_sessions(rows, filter).len().saturating_sub(1)),
         Overlay::Rewind { rows, sel } => (sel, rows.len().saturating_sub(1)),
         Overlay::Tree { rows, sel } => (sel, rows.len().saturating_sub(1)),
         Overlay::Diff { rows, sel, .. } => (sel, rows.len().saturating_sub(1)),
@@ -1674,12 +1671,7 @@ fn shell_capture(cmd: &str, cwd: &str) -> std::io::Result<(i32, String)> {
 
 /// Filtered transcript lines (history + in-flight live cells), used by
 /// both the overlay's height math and its render window.
-fn transcript_lines(
-    app: &App,
-    query: &str,
-    width: u16,
-    expand_tools: bool,
-) -> Vec<Line<'static>> {
+fn transcript_lines(app: &App, query: &str, width: u16, expand_tools: bool) -> Vec<Line<'static>> {
     let q = query.to_lowercase();
     app.history
         .iter()
@@ -1699,8 +1691,10 @@ fn transcript_lines(
 /// snapshot vs current working-tree content).
 fn collect_diff_rows(session_dir: &std::path::Path) -> Vec<DiffRow> {
     // First-seen manifest entry per path: (existed, stored, checkpoint dir).
-    let mut seen: std::collections::HashMap<std::path::PathBuf, (bool, String, std::path::PathBuf)> =
-        std::collections::HashMap::new();
+    let mut seen: std::collections::HashMap<
+        std::path::PathBuf,
+        (bool, String, std::path::PathBuf),
+    > = std::collections::HashMap::new();
     for b in overseer_core::session::checkpoints(session_dir) {
         let cp = session_dir.join("checkpoints").join(format!("e{b}"));
         let Ok(m) = std::fs::read_to_string(cp.join("manifest.jsonl")) else {
@@ -1717,8 +1711,11 @@ fn collect_diff_rows(session_dir: &std::path::Path) -> Vec<DiffRow> {
                 continue;
             };
             let existed = v.get("existed").and_then(|e| e.as_bool()).unwrap_or(false);
-            seen.entry(std::path::PathBuf::from(path))
-                .or_insert((existed, stored.to_string(), cp.clone()));
+            seen.entry(std::path::PathBuf::from(path)).or_insert((
+                existed,
+                stored.to_string(),
+                cp.clone(),
+            ));
         }
     }
     const CAP: usize = 400; // LCS is O(n·m) — cap the compared prefix
@@ -1767,215 +1764,232 @@ impl App {
     fn overlay_lines(&self, o: &Overlay, width: u16) -> Vec<Line<'static>> {
         use crate::theme;
         match o {
-        Overlay::Sessions {
-            rows,
-            branches,
-            sel,
-            filter,
-            wide,
-        } => {
-            // Hint goes LAST — the region clips from the top, so the
-            // key hints survive regardless of viewport height.
-            let mut out = vec![Line::from(vec![
-                Span::styled("> ", theme::dialog_key()),
-                Span::styled(format!("{filter}▌"), theme::dialog()),
-            ])];
-            let shown = filtered_sessions(rows, filter);
-            if shown.is_empty() {
-                out.push(Line::from(Span::styled(
-                    "  no matching sessions".to_string(),
-                    theme::dim(),
-                )));
-            }
-            for (i, (idx, s)) in shown.iter().take(6).enumerate() {
-                let cur = i == *sel;
-                let mark = if cur { "›" } else { " " };
-                let when = rel_time(s.last_ms);
-                // ⤶ marks a fork (SessionStart.parent set).
-                let fork = if s.parent.is_some() { "⤶ " } else { "" };
-                let head = format!(
-                    "{mark} {when} · {}{} · {}",
-                    fork,
-                    short_id(&s.id),
-                    s.first_user.as_deref().unwrap_or("(no prompt)")
-                );
-                out.push(Line::from(Span::styled(
-                    head,
-                    if cur { theme::dialog_sel() } else { theme::dialog() },
-                )));
-                if *wide {
-                    let branch = branches
-                        .get(*idx)
-                        .and_then(|b| b.as_deref())
-                        .unwrap_or("-");
+            Overlay::Sessions {
+                rows,
+                branches,
+                sel,
+                filter,
+                wide,
+            } => {
+                // Hint goes LAST — the region clips from the top, so the
+                // key hints survive regardless of viewport height.
+                let mut out = vec![Line::from(vec![
+                    Span::styled("> ", theme::dialog_key()),
+                    Span::styled(format!("{filter}▌"), theme::dialog()),
+                ])];
+                let shown = filtered_sessions(rows, filter);
+                if shown.is_empty() {
                     out.push(Line::from(Span::styled(
-                        format!(
-                            "    {} · {} · ⎇ {} · {} events · {} checkpoint(s)",
-                            s.cwd,
-                            s.model,
-                            branch,
-                            s.events,
-                            s.checkpoints.len()
-                        ),
+                        "  no matching sessions".to_string(),
                         theme::dim(),
                     )));
                 }
-            }
-            out.push(Line::from(Span::styled(
-                "type to filter · ↑↓ · tab preview · enter switch · esc",
-                theme::dim(),
-            )));
-            out
-        }
-        Overlay::Tree { rows, sel } => {
-            let mut out = Vec::new();
-            for (i, (s, depth)) in rows.iter().take(6).enumerate() {
-                let cur = i == *sel;
-                let mark = if cur { "›" } else { " " };
-                let indent = "  ".repeat((*depth).min(4));
-                let fork_mark = if *depth > 0 { "↳ " } else { "" };
-                let here = if s.dir == self.session_dir {
-                    " · (current)"
-                } else {
-                    ""
-                };
-                out.push(Line::from(Span::styled(
-                    format!(
-                        "{mark} {indent}{fork_mark}{} · {} · {}{}",
-                        short_id(&s.id),
-                        rel_time(s.last_ms),
-                        s.first_user.as_deref().unwrap_or("(no prompt)"),
-                        here
-                    ),
-                    if cur { theme::dialog_sel() } else { theme::dialog() },
-                )));
-            }
-            out.push(Line::from(Span::styled(
-                "↑↓ · enter switch · esc",
-                theme::dim(),
-            )));
-            out
-        }
-        Overlay::Rewind { rows, sel } => {
-            let mut out: Vec<Line<'static>> = rows
-                .iter()
-                .take(6)
-                .enumerate()
-                .map(|(i, r)| {
+                for (i, (idx, s)) in shown.iter().take(6).enumerate() {
                     let cur = i == *sel;
-                    Line::from(Span::styled(
-                        format!(
-                            "{} e{} · {} file(s) · {}",
-                            if cur { "›" } else { " " },
-                            r.boundary,
-                            r.files,
-                            r.label
-                        ),
-                        if cur { theme::dialog_sel() } else { theme::dialog() },
-                    ))
-                })
-                .collect();
-            out.push(Line::from(Span::styled(
-                "↑↓ · enter restore files+conversation · esc",
-                theme::dim(),
-            )));
-            out
-        }
-        Overlay::Transcript {
-            query,
-            scroll,
-            expand_tools,
-        } => {
-            let all = transcript_lines(self, query, width, *expand_tools);
-            let n = all.len();
-            let mut out = vec![Line::from(vec![
-                Span::styled("/ ", theme::dialog_key()),
-                Span::styled(format!("{query}▌"), theme::dialog()),
-            ])];
-            // Scroll is a line offset; usize::MAX (fresh open) means tail.
-            let max = n.saturating_sub(4);
-            let start = (*scroll).min(max);
-            out.extend(all.into_iter().skip(start).take(4));
-            out.push(Line::from(Span::styled(
-                format!("{n} lines · type to filter · ↑↓/pgdn · tab expand tools · esc"),
-                theme::dim(),
-            )));
-            out
-        }
-        Overlay::Diff {
-            rows,
-            sel,
-            preview,
-            hunk_sel,
-        } => {
-            let mut out = Vec::new();
-            for (i, r) in rows.iter().take(4).enumerate() {
-                let cur = i == *sel;
-                let mark = if cur { "›" } else { " " };
-                let nrej = r.rejected.iter().filter(|x| **x).count();
-                let rej = if nrej > 0 {
-                    format!(" · {nrej} marked reject")
-                } else {
-                    String::new()
-                };
-                out.push(Line::from(Span::styled(
-                    format!(
-                        "{mark} {} +{} -{} {}{}",
-                        r.status,
-                        r.added,
-                        r.deleted,
-                        display_path(&self.cwd, &r.path),
-                        rej
-                    ),
-                    if cur { theme::dialog_sel() } else { theme::dialog() },
-                )));
-                if *preview && cur {
-                    for (hi, h) in r.hunks.iter().take(3).enumerate() {
-                        let hcur = hi == *hunk_sel;
+                    let mark = if cur { "›" } else { " " };
+                    let when = rel_time(s.last_ms);
+                    // ⤶ marks a fork (SessionStart.parent set).
+                    let fork = if s.parent.is_some() { "⤶ " } else { "" };
+                    let head = format!(
+                        "{mark} {when} · {}{} · {}",
+                        fork,
+                        short_id(&s.id),
+                        s.first_user.as_deref().unwrap_or("(no prompt)")
+                    );
+                    out.push(Line::from(Span::styled(
+                        head,
+                        if cur {
+                            theme::dialog_sel()
+                        } else {
+                            theme::dialog()
+                        },
+                    )));
+                    if *wide {
+                        let branch = branches.get(*idx).and_then(|b| b.as_deref()).unwrap_or("-");
                         out.push(Line::from(Span::styled(
                             format!(
-                                "  {} {} hunk {} (+{} -{})",
-                                if hcur { "›" } else { " " },
-                                if r.rejected[hi] { "[x]" } else { "[ ]" },
-                                hi + 1,
-                                h.added,
-                                h.deleted
+                                "    {} · {} · ⎇ {} · {} events · {} checkpoint(s)",
+                                s.cwd,
+                                s.model,
+                                branch,
+                                s.events,
+                                s.checkpoints.len()
                             ),
-                            if hcur { theme::dialog_sel() } else { theme::dialog() },
-                        )));
-                        if hcur {
-                            for l in h.lines.iter().skip(1).take(4) {
-                                let style = if l.starts_with('-') {
-                                    theme::error()
-                                } else if l.starts_with('+') {
-                                    theme::meta()
-                                } else {
-                                    theme::dim()
-                                };
-                                out.push(Line::from(Span::styled(format!("    {l}"), style)));
-                            }
-                        }
-                    }
-                    if r.hunks.len() > 3 {
-                        out.push(Line::from(Span::styled(
-                            format!("    … {} more hunk(s)", r.hunks.len() - 3),
                             theme::dim(),
                         )));
                     }
                 }
+                out.push(Line::from(Span::styled(
+                    "type to filter · ↑↓ · tab preview · enter switch · esc",
+                    theme::dim(),
+                )));
+                out
             }
-            out.push(Line::from(Span::styled(
-                if *preview {
-                    "↑↓ file · ←→ hunk · space reject · enter revert · esc"
-                } else {
-                    "↑↓ file · tab diff · enter revert · esc"
-                },
-                theme::dim(),
-            )));
-            out
+            Overlay::Tree { rows, sel } => {
+                let mut out = Vec::new();
+                for (i, (s, depth)) in rows.iter().take(6).enumerate() {
+                    let cur = i == *sel;
+                    let mark = if cur { "›" } else { " " };
+                    let indent = "  ".repeat((*depth).min(4));
+                    let fork_mark = if *depth > 0 { "↳ " } else { "" };
+                    let here = if s.dir == self.session_dir {
+                        " · (current)"
+                    } else {
+                        ""
+                    };
+                    out.push(Line::from(Span::styled(
+                        format!(
+                            "{mark} {indent}{fork_mark}{} · {} · {}{}",
+                            short_id(&s.id),
+                            rel_time(s.last_ms),
+                            s.first_user.as_deref().unwrap_or("(no prompt)"),
+                            here
+                        ),
+                        if cur {
+                            theme::dialog_sel()
+                        } else {
+                            theme::dialog()
+                        },
+                    )));
+                }
+                out.push(Line::from(Span::styled(
+                    "↑↓ · enter switch · esc",
+                    theme::dim(),
+                )));
+                out
+            }
+            Overlay::Rewind { rows, sel } => {
+                let mut out: Vec<Line<'static>> = rows
+                    .iter()
+                    .take(6)
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let cur = i == *sel;
+                        Line::from(Span::styled(
+                            format!(
+                                "{} e{} · {} file(s) · {}",
+                                if cur { "›" } else { " " },
+                                r.boundary,
+                                r.files,
+                                r.label
+                            ),
+                            if cur {
+                                theme::dialog_sel()
+                            } else {
+                                theme::dialog()
+                            },
+                        ))
+                    })
+                    .collect();
+                out.push(Line::from(Span::styled(
+                    "↑↓ · enter restore files+conversation · esc",
+                    theme::dim(),
+                )));
+                out
+            }
+            Overlay::Transcript {
+                query,
+                scroll,
+                expand_tools,
+            } => {
+                let all = transcript_lines(self, query, width, *expand_tools);
+                let n = all.len();
+                let mut out = vec![Line::from(vec![
+                    Span::styled("/ ", theme::dialog_key()),
+                    Span::styled(format!("{query}▌"), theme::dialog()),
+                ])];
+                // Scroll is a line offset; usize::MAX (fresh open) means tail.
+                let max = n.saturating_sub(4);
+                let start = (*scroll).min(max);
+                out.extend(all.into_iter().skip(start).take(4));
+                out.push(Line::from(Span::styled(
+                    format!("{n} lines · type to filter · ↑↓/pgdn · tab expand tools · esc"),
+                    theme::dim(),
+                )));
+                out
+            }
+            Overlay::Diff {
+                rows,
+                sel,
+                preview,
+                hunk_sel,
+            } => {
+                let mut out = Vec::new();
+                for (i, r) in rows.iter().take(4).enumerate() {
+                    let cur = i == *sel;
+                    let mark = if cur { "›" } else { " " };
+                    let nrej = r.rejected.iter().filter(|x| **x).count();
+                    let rej = if nrej > 0 {
+                        format!(" · {nrej} marked reject")
+                    } else {
+                        String::new()
+                    };
+                    out.push(Line::from(Span::styled(
+                        format!(
+                            "{mark} {} +{} -{} {}{}",
+                            r.status,
+                            r.added,
+                            r.deleted,
+                            display_path(&self.cwd, &r.path),
+                            rej
+                        ),
+                        if cur {
+                            theme::dialog_sel()
+                        } else {
+                            theme::dialog()
+                        },
+                    )));
+                    if *preview && cur {
+                        for (hi, h) in r.hunks.iter().take(3).enumerate() {
+                            let hcur = hi == *hunk_sel;
+                            out.push(Line::from(Span::styled(
+                                format!(
+                                    "  {} {} hunk {} (+{} -{})",
+                                    if hcur { "›" } else { " " },
+                                    if r.rejected[hi] { "[x]" } else { "[ ]" },
+                                    hi + 1,
+                                    h.added,
+                                    h.deleted
+                                ),
+                                if hcur {
+                                    theme::dialog_sel()
+                                } else {
+                                    theme::dialog()
+                                },
+                            )));
+                            if hcur {
+                                for l in h.lines.iter().skip(1).take(4) {
+                                    let style = if l.starts_with('-') {
+                                        theme::error()
+                                    } else if l.starts_with('+') {
+                                        theme::meta()
+                                    } else {
+                                        theme::dim()
+                                    };
+                                    out.push(Line::from(Span::styled(format!("    {l}"), style)));
+                                }
+                            }
+                        }
+                        if r.hunks.len() > 3 {
+                            out.push(Line::from(Span::styled(
+                                format!("    … {} more hunk(s)", r.hunks.len() - 3),
+                                theme::dim(),
+                            )));
+                        }
+                    }
+                }
+                out.push(Line::from(Span::styled(
+                    if *preview {
+                        "↑↓ file · ←→ hunk · space reject · enter revert · esc"
+                    } else {
+                        "↑↓ file · tab diff · enter revert · esc"
+                    },
+                    theme::dim(),
+                )));
+                out
+            }
         }
     }
-}
 }
 
 /// `/diff` row path: relative to the workspace when possible, else the

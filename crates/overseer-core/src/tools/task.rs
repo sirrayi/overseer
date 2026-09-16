@@ -211,9 +211,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
                 wt
             }
             Err(e) => {
-                return ToolOutput::err(format!(
-                    "task: mode=write needs a git worktree — {e}"
-                ))
+                return ToolOutput::err(format!("task: mode=write needs a git worktree — {e}"))
             }
         }
     } else {
@@ -248,8 +246,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         let prompt = prompt.to_string();
         let id2 = id.clone();
         std::thread::spawn(move || {
-            let (digest, outcome) =
-                run_subagent(provider, cfg, registry, &dir2, &id2, &prompt);
+            let (digest, outcome) = run_subagent(provider, cfg, registry, &dir2, &id2, &prompt);
             // Marker last: done.txt is the parent loop's notification.
             let _ = std::fs::write(
                 dir2.join("done.txt"),
@@ -355,10 +352,7 @@ mod tests {
     fn background_spawns_and_marks_done() {
         let dir = tmpdir();
         let mut c = ctx(&dir);
-        let out = run(
-            &json!({"prompt": "bg work", "background": true}),
-            &mut c,
-        );
+        let out = run(&json!({"prompt": "bg work", "background": true}), &mut c);
         assert!(!out.is_error);
         assert!(out.text.contains("Background task task-1 started"));
         // Wait for the thread to write the marker.
@@ -370,7 +364,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(marker.exists(), "bg subagent must write done.txt");
-        assert!(std::fs::read_to_string(&marker).unwrap().contains("digest body"));
+        assert!(std::fs::read_to_string(&marker)
+            .unwrap()
+            .contains("digest body"));
         // Fan-out count drops to zero once done.
         assert_eq!(bg_in_flight(&dir.join("session/subagents")), 0);
     }
@@ -398,7 +394,16 @@ mod tests {
         // Needs a git repo at cwd.
         for args in [
             vec!["init", "-q"],
-            vec!["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x", "--allow-empty"],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "x",
+                "--allow-empty",
+            ],
         ] {
             let st = Command::new("git")
                 .arg("-C")
