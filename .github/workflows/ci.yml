@@ -44,6 +44,11 @@ jobs:
       - name: oracle check (task solvability)
         working-directory: eval
         run: uv run python run.py --oracle-check
+      - name: held-out suite check
+        working-directory: eval
+        run: |
+          uv run python run.py --task-dir heldout/tasks --oracle-check
+          uv run python run.py --audit
       - name: fail-arm self-test
         working-directory: eval
         run: |
