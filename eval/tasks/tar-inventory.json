@@ -1,0 +1,16 @@
+{
+  "id": "tar-inventory",
+  "version": 1,
+  "tags": ["script", "fs"],
+  "difficulty": "med",
+  "instruction": "Write inventory.py: walks data/ and writes inventory.txt — lines 'relpath size_bytes' sorted by path, directories excluded. Run it; data/ is already populated.",
+  "setup": "mkdir -p data/sub && printf 'alpha' > data/a.txt && printf 'beta22' > data/sub/b.txt && printf 'g' > data/c.bin",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 inventory.py && printf 'a.txt 5\\nc.bin 1\\nsub/b.txt 6\\n' | diff - inventory.txt"
+  },
+  "oracle": {
+    "script": "cat > inventory.py <<'EOF'\nimport os\nfrom pathlib import Path\nrows = []\nfor p in Path('data').rglob('*'):\n    if p.is_file():\n        rows.append((str(p.relative_to('data')), p.stat().st_size))\nopen('inventory.txt','w').write('\\n'.join(f'{n} {s}' for n, s in sorted(rows)) + '\\n')\nEOF\npython3 inventory.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}

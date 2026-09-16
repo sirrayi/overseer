@@ -1,0 +1,16 @@
+{
+  "id": "word-ladder",
+  "version": 1,
+  "tags": ["script", "graph"],
+  "difficulty": "hard",
+  "instruction": "words.txt holds lowercase 4-letter words. Write ladder.py printing the shortest word-ladder from 'cold' to 'warm' (one letter changed per step, every step in words.txt), one word per line. Run it.",
+  "setup": "printf 'cold\\ncord\\ncard\\nward\\nwarm\\ncolb\\nolds\\nwark\\ncorm\\nworm\\n' > words.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 ladder.py | python3 -c \"\nimport sys\npath = [l.strip() for l in sys.stdin if l.strip()]\nwords = set(open('words.txt').read().split())\nassert path[0]=='cold' and path[-1]=='warm', 'endpoints wrong'\nassert all(w in words for w in path), 'word not in dict'\nassert all(sum(a!=b for a,b in zip(x,y))==1 for x,y in zip(path,path[1:])), 'step != 1 letter'\nassert len(path) <= 5, 'not shortest'\n\""
+  },
+  "oracle": {
+    "script": "cat > ladder.py <<'EOF'\nfrom collections import deque\nwords = set(open('words.txt').read().split())\ndef neigh(w):\n    return [x for x in words if sum(a!=b for a,b in zip(x,w))==1]\nq, prev = deque(['cold']), {'cold': None}\nwhile q:\n    w = q.popleft()\n    if w == 'warm': break\n    for n in neigh(w):\n        if n not in prev:\n            prev[n] = w\n            q.append(n)\npath = []\nw = 'warm'\nwhile w: path.append(w); w = prev[w]\nprint('\\n'.join(reversed(path)))\nEOF\npython3 ladder.py"
+  },
+  "limits": {"max_steps": 15, "max_cost_usd": 0.6, "wall_s": 900}
+}
