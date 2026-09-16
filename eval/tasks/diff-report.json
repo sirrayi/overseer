@@ -1,0 +1,16 @@
+{
+  "id": "diff-report",
+  "version": 1,
+  "tags": ["script", "git"],
+  "difficulty": "med",
+  "instruction": "The workspace is a git repo with staged+unstaged changes vs HEAD. Write report.py producing report.txt: 'files_changed: N' and 'lines_added: M' (count of + lines excluding +++ headers) for `git diff HEAD`. Run it.",
+  "setup": "git init -q . && git config user.email a@x && git config user.name T && printf 'one\\ntwo\\n' > f.txt && git add -A && git commit -qm base && printf 'one\\ntwo\\nthree\\nfour\\n' > f.txt && printf 'new\\n' > g.txt && git add g.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 report.py && printf 'files_changed: 2\\nlines_added: 3\\n' | diff - report.txt"
+  },
+  "oracle": {
+    "script": "cat > report.py <<'EOF'\nimport subprocess\ndiff = subprocess.run(['git','diff','HEAD'], capture_output=True, text=True).stdout\nfiles = set()\nadded = 0\nfor ln in diff.splitlines():\n    if ln.startswith('+++ b/'):\n        files.add(ln[6:])\n    elif ln.startswith('+') and not ln.startswith('+++'):\n        added += 1\nopen('report.txt','w').write(f'files_changed: {len(files)}\\nlines_added: {added}\\n')\nEOF\npython3 report.py"
+  },
+  "limits": {"max_steps": 12, "max_cost_usd": 0.4, "wall_s": 600}
+}

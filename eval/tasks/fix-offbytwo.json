@@ -1,0 +1,16 @@
+{
+  "id": "fix-offbytwo",
+  "version": 1,
+  "tags": ["bugfix", "logic"],
+  "difficulty": "easy",
+  "instruction": "chunk.py should print nums.txt in pairs '[a, b]' one per line, last odd element alone. It skips indices entirely (steps by 3) and mislabels. Fix so output pairs correctly, then run it.",
+  "setup": "printf '1\\n2\\n3\\n4\\n5\\n' > nums.txt\ncat > chunk.py <<'EOF'\nnums = [int(l) for l in open('nums.txt')]\nfor i in range(0, len(nums), 3):\n    print(nums[i:i+3])\nEOF",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 chunk.py > .out.txt && printf '[1, 2]\\n[3, 4]\\n[5]\\n' | diff - .out.txt"
+  },
+  "oracle": {
+    "script": "cat > chunk.py <<'EOF'\nnums = [int(l) for l in open('nums.txt')]\nfor i in range(0, len(nums), 2):\n    print(nums[i:i+2])\nEOF\npython3 chunk.py"
+  },
+  "limits": {"max_steps": 8, "max_cost_usd": 0.2, "wall_s": 300}
+}

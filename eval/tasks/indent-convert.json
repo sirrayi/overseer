@@ -1,0 +1,16 @@
+{
+  "id": "indent-convert",
+  "version": 1,
+  "tags": ["script", "text"],
+  "difficulty": "med",
+  "instruction": "code.txt uses 2-space indents. Write widen.py producing wide.txt with every indent doubled (2→4 spaces per level), content unchanged. Run it.",
+  "setup": "printf 'def f():\\n  x = 1\\n  if x:\\n    y = 2\\n  return x\\n' > code.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 widen.py && printf 'def f():\\n    x = 1\\n    if x:\\n        y = 2\\n    return x\\n' | diff - wide.txt"
+  },
+  "oracle": {
+    "script": "cat > widen.py <<'EOF'\nout = []\nfor ln in open('code.txt'):\n    stripped = ln.lstrip(' ')\n    pad = len(ln) - len(stripped)\n    out.append(' ' * pad * 2 + stripped.rstrip('\\n'))\nopen('wide.txt','w').write('\\n'.join(out) + '\\n')\nEOF\npython3 widen.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}

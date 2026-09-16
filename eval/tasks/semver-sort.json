@@ -1,0 +1,16 @@
+{
+  "id": "semver-sort",
+  "version": 1,
+  "tags": ["script", "logic"],
+  "difficulty": "med",
+  "instruction": "versions.txt has one semver per line. Write sort.py emitting sorted.txt ordered by semver precedence (numeric compare of major.minor.patch; ignore pre-release suffixes — treat 1.2.3-rc1 as 1.2.3). Run it.",
+  "setup": "printf '1.10.0\\n1.2.3\\n0.9.9\\n1.2.10\\n2.0.0\\n1.2.3-rc1\\n' > versions.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 sort.py && printf '0.9.9\\n1.2.3\\n1.2.3-rc1\\n1.2.10\\n1.10.0\\n2.0.0\\n' | diff - sorted.txt"
+  },
+  "oracle": {
+    "script": "cat > sort.py <<'EOF'\ndef key(v):\n    core = v.split('-')[0]\n    return tuple(int(x) for x in core.split('.'))\nvs = open('versions.txt').read().split()\nvs.sort(key=lambda v: (key(v), '-rc' in v))\nopen('sorted.txt','w').write('\\n'.join(vs) + '\\n')\nEOF\npython3 sort.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}

@@ -1,0 +1,16 @@
+{
+  "id": "env-subst",
+  "version": 1,
+  "tags": ["script", "config"],
+  "difficulty": "med",
+  "instruction": "template.conf contains ${VAR} placeholders. Write render.py substituting from vars.env (KEY=val lines) — unknown vars become empty string. Output to rendered.conf. Run it.",
+  "setup": "printf 'host=${HOST}\\nport=${PORT}\\nmissing=${MISSING}\\n' > template.conf && printf 'HOST=db.local\\nPORT=5432\\n' > vars.env",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 render.py && printf 'host=db.local\\nport=5432\\nmissing=\\n' | diff - rendered.conf"
+  },
+  "oracle": {
+    "script": "cat > render.py <<'EOF'\nimport re\nenv = dict(l.split('=',1) for l in open('vars.env') if '=' in l)\nsrc = open('template.conf').read()\nout = re.sub(r'\\$\\{(\\w+)\\}', lambda m: env.get(m.group(1).strip(), '').strip(), src)\nopen('rendered.conf','w').write(out)\nEOF\npython3 render.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}

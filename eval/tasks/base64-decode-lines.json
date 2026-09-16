@@ -1,0 +1,16 @@
+{
+  "id": "base64-decode-lines",
+  "version": 1,
+  "tags": ["script", "encoding"],
+  "difficulty": "easy",
+  "instruction": "encoded.txt has base64 lines (some may be invalid — skip those). Write decode.py emitting decoded.txt with each decoded line in order. Run it.",
+  "setup": "printf 'aGVsbG8=\\nd29ybGQ=\\n!!!bad!!!\\nZm9vYmFy\\n' > encoded.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 decode.py && printf 'hello\\nworld\\nfoobar\\n' | diff - decoded.txt"
+  },
+  "oracle": {
+    "script": "cat > decode.py <<'EOF'\nimport base64\nout = []\nfor ln in open('encoded.txt'):\n    ln = ln.strip()\n    if not ln:\n        continue\n    try:\n        out.append(base64.b64decode(ln, validate=True).decode())\n    except Exception:\n        continue\nopen('decoded.txt','w').write('\\n'.join(out) + '\\n')\nEOF\npython3 decode.py"
+  },
+  "limits": {"max_steps": 8, "max_cost_usd": 0.2, "wall_s": 300}
+}
