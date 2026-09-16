@@ -1,0 +1,16 @@
+{
+  "id": "yaml-repair",
+  "version": 2,
+  "tags": ["fix", "config"],
+  "difficulty": "easy",
+  "instruction": "config.yaml has broken indentation (the 'env' list and 'limits' map are misaligned). Fix the file to valid YAML: env is a 2-item list [prod, staging], limits maps cpu=2, memory=512. Then write parsed.json containing {\"memory\": 512} (parse it however you like — no PyYAML is installed).",
+  "setup": "cat > config.yaml <<'EOF'\nservice: web\nenv:\n - prod\n- staging\nlimits:\n   cpu: 2\n    memory: 512\nEOF",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 -c \"import json; assert json.load(open('parsed.json'))=={'memory':512}\" && grep -Eq '^[[:space:]]+-[[:space:]]+prod' config.yaml && grep -Eq '^[[:space:]]+-[[:space:]]+staging' config.yaml && grep -Eq '^[[:space:]]+cpu:[[:space:]]*2' config.yaml && grep -Eq '^[[:space:]]+memory:[[:space:]]*512' config.yaml && ! grep -Eq '^-[[:space:]]' config.yaml && ! grep -Eq '^   ' config.yaml"
+  },
+  "oracle": {
+    "script": "cat > config.yaml <<'EOF'\nservice: web\nenv:\n  - prod\n  - staging\nlimits:\n  cpu: 2\n  memory: 512\nEOF\npython3 -c \"import json; json.dump({'memory':512}, open('parsed.json','w'))\""
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}

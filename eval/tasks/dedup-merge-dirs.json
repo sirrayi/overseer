@@ -1,0 +1,16 @@
+{
+  "id": "dedup-merge-dirs",
+  "version": 1,
+  "tags": ["script", "fs"],
+  "difficulty": "med",
+  "instruction": "dirs a/ and b/ contain files; some share a name with different content. Write merge.py producing merged/ with every file from a/ plus files from b/ that don't collide; for colliding names keep a/'s copy and append '_b' before the extension for b/'s copy (e.g. x.txt -> x_b.txt). merge.py must clear merged/ at the start so reruns are deterministic. Run it.",
+  "setup": "mkdir -p a b && echo a1 > a/x.txt && echo b1 > b/x.txt && echo aonly > a/y.txt && echo bonly > b/z.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 merge.py && python3 merge.py && [ \"$(cat merged/x.txt)\" = a1 ] && [ \"$(cat merged/x_b.txt)\" = b1 ] && [ \"$(cat merged/y.txt)\" = aonly ] && [ \"$(cat merged/z.txt)\" = bonly ] && [ \"$(ls merged | wc -l | tr -d ' ')\" = 4 ]"
+  },
+  "oracle": {
+    "script": "cat > merge.py <<'EOF'\nimport shutil\nfrom pathlib import Path\nout = Path('merged')\nif out.exists():\n    shutil.rmtree(out)\nout.mkdir()\nfor f in Path('a').iterdir():\n    shutil.copy(f, out / f.name)\nfor f in Path('b').iterdir():\n    tgt = out / f.name\n    if tgt.exists():\n        tgt = out / f'{f.stem}_b{f.suffix}'\n    shutil.copy(f, tgt)\nEOF\npython3 merge.py"
+  },
+  "limits": {"max_steps": 12, "max_cost_usd": 0.4, "wall_s": 600}
+}
