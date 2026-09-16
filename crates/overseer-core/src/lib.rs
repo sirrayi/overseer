@@ -10,6 +10,7 @@ pub mod control;
 pub mod event;
 pub mod ir;
 pub mod ledger;
+pub mod manifest;
 pub mod memory;
 pub mod perm;
 pub mod profile;
