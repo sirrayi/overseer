@@ -163,16 +163,27 @@ class SweBenchAdapter:
             missing = set(instance_ids) - have
             if missing:
                 raise BenchmarkUnavailable(f"unknown instance_ids: {sorted(missing)}")
+            wanted = set(instance_ids)
+            rows = [r for r in rows if r["instance_id"] in wanted]
             rows.sort(key=lambda r: instance_ids.index(r["instance_id"]))
-            rows = [r for r in rows if r["instance_id"] in set(instance_ids)]
         return rows[:limit] if limit else rows
 
     # ---- rollouts (PAID) ----
 
     def prepare_workdir(self, inst: dict, ws_root: Path) -> Path:
-        """Blobless clone of repo at base_commit — deterministic per instance."""
+        """Blobless clone of repo at base_commit. A reused checkout is
+        reset to a pristine base_commit first — the prior rollout's staged
+        diff (`_diff` runs `git add -A`) must never leak into the next
+        seed/arm's model_patch."""
         wd = Path(ws_root) / inst["instance_id"]
         if (wd / ".git").exists():
+            for cmd in (
+                ["git", "reset", "--hard", inst["base_commit"]],
+                ["git", "clean", "-fdx"],
+            ):
+                subprocess.run(
+                    cmd, cwd=wd, check=True, capture_output=True, timeout=600
+                )
             return wd
         wd.parent.mkdir(parents=True, exist_ok=True)
         url = f"https://github.com/{inst['repo']}.git"
@@ -199,9 +210,10 @@ class SweBenchAdapter:
             cwd=wd,
             check=True,
             capture_output=True,
-            text=True,
         )
-        return out.stdout
+        # surrogateescape keeps non-UTF8 hunks byte-stable — text=True
+        # would mangle them.
+        return out.stdout.decode("utf-8", errors="surrogateescape")
 
     def generate_predictions(
         self,
@@ -217,7 +229,7 @@ class SweBenchAdapter:
     ) -> dict[int, Path]:
         """Returns {seed: predictions.jsonl}. Rollout metrics land in a
         rollouts.jsonl sidecar next to each predictions file."""
-        solve = agents.REGISTRY[agent_name].solve
+        solve = agents.get(agent_name).solve
         out: dict[int, Path] = {}
         for seed in seeds:
             preds = self.logs_root / f"preds-s{seed}.jsonl"
@@ -310,7 +322,11 @@ class SweBenchAdapter:
             "--split",
             self.split,
             "--predictions_path",
-            str(predictions_path),
+            # resolve before cwd=logs_root — a relative path would bind
+            # under the wrong directory
+            str(predictions_path)
+            if str(predictions_path) == "gold"
+            else str(Path(predictions_path).resolve()),
             "--run_id",
             run_id,
             "--max_workers",
@@ -323,13 +339,18 @@ class SweBenchAdapter:
         if instance_ids:
             cmd += ["--instance_ids", *instance_ids]
         self.logs_root.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(
-            cmd,
-            cwd=self.logs_root,
-            capture_output=True,
-            text=True,
-            timeout=max(timeout * 2, 3600),
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=self.logs_root,
+                capture_output=True,
+                text=True,
+                timeout=max(timeout * 2, 3600),
+            )
+        except subprocess.TimeoutExpired as e:
+            raise BenchmarkUnavailable(
+                f"run_evaluation timed out after {e.timeout}s"
+            ) from e
         (self.logs_root / f"{run_id}.stdout.log").write_text(
             (proc.stdout or "") + "\n=== STDERR ===\n" + (proc.stderr or "")
         )
@@ -344,11 +365,12 @@ class SweBenchAdapter:
         sidecar = self.logs_root / f"rollouts-s{seed}.jsonl"
         if not sidecar.exists():
             return {}
-        return {
-            json.loads(ln)["instance_id"]: json.loads(ln)
-            for ln in sidecar.read_text().splitlines()
-            if ln.strip()
-        }
+        out = {}
+        for ln in sidecar.read_text().splitlines():
+            if ln.strip():
+                row = json.loads(ln)
+                out[row["instance_id"]] = row
+        return out
 
     def parse_results(
         self,
@@ -365,7 +387,7 @@ class SweBenchAdapter:
         token/cost/session provenance when rollouts ran here."""
         run_log_dir = Path(run_log_dir)
         rollouts = self._load_rollouts(seed)
-        env_digest = f"{self.dataset}@{self.split}"
+        env_digest = f"{self.dataset}@{self.split}:{self._image_arch()}"
         records = []
         for report in sorted(run_log_dir.glob("*/*/report.json")):
             iid = report.parent.name
@@ -381,10 +403,10 @@ class SweBenchAdapter:
                     "model": outcome.get("model") or evaluated_model,
                     "done": outcome.get("done", True),
                     "pass": bool(verdict.get("resolved")),
-                    "infra_error": bool(
-                        outcome.get("infra_error")
-                        or not verdict.get("patch_successfully_applied", True)
-                    ),
+                    # SWE-bench convention: a missing/unapplying patch is
+                    # a scored failure (resolved=False), NOT infra — only
+                    # rollout-side transport failures are.
+                    "infra_error": bool(outcome.get("infra_error")),
                     "error": outcome.get("error"),
                 }
             )
@@ -395,8 +417,10 @@ class SweBenchAdapter:
                 tags=[NAME, iid.split("__")[0]],
             )
             rec = manifest.build_record(
-                run_id=roll.get("run_id")
-                or store.new_run_id(task.id, agent_name, seed),
+                # deterministic id for eval-only ingests — re-parsing the
+                # same eval dir reproduces the same run_id instead of
+                # minting duplicates in the append-only store
+                run_id=roll.get("run_id") or f"{run_set_id}-s{seed}-{iid}",
                 task=task,
                 agent=agent_name,
                 seed=seed,
@@ -414,6 +438,7 @@ class SweBenchAdapter:
                 "patch_exists": verdict.get("patch_exists"),
                 "patch_applied": verdict.get("patch_successfully_applied"),
                 "tests_status": verdict.get("tests_status"),
+                "eval_only": not roll,
                 "report": str(report),
             }
             records.append(rec)
@@ -444,9 +469,26 @@ def run_cli(
     )
     limit = getattr(args, "swebench_limit", None)
     preds_arg = getattr(args, "predictions_path", None)
-    seeds = list(range(args.seeds))
+    # eval-only: identical predictions per seed would rerun the same eval
+    # k times — collapse to a single seed. --swebench-limit also applies
+    # here by restricting --instance_ids.
+    if preds_arg is not None:
+        seeds = [0]
+        if limit and not instance_ids:
+            instance_ids = [
+                r["instance_id"] for r in adapter.load_instances(limit=limit)
+            ]
+    else:
+        seeds = list(range(args.seeds))
     agent = args.agents.split(",")[0].strip()
     model_id = args.model or os.environ.get("OVERSEER_MODEL", "fleet-turbo")
+    if preds_arg is None and not os.environ.get("OVERSEER_API_KEY"):
+        print(
+            "OVERSEER_API_KEY required for swe_bench rollouts "
+            "(or pass --predictions-path for eval-only)",
+            file=sys.stderr,
+        )
+        return 2
     run_set = st.matrix_header(
         benchmark=NAME,
         agents=[agent],

@@ -313,19 +313,21 @@ impl ToolRegistry {
         &self.policy
     }
 
-    /// Dispatch a tool call. The permission gate runs first — a `Gate::Deny`
+    /// Dispatch a tool call. Disabled tools are refused before the
+    /// permission gate so an ablated run never prompts a human for a tool
+    /// that can never execute. The gate runs next — a `Gate::Deny`
     /// (rule-denied, human-denied, or headless Ask) returns a denied
     /// ToolOutput; the call never runs. Never panics: unknown names and bad
     /// inputs become error ToolOutputs that teach the model the contract.
     pub fn call(&mut self, name: &str, input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
-        match self.policy.gate(name, input) {
-            crate::perm::Gate::Allow => {}
-            crate::perm::Gate::Deny(reason) => return ToolOutput::denied(reason),
-        }
         if self.disabled.contains(name) {
             return ToolOutput::err(format!(
                 "Tool '{name}' is disabled for this run (--no-tools)."
             ));
+        }
+        match self.policy.gate(name, input) {
+            crate::perm::Gate::Allow => {}
+            crate::perm::Gate::Deny(reason) => return ToolOutput::denied(reason),
         }
         let out = match name {
             "bash" => bash::run(input, ctx),

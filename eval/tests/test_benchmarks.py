@@ -299,6 +299,38 @@ class TestHarbor:
         )
         assert recs[0]["infra_error"] is True and recs[0]["pass"] is False
 
+    def test_model_info_dict_becomes_string(self, tmp_path):
+        # harbor LLM-agent trials carry model_info as an object — a dict
+        # in record["model"] would poison report grouping (unhashable).
+        t = dict(HARBOR_TRIAL)
+        t["agent_info"] = {
+            "name": "terminus",
+            "version": "1",
+            "model_info": {"name": "openai/fleet-turbo"},
+        }
+        job = self._job(tmp_path, [t])
+        recs = harbor.TerminalBenchAdapter(jobs_root=tmp_path).parse_results(
+            job,
+            agent_name="terminus",
+            model_id="openai/fleet-turbo",
+            harness_commit="c",
+            run_set_id="rs",
+        )
+        assert recs[0]["model"] == "openai/fleet-turbo"
+
+    def test_none_git_commit_id(self, tmp_path):
+        t = dict(HARBOR_TRIAL)
+        t["task_id"] = {"path": "x", "git_commit_id": None}
+        job = self._job(tmp_path, [t])
+        recs = harbor.TerminalBenchAdapter(jobs_root=tmp_path).parse_results(
+            job,
+            agent_name="a",
+            model_id="m",
+            harness_commit="c",
+            run_set_id="rs",
+        )
+        assert "task@" in recs[0]["judge_version"]
+
 
 # Real schema observed from swebench 5.0.2:
 # logs/run_evaluation/<run_id>/<model>/<iid>/report.json
@@ -366,7 +398,10 @@ class TestSweBench:
         )
         assert recs[0]["pass"] is False and recs[0]["infra_error"] is False
 
-    def test_unapplied_patch_is_infra(self, tmp_path):
+    def test_unapplied_patch_is_scored_failure(self, tmp_path):
+        # SWE-bench convention: no patch / unapplying patch is a scored
+        # failure (resolved=False), never infra — else a do-nothing agent
+        # would be excluded from the pass@1 denominator.
         rep = {
             "i1": {
                 "resolved": False,
@@ -383,7 +418,8 @@ class TestSweBench:
             harness_commit="c",
             run_set_id="rs",
         )
-        assert recs[0]["infra_error"] is True
+        assert recs[0]["infra_error"] is False
+        assert recs[0]["pass"] is False
 
     def test_rollout_sidecar_merges_metrics(self, tmp_path):
         log_dir = self._report_tree(tmp_path)

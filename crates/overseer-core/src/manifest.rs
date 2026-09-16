@@ -86,6 +86,13 @@ pub fn write(
             "effort": config.effort.map(|e| e.as_str()),
             "thinking_budget": config.thinking_budget,
             "small_model": config.small_model,
+            // "profiled" = real price table; "estimated" = FALLBACK mid-tier
+            // guess — reports must not quote estimated cost as measured.
+            "cost_basis": if crate::profile::known(&config.model) {
+                "profiled"
+            } else {
+                "estimated"
+            },
         },
         "limits": {
             "max_steps": config.max_steps,

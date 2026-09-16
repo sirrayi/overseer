@@ -286,6 +286,16 @@ pub fn lookup(model: &str) -> &'static ModelProfile {
         .unwrap_or(&FALLBACK)
 }
 
+/// True when the model matched a real profile entry — cost figures are
+/// then computed from published prices. False means FALLBACK applied and
+/// `cost_usd` is a mid-tier estimate, not a measured price (P4.5 honesty:
+/// manifests must distinguish the two).
+pub fn known(model: &str) -> bool {
+    PROFILES
+        .iter()
+        .any(|p| p.match_prefixes.iter().any(|m| model.starts_with(m)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

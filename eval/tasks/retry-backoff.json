@@ -3,7 +3,7 @@
   "version": 1,
   "tags": ["script", "logic"],
   "difficulty": "med",
-  "instruction": "Implement retry.py: a `with_retry(fn, tries=4, base=0.1)` helper that calls fn, on exception sleeps base*2**i seconds (i=0..), and returns fn()'s result on success or re-raises after the last try. flaky.py fails twice then succeeds — running retry.py must print 'ok' and take >= 0.6s of sleeps (log each sleep to sleeps.txt, one delay per line).",
+  "instruction": "Implement retry.py: a `with_retry(fn, tries=4, base=0.1)` helper that calls fn, on exception sleeps base*2**i seconds (i=0..), and returns fn()'s result on success or re-raises after the last try. flaky.py fails twice then succeeds — running retry.py must print 'ok' and log each sleep delay to sleeps.txt, one delay per line, truncating the file at the start of each run so it only holds the latest run's delays.",
   "setup": "cat > flaky.py <<'EOF'\nstate = {'n': 0}\ndef work():\n    state['n'] += 1\n    if state['n'] < 3:\n        raise RuntimeError('fail')\n    return 'ok'\nEOF",
   "grader": {
     "type": "bash_assert",

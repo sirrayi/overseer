@@ -187,7 +187,7 @@ class HarborAdapter:
                 "tokens_in": agent_res.get("n_input_tokens"),
                 "tokens_out": agent_res.get("n_output_tokens"),
                 "cost_usd": agent_res.get("cost_usd"),
-                "model": (tr.get("agent_info") or {}).get("model_info") or model_id,
+                "model": _model_label(tr, model_id),
                 "ts": int(time.time()),
             }
             task = ExternalTask(
@@ -207,7 +207,7 @@ class HarborAdapter:
                 run_set_id=run_set_id,
                 session_dir=str(td),
                 judge_version=(
-                    f"harbor@{hver};task@{task_id.get('git_commit_id', '')[:12]}"
+                    f"harbor@{hver};task@{(task_id.get('git_commit_id') or '')[:12]}"
                 ),
                 harness_commit=harness_commit,
             )
@@ -221,6 +221,15 @@ class HarborAdapter:
             }
             records.append(rec)
         return records
+
+
+def _model_label(tr: dict, model_id: str | None):
+    """agent_info.model_info is an object ({name: ...}) in harbor's
+    schema — records need a string identity key, not a dict."""
+    mi = (tr.get("agent_info") or {}).get("model_info")
+    if isinstance(mi, dict):
+        return mi.get("name") or model_id
+    return mi or model_id
 
 
 class TerminalBenchAdapter(HarborAdapter):
@@ -257,6 +266,11 @@ def run_cli(
     # harbor's built-in LLM agents take openai/<model> against the FLEET
     # gateway; oracle/nop take no model at all.
     model_arg = None if agent in ("oracle", "nop") else f"openai/{model}"
+    if model_arg and not os.environ.get("OVERSEER_API_KEY"):
+        print(
+            f"OVERSEER_API_KEY required for {adapter.name} agent {agent!r}", file=sys.stderr
+        )
+        return 2
     jobs_dir = adapter.jobs_root / f"{adapter.name}-{int(time.time())}"
     header = st.matrix_header(
         benchmark=adapter.benchmark,
