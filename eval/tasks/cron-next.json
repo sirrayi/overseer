@@ -1,0 +1,16 @@
+{
+  "id": "cron-next",
+  "version": 1,
+  "tags": ["script", "logic"],
+  "difficulty": "hard",
+  "instruction": "Write next.py: given a 5-field cron spec in spec.txt ('m h dom mon dow') and a reference datetime 'YYYY-MM-DD HH:MM' in now.txt, print the next fire time as 'YYYY-MM-DD HH:MM'. Support '*', lists 'a,b', steps '*/n', and ranges 'a-b' in each field. Run it.",
+  "setup": "printf '*/15 9-17 * * 1-5\\n' > spec.txt && printf '2026-09-16 11:32\\n' > now.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 next.py | grep -qx '2026-09-16 11:45' && printf '0 9 * * 0\\n' > spec.txt && printf '2026-09-16 11:32\\n' > now.txt && python3 next.py | grep -qx '2026-09-20 09:00'"
+  },
+  "oracle": {
+    "script": "cat > next.py <<'EOF'\nfrom datetime import datetime, timedelta\n\nspec = open('spec.txt').read().split()\nnow = datetime.strptime(open('now.txt').read().strip(), '%Y-%m-%d %H:%M')\n\ndef expand(f, lo, hi):\n    vals = set()\n    for part in f.split(','):\n        step = 1\n        if '/' in part:\n            part, s = part.split('/')\n            step = int(s)\n        if part == '*':\n            a, b = lo, hi\n        elif '-' in part:\n            a, b = map(int, part.split('-'))\n        else:\n            a = b = int(part)\n        vals.update(range(a, b + 1, step))\n    return vals\n\nmins, hours, doms, mons, dows = (\n    expand(spec[0], 0, 59), expand(spec[1], 0, 23),\n    expand(spec[2], 1, 31), expand(spec[3], 1, 12), expand(spec[4], 0, 6),\n)\n# cron dow: 0=Sunday; python weekday(): Monday=0\n\nt = now.replace(second=0, microsecond=0) + timedelta(minutes=1)\nfor _ in range(366 * 24 * 60):\n    cron_dow = (t.weekday() + 1) % 7\n    if (t.minute in mins and t.hour in hours and t.day in doms\n            and t.month in mons and cron_dow in dows):\n        print(t.strftime('%Y-%m-%d %H:%M'))\n        break\n    t += timedelta(minutes=1)\nEOF\npython3 next.py"
+  },
+  "limits": {"max_steps": 20, "max_cost_usd": 0.8, "wall_s": 900}
+}

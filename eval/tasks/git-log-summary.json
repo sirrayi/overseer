@@ -1,0 +1,16 @@
+{
+  "id": "git-log-summary",
+  "version": 1,
+  "tags": ["script", "git"],
+  "difficulty": "med",
+  "instruction": "The workspace is a git repo. Write summarize.py producing summary.txt with two lines: 'commits: N' and 'authors: <comma-separated sorted unique author names>'. Run it.",
+  "setup": "git init -q . && git config user.email a@x && git config user.name 'Ann' && git commit -qm init --allow-empty && git config user.name 'Bob' && git commit -qm second --allow-empty && git config user.name 'Ann' && git commit -qm third --allow-empty",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 summarize.py && printf 'commits: 3\\nauthors: Ann, Bob\\n' | diff - summary.txt"
+  },
+  "oracle": {
+    "script": "cat > summarize.py <<'EOF'\nimport subprocess\nlog = subprocess.run(['git','log','--format=%an'], capture_output=True, text=True).stdout.splitlines()\nopen('summary.txt','w').write(f'commits: {len(log)}\\nauthors: {\", \".join(sorted(set(log)))}\\n')\nEOF\npython3 summarize.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}

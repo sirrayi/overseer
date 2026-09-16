@@ -1,0 +1,16 @@
+{
+  "id": "jsonl-filter",
+  "version": 1,
+  "tags": ["script", "data"],
+  "difficulty": "easy",
+  "instruction": "events.jsonl has one JSON object per line with fields {type, level, msg}. Write filter.py producing errors.jsonl containing only lines where level=='error', preserving order. Skip malformed lines. Run it.",
+  "setup": "printf '{\"type\":\"req\",\"level\":\"info\",\"msg\":\"a\"}\\nnot json\\n{\"type\":\"req\",\"level\":\"error\",\"msg\":\"b\"}\\n{\"type\":\"req\",\"level\":\"warn\",\"msg\":\"c\"}\\n{\"type\":\"req\",\"level\":\"error\",\"msg\":\"d\"}\\n' > events.jsonl",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 filter.py && printf '{\"type\":\"req\",\"level\":\"error\",\"msg\":\"b\"}\\n{\"type\":\"req\",\"level\":\"error\",\"msg\":\"d\"}\\n' | diff - errors.jsonl"
+  },
+  "oracle": {
+    "script": "cat > filter.py <<'EOF'\nimport json\nout = []\nfor ln in open('events.jsonl'):\n    try:\n        e = json.loads(ln)\n    except json.JSONDecodeError:\n        continue\n    if e.get('level') == 'error':\n        out.append(ln.rstrip('\\n'))\nopen('errors.jsonl','w').write('\\n'.join(out) + '\\n')\nEOF\npython3 filter.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}
