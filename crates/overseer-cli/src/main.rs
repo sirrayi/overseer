@@ -187,6 +187,7 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
         verify_cmd: flags.verify.clone(),
         verify_block_cap: flags.verify_cap,
         sandbox_bash: flags.sandbox,
+        disabled_tools: flags.no_tools.clone(),
         ask_handler: None,
         // --bare: no persisted rules — a CI run must not inherit or
         // mutate the operator's allow-list. Ask verdicts still
@@ -524,6 +525,8 @@ fn usage() {
          \x20 --no-sandbox        Run bash unsandboxed (default: sandbox-exec/\n\
          \x20                     bwrap wrapper when available)\n\
          \x20 --memory            Enable file memory at <cwd>/memory\n\
+         \x20 --no-tools <list>   Ablation: comma-separated tool names removed\n\
+         \x20                     from the spec list and refused at dispatch\n\
          \n\
          ENV:\n\
          \x20 OVERSEER_API_KEY    Provider key (preferred, any provider)\n\
@@ -566,6 +569,9 @@ struct ExecFlags {
     best_of: u32,
     sandbox: bool,
     memory: bool,
+    /// `--no-tools a,b,c` — P4.3 ablation: named tools are removed from the
+    /// spec list and refused at dispatch.
+    no_tools: Vec<String>,
     prompt: Option<String>,
 }
 
@@ -596,6 +602,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         best_of: 0,
         sandbox: true,
         memory: false,
+        no_tools: Vec::new(),
         prompt: None,
     };
     let mut i = 0;
@@ -655,6 +662,18 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
             }
             "--no-sandbox" => f.sandbox = false,
             "--memory" => f.memory = true,
+            "--no-tools" => {
+                let v = take(&mut i)?;
+                for name in v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    if !overseer_core::tools::TOOL_NAMES.contains(&name) {
+                        return Err(format!(
+                            "unknown tool '{name}' (--no-tools expects one of: {})",
+                            overseer_core::tools::TOOL_NAMES.join(",")
+                        ));
+                    }
+                    f.no_tools.push(name.to_string());
+                }
+            }
             "-" => {
                 // Read the prompt from stdin (CI-friendly).
                 let mut buf = String::new();

@@ -97,6 +97,7 @@ pub fn write(
             "full_access": config.full_access,
             "sandbox_bash": config.sandbox_bash,
             "ask_channel": if config.ask_handler.is_some() { "human" } else { "headless" },
+            "disabled_tools": config.disabled_tools,
         },
         "context": {
             "auto_compact": config.auto_compact,
