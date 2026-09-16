@@ -26,7 +26,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let d = std::env::temp_dir().join(format!(
         "overseer-stress-{tag}-{}-{nanos}",
         SEQ.fetch_add(1, Ordering::Relaxed)
@@ -45,7 +48,9 @@ impl Provider for Echo {
             std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
         }
         Ok(Response {
-            blocks: vec![Block::Text { text: "digest body".into() }],
+            blocks: vec![Block::Text {
+                text: "digest body".into(),
+            }],
             stop_reason: StopReason::EndTurn,
             usage: Usage::default(),
             request_bytes: 0,
@@ -134,7 +139,9 @@ fn memory_at_cap_200_topics() {
     // Index at the cap plus overflow — segment must stay bounded.
     let mut body = String::new();
     for i in 0..600 {
-        body.push_str(&format!("topic-{i}.md — pointer line number {i} with some extra words\n"));
+        body.push_str(&format!(
+            "topic-{i}.md — pointer line number {i} with some extra words\n"
+        ));
     }
     std::fs::write(&idx, &body).unwrap();
     for i in 0..200 {
@@ -143,7 +150,11 @@ fn memory_at_cap_200_topics() {
     let t = Instant::now();
     let seg = memory::index_segment(&mem);
     let ms = t.elapsed().as_millis();
-    eprintln!("memory index_segment: {}B (from {}B) in {ms}ms", seg.len(), body.len());
+    eprintln!(
+        "memory index_segment: {}B (from {}B) in {ms}ms",
+        seg.len(),
+        body.len()
+    );
     assert!(seg.len() < body.len(), "segment must be capped");
     // Git commit at volume.
     let t = Instant::now();
@@ -161,7 +172,9 @@ fn memory_consolidate_under_load() {
     }
     std::fs::write(
         mem.join("INDEX.md"),
-        (0..60).map(|i| format!("t-{i}.md — note {i}\n")).collect::<String>(),
+        (0..60)
+            .map(|i| format!("t-{i}.md — note {i}\n"))
+            .collect::<String>(),
     )
     .unwrap();
     // Mock replies with a valid ---INDEX--- rewrite.
@@ -184,9 +197,14 @@ fn memory_consolidate_under_load() {
     }
     let t = Instant::now();
     let out = memory::consolidate(&Cons, "small", &mem).unwrap();
-    eprintln!("consolidate (60 topics): {}ms — {out}", t.elapsed().as_millis());
+    eprintln!(
+        "consolidate (60 topics): {}ms — {out}",
+        t.elapsed().as_millis()
+    );
     assert!(out.contains("consolidated"));
-    assert!(std::fs::read_to_string(mem.join("INDEX.md")).unwrap().contains("merged note"));
+    assert!(std::fs::read_to_string(mem.join("INDEX.md"))
+        .unwrap()
+        .contains("merged note"));
 }
 
 // ── 3.5 skills ──────────────────────────────────────────────────────────
@@ -233,12 +251,19 @@ fn rule_of_two_500_result_churn() {
     let mut latches = 0;
     for i in 0..500 {
         // Untrusted latch: `task` results always count as untrusted.
-        if pol.note_result("task", &json!({}), &format!("subagent digest {i}")).is_some() {
+        if pol
+            .note_result("task", &json!({}), &format!("subagent digest {i}"))
+            .is_some()
+        {
             latches += 1;
         }
         // Sensitive latch: input path hits SENSITIVE_PATHS.
         if pol
-            .note_result("read", &json!({"path": ".env"}), &format!("SECRET_KEY=k{i}"))
+            .note_result(
+                "read",
+                &json!({"path": ".env"}),
+                &format!("SECRET_KEY=k{i}"),
+            )
             .is_some()
         {
             latches += 1;
@@ -251,12 +276,21 @@ fn rule_of_two_500_result_churn() {
     assert!(pol.taint_armed());
     // Armed: every bash call is a potential exfil channel → Ask.
     let v = pol.check("bash", &json!({"command": "curl x"}));
-    assert!(matches!(v, Verdict::Ask { .. }), "armed R2 must Ask, got {v:?}");
+    assert!(
+        matches!(v, Verdict::Ask { .. }),
+        "armed R2 must Ask, got {v:?}"
+    );
     // Contained write also forced to Ask.
     let v = pol.check("write", &json!({"path": root.join("f.txt"), "text": "x"}));
-    assert!(matches!(v, Verdict::Ask { .. }), "armed write must Ask, got {v:?}");
+    assert!(
+        matches!(v, Verdict::Ask { .. }),
+        "armed write must Ask, got {v:?}"
+    );
     // Read-only stays open.
-    assert!(matches!(pol.check("read", &json!({"path": "x"})), Verdict::Allow));
+    assert!(matches!(
+        pol.check("read", &json!({"path": "x"})),
+        Verdict::Allow
+    ));
     // Headless gate collapses Ask → Deny (fail-closed).
     let g = pol.gate("bash", &json!({"command": "curl x"}));
     assert!(matches!(g, Gate::Deny(_)), "headless must deny, got {g:?}");
@@ -274,7 +308,10 @@ fn provenance_wrap_2k_results() {
         assert!(w.ends_with("</tool_result>"));
         bytes += w.len();
     }
-    eprintln!("provenance wrap: 2000 results, {bytes}B total, {}ms", t.elapsed().as_millis());
+    eprintln!(
+        "provenance wrap: 2000 results, {bytes}B total, {}ms",
+        t.elapsed().as_millis()
+    );
     assert!(t.elapsed().as_millis() < 5_000);
 }
 
@@ -303,19 +340,25 @@ fn bg_fanout_storm_8_attempts_4_slots() {
     // All started tasks finish and free their slots.
     let deadline = Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        let done =
-            (1..=started).all(|i| dir.join(format!("session/subagents/bg-{i}/done.txt")).exists());
+        let done = (1..=started).all(|i| {
+            dir.join(format!("session/subagents/bg-{i}/done.txt"))
+                .exists()
+        });
         if done || Instant::now() > deadline {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     for i in 1..=started {
-        assert!(dir.join(format!("session/subagents/bg-{i}/done.txt")).exists());
+        assert!(dir
+            .join(format!("session/subagents/bg-{i}/done.txt"))
+            .exists());
     }
     assert_eq!(bg_in_flight(&dir.join("session/subagents")), 0);
     // Refused leaves no orphan dirs beyond the started set.
-    let dirs = std::fs::read_dir(dir.join("session/subagents")).unwrap().count();
+    let dirs = std::fs::read_dir(dir.join("session/subagents"))
+        .unwrap()
+        .count();
     assert_eq!(dirs, started);
 }
 
@@ -324,7 +367,16 @@ fn write_worktree_storm_isolation() {
     let dir = tmpdir("wt");
     for args in [
         vec!["init", "-q"],
-        vec!["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x", "--allow-empty"],
+        vec![
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "x",
+            "--allow-empty",
+        ],
     ] {
         let st = std::process::Command::new("git")
             .arg("-C")
@@ -344,13 +396,20 @@ fn write_worktree_storm_isolation() {
         assert!(!out.is_error, "iter {i}: {}", out.text);
         assert!(sess.join(format!("s{i}/subagents/wt-{i}/wt")).exists());
     }
-    eprintln!("4 sequential write worktrees: {}ms", t.elapsed().as_millis());
+    eprintln!(
+        "4 sequential write worktrees: {}ms",
+        t.elapsed().as_millis()
+    );
     // Each run leaves an auditable worktree + doesn't dirty the main tree.
     let dirty = std::process::Command::new("git")
         .args(["-C", dir.to_str().unwrap(), "status", "--porcelain"])
         .output()
         .unwrap();
-    assert!(dirty.stdout.is_empty(), "main tree polluted: {:?}", dirty.stdout);
+    assert!(
+        dirty.stdout.is_empty(),
+        "main tree polluted: {:?}",
+        dirty.stdout
+    );
 }
 
 // ── mixed-kind event log at volume (P0 invariant under P3 kinds) ────────
@@ -370,11 +429,20 @@ fn event_log_30k_mixed_kinds_replay() {
     .unwrap();
     let t = Instant::now();
     for i in 0..6_000u64 {
-        log.append(EventKind::UserInput { text: format!("prompt {i}") }).unwrap();
+        log.append(EventKind::UserInput {
+            text: format!("prompt {i}"),
+        })
+        .unwrap();
         log.append(EventKind::ModelResponse {
             blocks: vec![
-                Block::Text { text: format!("thinking about {i}") },
-                Block::ToolCall { id: format!("c{i}"), name: "bash".into(), input: json!({"cmd": "ls"}) },
+                Block::Text {
+                    text: format!("thinking about {i}"),
+                },
+                Block::ToolCall {
+                    id: format!("c{i}"),
+                    name: "bash".into(),
+                    input: json!({"cmd": "ls"}),
+                },
             ],
             usage: Usage::default(),
             stop_reason: "tool_use".into(),
@@ -408,13 +476,22 @@ fn event_log_30k_mixed_kinds_replay() {
                 .unwrap();
             }
             1 => {
-                log.append(EventKind::Tainted { detail: format!("latch {i}") }).unwrap();
+                log.append(EventKind::Tainted {
+                    detail: format!("latch {i}"),
+                })
+                .unwrap();
             }
             2 => {
-                log.append(EventKind::Nudge { text: format!("steer {i}") }).unwrap();
+                log.append(EventKind::Nudge {
+                    text: format!("steer {i}"),
+                })
+                .unwrap();
             }
             3 => {
-                log.append(EventKind::StuckDetected { pattern: "repeat".into() }).unwrap();
+                log.append(EventKind::StuckDetected {
+                    pattern: "repeat".into(),
+                })
+                .unwrap();
             }
             _ => {}
         }
@@ -458,8 +535,14 @@ fn event_log_30k_mixed_kinds_replay() {
     }
     // Audit-only kinds never enter the model view; provenance survives replay.
     let serialized = serde_json::to_string(&msgs).unwrap();
-    assert!(!serialized.contains("latch"), "Tainted leaked into model view");
-    assert!(serialized.contains("<tool_result"), "provenance wrap lost on rehydrate");
+    assert!(
+        !serialized.contains("latch"),
+        "Tainted leaked into model view"
+    );
+    assert!(
+        serialized.contains("<tool_result"),
+        "provenance wrap lost on rehydrate"
+    );
     let _ = Role::Assistant; // silence unused-import lint
 }
 
@@ -480,7 +563,10 @@ fn fork_storm_60_over_p3_log() {
     })
     .unwrap();
     for i in 0..50 {
-        log.append(EventKind::UserInput { text: format!("p{i}") }).unwrap();
+        log.append(EventKind::UserInput {
+            text: format!("p{i}"),
+        })
+        .unwrap();
         log.append(EventKind::ModelResponse {
             blocks: vec![Block::Text { text: "r".into() }],
             usage: Usage::default(),
@@ -489,9 +575,13 @@ fn fork_storm_60_over_p3_log() {
             cost_usd: 0.0,
         })
         .unwrap();
-        log.append(EventKind::SubagentDone { task_id: format!("bg-{i}"), trace: "t".into() })
+        log.append(EventKind::SubagentDone {
+            task_id: format!("bg-{i}"),
+            trace: "t".into(),
+        })
+        .unwrap();
+        log.append(EventKind::Tainted { detail: "x".into() })
             .unwrap();
-        log.append(EventKind::Tainted { detail: "x".into() }).unwrap();
     }
     drop(log);
     let t = Instant::now();
@@ -539,12 +629,23 @@ fn spill_1mb_tool_output() {
     };
     let big = "x".repeat(1_000_000);
     let out = tools::enforce_budget(
-        ToolOutput { text: big, is_error: false, raw_bytes: 0, spilled_to: None, denied: false },
+        ToolOutput {
+            text: big,
+            is_error: false,
+            raw_bytes: 0,
+            spilled_to: None,
+            denied: false,
+        },
         &mut ctx,
     );
-    assert!(out.text.len() < 40_000, "inline too big: {}", out.text.len());
-    let spilled =
-        std::fs::read_dir(dir.join("tool-outputs")).map(|d| d.count()).unwrap_or(0);
+    assert!(
+        out.text.len() < 40_000,
+        "inline too big: {}",
+        out.text.len()
+    );
+    let spilled = std::fs::read_dir(dir.join("tool-outputs"))
+        .map(|d| d.count())
+        .unwrap_or(0);
     assert!(spilled >= 1, "no spill file written");
 }
 
@@ -605,13 +706,19 @@ fn gemini_1k_messages_full_path() {
     for i in 0..250 {
         messages.push(Message {
             role: Role::User,
-            content: vec![Block::Text { text: format!("user {i} ").repeat(10) }],
+            content: vec![Block::Text {
+                text: format!("user {i} ").repeat(10),
+            }],
         });
         messages.push(Message {
             role: Role::Assistant,
             content: vec![
-                Block::Reasoning { raw: json!({"thoughtSignature": "sig"}) },
-                Block::Text { text: format!("asst {i}") },
+                Block::Reasoning {
+                    raw: json!({"thoughtSignature": "sig"}),
+                },
+                Block::Text {
+                    text: format!("asst {i}"),
+                },
                 Block::ToolCall {
                     id: format!("c{i}"),
                     name: "bash".into(),
@@ -629,11 +736,16 @@ fn gemini_1k_messages_full_path() {
         });
         messages.push(Message {
             role: Role::User,
-            content: vec![Block::Text { text: format!("next {i}") }],
+            content: vec![Block::Text {
+                text: format!("next {i}"),
+            }],
         });
     }
     let g = overseer_core::provider::gemini::Gemini::new("k", format!("http://127.0.0.1:{port}"));
-    let system = vec![SystemSegment { text: "sys".into(), cacheable: true }];
+    let system = vec![SystemSegment {
+        text: "sys".into(),
+        cacheable: true,
+    }];
     let tool_specs = vec![ToolSpec {
         name: "bash".into(),
         description: "run".into(),
@@ -656,7 +768,10 @@ fn gemini_1k_messages_full_path() {
     let t = Instant::now();
     let resp = g.complete(&req).unwrap();
     let ms = t.elapsed().as_millis();
-    eprintln!("gemini 1k-message complete: {ms}ms, {} req bytes", resp.request_bytes);
+    eprintln!(
+        "gemini 1k-message complete: {ms}ms, {} req bytes",
+        resp.request_bytes
+    );
     assert_eq!(resp.stop_reason, StopReason::EndTurn);
     assert_eq!(resp.usage.fresh_input, 50_000);
     assert!(resp.request_bytes > 50_000, "request should be large");
@@ -705,7 +820,10 @@ fn compaction_view_preserves_p3_audit() {
     .unwrap();
     let mut last_model_id = 0u64;
     for i in 0..20 {
-        log.append(EventKind::UserInput { text: format!("p{i}") }).unwrap();
+        log.append(EventKind::UserInput {
+            text: format!("p{i}"),
+        })
+        .unwrap();
         last_model_id = log
             .append(EventKind::ModelResponse {
                 blocks: vec![Block::Text { text: "r".into() }],
@@ -715,7 +833,10 @@ fn compaction_view_preserves_p3_audit() {
                 cost_usd: 0.0,
             })
             .unwrap();
-        log.append(EventKind::Tainted { detail: format!("d{i}") }).unwrap();
+        log.append(EventKind::Tainted {
+            detail: format!("d{i}"),
+        })
+        .unwrap();
     }
     drop(log);
     let mut evs = EventLog::replay(&path).unwrap();
@@ -724,13 +845,18 @@ fn compaction_view_preserves_p3_audit() {
         id: next_id,
         parent_id: None,
         ts_ms: 0,
-        kind: EventKind::Compaction { summary: "sum".into(), tail_from: last_model_id },
+        kind: EventKind::Compaction {
+            summary: "sum".into(),
+            tail_from: last_model_id,
+        },
     });
     // The compaction marker is a view: Tainted audit entries still exist in
     // the raw log even though the model view is compacted.
     let raw = EventLog::replay(&path).unwrap();
     assert_eq!(
-        raw.iter().filter(|e| matches!(e.kind, EventKind::Tainted { .. })).count(),
+        raw.iter()
+            .filter(|e| matches!(e.kind, EventKind::Tainted { .. }))
+            .count(),
         20
     );
 }

@@ -740,10 +740,7 @@ impl Agent {
     /// Fire-and-notify delivery (P3.4): scan subagents/bg-*/ for newly
     /// written done.txt markers; each becomes a user message + a
     /// SubagentDone event so resumes replay it identically.
-    fn drain_bg_notices(
-        &mut self,
-        on_event: &mut dyn FnMut(&Event),
-    ) -> std::io::Result<()> {
+    fn drain_bg_notices(&mut self, on_event: &mut dyn FnMut(&Event)) -> std::io::Result<()> {
         let dir = self.session_dir.join("subagents");
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Ok(());
@@ -753,12 +750,9 @@ impl Agent {
             .filter(|e| e.file_name().to_string_lossy().starts_with("bg-"))
             .filter_map(|e| {
                 let p = e.path();
-                p.join("done.txt").exists().then(|| {
-                    (
-                        e.file_name().to_string_lossy().to_string(),
-                        p,
-                    )
-                })
+                p.join("done.txt")
+                    .exists()
+                    .then(|| (e.file_name().to_string_lossy().to_string(), p))
             })
             .collect();
         done.sort(); // deterministic injection order
@@ -1025,10 +1019,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(req.system.iter().map(|s| s.text.clone()).collect());
-            self.seen_models
-                .lock()
-                .unwrap()
-                .push(req.model.to_string());
+            self.seen_models.lock().unwrap().push(req.model.to_string());
             if self.fail_models.iter().any(|m| m == req.model) {
                 return Err(ProviderError::Transport("mock fail".into()));
             }
@@ -1405,7 +1396,10 @@ mod tests {
             ..AgentConfig::default()
         };
         let provider = Mock::new(vec![
-            resp(vec![bash_call("c1", "echo one"), bash_call("c2", "echo two")]),
+            resp(vec![
+                bash_call("c1", "echo one"),
+                bash_call("c2", "echo two"),
+            ]),
             done(),
         ]);
         let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
@@ -1446,9 +1440,9 @@ mod tests {
         let cfg = AgentConfig {
             cwd: dir.clone(),
             sandbox_bash: false,
-            ask_handler: Some(crate::perm::AskHandler(std::sync::Arc::new(
-                |_| crate::perm::AskDecision::Deny,
-            ))),
+            ask_handler: Some(crate::perm::AskHandler(std::sync::Arc::new(|_| {
+                crate::perm::AskDecision::Deny
+            }))),
             ..AgentConfig::default()
         };
         let provider = Mock::new(vec![
@@ -1522,14 +1516,18 @@ mod tests {
             .messages()
             .iter()
             .flat_map(|m| m.content.iter())
-            .any(|b| matches!(b, Block::ToolResult { content, .. }
-                if content.contains("<tool_result tool=\"bash\">")));
+            .any(|b| {
+                matches!(b, Block::ToolResult { content, .. }
+                if content.contains("<tool_result tool=\"bash\">"))
+            });
         assert!(wrapped, "tool results must be provenance-wrapped");
 
         // Event log stays raw; the resumed view re-wraps identically.
         let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
-        let raw = events.iter().any(|e| matches!(&e.kind,
-            EventKind::ToolResult { content, .. } if !content.contains("<tool_result")));
+        let raw = events.iter().any(|e| {
+            matches!(&e.kind,
+            EventKind::ToolResult { content, .. } if !content.contains("<tool_result"))
+        });
         assert!(raw, "event log stores raw output");
         let resumed = rehydrate_messages(&events);
         let rewrapped = resumed.iter().flat_map(|m| m.content.iter()).any(|b| {

@@ -66,8 +66,7 @@ impl Composer {
     }
 
     fn snapshot(&mut self) {
-        self.undo
-            .push((self.lines.clone(), self.row, self.col));
+        self.undo.push((self.lines.clone(), self.row, self.col));
         if self.undo.len() > UNDO_CAP {
             self.undo.remove(0);
         }
@@ -226,8 +225,7 @@ impl Composer {
                 let was_space = Self::word_is_space(&e);
                 did = true;
                 if !was_space
-                    && (self.col == 0
-                        || Self::word_is_space(&self.lines[self.row][self.col - 1]))
+                    && (self.col == 0 || Self::word_is_space(&self.lines[self.row][self.col - 1]))
                 {
                     break; // consumed the word back to whitespace/start
                 }

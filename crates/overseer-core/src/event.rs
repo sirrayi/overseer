@@ -261,10 +261,8 @@ pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
             // pairing position as the live drain (after tool results).
             EventKind::SubagentDone { task_id: id, trace } => {
                 flush_results(&mut pending_results, &mut messages);
-                let digest = std::fs::read_to_string(
-                    std::path::Path::new(trace).join("done.txt"),
-                )
-                .unwrap_or_else(|_| "(digest missing)".into());
+                let digest = std::fs::read_to_string(std::path::Path::new(trace).join("done.txt"))
+                    .unwrap_or_else(|_| "(digest missing)".into());
                 messages.push(Message::user_text(format!(
                     "[subagent {id} finished]\n{digest}"
                 )));

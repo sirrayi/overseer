@@ -344,10 +344,7 @@ fn drive(
 /// Suspend the TUI, run $VISUAL/$EDITOR (fallback `vi`) on a temp file
 /// seeded with `draft`, reinstall the result as the composer buffer.
 fn edit_in_editor(draft: String, app: &mut App) -> std::io::Result<()> {
-    let file = std::env::temp_dir().join(format!(
-        "overseer-draft-{}.md",
-        std::process::id()
-    ));
+    let file = std::env::temp_dir().join(format!("overseer-draft-{}.md", std::process::id()));
     std::fs::write(&file, &draft)?;
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))

@@ -67,8 +67,7 @@ pub fn for_cwd(root: &Path, cwd: &Path) -> Vec<SessionInfo> {
 /// sorts by recency. Deterministic; a session appears exactly once.
 pub fn tree(root: &Path) -> Vec<(SessionInfo, usize)> {
     let all = list(root);
-    let known: std::collections::HashSet<String> =
-        all.iter().map(|s| s.id.clone()).collect();
+    let known: std::collections::HashSet<String> = all.iter().map(|s| s.id.clone()).collect();
     let mut children: std::collections::HashMap<Option<String>, Vec<SessionInfo>> =
         std::collections::HashMap::new();
     for s in all {
@@ -79,14 +78,11 @@ pub fn tree(root: &Path) -> Vec<(SessionInfo, usize)> {
         children.entry(key).or_default().push(s);
     }
     let mut out = Vec::new();
-    let mut stack: Vec<SessionInfo> = children
-        .remove(&None)
-        .unwrap_or_default();
+    let mut stack: Vec<SessionInfo> = children.remove(&None).unwrap_or_default();
     stack.sort_by_key(|s| s.last_ms); // pop() → most recent first
-    // Depth-first: each pop pushes its children so they render right
-    // under their parent. Depth tracked parallel to the stack.
-    let mut stack: Vec<(SessionInfo, usize)> =
-        stack.into_iter().map(|s| (s, 0)).collect();
+                                      // Depth-first: each pop pushes its children so they render right
+                                      // under their parent. Depth tracked parallel to the stack.
+    let mut stack: Vec<(SessionInfo, usize)> = stack.into_iter().map(|s| (s, 0)).collect();
     while let Some((info, depth)) = stack.pop() {
         let mut kids = children.remove(&Some(info.id.clone())).unwrap_or_default();
         kids.sort_by_key(|s| s.last_ms);
@@ -341,7 +337,8 @@ mod tests {
     use crate::ir::{Block, Usage};
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("overseer-session-{tag}-{}", uuid::Uuid::now_v7()));
+        let d =
+            std::env::temp_dir().join(format!("overseer-session-{tag}-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -366,9 +363,7 @@ mod tests {
             })
             .unwrap();
             log.append(EventKind::ModelResponse {
-                blocks: vec![Block::Text {
-                    text: "ok".into(),
-                }],
+                blocks: vec![Block::Text { text: "ok".into() }],
                 usage: Usage::default(),
                 stop_reason: "end_turn".into(),
                 latency_ms: 1,
@@ -424,10 +419,7 @@ mod tests {
         // Any cwd → the newest.
         assert_eq!(most_recent(&root, None).unwrap(), root.join("bbb"));
         // Scoped to /work/a → the older one wins by filter.
-        assert_eq!(
-            most_recent(&root, Some(Path::new("/work/a"))).unwrap(),
-            a
-        );
+        assert_eq!(most_recent(&root, Some(Path::new("/work/a"))).unwrap(), a);
         assert!(most_recent(&root, Some(Path::new("/work/never"))).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -448,7 +440,9 @@ mod tests {
         // Copied history stops at 4; the fork's own SessionStart is id 5.
         assert_eq!(ids, vec![1, 2, 3, 4, 5]);
         match &events[4].kind {
-            EventKind::SessionStart { session_id, cwd, .. } => {
+            EventKind::SessionStart {
+                session_id, cwd, ..
+            } => {
                 assert_eq!(session_id, "forked");
                 assert_eq!(cwd, "/work");
             }
@@ -504,10 +498,7 @@ mod tests {
             other => panic!("expected SessionStart, got {other:?}"),
         }
         // And it survives the summary path.
-        let info = list(&root)
-            .into_iter()
-            .find(|s| s.dir == dst)
-            .unwrap();
+        let info = list(&root).into_iter().find(|s| s.dir == dst).unwrap();
         assert_eq!(info.parent.as_deref(), Some("src"));
         // The source session stays a root.
         let src_info = list(&root).into_iter().find(|s| s.dir == src).unwrap();
@@ -551,10 +542,7 @@ mod tests {
         let d = mk_session(&root, "root-d", "/w", &["d"]);
 
         let t = tree(&root);
-        let order: Vec<(&str, usize)> = t
-            .iter()
-            .map(|(s, d)| (s.id.as_str(), *d))
-            .collect();
+        let order: Vec<(&str, usize)> = t.iter().map(|(s, d)| (s.id.as_str(), *d)).collect();
         // DFS: each parent's subtree completes before the next root.
         let pos = |id: &str| order.iter().position(|(s, _)| *s == id).unwrap();
         assert!(pos("root-a") < pos("child-b"));
