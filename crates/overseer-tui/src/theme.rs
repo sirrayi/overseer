@@ -63,16 +63,16 @@ impl Theme {
             spinner: Style::new().fg(Color::Cyan),
             queue: Style::new().fg(Color::DarkGray),
             dialog: Style::new().fg(Color::White),
-            dialog_key: Style::new()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            dialog_key: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             dialog_sel: Style::new()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
             code: Style::new().fg(Color::Green),
             prompt: Style::new().fg(Color::Green),
-            link: Style::new().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED),
+            link: Style::new()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED),
         }
     }
 
@@ -111,19 +111,13 @@ impl Theme {
         t.reasoning = Style::new().fg(Color::Gray);
         t.status = Style::new().fg(Color::Gray);
         t.queue = Style::new().fg(Color::Gray);
-        t.dialog = Style::new()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
+        t.dialog = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
         t.dialog_sel = Style::new()
             .fg(Color::Black)
             .bg(Color::White)
             .add_modifier(Modifier::BOLD);
-        t.meta = Style::new()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD);
-        t.error = Style::new()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD);
+        t.meta = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+        t.error = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
         t
     }
 

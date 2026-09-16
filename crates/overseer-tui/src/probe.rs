@@ -57,7 +57,11 @@ pub fn probe(timeout: Duration) -> Caps {
     let query = "\x1b[?2026$p\x1b[>0q\x1b[c";
     {
         let mut out = std::io::stdout();
-        if out.write_all(query.as_bytes()).and_then(|_| out.flush()).is_err() {
+        if out
+            .write_all(query.as_bytes())
+            .and_then(|_| out.flush())
+            .is_err()
+        {
             return caps;
         }
     }
@@ -224,7 +228,10 @@ mod tests {
             xtversion(b"\x1bP>|0;389;0\x1b\\"),
             Some("0;389;0".to_string())
         );
-        assert_eq!(xtversion(b"\x1bP>|ghostty 1.2\x07"), Some("ghostty 1.2".into()));
+        assert_eq!(
+            xtversion(b"\x1bP>|ghostty 1.2\x07"),
+            Some("ghostty 1.2".into())
+        );
         assert_eq!(xtversion(b"none"), None);
     }
 }

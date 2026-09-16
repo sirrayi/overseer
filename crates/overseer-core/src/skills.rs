@@ -157,7 +157,12 @@ mod tests {
         let dir = tmpdir();
         let root = dir.join(".overseer/skills");
         mk_skill(&root, "beta", "name: beta\ndescription: second\n", "B body");
-        mk_skill(&root, "alpha", "name: alpha\ndescription: first\n", "A body");
+        mk_skill(
+            &root,
+            "alpha",
+            "name: alpha\ndescription: first\n",
+            "A body",
+        );
         let skills = scan(&dir);
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].name, "alpha");
@@ -168,7 +173,12 @@ mod tests {
     fn body_loads_with_provenance() {
         let dir = tmpdir();
         let root = dir.join(".overseer/skills");
-        mk_skill(&root, "x", "name: x\ndescription: does x\n", "do the x thing");
+        mk_skill(
+            &root,
+            "x",
+            "name: x\ndescription: does x\n",
+            "do the x thing",
+        );
         let out = load(&dir, "x").unwrap();
         assert!(out.contains("<skill name=\"x\" source=\"workspace\""));
         assert!(out.contains("do the x thing"));

@@ -17,7 +17,7 @@ pub mod prompt;
 pub mod provider;
 pub mod repomap;
 pub mod rewind;
-pub mod skills;
 pub mod session;
+pub mod skills;
 pub mod stuck;
 pub mod tools;
