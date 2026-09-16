@@ -24,7 +24,7 @@ identical tasks so every harness change gets a paired benchmark delta.
 
 ## Layout
 
-- `tasks/` — public corpus (15 tasks, all oracle-verified)
+- `tasks/` — public corpus (35 tasks, all oracle-verified)
 - `heldout/tasks/` — private canary-instrumented suite; `run.py
   --task-dir heldout/tasks` runs it, `--audit` scans stored runs for
   canary leakage

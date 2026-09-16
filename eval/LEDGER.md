@@ -30,7 +30,8 @@ deferred. Every claim below cites a check that actually ran.
 | Held-out suite + canary audit | `heldout/tasks/`, `rig/audit.py` | 5/5 oracles; `--audit` clean |
 | Ablation arms `overseer@<preset>` + `--no-tools` | `rig/agents/__init__.py`, `tools/mod.rs` | manifest shows specs removed + dispatch refused |
 | Offline eval CI job | `.github/workflows/ci.yml` | this PR's checks |
-| Local corpus: 15 public + 5 held-out tasks | `eval/tasks/`, `eval/heldout/tasks/` | `--oracle-check` 15/15 + 5/5 |
+| Local corpus: 35 public + 5 held-out tasks | `eval/tasks/`, `eval/heldout/tasks/` | `--oracle-check` 35/35 + 5/5 |
+| cargo-dist release scaffold | `dist-workspace.toml`, `release.yml` | `dist plan` → 4 unix targets |
 
 ## Verification actually run
 
