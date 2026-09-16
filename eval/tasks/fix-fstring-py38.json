@@ -1,0 +1,16 @@
+{
+  "id": "fix-fstring-py38",
+  "version": 1,
+  "tags": ["bugfix", "compat"],
+  "difficulty": "med",
+  "instruction": "report.py fails on Python <3.12 because it uses a nested-quote f-string `f\"{d[\"k\"]}\"`. Rewrite it compatibly (no nested same-quote f-strings) so it runs under this interpreter and writes report.txt containing 'count=3'.",
+  "setup": "cat > report.py <<'EOF'\ndata = {'k': 'count', 'v': 3}\nline = f\"{data['v']}\"\nopen('report.txt','w').write(f\"count={line}\\n\")\nEOF\ncat > check.sh <<'EOF'\n#!/bin/bash\npython3 -c \"import ast,sys; t=ast.parse(open('report.py').read()); src=open('report.py').read(); assert 'f\\\"' not in src or sys.version_info>=(3,12)\" || exit 1\nEOF",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 report.py && grep -qx 'count=3' report.txt && ! grep -q 'f\"{data\\[' report.py"
+  },
+  "oracle": {
+    "script": "cat > report.py <<'EOF'\ndata = {'k': 'count', 'v': 3}\nline = str(data['v'])\nopen('report.txt','w').write('count=' + line + '\\n')\nEOF\npython3 report.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 600}
+}

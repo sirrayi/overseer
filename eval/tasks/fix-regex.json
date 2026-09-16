@@ -1,0 +1,16 @@
+{
+  "id": "fix-regex",
+  "version": 1,
+  "tags": ["bugfix", "regex"],
+  "difficulty": "med",
+  "instruction": "extract.py uses a regex to pull key=value pairs from input.txt, but it drops keys containing underscores and values with dots. Fix the regex so all pairs extract, then run it: expected pairs.txt has 4 lines.",
+  "setup": "printf 'user_name=ann\\nport=8080\\nhost=db.local\\ntimeout=30\\n' > input.txt\ncat > extract.py <<'EOF'\nimport re\npairs = re.findall(r'([a-z]+)=(\\w+)', open('input.txt').read())\nopen('pairs.txt','w').write('\\n'.join(f'{k}={v}' for k,v in pairs) + '\\n')\nEOF",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 extract.py && printf 'user_name=ann\\nport=8080\\nhost=db.local\\ntimeout=30\\n' | diff - pairs.txt"
+  },
+  "oracle": {
+    "script": "cat > extract.py <<'EOF'\nimport re\npairs = re.findall(r'([A-Za-z_][A-Za-z0-9_]*)=(\\S+)', open('input.txt').read())\nopen('pairs.txt','w').write('\\n'.join(f'{k}={v}' for k,v in pairs) + '\\n')\nEOF\npython3 extract.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 600}
+}
