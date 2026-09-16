@@ -22,9 +22,16 @@ import time
 import urllib.request
 from pathlib import Path
 
-BASE_URL = os.environ.get("LEK_BASE_URL", "https://inference.legionedge.ai/v1")
-MODEL = os.environ.get("LEK_MODEL", "kimi-k3-turbo")
 OUT_CAP = 4000
+
+
+def _cfg() -> tuple[str, str]:
+    """Resolved per call — module-level env binding would freeze --model."""
+    return (
+        os.environ.get("LEK_BASE_URL", "https://inference.legionedge.ai/v1"),
+        os.environ.get("LEK_MODEL", "kimi-k3-turbo"),
+    )
+
 
 SYSTEM = """\
 You are a coding agent. Reply with exactly ONE action per turn.
@@ -43,15 +50,16 @@ task directory; prefer simple, verifiable steps."""
 
 
 def chat(messages: list[dict]) -> tuple[str, dict]:
+    base_url, model = _cfg()
     body = json.dumps(
         {
-            "model": MODEL,
+            "model": model,
             "max_tokens": 2048,
             "messages": [{"role": "system", "content": SYSTEM}] + messages,
         }
     ).encode()
     req = urllib.request.Request(
-        f"{BASE_URL}/chat/completions",
+        f"{base_url}/chat/completions",
         data=body,
         headers={
             "Authorization": f"Bearer {os.environ['LEK_API_KEY']}",
@@ -78,9 +86,17 @@ def extract_action(text: str) -> tuple[str, str]:
 
 
 def run_bash(cmd: str, cwd: str) -> str:
+    # Model-controlled commands run without credentials — the key is for the
+    # API call only, it must never be readable from inside a task shell.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("LEK_")}
     try:
         p = subprocess.run(
-            ["sh", "-c", cmd], cwd=cwd, capture_output=True, text=True, timeout=60
+            ["sh", "-c", cmd],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
         )
         out = (p.stdout + p.stderr).strip() or "(no output)"
         return f"exit {p.returncode}\n{out[:OUT_CAP]}"
@@ -99,6 +115,7 @@ def solve(
 ) -> dict:
     limits = limits or {}
     max_steps = int(limits.get("max_steps", 30))
+    _, model = _cfg()
     Path(session_dir).mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
@@ -131,7 +148,7 @@ def solve(
             "error": f"transport: {e}",
             "infra_error": True,
             "wall_s": round(time.time() - t0, 1),
-            "model": MODEL,
+            "model": model,
             "steps": len(traj),
             "ts": int(time.time()),
         }
@@ -146,6 +163,6 @@ def solve(
         "tokens_out": tokens_out or None,
         "cost_usd": None,  # unknown pricing for the control arm — honest null
         "trajectory": str(traj_path),
-        "model": MODEL,
+        "model": model,
         "ts": int(time.time()),
     }

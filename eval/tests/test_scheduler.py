@@ -85,6 +85,31 @@ class TestOracle:
         finally:
             del agents.REGISTRY["bad"]
 
+    def test_infra_retry_success(self, tmp_path):
+        """First attempt infra, retry succeeds → recorded as the retry's run."""
+        from rig import agents
+
+        calls = {"n": 0}
+
+        def flaky(instruction, workdir, session_dir, *, limits=None, seed=0, task=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise FileNotFoundError("transient")
+            graders.run_script("echo done > done.txt", workdir)
+            return {"done": True, "model": "flaky", "ts": 0}
+
+        agents.REGISTRY["flaky"] = type("M", (), {"solve": staticmethod(flaky)})
+        try:
+            _, recs = _run([_task()], ["flaky"], 1, tmp_path)
+            assert len(recs) == 1
+            assert recs[0]["pass"] is True
+            assert recs[0]["retried"] is True
+            assert calls["n"] == 2
+            # session_dir points at the retry's run dir, not the first's
+            assert recs[0]["session_dir"].endswith("r")
+        finally:
+            del agents.REGISTRY["flaky"]
+
     def test_done_gate(self, tmp_path):
         """Solver that does the work but never says done → fail."""
         from rig import agents

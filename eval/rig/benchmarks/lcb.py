@@ -137,11 +137,13 @@ class LcbAdapter:
                 "done": True,
                 "pass": bool(g),
                 "score": 1.0 if g else 0.0,
-                "steps": 1,
-                "wall_s": 0.0,
-                "tokens_in": meta.get("input_tokens") or 0,
-                "tokens_out": meta.get("output_tokens") or 0,
-                "cost_usd": meta.get("cost_usd") or 0.0,
+                "steps": 1,  # one generation per sample — semantically true
+                "wall_s": None,
+                # None (absent), not 0 — fabricated zeros would poison
+                # cost/token statistics.
+                "tokens_in": meta.get("input_tokens"),
+                "tokens_out": meta.get("output_tokens"),
+                "cost_usd": meta.get("cost_usd"),
                 "model": model_id,
                 "ts": int(time.time()),
             }

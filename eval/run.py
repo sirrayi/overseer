@@ -36,12 +36,13 @@ WORKSPACES = ROOT / "workspaces"
 
 def harness_commit() -> str:
     try:
-        return subprocess.run(
+        p = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=REPO,
             capture_output=True,
             text=True,
-        ).stdout.strip()
+        )
+        return p.stdout.strip() if p.returncode == 0 else "unknown"
     except Exception:
         return "unknown"
 
@@ -109,7 +110,12 @@ def main() -> int:
 
     if args.report:
         records = st.runs()
-        md, js = report.render(records, k=args.k_report, contamination_notes=None)
+        md, js = report.render(
+            records,
+            k=args.k_report,
+            noninferiority_pp=args.noninferiority_pp,
+            contamination_notes=None,
+        )
         print(md)
         out = RESULTS / f"report-{int(__import__('time').time())}"
         out.with_suffix(".md").write_text(md)
@@ -162,7 +168,7 @@ def main() -> int:
         sys.exit("LEK_API_KEY required for " + ",".join(needs_key))
 
     print(f"matrix: {len(tasks)} tasks × {agent_names} × {args.seeds} seeds")
-    scheduler.run_matrix(
+    records = scheduler.run_matrix(
         tasks,
         agent_names,
         args.seeds,
@@ -176,7 +182,9 @@ def main() -> int:
     )
 
     # Post-run summary against just this matrix's records.
-    md, _ = report.render(st.load(), k=args.k_report)
+    md, _ = report.render(
+        records, k=args.k_report, noninferiority_pp=args.noninferiority_pp
+    )
     print("\n" + md)
     return 0
 

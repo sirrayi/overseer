@@ -17,12 +17,18 @@ import subprocess
 import time
 from pathlib import Path
 
-OVERSEER_BIN = os.environ.get(
-    "OVERSEER_BIN",
-    str(Path(__file__).resolve().parents[3] / "target" / "release" / "overseer"),
+DEFAULT_BIN = str(
+    Path(__file__).resolve().parents[3] / "target" / "release" / "overseer"
 )
-BASE_URL = os.environ.get("LEK_BASE_URL", "https://inference.legionedge.ai/v1")
-MODEL = os.environ.get("LEK_MODEL", "kimi-k3-turbo")
+
+
+def _cfg() -> tuple[str, str, str]:
+    """Resolved per call — module-level env binding would freeze --model."""
+    return (
+        os.environ.get("OVERSEER_BIN", DEFAULT_BIN),
+        os.environ.get("LEK_BASE_URL", "https://inference.legionedge.ai/v1"),
+        os.environ.get("LEK_MODEL", "kimi-k3-turbo"),
+    )
 
 
 def solve(
@@ -37,18 +43,19 @@ def solve(
     limits = limits or {}
     max_steps = int(limits.get("max_steps", 30))
     wall_cap = int(limits.get("wall_s", 900))
+    binary, base_url, model = _cfg()
     Path(session_dir).mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        OVERSEER_BIN,
+        binary,
         "exec",
         "--json",
         "--provider",
         "openai",
         "--base-url",
-        BASE_URL,
+        base_url,
         "--model",
-        MODEL,
+        model,
         "--session",
         session_dir,
         "--cwd",
@@ -72,16 +79,16 @@ def solve(
             "error": f"wall timeout {wall_cap}s",
             "infra_error": False,
             "wall_s": wall_cap,
-            "model": MODEL,
+            "model": model,
             "ts": int(time.time()),
         }
     except FileNotFoundError:
         return {
             "done": False,
-            "error": f"binary missing: {OVERSEER_BIN}",
+            "error": f"binary missing: {binary}",
             "infra_error": True,
             "wall_s": 0.0,
-            "model": MODEL,
+            "model": model,
             "ts": int(time.time()),
         }
     wall_s = time.time() - t0
@@ -111,12 +118,14 @@ def solve(
         "steps": len(usage_events),
         "wall_s": round(wall_s, 1),
         "tokens_in": total_in,
-        "tokens_out": sum(e["usage"]["output"] for e in usage_events),
+        "tokens_out": sum(
+            e["usage"]["output"] + e["usage"].get("reasoning", 0) for e in usage_events
+        ),  # billed as output+reasoning
         "cache_hit_rate": round(cache_read / total_in, 3) if total_in else 0.0,
         "cost_usd": sum(e.get("cost_usd", 0.0) for e in usage_events),
         "trajectory": str(traj),
         "exit_code": proc.returncode,
         "stderr": proc.stderr[-2000:],
-        "model": MODEL,
+        "model": model,
         "ts": int(time.time()),
     }

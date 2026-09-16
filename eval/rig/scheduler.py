@@ -131,12 +131,11 @@ def run_matrix(
                             runs_root=results_root,
                             run_id=run_id + "r",
                         )
-                        if not _is_infra(retry):
-                            outcome = retry
-                            sess = results_root / "runs" / (run_id + "r")
-                        else:
-                            retry["retried"] = True
-                            outcome = retry
+                        # Either way the retry is the recorded attempt: its
+                        # session dir and outcome describe the same run.
+                        retry["retried"] = True
+                        outcome = retry
+                        sess = results_root / "runs" / (run_id + "r")
                     except Exception as e:
                         outcome["error"] = f"{outcome.get('error')} | retry: {e}"
 

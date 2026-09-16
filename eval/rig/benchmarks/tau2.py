@@ -28,12 +28,16 @@ from . import BenchmarkUnavailable, ExternalTask, has_cli
 NAME = "tau2"
 DOMAINS = ("airline", "retail")
 
-# Terminations that are NOT the agent's outcome — dropped from the matrix.
-INFRA_TERMS = {"infrastructure_error", "user_error", "unexpected_error"}
+# Terminations that are NOT the agent's outcome — excluded from pass stats.
+# Aligned with upstream NON_EVALUABLE_TERMINATION_REASONS
+# (sierra-research/tau2-bench): {infrastructure_error,
+# context_window_exceeded}. Diverging from this set breaks comparability
+# with published τ² numbers.
+INFRA_TERMS = {"infrastructure_error", "context_window_exceeded"}
 # Terminations scored as agent outcomes with done=True (natural stops).
 NATURAL_TERMS = {"user_stop", "agent_stop"}
-# {agent_error, max_steps, timeout, context_window_exceeded, too_many_errors}
-# are agent/model-side outcomes: pass=False unless reward says otherwise.
+# {agent_error, max_steps, timeout, user_error, unexpected_error,
+# too_many_errors} are scored failures upstream — we score them too.
 
 
 class Tau2Adapter:
@@ -151,7 +155,12 @@ class Tau2Adapter:
             messages = sim.get("messages") or []
             steps = sum(1 for m in messages if m.get("role") == "assistant")
             usage = sim.get("agent_usage") or {}
-            trial = sim.get("trial") or 0
+            # trial is the seed axis; fall back to position within the task
+            # group so missing trials can't silently collapse to seed 0.
+            trial = sim.get("trial")
+            if trial is None:
+                same_task = [s for s in sims if s.get("task_id") == sim.get("task_id")]
+                trial = same_task.index(sim) if len(same_task) > 1 else 0
             task = ExternalTask(
                 id=f"tau2-{domain}-{sim.get('task_id')}",
                 version=1,
@@ -161,14 +170,20 @@ class Tau2Adapter:
             outcome = {
                 "done": term in NATURAL_TERMS,
                 "pass": bool(reward is not None and reward >= 1.0),
-                "score": reward if reward is not None else 0.0,
+                "score": reward,
                 "infra_error": term in INFRA_TERMS,
                 "error": None if term in NATURAL_TERMS else term,
                 "steps": steps,
-                "wall_s": round(float(sim.get("duration") or 0.0), 1),
-                "tokens_in": usage.get("prompt_tokens") or 0,
-                "tokens_out": usage.get("completion_tokens") or 0,
-                "cost_usd": sim.get("agent_cost") or 0.0,
+                "wall_s": (
+                    round(float(sim["duration"]), 1)
+                    if sim.get("duration") is not None
+                    else None
+                ),
+                # None (absent), not 0 — fabricated zeros would poison
+                # cost/token statistics.
+                "tokens_in": usage.get("prompt_tokens"),
+                "tokens_out": usage.get("completion_tokens"),
+                "cost_usd": sim.get("agent_cost"),
                 "model": model_id,
                 "ts": int(time.time()),
             }

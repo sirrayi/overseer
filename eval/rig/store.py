@@ -67,6 +67,7 @@ class Store:
         extra: dict | None = None,
     ) -> dict:
         header = {
+            **(extra or {}),  # extras first — reserved keys always win
             "kind": "matrix",
             "run_set_id": uuid.uuid4().hex[:12],
             "benchmark": benchmark,
@@ -75,7 +76,6 @@ class Store:
             "tasks": tasks,
             "scheduler_seed": scheduler_seed,
             "ts": int(time.time()),
-            **(extra or {}),
         }
         self.append(header)
         return header

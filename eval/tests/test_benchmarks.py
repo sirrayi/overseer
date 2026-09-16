@@ -7,18 +7,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from rig.benchmarks import lcb, tau2
 
-
-class FakeArgs:
-    agents = "overseer"
-    model = None
-    seeds = 4
-    scheduler_seed = 0
-    tau2_domain = "airline"
-    tau2_trials = 2
-    tau2_user_llm = "openai/fixed-user"
-    release_version = "v6"
-
-
 TAU2_RESULTS = {
     "timestamp": "2026-01-01T00:00:00",
     "info": {"domain": "airline"},
@@ -59,6 +47,20 @@ TAU2_RESULTS = {
         },
         {
             "id": "s3",
+            "task_id": "task-1",
+            "trial": 2,
+            "seed": 0,
+            "start_time": "",
+            "end_time": "",
+            "duration": 40.0,
+            "termination_reason": "context_window_exceeded",
+            "agent_cost": 0.08,
+            "user_cost": 0.02,
+            "reward_info": {"reward": 0.0},
+            "messages": [{"role": "assistant"}],
+        },
+        {
+            "id": "s4",
             "task_id": "task-2",
             "trial": 0,
             "seed": 0,
@@ -70,6 +72,18 @@ TAU2_RESULTS = {
             "user_cost": 0.03,
             "reward_info": {"reward": 0.0},
             "messages": [{"role": "assistant"}],
+        },
+        {
+            "id": "s5",
+            "task_id": "task-2",
+            "trial": 1,
+            "seed": 0,
+            "start_time": "",
+            "end_time": "",
+            "duration": 5.0,
+            "termination_reason": "user_error",
+            "reward_info": {"reward": 0.0},
+            "messages": [],
         },
     ],
 }
@@ -88,30 +102,54 @@ class TestTau2:
             harness_commit="abc",
             run_set_id="rs",
         )
-        assert len(recs) == 3
-        # deterministic order: (task-1,t0), (task-1,t1), (task-2,t0)
-        assert [r["task_id"] for r in recs] == [
-            "tau2-airline-task-1",
-            "tau2-airline-task-1",
-            "tau2-airline-task-2",
-        ]
+        assert len(recs) == 5
+        # deterministic order: (task-1,t0..2), (task-2,t0..1)
+        assert [r["task_id"] for r in recs] == (
+            ["tau2-airline-task-1"] * 3 + ["tau2-airline-task-2"] * 2
+        )
         r0 = recs[0]
         assert r0["pass"] is True and r0["done"] is True
         assert r0["steps"] == 2  # assistant messages counted
         assert r0["cost_usd"] == 0.043
         assert r0["tau2"]["user_llm"] == "openai/fixed-user"
-        # infra sim excluded from trials
+        # upstream non-evaluable terminations → infra (excluded from stats):
+        # infrastructure_error AND context_window_exceeded
         assert recs[1]["infra_error"] is True
-        assert recs[1]["pass"] is False
+        assert recs[2]["infra_error"] is True  # context_window_exceeded
+        # user_error IS an evaluable failure upstream — scored, not dropped
+        assert recs[4]["infra_error"] is False
+        assert recs[4]["pass"] is False
         # max_steps is an agent outcome
-        assert recs[2]["infra_error"] is False
-        assert recs[2]["done"] is False
-        assert recs[2]["pass"] is False
+        assert recs[3]["infra_error"] is False
+        assert recs[3]["done"] is False
+        # missing fields stay None — never fabricated zeros
+        assert recs[4]["cost_usd"] is None
+        assert recs[4]["tokens_in"] is None
         # identity keys present
         for r in recs:
             assert r["env_digest"].startswith("tau2@")
             assert r["judge_version"].startswith("tau2-evaluator@")
             assert r["benchmark"] == "tau2"
+
+    def test_missing_trial_falls_back_to_position(self, tmp_path):
+        data = dict(TAU2_RESULTS)
+        data["simulations"] = [
+            dict(s, trial=None)
+            for s in TAU2_RESULTS["simulations"][:3]
+            if s["task_id"] == "task-1"
+        ]
+        p = tmp_path / "results.json"
+        p.write_text(json.dumps(data))
+        recs = tau2.Tau2Adapter(tmp_path).parse_results(
+            p,
+            domain="airline",
+            agent_name="a",
+            user_llm="u",
+            model_id="m",
+            harness_commit="c",
+            run_set_id="rs",
+        )
+        assert {r["seed"] for r in recs} == {0, 1, 2}  # not all 0
 
     def test_domain_guard(self, tmp_path):
         a = tau2.Tau2Adapter(tmp_path)
@@ -168,6 +206,9 @@ class TestLcb:
         assert recs[0]["difficulty"] == "easy"
         assert recs[0]["lcb"]["release_version"] == "v6"
         assert recs[0]["tokens_in"] == 500
+        # absent metadata stays None
+        assert recs[2]["tokens_in"] is None
+        assert recs[2]["cost_usd"] is None
         for r in recs:
             assert r["env_digest"].startswith("lcb@")
             assert r["judge_version"].startswith("lcb@")
@@ -184,5 +225,6 @@ class TestDockerGated:
 
         a = docker_gated.SweBenchAdapter()
         ok, why = a.available()
-        # OrbStack is up on this machine — either answer is honest
         assert isinstance(ok, bool) and isinstance(why, str)
+        if not ok:
+            assert "OrbStack" in why or "docker" in why

@@ -52,6 +52,10 @@ def build_record(
             "system_prompt": manifest.get("system_prompt"),
             "tools": manifest.get("tools"),
         }
+    # manifest.model may be a dict (harness manifest) or a plain string —
+    # tolerate both; the record's model falls back to outcome.model.
+    m_model = manifest.get("model") if manifest else None
+    model_name = m_model.get("name") if isinstance(m_model, dict) else m_model
     return {
         "kind": "run",
         "schema": SCHEMA,
@@ -63,7 +67,7 @@ def build_record(
         "task_version": task.version,
         "harness": agent,
         "harness_commit": harness_commit,
-        "model": (manifest or {}).get("model", {}).get("name") or outcome.get("model"),
+        "model": model_name or outcome.get("model"),
         "seed": seed,
         "env_digest": task.env_digest,
         "judge_version": judge_version,
@@ -72,6 +76,8 @@ def build_record(
         "infra_error": bool(outcome.get("infra_error")),
         "error": outcome.get("error"),
         "grader_exit": outcome.get("grader_exit"),
+        "grader_tail": outcome.get("grader_tail"),
+        "retried": outcome.get("retried"),
         "steps": outcome.get("steps"),
         "wall_s": outcome.get("wall_s"),
         "tokens_in": outcome.get("tokens_in"),
