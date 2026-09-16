@@ -224,13 +224,22 @@ impl Agent {
         }
         let cwd = agent.config.cwd.display().to_string();
         agent.log.append(EventKind::SessionStart {
-            session_id,
+            session_id: session_id.clone(),
             cwd,
             model: agent.config.model.clone(),
             harness_version: env!("CARGO_PKG_VERSION").to_string(),
             parent: None,
         })?;
         agent.log.flush()?;
+        // Run manifest (P4.5): provenance record for the reporting
+        // standard — written once, never rewritten by resume.
+        crate::manifest::write(
+            &agent.session_dir,
+            &session_id,
+            &agent.config,
+            agent.provider.as_ref(),
+            &agent.tools,
+        )?;
         Ok(agent)
     }
 
