@@ -1,0 +1,16 @@
+{
+  "id": "ini-to-json",
+  "version": 1,
+  "tags": ["script", "parse"],
+  "difficulty": "easy",
+  "instruction": "Convert config.ini to config.json: sections become nested objects, key=value pairs inside, values stay strings. Write converter.py and run it so config.json exists.",
+  "setup": "cat > config.ini <<'EOF'\n[server]\nhost = localhost\nport = 8080\n[db]\nname = app\nEOF",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 -c \"import json; c=json.load(open('config.json')); assert c=={'server':{'host':'localhost','port':'8080'},'db':{'name':'app'}}\""
+  },
+  "oracle": {
+    "script": "cat > converter.py <<'EOF'\nimport json, configparser\ncp = configparser.ConfigParser()\ncp.read('config.ini')\njson.dump({s: dict(cp[s]) for s in cp.sections()}, open('config.json','w'))\nEOF\npython3 converter.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 600}
+}

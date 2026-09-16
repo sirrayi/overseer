@@ -21,8 +21,12 @@ You are Overseer, an agentic coding engine running as a CLI on the user's machin
 const CONTRACT: &str = "\
 Use the tools to accomplish the task. Prefer dedicated tools over bash for file operations.\n\
 Keep prose between tool calls under 25 words. Verify work with builds/tests when available.\n\
-Large tool outputs are spilled to files — read or grep them by path for more.\n\
-Delegate read-heavy subtasks to the `task` subagent — it investigates in an \
+Large tool outputs are spilled to files — read or grep them by path for more.";
+
+/// Appended to CONTRACT unless the `task` tool is ablated — a disabled arm
+/// must not advertise a tool the model can never call (P4.3 confound).
+const CONTRACT_TASK: &str = "\
+\nDelegate read-heavy subtasks to the `task` subagent — it investigates in an \
 isolated context and returns a compact digest.";
 
 /// Non-negotiable behavior constraints. Fixed across all sessions.
@@ -34,9 +38,14 @@ actually did it. If a tool errors, read the error before retrying differently.";
 /// wire order — reordering a cacheable section is a cache-breaking change
 /// and must be deliberate.
 pub fn assemble(config: &AgentConfig) -> Vec<SystemSegment> {
+    let contract = if config.disabled_tools.iter().any(|t| t == "task") {
+        CONTRACT.to_string()
+    } else {
+        format!("{CONTRACT}{CONTRACT_TASK}")
+    };
     let mut segments = vec![
         seg("identity", IDENTITY),
-        seg("contract", CONTRACT),
+        seg("contract", &contract),
         seg("safety", SAFETY),
     ];
     // Last static slot: the memory index (volatile content, stable position —
@@ -49,11 +58,15 @@ pub fn assemble(config: &AgentConfig) -> Vec<SystemSegment> {
     }
     // Skill metadata (P3.5): resident pointer lines; bodies load on
     // demand via the `skill` tool. Static tail — installs are rare.
-    if let Some(seg) = crate::skills::index_segment(&config.cwd) {
-        segments.push(SystemSegment {
-            text: seg,
-            cacheable: true,
-        });
+    // Suppressed when `skill` is ablated: the index advertises a tool the
+    // arm removed.
+    if !config.disabled_tools.iter().any(|t| t == "skill") {
+        if let Some(seg) = crate::skills::index_segment(&config.cwd) {
+            segments.push(SystemSegment {
+                text: seg,
+                cacheable: true,
+            });
+        }
     }
     // --- DYNAMIC boundary: non-cacheable per-turn sections go below. ---
     segments

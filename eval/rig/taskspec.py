@@ -21,8 +21,11 @@ Every task file is JSON:
       "max_steps": 15,
       "max_cost_usd": 0.5,
       "wall_s": 900
-    }
-  }
+    },
+    "canary": "OVR-CANARY-<hex>"     # optional — held-out tasks carry a
+  }                                  # unique token planted in the workspace;
+                                     # rig.audit flags it appearing in a run
+                                     # that doesn't own it (contamination).
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ class TaskSpec:
     limits: dict
     tags: list[str] = field(default_factory=list)
     difficulty: str | None = None
+    canary: str | None = None
     env_digest: str = "local-sh"
     source_path: str | None = None
 
@@ -106,6 +110,7 @@ def parse(raw: dict, ctx: str = "task") -> TaskSpec:
         limits=limits,
         tags=list(raw.get("tags") or []),
         difficulty=difficulty,
+        canary=raw.get("canary"),
         env_digest=env.get("image_digest") or "local-sh",
     )
 

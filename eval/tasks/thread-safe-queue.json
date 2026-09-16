@@ -1,0 +1,16 @@
+{
+  "id": "thread-safe-queue",
+  "version": 1,
+  "tags": ["script", "concurrency"],
+  "difficulty": "hard",
+  "instruction": "counter.py spawns 4 threads each incrementing a shared counter 25000 times — it races and prints a wrong total. Fix it (lock or queue) so it always prints exactly 100000, then run it twice to prove determinism.",
+  "setup": "cat > counter.py <<'EOF'\nimport threading\ntotal = 0\ndef bump():\n    global total\n    for _ in range(25000):\n        total += 1\nthreads = [threading.Thread(target=bump) for _ in range(4)]\nfor t in threads: t.start()\nfor t in threads: t.join()\nprint(total)\nEOF",
+  "grader": {
+    "type": "bash_assert",
+    "script": "[ \"$(python3 counter.py)\" = 100000 ] && [ \"$(python3 counter.py)\" = 100000 ]"
+  },
+  "oracle": {
+    "script": "cat > counter.py <<'EOF'\nimport threading\ntotal = 0\nlock = threading.Lock()\ndef bump():\n    global total\n    for _ in range(25000):\n        with lock:\n            total += 1\nthreads = [threading.Thread(target=bump) for _ in range(4)]\nfor t in threads: t.start()\nfor t in threads: t.join()\nprint(total)\nEOF\npython3 counter.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 600}
+}

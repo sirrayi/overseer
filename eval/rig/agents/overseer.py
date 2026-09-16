@@ -39,6 +39,7 @@ def solve(
     limits: dict | None = None,
     seed: int = 0,
     task=None,
+    extra_flags: list | None = None,
 ) -> dict:
     limits = limits or {}
     max_steps = int(limits.get("max_steps", 30))
@@ -63,6 +64,7 @@ def solve(
         "--max-steps",
         str(max_steps),
         "--full-access",
+        *(extra_flags or []),
         "-",
     ]
     if limits.get("max_cost_usd") is not None:

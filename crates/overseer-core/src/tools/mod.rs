@@ -161,6 +161,12 @@ struct ReadRecord {
 /// edit tracker — a harness-enforced anti-hallucination invariant, Ch.4 §2.3).
 /// Owns the permission policy: the gate lives at the dispatch boundary so no
 /// caller path can skip it (Invariant 3).
+/// All tool names the core registry can emit — the validation set for
+/// `--no-tools` ablations (typo'd names fail fast, not silently no-op).
+pub const TOOL_NAMES: [&str; 11] = [
+    "bash", "read", "write", "edit", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol",
+];
+
 pub struct ToolRegistry {
     pub specs: Vec<crate::provider::ToolSpec>,
     /// Paths the agent has read this session (canonicalized).
@@ -171,6 +177,9 @@ pub struct ToolRegistry {
     /// Rule-of-Two latch notices (P3.10): drained by the agent loop and
     /// emitted as `Tainted` events.
     pub taint_notices: Vec<String>,
+    /// P4.3 ablation: names removed via --no-tools. Hidden from the spec
+    /// list AND refused at dispatch — defense in depth.
+    disabled: HashSet<String>,
 }
 
 impl ToolRegistry {
@@ -197,6 +206,7 @@ impl ToolRegistry {
             read_log: HashMap::new(),
             policy,
             taint_notices: Vec::new(),
+            disabled: HashSet::new(),
         }
     }
 
@@ -210,6 +220,7 @@ impl ToolRegistry {
             read_log: HashMap::new(),
             policy,
             taint_notices: Vec::new(),
+            disabled: HashSet::new(),
         }
     }
 
@@ -225,7 +236,18 @@ impl ToolRegistry {
             read_log: HashMap::new(),
             policy,
             taint_notices: Vec::new(),
+            disabled: HashSet::new(),
         }
+    }
+
+    /// P4.3 ablation: drop `names` from the advertised spec list and refuse
+    /// them at dispatch. Unknown names are ignored here — the CLI validates
+    /// against TOOL_NAMES before this is ever called.
+    pub fn disable(&mut self, names: &[String]) {
+        for n in names {
+            self.disabled.insert(n.clone());
+        }
+        self.specs.retain(|s| !self.disabled.contains(&s.name));
     }
 
     pub fn mark_read(&mut self, path: &Path) {
@@ -291,11 +313,18 @@ impl ToolRegistry {
         &self.policy
     }
 
-    /// Dispatch a tool call. The permission gate runs first — a `Gate::Deny`
+    /// Dispatch a tool call. Disabled tools are refused before the
+    /// permission gate so an ablated run never prompts a human for a tool
+    /// that can never execute. The gate runs next — a `Gate::Deny`
     /// (rule-denied, human-denied, or headless Ask) returns a denied
     /// ToolOutput; the call never runs. Never panics: unknown names and bad
     /// inputs become error ToolOutputs that teach the model the contract.
     pub fn call(&mut self, name: &str, input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
+        if self.disabled.contains(name) {
+            return ToolOutput::err(format!(
+                "Tool '{name}' is disabled for this run (--no-tools)."
+            ));
+        }
         match self.policy.gate(name, input) {
             crate::perm::Gate::Allow => {}
             crate::perm::Gate::Deny(reason) => return ToolOutput::denied(reason),
@@ -552,6 +581,23 @@ mod tests {
             std::fs::read_to_string(dir.join("c.json")).unwrap(),
             "{\"a\": 1}"
         );
+    }
+
+    #[test]
+    fn disable_hides_and_refuses_tool() {
+        let dir = tmpdir();
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        reg.disable(&["grep".to_string(), "task".to_string()]);
+        // Spec list no longer advertises them (capability removal).
+        let names: Vec<&str> = reg.specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"grep"));
+        assert!(!names.contains(&"task"));
+        assert!(names.contains(&"read"));
+        // And dispatch refuses them outright (defense in depth).
+        let mut c = ctx(&dir);
+        let out = reg.call("grep", &json!({"pattern": "x"}), &mut c);
+        assert!(out.is_error);
+        assert!(out.text.contains("disabled"));
     }
 
     #[test]

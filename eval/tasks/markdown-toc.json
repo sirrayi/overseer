@@ -1,0 +1,16 @@
+{
+  "id": "markdown-toc",
+  "version": 1,
+  "tags": ["script", "text"],
+  "difficulty": "med",
+  "instruction": "Write toc.py: reads doc.md, writes toc.txt listing every ATX heading (#, ##, ###...) as '<depth>. <title>' where depth = number of # chars, title = heading text. Skip fenced code blocks. Run it.",
+  "setup": "cat > doc.md <<'EOF'\n# Title\nintro\n## Install\n```\n# not a heading\n```\n### Deep\n## Usage\nEOF",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 toc.py && printf '1. Title\\n2. Install\\n3. Deep\\n2. Usage\\n' | diff - toc.txt"
+  },
+  "oracle": {
+    "script": "cat > toc.py <<'EOF'\nimport re\nout, fence = [], False\nfor ln in open('doc.md'):\n    if ln.strip().startswith('```'):\n        fence = not fence\n        continue\n    if fence:\n        continue\n    m = re.match(r'^(#{1,6})\\s+(.*)', ln)\n    if m:\n        out.append(f'{len(m.group(1))}. {m.group(2).strip()}')\nopen('toc.txt','w').write('\\n'.join(out) + '\\n')\nEOF\npython3 toc.py"
+  },
+  "limits": {"max_steps": 12, "max_cost_usd": 0.4, "wall_s": 600}
+}

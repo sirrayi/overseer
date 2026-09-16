@@ -1,0 +1,16 @@
+{
+  "id": "fix-fstring-py38",
+  "version": 2,
+  "tags": ["bugfix", "syntax"],
+  "difficulty": "easy",
+  "instruction": "report.py has a syntax error — an unterminated f-string expression. Fix it so the script runs and writes 'count=3' to report.txt.",
+  "setup": "cat > report.py <<'EOF'\ndata = {'k': 'count', 'v': 3}\nopen('report.txt','w').write(f\"count={data['v']\\n\")\nEOF",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 report.py && grep -qx 'count=3' report.txt"
+  },
+  "oracle": {
+    "script": "cat > report.py <<'EOF'\ndata = {'k': 'count', 'v': 3}\nopen('report.txt','w').write(f\"count={data['v']}\\n\")\nEOF\npython3 report.py"
+  },
+  "limits": {"max_steps": 8, "max_cost_usd": 0.3, "wall_s": 300}
+}
