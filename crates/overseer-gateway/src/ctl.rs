@@ -4,8 +4,13 @@
 //! reach the daemon without sharing process state.
 //!
 //! Reachable commands: status, kill, inbox.list, inbox.decide,
-//! trigger.fire, reload. There is deliberately **no** config.patch —
-//! config mutation is not a socket surface (OpenClaw lesson).
+//! trigger.fire, reload, and (P7) channel.send, digest.get,
+//! desktop.signal. There is deliberately **no** config.patch — config
+//! mutation is not a socket surface (OpenClaw lesson).
+//!
+//! Method strings are a wire contract: each variant's `rename` is pinned by
+//! the round-trip test below. Adding is allowed; renaming silently breaks
+//! every frontend, so it is not.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -39,6 +44,20 @@ pub enum CtlRequest {
     Reload,
     /// Approve-and-act: mark acted + spawn the item's prompt.
     InboxAct { id: String },
+    /// P7-5: queue an outbound channel message. This only ever *drafts* the
+    /// message — approval happens through inbox.decide/inbox.act, so the
+    /// ladder's external → Ask is never bypassed by a socket call.
+    ChannelSend {
+        to: String,
+        #[serde(default)]
+        thread: Option<String>,
+        text: String,
+        /// Transport ("local" = the daemon's own outbox log).
+        #[serde(default)]
+        channel: Option<String>,
+    },
+    /// P7-5: the attention digest as cards (a view over the inbox).
+    DigestGet,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,6 +186,63 @@ mod ctl_serde_tests {
             let again = serde_json::to_value(&back).expect("value");
             assert_eq!(again, serde_json::to_value(&req).expect("value"));
         }
+    }
+
+    /// Wire contract: every method string, in order, verbatim. Renaming one
+    /// breaks every frontend silently — this test is the alarm.
+    #[test]
+    fn every_method_tag_is_pinned() {
+        let cases: Vec<(CtlRequest, &str)> = vec![
+            (CtlRequest::Status, "status"),
+            (CtlRequest::Kill, "kill"),
+            (CtlRequest::InboxList, "inbox_list"),
+            (
+                CtlRequest::InboxDecide {
+                    id: "x".into(),
+                    decision: "approve".into(),
+                    snooze_ms: None,
+                },
+                "inbox_decide",
+            ),
+            (
+                CtlRequest::TriggerFire {
+                    source: "s".into(),
+                    class: "c".into(),
+                    payload: "p".into(),
+                },
+                "trigger_fire",
+            ),
+            (CtlRequest::Reload, "reload"),
+            (CtlRequest::InboxAct { id: "x".into() }, "inbox_act"),
+            (
+                CtlRequest::ChannelSend {
+                    to: "ops".into(),
+                    thread: None,
+                    text: "hello".into(),
+                    channel: None,
+                },
+                "channel_send",
+            ),
+            (CtlRequest::DigestGet, "digest_get"),
+        ];
+        for (req, tag) in cases {
+            let v = serde_json::to_value(&req).unwrap();
+            assert_eq!(v["method"], tag, "tag for {req:?}");
+            // …and it round-trips from the wire form.
+            let back: CtlRequest = serde_json::from_str(&v.to_string()).unwrap();
+            assert_eq!(serde_json::to_value(&back).unwrap(), v);
+        }
+        // The optional fields really are optional on the wire.
+        let minimal: CtlRequest =
+            serde_json::from_str(r#"{"method":"channel_send","to":"ops","text":"hi"}"#).unwrap();
+        assert!(matches!(
+            minimal,
+            CtlRequest::ChannelSend {
+                thread: None,
+                channel: None,
+                ..
+            }
+        ));
     }
 
     #[test]

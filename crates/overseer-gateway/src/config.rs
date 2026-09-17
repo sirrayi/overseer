@@ -53,11 +53,16 @@ impl DaemonDirs {
     pub fn webhook_spool(&self) -> PathBuf {
         self.root.join("webhook")
     }
+    /// P7-5: outbound drafts + the local delivery sink.
+    pub fn outbox(&self) -> PathBuf {
+        self.root.join("outbox")
+    }
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.inbox())?;
         std::fs::create_dir_all(self.runs())?;
         std::fs::create_dir_all(self.channels())?;
-        std::fs::create_dir_all(self.webhook_spool())
+        std::fs::create_dir_all(self.webhook_spool())?;
+        std::fs::create_dir_all(self.outbox())
     }
 }
 
