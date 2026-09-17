@@ -12,6 +12,7 @@ use std::process::{Child, Command, Stdio};
 
 use serde::Serialize;
 
+use crate::channels;
 use crate::config::SpawnConfig;
 use crate::event::now_ms;
 
@@ -25,6 +26,16 @@ pub struct Spawned {
     pub timeout_ms: u64,
     pub prompt: String,
     pub log_path: PathBuf,
+}
+
+/// The policy a run is spawned under. `Untrusted` runs carry the
+/// external-approval floor and the engine's untrusted marker; local runs
+/// keep the operator's own configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    Local,
+    /// Caused by an inbound channel message: `channel:<channel>:<sender>`.
+    Untrusted(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -48,23 +59,73 @@ pub fn spawn_run(
     inbox_id: Option<String>,
     overseer_bin: &PathBuf,
 ) -> Result<Spawned, String> {
+    spawn_run_from(
+        cfg,
+        runs_dir,
+        prompt,
+        inbox_id,
+        overseer_bin,
+        &Origin::Local,
+    )
+}
+
+/// Build the child command. Kept separate (and pure but for `Stdio`) so the
+/// argv and environment a run is launched with can be asserted directly
+/// instead of re-derived in tests.
+fn build_command(
+    cfg: &SpawnConfig,
+    prompt: &str,
+    origin: &Origin,
+    overseer_bin: &Path,
+    out: Stdio,
+    err: Stdio,
+) -> Command {
+    let mut cmd = Command::new(overseer_bin);
+    cmd.arg("exec")
+        .arg("--bare")
+        .arg("--max-steps")
+        .arg(cfg.max_steps.to_string());
+    if let Origin::Untrusted(marker) = origin {
+        // An untrusted-originated run may not act on external effects
+        // without approval, whatever the local autonomy map says, and it
+        // tells the engine where it came from so the session starts armed.
+        cmd.args(channels::UNTRUSTED_AUTONOMY_FLOOR);
+        cmd.env(channels::UNTRUSTED_ENV, marker);
+    }
+    cmd.arg(prompt)
+        .stdout(out)
+        .stderr(err)
+        .stdin(Stdio::null());
+    if let Some(cwd) = &cfg.cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd
+}
+
+/// Spawn with an explicit origin (P7-4). An untrusted origin *adds* the
+/// external-approval autonomy floor and exports the marker the engine
+/// arms on; it never removes anything the local config set.
+pub fn spawn_run_from(
+    cfg: &SpawnConfig,
+    runs_dir: &Path,
+    prompt: &str,
+    inbox_id: Option<String>,
+    overseer_bin: &PathBuf,
+    origin: &Origin,
+) -> Result<Spawned, String> {
     let id = uuid::Uuid::now_v7().to_string();
     let log_path = runs_dir.join(format!("{id}.log"));
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
 
-    let mut cmd = Command::new(overseer_bin);
-    cmd.arg("exec")
-        .arg("--bare")
-        .arg("--max-steps")
-        .arg(cfg.max_steps.to_string())
-        .arg(prompt)
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
-        .stdin(Stdio::null());
-    if let Some(cwd) = &cfg.cwd {
-        cmd.current_dir(cwd);
-    }
+    let mut cmd = build_command(
+        cfg,
+        prompt,
+        origin,
+        overseer_bin,
+        Stdio::from(log),
+        Stdio::from(log_err),
+    );
     let child = cmd.spawn().map_err(|e| format!("spawn overseer: {e}"))?;
     Ok(Spawned {
         id,
@@ -135,6 +196,71 @@ mod tests {
             prompt: "test".to_string(),
             log_path: tmpdir(tag).join("test.log"),
         }
+    }
+
+    #[test]
+    fn untrusted_spawn_carries_the_floor_and_the_marker() {
+        // P7-4: an untrusted-originated run gets the autonomy floor in its
+        // argv and the origin marker in its environment. A local run gets
+        // neither — the floor is added, never subtracted from.
+        let cfg = SpawnConfig {
+            max_concurrent: 1,
+            max_steps: 7,
+            timeout_s: 5,
+            cwd: None,
+        };
+        let bin = PathBuf::from("/nonexistent/overseer");
+        let untrusted = build_command(
+            &cfg,
+            "do the thing",
+            &Origin::Untrusted("channel:telegram:77".into()),
+            &bin,
+            Stdio::null(),
+            Stdio::null(),
+        );
+        let args: Vec<String> = untrusted
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--bare",
+                "--max-steps",
+                "7",
+                "--autonomy",
+                "external=approve",
+                "do the thing",
+            ]
+        );
+        let envs: Vec<(String, Option<String>)> = untrusted
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs,
+            vec![(
+                channels::UNTRUSTED_ENV.to_string(),
+                Some("channel:telegram:77".to_string())
+            )]
+        );
+
+        let local = build_command(&cfg, "do the thing", &Origin::Local, &bin, Stdio::null(), Stdio::null());
+        let local_args: Vec<String> = local
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            local_args,
+            vec!["exec", "--bare", "--max-steps", "7", "do the thing"]
+        );
+        assert_eq!(local.get_envs().count(), 0, "local runs export nothing");
     }
 
     #[test]

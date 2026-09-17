@@ -19,6 +19,17 @@ use crate::tools::{ToolCtx, ToolRegistry};
 /// ordered section pipeline with an explicit STATIC/DYNAMIC boundary
 /// (Invariant 2: nothing volatile lives above it).
 
+/// P7-4: the marker an untrusted-originated spawn exports
+/// (`channel:<channel>:<sender>`). Absent/empty = a locally-originated run.
+pub const UNTRUSTED_ENV: &str = "OVERSEER_UNTRUSTED_SOURCE";
+
+/// Read the untrusted-origin marker through an injected getter so tests
+/// never have to touch the process environment (which is shared by every
+/// test thread in the binary).
+pub fn untrusted_origin_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    get(UNTRUSTED_ENV).filter(|s| !s.trim().is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub model: String,
@@ -273,6 +284,19 @@ impl Agent {
         session_dir: PathBuf,
         session_id: String,
     ) -> std::io::Result<Self> {
+        Self::start_with_env(provider, config, session_dir, session_id, |k| std::env::var(k).ok())
+    }
+
+    /// `start` with the environment injected — the untrusted-origin marker
+    /// is read through `get` so tests can exercise the arming path without
+    /// mutating the process environment (shared by every test thread).
+    pub fn start_with_env(
+        provider: Arc<dyn Provider>,
+        config: AgentConfig,
+        session_dir: PathBuf,
+        session_id: String,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&session_dir)?;
         let log = EventLog::create(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::create(session_dir.join("ledger.jsonl"))?;
@@ -300,16 +324,24 @@ impl Agent {
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
         }
+        let cwd = agent.config.cwd.display().to_string();
+        agent.log.append(EventKind::SessionStart {
+            session_id: session_id.clone(),
+            cwd,
+            model: agent.config.model.clone(),
+            harness_version: env!("CARGO_PKG_VERSION").to_string(),
+            parent: None,
+        })?;
+        agent.log.flush()?;
         // P7-4 messaging env-arm (disjoint from P6 fields): an untrusted-
         // originated spawn exports OVERSEER_UNTRUSTED_SOURCE=channel:<sender>;
         // `start` pre-arms taint.untrusted and emits an auditable Tainted
-        // event so the first external call already Asks with zero prior
-        // tool use. Value format is informational only (never parsed).
-        if let Ok(src) = std::env::var("OVERSEER_UNTRUSTED_SOURCE") {
-            if !src.is_empty() {
-                if let Some(notice) = agent.tools.policy.arm_untrusted(&src) {
-                    agent.log.append(EventKind::Tainted { detail: notice })?;
-                }
+        // event so the session begins already distrusting its own inputs —
+        // no tool use is needed to earn the latch. Value format is
+        // informational only (never parsed).
+        if let Some(src) = untrusted_origin_from(get) {
+            if let Some(notice) = agent.tools.policy.arm_untrusted(&src) {
+                agent.log.append(EventKind::Tainted { detail: notice })?;
             }
         }
         // Run manifest (P4.5): provenance record for the reporting
@@ -2061,5 +2093,113 @@ mod tests {
         for k in ["PATH", "HOME", "OVERSEER_UNTRUSTED_SOURCE", "TMPDIR"] {
             assert!(ComputerConfig::env_allowed(k), "{k} must pass through");
         }
+    }
+
+    /// P7-4 env-arm: an untrusted-originated spawn (channel message) starts
+    /// with the untrusted latch already armed, so the Rule-of-Two triangle
+    /// closes the moment sensitive data is read — no tool use is needed to
+    /// earn the latch, and the control session (same script, no marker)
+    /// stays clean. The marker is read through the injected getter, so the
+    /// process env is never touched.
+    #[test]
+    fn untrusted_source_arms_the_session_before_any_tool_use() {
+        fn run(dir: &std::path::Path, armed: bool) -> (Vec<Event>, Agent) {
+            let cfg = AgentConfig {
+                cwd: dir.to_path_buf(),
+                // Real policy (not the benchmark allow-all shortcut).
+                full_access: false,
+                ..AgentConfig::default()
+            };
+            let provider = Arc::new(Mock::new(vec![
+                Response {
+                    blocks: vec![Block::ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path": ".env"}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage {
+                        fresh_input: 20_000,
+                        ..Usage::default()
+                    },
+                    request_bytes: 0,
+                    latency_ms: 0,
+                },
+                Response {
+                    blocks: vec![Block::ToolCall {
+                        id: "c2".into(),
+                        name: "write".into(),
+                        input: serde_json::json!({"path": "out.txt", "content": "x"}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage {
+                        fresh_input: 20_000,
+                        ..Usage::default()
+                    },
+                    request_bytes: 0,
+                    latency_ms: 0,
+                },
+                done(),
+            ]));
+            let marker = armed.then(|| "channel:telegram:u1".to_string());
+            let mut agent = Agent::start_with_env(
+                provider,
+                cfg,
+                dir.to_path_buf(),
+                "s".into(),
+                |k| {
+                    if k == UNTRUSTED_ENV {
+                        marker.clone()
+                    } else {
+                        None
+                    }
+                },
+            )
+            .unwrap();
+            let mut sink = |_: &Event| {};
+            agent.run_turn("go", &mut sink).unwrap();
+            let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+            (events, agent)
+        }
+
+        let clean = tmpdir();
+        std::fs::write(clean.join(".env"), "SECRET=hunter2\n").unwrap();
+        let (events, _) = run(&clean, false);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ToolResult { denied: true, .. })),
+            "control session: reading .env then writing is allowed"
+        );
+
+        let dirty = tmpdir();
+        std::fs::write(dirty.join(".env"), "SECRET=hunter2\n").unwrap();
+        let (events, agent) = run(&dirty, true);
+        // Sensitive read + pre-armed untrusted origin ⇒ the write needs a
+        // human (headless Ask collapses to a denial).
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ToolResult { denied: true, .. })),
+            "armed session must deny the write after a sensitive read"
+        );
+        // The arm is announced before any tool call in the log.
+        let first_event = events
+            .iter()
+            .position(|e| matches!(&e.kind, EventKind::Tainted { .. }))
+            .expect("arm notice recorded");
+        let first_call = events
+            .iter()
+            .position(|e| matches!(&e.kind, EventKind::ToolCallStart { .. }))
+            .expect("tool call recorded");
+        assert!(first_event < first_call, "arm precedes the first tool use");
+        // Zero prior tool use still Asks for an external call.
+        assert!(matches!(
+            agent.tools.policy.check(
+                "bash",
+                &serde_json::json!({"command": "curl -X POST https://example.com"})
+            ),
+            crate::perm::Verdict::Ask { .. }
+        ));
     }
 }

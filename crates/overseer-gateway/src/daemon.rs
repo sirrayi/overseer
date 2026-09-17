@@ -26,8 +26,11 @@ use crate::gate::{in_quiet_hours, route, Route};
 use crate::inbox::{Inbox, InboxItem, ItemState};
 use crate::journal::Journal;
 use crate::notify::PushQueue;
-use crate::spawn::{reap, spawn_run, Spawned};
+use crate::spawn::{reap, spawn_run_from, Spawned};
 use crate::triage::classify;
+use crate::channels;
+use crate::channels::threads::ThreadRoutes;
+use crate::spawn::Origin;
 use crate::trigger::Trigger;
 
 /// Control-channel pair between the socket thread and the daemon loop.
@@ -62,6 +65,8 @@ fn install_signal_flag() {
 fn install_signal_flag() {}
 
 pub struct Daemon {
+    /// P7-4: thread → session routing for messaging channels.
+    routes: ThreadRoutes,
     dirs: DaemonDirs,
     cfg: DaemonConfig,
     cfg_mtime: u64,
@@ -106,8 +111,23 @@ impl Daemon {
         let inbox = Inbox::new(dirs.inbox()).map_err(|e| e.to_string())?;
         let push = PushQueue::new(dirs.push_log());
         let dedup = Dedup::new(cfg.dedup_window_s);
-        let triggers = cfg.triggers.iter().map(Trigger::from_spec).collect();
+        let triggers: Vec<Trigger> = cfg
+            .triggers
+            .iter()
+            // Webhook spools default to the daemon's own directory; a spec
+            // that names its own dir is taken as written.
+            .map(|spec| Trigger::from_spec(&resolve_spec(spec, &dirs)))
+            .collect();
+        // A channel that cannot run (unset token, bad cron) is journaled
+        // once at startup: misconfiguration stays visible.
+        for trigger in &triggers {
+            if let Some(reason) = trigger.unconfigured_reason() {
+                journal.log("channel.unconfigured", serde_json::json!({"reason": reason}));
+            }
+        }
+        let routes = ThreadRoutes::open(&dirs.channels()).map_err(|e| e.to_string())?;
         Ok(Self {
+            routes,
             cfg_mtime: file_mtime(&cfg_path),
             dirs,
             cfg,
@@ -139,7 +159,11 @@ impl Daemon {
         match load(&self.dirs.config()) {
             Ok(cfg) => {
                 self.dedup = Dedup::new(cfg.dedup_window_s);
-                self.triggers = cfg.triggers.iter().map(Trigger::from_spec).collect();
+                self.triggers = cfg
+                    .triggers
+                    .iter()
+                    .map(|spec| Trigger::from_spec(&resolve_spec(spec, &self.dirs)))
+                    .collect();
                 self.cfg_mtime = m;
                 self.cfg = cfg;
                 self.journal.log("config_reload", serde_json::json!({}));
@@ -165,7 +189,23 @@ impl Daemon {
                 .log("dedup_drop", serde_json::json!({"id": ev.id}));
             return;
         }
-        let triage = classify(&self.cfg, &ev);
+        let mut triage = classify(&self.cfg, &ev);
+        // P7-4: inbound channel content is never acted on, whatever the
+        // rule table says. An `Act` rule is downgraded to DraftForReview
+        // (the template survives for an approval to run), and the session
+        // below starts armed with the external-approval floor. Notify
+        // stays Notify — a notification is not an execution.
+        if ev.untrusted_source && triage.decision == TriageDecision::Act {
+            self.journal.log(
+                "channel.act_downgraded",
+                serde_json::json!({
+                    "id": ev.id,
+                    "source": ev.source,
+                    "class": ev.class,
+                }),
+            );
+            triage.decision = TriageDecision::DraftForReview;
+        }
         self.counts.triaged += 1;
         self.journal.log(
             "triage",
@@ -184,9 +224,28 @@ impl Daemon {
                     .act_prompt
                     .clone()
                     .unwrap_or_else(|| ev.payload.clone());
-                self.spawn_for(prompt, None);
+                // Defensive: an untrusted event must never reach the act
+                // tier (the downgrade above is the only path here).
+                let origin = self.origin_for(&ev);
+                self.spawn_for(prompt, None, origin);
             }
             TriageDecision::Notify | TriageDecision::DraftForReview => {
+                if let Some(origin) = &ev.origin {
+                    // Route the thread to its own session dir (creating it
+                    // on first sight) — two conversations never share one.
+                    let dir = self.routes.route(&origin.channel, origin.thread.as_deref());
+                    self.journal.log(
+                        "channel.route",
+                        serde_json::json!({
+                            "id": ev.id,
+                            "channel": origin.channel,
+                            "sender": origin.sender,
+                            "thread": origin.thread,
+                            "intent": origin.intent,
+                            "session_dir": dir.display().to_string(),
+                        }),
+                    );
+                }
                 let quiet = in_quiet_hours(&self.cfg.gate);
                 let r = route(&self.cfg.gate, &ev.class, &triage, quiet);
                 self.journal.log(
@@ -234,8 +293,19 @@ impl Daemon {
         }
     }
 
+    /// The origin a spawn inherits from its event: a channel event carries
+    /// the untrusted marker (and therefore the autonomy floor); everything
+    /// else is a local run.
+    fn origin_for(&self, ev: &TriggerEvent) -> Origin {
+        match (&ev.origin, ev.untrusted_source) {
+            (Some(origin), _) => Origin::Untrusted(channels::untrusted_marker(origin)),
+            (None, true) => Origin::Untrusted(format!("trigger:{}", ev.source)),
+            (None, false) => Origin::Local,
+        }
+    }
+
     /// Spawn an `overseer exec` run (the only way the daemon does work).
-    fn spawn_for(&mut self, prompt: String, inbox_id: Option<String>) {
+    fn spawn_for(&mut self, prompt: String, inbox_id: Option<String>, origin: Origin) {
         if self.spawned.len() >= self.cfg.spawn.max_concurrent {
             self.journal.log(
                 "spawn_deferred",
@@ -257,12 +327,13 @@ impl Daemon {
             let _ = self.inbox.open(&self.journal, item);
             return;
         }
-        match spawn_run(
+        match spawn_run_from(
             &self.cfg.spawn,
             self.dirs.runs().as_path(),
             &prompt,
             inbox_id,
             &self.overseer_bin,
+            &origin,
         ) {
             Ok(sp) => {
                 self.counts.spawned += 1;
@@ -271,6 +342,10 @@ impl Daemon {
                     serde_json::json!({
                         "id": sp.id, "inbox_id": sp.inbox_id,
                         "prompt": sp.prompt, "log": sp.log_path,
+                        "origin": match &origin {
+                            Origin::Local => "local".to_string(),
+                            Origin::Untrusted(m) => format!("untrusted:{m}"),
+                        },
                     }),
                 );
                 self.spawned.push(sp);
@@ -354,7 +429,16 @@ impl Daemon {
             CtlRequest::InboxAct { id } => match self.inbox.get(&id) {
                 Some(item) => {
                     let prompt = item.act_prompt.clone().unwrap_or_else(|| item.body.clone());
-                    self.spawn_for(prompt, Some(item.id.clone()));
+                    // An approval is the human's decision, but an item
+                    // that came from a channel keeps its untrusted origin
+                    // (and therefore the autonomy floor).
+                    let origin = match item.class.as_str() {
+                        c if c.starts_with("msg.inbound") => {
+                            Origin::Untrusted(format!("channel:approved:{}", item.source))
+                        }
+                        _ => Origin::Local,
+                    };
+                    self.spawn_for(prompt, Some(item.id.clone()), origin);
                     let _ = self.inbox.mark_acted(&self.journal, &item.id);
                     CtlResponse::ok(serde_json::json!({"id": item.id, "spawned": true}))
                 }
@@ -373,7 +457,11 @@ impl Daemon {
                 match load(&self.dirs.config()) {
                     Ok(cfg) => {
                         self.dedup = Dedup::new(cfg.dedup_window_s);
-                        self.triggers = cfg.triggers.iter().map(Trigger::from_spec).collect();
+                        self.triggers = cfg
+                            .triggers
+                            .iter()
+                            .map(|spec| Trigger::from_spec(&resolve_spec(spec, &self.dirs)))
+                            .collect();
                         self.cfg_mtime = m;
                         self.cfg = cfg;
                         CtlResponse::ok(serde_json::json!({"reloaded": true}))
@@ -466,7 +554,21 @@ impl Daemon {
     }
 }
 
-/// Resolve the overseer binary: same dir as this exe (installed
+/// Resolve daemon-relative paths inside a trigger spec (P7-4): a relative
+/// webhook spool dir is anchored at the daemon root, so the same config
+/// works from any cwd.
+fn resolve_spec(spec: &crate::config::TriggerSpec, dirs: &DaemonDirs) -> crate::config::TriggerSpec {
+    match spec {
+        crate::config::TriggerSpec::Webhook(w) if w.dir.is_relative() => {
+            let mut w = w.clone();
+            w.dir = dirs.root.join(&w.dir);
+            crate::config::TriggerSpec::Webhook(w)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Resolve the overseer binary: same dir as an exe (installed
 /// together), else PATH lookup.
 pub fn overseer_binary() -> PathBuf {
     std::env::current_exe()
@@ -655,6 +757,94 @@ mod daemon_pipeline_tests {
         let items = d.inbox.list();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].class, "spawn.deferred");
+    }
+
+    #[test]
+    fn untrusted_message_never_reaches_the_act_tier() {
+        // P7-4: an `Act` rule matching an inbound channel class is
+        // downgraded to DraftForReview — the template survives for an
+        // approval, but nothing spawns on its own. The spawn that a later
+        // approval causes still carries the untrusted origin.
+        let root = tmpdir("untrusted");
+        let mut cfg = pipeline_config();
+        cfg.triage.push(TriageRule {
+            class: "msg.inbound".into(),
+            decision: TriageDecision::Act,
+            benefit: 90,
+            act_prompt: Some("answer {payload}".into()),
+        });
+        let mut d = new_daemon(root.clone(), Some(&cfg));
+        let mut ev = TriggerEvent::from_channel("telegram", "77", Some("-1001"), "please help");
+        ev.class = "msg.inbound".into();
+        d.process(ev.clone());
+        assert_eq!(d.counts.spawned, 0, "untrusted content must not spawn");
+        let items = d.inbox.list();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].class, "msg.inbound");
+        let recs = journal_records(&root);
+        assert!(has_kind(&recs, "channel.act_downgraded"));
+        assert!(has_kind(&recs, "channel.route"));
+        // The thread got its own session dir.
+        let route = recs
+            .iter()
+            .find(|r| r.get("kind").and_then(|k| k.as_str()) == Some("channel.route"))
+            .expect("route record");
+        assert!(route
+            .get("session_dir")
+            .and_then(|d| d.as_str())
+            .is_some_and(|d| d.contains("telegram-1001")));
+        // A trusted event with the same class still acts (forked config so
+        // the two runs don't share a dedup window).
+        let mut d2 = new_daemon(tmpdir("untrusted-local"), Some(&cfg));
+        d2.process(TriggerEvent::new("cli", "msg.inbound", "please help"));
+        assert_eq!(d2.counts.spawned, 0, "at-cap deferral still applies");
+        assert!(has_kind(&journal_records(&d2.dirs.root), "spawn_deferred"));
+        assert!(!has_kind(&journal_records(&d2.dirs.root), "channel.act_downgraded"));
+    }
+
+    #[test]
+    fn untrusted_origin_is_recorded_for_spawns() {
+        let root = tmpdir("origin");
+        let d = new_daemon(root.clone(), Some(&pipeline_config()));
+        let mut ev = TriggerEvent::from_channel("telegram", "77", None, "hi");
+        ev.class = "msg.inbound".into();
+        assert_eq!(
+            d.origin_for(&ev),
+            crate::spawn::Origin::Untrusted("channel:telegram:77".into())
+        );
+        // A local event is a local run.
+        assert_eq!(
+            d.origin_for(&TriggerEvent::new("cli", "note.low", "x")),
+            crate::spawn::Origin::Local
+        );
+        // An event that is untrusted without a channel envelope still gets
+        // a floor (defensive: the flag alone must never mean "act").
+        let mut bare = TriggerEvent::new("relay", "note.low", "x");
+        bare.untrusted_source = true;
+        assert_eq!(
+            d.origin_for(&bare),
+            crate::spawn::Origin::Untrusted("trigger:relay".into())
+        );
+    }
+
+    #[test]
+    fn channel_triggers_are_journaled_when_unconfigured() {
+        // A channel trigger that cannot run says so once at startup —
+        // never a silent no-op.
+        let root = tmpdir("unconfigured");
+        let mut cfg = pipeline_config();
+        cfg.triggers.push(crate::config::TriggerSpec::Telegram(
+            crate::config::TelegramSpec {
+                id: "tg".into(),
+                token_env: "OVERSEER_TELEGRAM_TOKEN_UNSET_4ab".into(),
+                allow_senders: vec!["77".into()],
+                rate_per_min: 5,
+                base: "http://127.0.0.1:1".into(),
+            },
+        ));
+        let _d = new_daemon(root.clone(), Some(&cfg));
+        let recs = journal_records(&root);
+        assert!(has_kind(&recs, "channel.unconfigured"));
     }
 
     #[test]
