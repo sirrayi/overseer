@@ -350,6 +350,9 @@ pub fn feed(ev: &Event) -> Feed {
             style: theme::error(),
             text: format!("error: {message}"),
         }]),
+        // Audit-only engine events (P6-2 memory commits, P6-4 consent
+        // grants) are provenance, not conversation — never rendered.
+        EventKind::MemoryUpdated { .. } | EventKind::ConsentGranted { .. } => Feed::Ignore,
         EventKind::RunEnd {
             stop_reason,
             steps,

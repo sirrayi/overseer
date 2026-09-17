@@ -99,6 +99,11 @@ pub struct AgentConfig {
     /// `[reflection]`-tagged Nudge. `Off` disables; `Reflexion` reflects on
     /// verify blocks only (never on success). Default: Reflexion.
     pub reflect: ReflectMode,
+    /// P6-4 credential store: where secrets are read from at session start.
+    /// The CLI resolves the configured value against the machine (keychain
+    /// backend present? entry usable?) and stores the *effective* store
+    /// here, so the manifest records what actually held the secret.
+    pub credential_store: crate::cred::CredentialStore,
 }
 
 /// B1-7: when the Reflexion hook fires.
@@ -138,6 +143,7 @@ impl Default for AgentConfig {
             disabled_tools: Vec::new(),
             autonomy: Default::default(),
             reflect: ReflectMode::Reflexion,
+            credential_store: crate::cred::CredentialStore::Auto,
         }
     }
 }
@@ -265,6 +271,19 @@ impl Agent {
             harness_version: env!("CARGO_PKG_VERSION").to_string(),
             parent: None,
         })?;
+        agent.log.flush()?;
+        // P6-4: consent grants loaded into the broker are audited at
+        // session start — audit-only events carrying client/scope metadata,
+        // never secret material (Invariant 1: the log is the paper trail).
+        for g in agent.config.broker.grants() {
+            agent.log.append(EventKind::ConsentGranted {
+                client: g.client.clone(),
+                scopes: g.scopes.clone(),
+                expires_ms: g.expires_ms,
+                actor: g.actor.clone(),
+                approved_by: g.approved_by.clone(),
+            })?;
+        }
         agent.log.flush()?;
         // Run manifest (P4.5): provenance record for the reporting
         // standard — written once, never rewritten by resume.
@@ -2149,5 +2168,67 @@ mod tests {
         let raw = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
         assert!(!raw.contains("pw-real-9"), "events.jsonl leaked the real");
         assert!(raw.contains(&sentinel), "events.jsonl must carry the sentinel");
+    }
+
+    /// P6-4 accept: consent grants are audited at session start and stay
+    /// audit-only — rehydration must not turn them into model context, and
+    /// the audit copy carries metadata only (no real, no sentinel).
+    #[test]
+    fn consent_grant_is_audited_and_never_rehydrates() {
+        let dir = tmpdir();
+        let mut cfg = AgentConfig {
+            cwd: dir.clone(),
+            ..AgentConfig::default()
+        };
+        cfg.broker.grant_book_mut().add(crate::cred::Grant {
+            client: "gh".into(),
+            scopes: vec!["repo".into(), "read".into()],
+            expires_ms: 0,
+            actor: "user".into(),
+            approved_by: "alice".into(),
+        });
+        let sentinel = cfg.broker.issue_capability(
+            "gh",
+            "GH_TOKEN",
+            "ghp_real_grant_1",
+            vec![],
+            vec!["repo".into()],
+            None,
+        );
+        let agent = Agent::start(
+            Arc::new(Mock::new(vec![])),
+            cfg,
+            dir.clone(),
+            "s".into(),
+        )
+        .unwrap();
+        drop(agent);
+
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        let granted: Vec<(&str, &[String], &str)> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ConsentGranted {
+                    client,
+                    scopes,
+                    approved_by,
+                    ..
+                } => Some((client.as_str(), scopes.as_slice(), approved_by.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(granted.len(), 1, "the grant must be on the record");
+        assert_eq!(granted[0].0, "gh");
+        assert_eq!(granted[0].1, ["repo".to_string(), "read".to_string()]);
+        assert_eq!(granted[0].2, "alice");
+        let raw = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert!(!raw.contains("ghp_real_grant_1"), "audit event leaked a real");
+        assert!(!raw.contains(&sentinel), "audit event must not carry sentinels");
+
+        // Audit-only: no message view entry, no context injection.
+        let msgs = crate::event::rehydrate_messages(&events);
+        let view = format!("{msgs:?}");
+        assert!(!view.contains("alice"), "grant leaked into the view: {view}");
+        assert!(!view.contains("consent"), "grant leaked into the view: {view}");
     }
 }
