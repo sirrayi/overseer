@@ -70,3 +70,87 @@ pub fn run_symbol(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     }
     ToolOutput::ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::ToolRegistry;
+
+    fn tmpdir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("overseer-sym-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn ctx(dir: &std::path::Path) -> ToolCtx<'static> {
+        ToolCtx {
+            cwd: dir.to_path_buf(),
+            session_dir: dir.join("session"),
+            spill_seq: 0,
+            provider: None,
+            agent_config: None,
+            subagent_seq: 0,
+            checkpoint: None,
+            sandbox: false,
+        }
+    }
+
+    #[test]
+    fn symbol_returns_window_with_valid_read_hint() {
+        // D4: the hint must be executable read syntax (path + offset/limit),
+        // and the expansion path must work.
+        let dir = tmpdir();
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn alpha() {\n    let x = 1;\n    let y = 2;\n    x + y\n}\n",
+        )
+        .unwrap();
+        let mut c = ctx(&dir);
+        let out = run_symbol(&serde_json::json!({"name": "alpha"}), &mut c);
+        assert!(!out.is_error);
+        assert!(out.text.contains("a.rs"), "got: {}", out.text);
+        assert!(
+            out.text.contains("with offset=") && out.text.contains("limit="),
+            "valid read hint, got: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("`read a.rs:"),
+            "no colon-range syntax, got: {}",
+            out.text
+        );
+        // Expansion path: parse offset/limit from the hint and read.
+        let hint = out
+            .text
+            .lines()
+            .find(|l| l.contains("with offset="))
+            .expect("hint line")
+            .to_string();
+        let off: usize = hint
+            .split("offset=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("offset parses");
+        let lim: usize = hint
+            .split("limit=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.split(']').next())
+            .and_then(|s| s.parse().ok())
+            .expect("limit parses");
+        let mut c2 = ctx(&dir);
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let expanded = crate::tools::read::run(
+            &serde_json::json!({"path": "a.rs", "offset": off, "limit": lim}),
+            &mut c2,
+            &mut reg,
+        );
+        assert!(
+            !expanded.is_error,
+            "expansion read works: {}",
+            expanded.text
+        );
+        assert!(expanded.text.contains("alpha"));
+    }
+}
