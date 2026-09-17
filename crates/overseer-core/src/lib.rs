@@ -13,6 +13,7 @@ pub mod ir;
 pub mod ledger;
 pub mod manifest;
 pub mod memory;
+pub mod onboard;
 pub mod perm;
 pub mod profile;
 pub mod prompt;

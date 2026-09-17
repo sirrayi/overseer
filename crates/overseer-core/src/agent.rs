@@ -104,6 +104,10 @@ pub struct AgentConfig {
     /// backend present? entry usable?) and stores the *effective* store
     /// here, so the manifest records what actually held the secret.
     pub credential_store: crate::cred::CredentialStore,
+    /// P6-5 persona dir (onboarding). Some = the persona segment renders
+    /// (approved bodies, or a one-line pending notice) and the draft gate
+    /// closes file tools on an unapproved dir.
+    pub persona_dir: Option<PathBuf>,
 }
 
 /// B1-7: when the Reflexion hook fires.
@@ -144,6 +148,7 @@ impl Default for AgentConfig {
             autonomy: Default::default(),
             reflect: ReflectMode::Reflexion,
             credential_store: crate::cred::CredentialStore::Auto,
+            persona_dir: None,
         }
     }
 }
@@ -263,6 +268,11 @@ impl Agent {
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
         }
+        // P6-5: the persona dir is seeded as drafts (never overwritten) so
+        // the interview has files to write and the gate has a target.
+        if let Some(dir) = agent.config.persona_dir.clone() {
+            crate::onboard::ensure_persona_dir(&dir)?;
+        }
         let cwd = agent.config.cwd.display().to_string();
         agent.log.append(EventKind::SessionStart {
             session_id: session_id.clone(),
@@ -365,6 +375,32 @@ impl Agent {
 
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Record a user-role message without running a turn (P6-5): interview
+    /// answers land in the log — written, flushed, fsynced — before any
+    /// persona file is drafted, so a crash mid-interview loses nothing.
+    pub fn record_user_input(
+        &mut self,
+        text: &str,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<()> {
+        self.messages.push(Message::user_text(text));
+        self.emit(EventKind::UserInput { text: text.into() }, on_event)?;
+        self.log.flush()
+    }
+
+    /// Record harness-authored user-role text without running a turn
+    /// (P6-5): the onboarding questions. `Nudge` is provably not user-typed
+    /// (same durability contract as `record_user_input`).
+    pub fn record_nudge(
+        &mut self,
+        text: &str,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<()> {
+        self.messages.push(Message::user_text(text));
+        self.emit(EventKind::Nudge { text: text.into() }, on_event)?;
+        self.log.flush()
     }
 
     /// Run one user turn through the ReAct loop until the model stops calling
@@ -1064,6 +1100,14 @@ impl Agent {
             p.ask_handler = config.ask_handler.clone();
             p.autonomy = config.autonomy.clone();
             p.memory_dir = config.memory_dir.clone();
+            // P6-5: the draft gate needs the dir and the approval verdict —
+            // computed once here so a mid-session `--approve` is a restart
+            // (approval is a trust-boundary change, like a preset swap).
+            p.persona_dir = config.persona_dir.clone();
+            p.persona_approved = config
+                .persona_dir
+                .as_deref()
+                .is_some_and(crate::onboard::all_approved);
             if let Some(path) = &config.rules_path {
                 p.load_rules(path.clone());
             }
@@ -2230,5 +2274,67 @@ mod tests {
         let view = format!("{msgs:?}");
         assert!(!view.contains("alice"), "grant leaked into the view: {view}");
         assert!(!view.contains("consent"), "grant leaked into the view: {view}");
+    }
+
+    /// P6-5 accept, at the engine boundary: an unapproved persona dir is
+    /// closed to the file tools AND invisible in the prompt; approving it
+    /// flips both halves for the next session.
+    #[test]
+    fn persona_draft_gate_is_wired_through_registry_and_prompt() {
+        let dir = tmpdir();
+        let persona = dir.join("persona");
+        crate::onboard::ensure_persona_dir(&persona).unwrap();
+        crate::onboard::write_drafts(
+            &persona,
+            &[(
+                "identity.md".to_string(),
+                vec![crate::onboard::Insight {
+                    text: "DRAFT_INSIGHT_A".to_string(),
+                    source: 1,
+                }],
+            )],
+            1,
+        )
+        .unwrap();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            persona_dir: Some(persona.clone()),
+            ..AgentConfig::default()
+        };
+        let rel = serde_json::json!({"path": "persona/identity.md"});
+
+        let agent = Agent::start(
+            Arc::new(Mock::new(vec![])),
+            cfg.clone(),
+            dir.join("s1"),
+            "s1".into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            agent.tools.policy().check("read", &rel),
+            crate::perm::Verdict::Deny { .. }
+        ));
+        let system = crate::prompt::assemble(&agent.config);
+        let seg = system.iter().find(|s| s.name == "persona").unwrap();
+        assert!(!seg.text.contains("DRAFT_INSIGHT_A"), "{}", seg.text);
+        drop(agent);
+
+        // Approve → the next session can read it and the prompt carries it.
+        crate::onboard::approve(&persona).unwrap();
+        let agent = Agent::start(
+            Arc::new(Mock::new(vec![])),
+            cfg,
+            dir.join("s2"),
+            "s2".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            agent.tools.policy().check("read", &rel),
+            crate::perm::Verdict::Allow
+        );
+        let system = crate::prompt::assemble(&agent.config);
+        assert!(system
+            .iter()
+            .any(|s| s.name == "persona" && s.text.contains("DRAFT_INSIGHT_A")));
     }
 }
