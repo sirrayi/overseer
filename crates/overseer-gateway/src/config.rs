@@ -57,6 +57,10 @@ impl DaemonDirs {
     pub fn outbox(&self) -> PathBuf {
         self.root.join("outbox")
     }
+    /// P7-6: what the desktop notifier showed (also the fallback log).
+    pub fn notify_log(&self) -> PathBuf {
+        self.root.join("notify.jsonl")
+    }
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.inbox())?;
         std::fs::create_dir_all(self.runs())?;
@@ -217,6 +221,22 @@ pub struct GateConfig {
     /// Classes that bypass the gate entirely (e.g. "security.alert").
     #[serde(default)]
     pub always_push: Vec<String>,
+    /// P7-6: extra interruption cost while the user is focused (added to
+    /// `cost`, clamped at 100). A focused user is expensive to interrupt —
+    /// this is the desktop half of the Horvitz EV check.
+    #[serde(default = "default_focus_boost")]
+    pub focus_boost: u8,
+    /// P7-6: treat a busy calendar like quiet hours (cost 100). On by
+    /// default: a meeting is a commitment, not an idle moment.
+    #[serde(default = "default_calendar_as_quiet")]
+    pub calendar_as_quiet: bool,
+}
+
+fn default_focus_boost() -> u8 {
+    20
+}
+fn default_calendar_as_quiet() -> bool {
+    true
 }
 
 fn default_theta() -> i16 {
@@ -309,6 +329,8 @@ impl Default for DaemonConfig {
                 cost: default_cost(),
                 quiet_hours: None,
                 always_push: Vec::new(),
+                focus_boost: default_focus_boost(),
+                calendar_as_quiet: default_calendar_as_quiet(),
             },
             spawn: SpawnConfig {
                 max_concurrent: default_max_runs(),
@@ -330,6 +352,8 @@ impl Default for GateConfig {
             cost: default_cost(),
             quiet_hours: None,
             always_push: Vec::new(),
+            focus_boost: default_focus_boost(),
+            calendar_as_quiet: default_calendar_as_quiet(),
         }
     }
 }

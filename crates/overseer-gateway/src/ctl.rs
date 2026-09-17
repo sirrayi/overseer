@@ -58,6 +58,17 @@ pub enum CtlRequest {
     },
     /// P7-5: the attention digest as cards (a view over the inbox).
     DigestGet,
+    /// P7-6: the desktop's attention state, pushed by the frontend each
+    /// tick. Facts only — the daemon never senses anything itself.
+    DesktopSignal {
+        focused: bool,
+        dnd: bool,
+        calendar_busy: bool,
+        #[serde(default)]
+        active_app: Option<String>,
+        #[serde(default)]
+        idle_s: Option<u64>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,6 +235,16 @@ mod ctl_serde_tests {
                 "channel_send",
             ),
             (CtlRequest::DigestGet, "digest_get"),
+            (
+                CtlRequest::DesktopSignal {
+                    focused: true,
+                    dnd: false,
+                    calendar_busy: false,
+                    active_app: Some("iTerm".into()),
+                    idle_s: Some(3),
+                },
+                "desktop_signal",
+            ),
         ];
         for (req, tag) in cases {
             let v = serde_json::to_value(&req).unwrap();
@@ -235,6 +256,18 @@ mod ctl_serde_tests {
         // The optional fields really are optional on the wire.
         let minimal: CtlRequest =
             serde_json::from_str(r#"{"method":"channel_send","to":"ops","text":"hi"}"#).unwrap();
+        let signal: CtlRequest = serde_json::from_str(
+            r#"{"method":"desktop_signal","focused":true,"dnd":false,"calendar_busy":false}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            signal,
+            CtlRequest::DesktopSignal {
+                active_app: None,
+                idle_s: None,
+                ..
+            }
+        ));
         assert!(matches!(
             minimal,
             CtlRequest::ChannelSend {

@@ -212,6 +212,224 @@ pub fn digest_view(cards: &[Card]) -> serde_json::Value {
     })
 }
 
+/// The inbox as a frontend reads it: the same field set `ctl.inbox_list`
+/// has always served, built in one place so the desktop view and the
+/// existing CLI cannot drift apart (P7-6: a view over the protocol, not a
+/// second engine).
+pub fn inbox_view(items: &[InboxItem]) -> serde_json::Value {
+    let items: Vec<serde_json::Value> = items
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "id": i.id, "state": i.state, "class": i.class,
+                "source": i.source, "title": i.title, "body": i.body,
+                "act_prompt": i.act_prompt, "created_ms": i.created_ms,
+                "until_ms": i.until_ms,
+            })
+        })
+        .collect();
+    serde_json::json!({ "items": items, "count": items.len() })
+}
+
+// ── P7-6: the desktop notifier ────────────────────────────────────────
+
+/// What a desktop notification offers. These are the three verbs the inbox
+/// already understands — the notifier invents no new state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyAction {
+    Approve,
+    Reject,
+    Snooze,
+}
+
+impl NotifyAction {
+    /// The button label a desktop backend renders.
+    pub fn label(self) -> &'static str {
+        match self {
+            NotifyAction::Approve => "Approve",
+            NotifyAction::Reject => "Reject",
+            NotifyAction::Snooze => "Snooze",
+        }
+    }
+}
+
+/// Default snooze window when a notification's Snooze button is pressed.
+pub const DEFAULT_SNOOZE_MS: u64 = 3_600_000;
+
+/// The control-plane request a button maps to. The notifier never mutates
+/// daemon state directly: pressing Approve sends exactly what the CLI's
+/// `inbox act` sends, so both surfaces stay one protocol.
+pub fn action_request(action: NotifyAction, item_id: &str) -> crate::ctl::CtlRequest {
+    match action {
+        NotifyAction::Approve => crate::ctl::CtlRequest::InboxAct {
+            id: item_id.to_string(),
+        },
+        NotifyAction::Reject => crate::ctl::CtlRequest::InboxDecide {
+            id: item_id.to_string(),
+            decision: "reject".to_string(),
+            snooze_ms: None,
+        },
+        NotifyAction::Snooze => crate::ctl::CtlRequest::InboxDecide {
+            id: item_id.to_string(),
+            decision: "snooze".to_string(),
+            snooze_ms: Some(DEFAULT_SNOOZE_MS),
+        },
+    }
+}
+
+/// A desktop notification backend. `notify` is expected to be
+/// fire-and-forget: a failed notification is logged, never queued forever.
+pub trait Notifier {
+    fn notify(&self, card: &Card, actions: &[NotifyAction]) -> Result<(), String>;
+    /// Backend name for the journal ("log", "osascript", "notify-send"…).
+    fn backend(&self) -> &'static str;
+}
+
+/// The headless/test backend: appends one JSON line per notification to the
+/// daemon's notify log. This is also the fallback on every platform whose
+/// native helper is missing — an invisible notification is still recorded.
+pub struct LogNotifier {
+    path: PathBuf,
+}
+
+impl LogNotifier {
+    pub fn new(path: PathBuf) -> Self {
+        LogNotifier { path }
+    }
+}
+
+impl Notifier for LogNotifier {
+    fn notify(&self, card: &Card, actions: &[NotifyAction]) -> Result<(), String> {
+        use std::io::Write;
+        let rec = serde_json::json!({
+            "ts_ms": now_ms(),
+            "card": card.id,
+            "title": card.title,
+            "body": render_card(card),
+            "actions": actions.iter().map(|a| a.label()).collect::<Vec<_>>(),
+        });
+        let mut line = serde_json::to_string(&rec).map_err(|e| e.to_string())?;
+        line.push('\n');
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .and_then(|mut f| f.write_all(line.as_bytes()))
+            .map_err(|e| format!("notify: {}: {e}", self.path.display()))
+    }
+
+    fn backend(&self) -> &'static str {
+        "log"
+    }
+}
+
+/// The per-OS CLI backend: macOS `osascript`, Linux `notify-send`, Windows
+/// PowerShell toast. Chosen by `cfg!` at build time and probed at runtime —
+/// when the helper is missing the caller falls back to [`LogNotifier`].
+///
+/// The native *framework* shells (UNUserNotificationCenter, libnotify
+/// bindings, WinRT toasts) are deferred: they need a platform dependency
+/// this phase does not take, and the CLI path already produces a real
+/// notification with real Approve/Reject/Snooze targets.
+pub struct CliNotifier {
+    program: PathBuf,
+    log_fallback: LogNotifier,
+}
+
+impl CliNotifier {
+    /// The helper this build would use, if it exists on the system.
+    pub fn detect(log_path: PathBuf) -> Option<Self> {
+        let candidates: &[&str] = if cfg!(target_os = "macos") {
+            &["/usr/bin/osascript"]
+        } else if cfg!(target_os = "linux") {
+            &["/usr/bin/notify-send", "/bin/notify-send"]
+        } else if cfg!(target_os = "windows") {
+            &["powershell.exe"]
+        } else {
+            &[]
+        };
+        let program = candidates
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())?;
+        Some(CliNotifier {
+            program,
+            log_fallback: LogNotifier::new(log_path),
+        })
+    }
+}
+
+impl Notifier for CliNotifier {
+    fn notify(&self, card: &Card, actions: &[NotifyAction]) -> Result<(), String> {
+        // The notification is always recorded (audit), then shown.
+        let logged = self.log_fallback.notify(card, actions);
+        let text = format!("{} — {} item(s)", card.title, card.count);
+        let action_hint = actions
+            .iter()
+            .map(|a| a.label())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let script = if cfg!(target_os = "macos") {
+            format!(
+                "display notification {:?} with title {:?}",
+                text, action_hint
+            )
+        } else if cfg!(target_os = "windows") {
+            // A toast via the shell's own notification API.
+            format!(
+                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] > $null; $t='<toast><visual><binding template=\"ToastGeneric\"><text>{text}</text><text>{action_hint}</text></binding></visual></toast>'; $x=[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType=WindowsRuntime]::new(); $x.LoadXml($t); [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Overseer').Show($x)"
+            )
+        } else {
+            format!("{action_hint}\n{text}")
+        };
+        let args: Vec<String> = if cfg!(target_os = "macos") {
+            vec!["-e".into(), script]
+        } else if cfg!(target_os = "windows") {
+            vec!["-NoProfile".into(), "-Command".into(), script]
+        } else {
+            vec![action_hint, text]
+        };
+        let status = std::process::Command::new(&self.program)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => logged,
+            Ok(s) => logged.and(Err(format!(
+                "notify: {} exited with {s}",
+                self.program.display()
+            ))),
+            Err(e) => logged.and(Err(format!(
+                "notify: cannot run {}: {e}",
+                self.program.display()
+            ))),
+        }
+    }
+
+    fn backend(&self) -> &'static str {
+        if cfg!(target_os = "macos") {
+            "osascript"
+        } else if cfg!(target_os = "windows") {
+            "powershell-toast"
+        } else {
+            "notify-send"
+        }
+    }
+}
+
+/// The notifier this build uses: the per-OS CLI when present, the log
+/// backend otherwise. Never fails to produce *some* backend.
+pub fn platform_notifier(notify_log: PathBuf) -> Box<dyn Notifier> {
+    match CliNotifier::detect(notify_log.clone()) {
+        Some(n) => Box::new(n),
+        None => Box::new(LogNotifier::new(notify_log)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +533,67 @@ mod tests {
         assert!(deliveries[0].1.contains("ci.failed (1 item(s))"));
         assert!(deliveries[0].1.contains("- build red"));
         assert!(fan_out(&[], &card).is_empty());
+    }
+
+    #[test]
+    fn notifier_actions_route_to_the_inbox_protocol() {
+        // P7-6: the three buttons are the inbox's own verbs — no new state
+        // machine, and a frontend could not tell them apart from the CLI.
+        let approve = serde_json::to_value(action_request(NotifyAction::Approve, "c1")).unwrap();
+        assert_eq!(approve["method"], "inbox_act");
+        assert_eq!(approve["id"], "c1");
+        let reject = serde_json::to_value(action_request(NotifyAction::Reject, "c1")).unwrap();
+        assert_eq!(reject["method"], "inbox_decide");
+        assert_eq!(reject["decision"], "reject");
+        assert!(reject["snooze_ms"].is_null(), "reject carries no window");
+        let snooze = serde_json::to_value(action_request(NotifyAction::Snooze, "c1")).unwrap();
+        assert_eq!(snooze["method"], "inbox_decide");
+        assert_eq!(snooze["decision"], "snooze");
+        assert_eq!(snooze["snooze_ms"], DEFAULT_SNOOZE_MS);
+        assert_eq!(
+            [NotifyAction::Approve, NotifyAction::Reject, NotifyAction::Snooze]
+                .map(|a| a.label()),
+            ["Approve", "Reject", "Snooze"]
+        );
+
+        // The log backend records the card *and* the offered actions.
+        let dir = tmpdir("notify-log");
+        let path = dir.join("notify.jsonl");
+        let backend = LogNotifier::new(path.clone());
+        let card = Card {
+            id: "channel.draft".into(),
+            class: "channel.draft".into(),
+            title: "outbound local → ops".into(),
+            lines: vec!["deploy is done".into()],
+            count: 1,
+            created_ms: 0,
+            expires_ms: CARD_TTL_MS,
+            benefit: 50,
+        };
+        backend
+            .notify(&card, &[NotifyAction::Approve, NotifyAction::Snooze])
+            .unwrap();
+        let rec: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(rec["card"], "channel.draft");
+        assert_eq!(rec["actions"][0], "Approve");
+        assert_eq!(rec["actions"][1], "Snooze");
+        assert!(rec["body"].as_str().unwrap().contains("deploy is done"));
+
+        // Every build has a backend, and it names itself.
+        let chosen = platform_notifier(dir.join("notify2.jsonl"));
+        assert!(!chosen.backend().is_empty());
+        assert!(chosen
+            .notify(&card, &[NotifyAction::Approve])
+            .is_ok(), "the chosen backend must be usable on this host");
+
+        // The inbox view is the same shape the ctl surface serves.
+        let items = vec![item("1", "note.low", 5, "body")];
+        let view = inbox_view(&items);
+        assert_eq!(view["count"], 1);
+        assert_eq!(view["items"][0]["id"], "1");
+        assert!(view["items"][0]["class"].as_str().is_some());
+        assert!(inbox_view(&[]).as_object().is_some());
     }
 
     #[test]

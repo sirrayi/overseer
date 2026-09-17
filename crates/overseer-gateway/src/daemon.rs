@@ -22,7 +22,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use crate::config::{load, DaemonConfig, DaemonDirs, TriageDecision};
 use crate::ctl::{listen, CtlRequest, CtlResponse};
 use crate::event::{now_ms, Dedup, TriggerEvent};
-use crate::gate::{in_quiet_hours, route, Route};
+use crate::gate::{in_quiet_hours, route_desktop, Route};
 use crate::inbox::{Inbox, InboxItem, ItemState};
 use crate::journal::Journal;
 use crate::notify::PushQueue;
@@ -30,6 +30,7 @@ use crate::spawn::{reap, spawn_run_from, Spawned};
 use crate::triage::classify;
 use crate::channels;
 use crate::channels::threads::ThreadRoutes;
+use crate::gate::{cost_for, FocusState, PushedFocus};
 use crate::outbox::{LogSender, Outbox, Sender as OutboxSender};
 use crate::spawn::Origin;
 use crate::trigger::Trigger;
@@ -70,6 +71,10 @@ pub struct Daemon {
     routes: ThreadRoutes,
     /// P7-5: outbound drafts (draft → approve → send).
     outbox: Outbox,
+    /// P7-6: the desktop's last pushed attention state.
+    focus: PushedFocus,
+    /// P7-6: the notifier this build uses (per-OS CLI, else the log).
+    notifier: Box<dyn crate::notify::Notifier>,
     dirs: DaemonDirs,
     cfg: DaemonConfig,
     cfg_mtime: u64,
@@ -130,9 +135,12 @@ impl Daemon {
         }
         let routes = ThreadRoutes::open(&dirs.channels()).map_err(|e| e.to_string())?;
         let outbox = Outbox::new(dirs.outbox()).map_err(|e| e.to_string())?;
+        let notifier = crate::notify::platform_notifier(dirs.notify_log());
         Ok(Self {
             routes,
             outbox,
+            focus: PushedFocus::default(),
+            notifier,
             cfg_mtime: file_mtime(&cfg_path),
             dirs,
             cfg,
@@ -252,7 +260,10 @@ impl Daemon {
                     );
                 }
                 let quiet = in_quiet_hours(&self.cfg.gate);
-                let r = route(&self.cfg.gate, &ev.class, &triage, quiet);
+                // P7-6: the pushed desktop state refines the cost — a
+                // focused user defers pushes to the next breakpoint.
+                let focus = Some(crate::gate::FocusSource::state(&self.focus, now_ms()));
+                let r = route_desktop(&self.cfg.gate, &ev.class, &triage, quiet, focus.as_ref());
                 self.journal.log(
                     "route",
                     serde_json::json!({"id": ev.id, "route": format!("{r:?}").to_lowercase()}),
@@ -266,6 +277,34 @@ impl Daemon {
                     Route::Push => {
                         self.counts.pushed += 1;
                         let ok = self.push.push(&ev.class, &ev.source, &ev.payload);
+                        // P7-6: the OS notification is fire-and-forget; a
+                        // failure is journaled, never retried forever.
+                        let card = crate::notify::Card {
+                            id: ev.class.clone(),
+                            class: ev.class.clone(),
+                            title: format!("{} · {}", ev.class, ev.source),
+                            lines: vec![ev.payload.clone()],
+                            count: 1,
+                            created_ms: now_ms(),
+                            expires_ms: now_ms() + crate::notify::CARD_TTL_MS,
+                            benefit: triage.benefit as i16,
+                        };
+                        let delivered = self.notifier.notify(
+                            &card,
+                            &[
+                                crate::notify::NotifyAction::Approve,
+                                crate::notify::NotifyAction::Reject,
+                                crate::notify::NotifyAction::Snooze,
+                            ],
+                        );
+                        self.journal.log(
+                            "desktop.notify",
+                            serde_json::json!({
+                                "id": ev.id, "backend": self.notifier.backend(),
+                                "delivered": delivered.is_ok(),
+                                "error": delivered.err(),
+                            }),
+                        );
                         self.journal
                             .log("push", serde_json::json!({"id": ev.id, "delivered": ok}));
                         // Pushes also leave an inbox trace for audit.
@@ -442,20 +481,9 @@ impl Daemon {
                 CtlResponse::ok(serde_json::json!({"stopping": true}))
             }
             CtlRequest::InboxList => {
-                let items: Vec<serde_json::Value> = self
-                    .inbox
-                    .list()
-                    .into_iter()
-                    .map(|i| {
-                        serde_json::json!({
-                            "id": i.id, "state": i.state, "class": i.class,
-                            "source": i.source, "title": i.title, "body": i.body,
-                            "act_prompt": i.act_prompt, "created_ms": i.created_ms,
-                            "until_ms": i.until_ms,
-                        })
-                    })
-                    .collect();
-                CtlResponse::ok(serde_json::json!({"items": items}))
+                // One builder for the inbox view (P7-6): the CLI, the
+                // desktop and the digest all read the same shape.
+                CtlResponse::ok(crate::notify::inbox_view(&self.inbox.list()))
             }
             CtlRequest::InboxDecide {
                 id,
@@ -563,6 +591,36 @@ impl Daemon {
                     }
                     Err(e) => CtlResponse::err(e),
                 }
+            }
+            CtlRequest::DesktopSignal {
+                focused,
+                dnd,
+                calendar_busy,
+                active_app,
+                idle_s,
+            } => {
+                let state = FocusState {
+                    focused,
+                    dnd,
+                    calendar_busy,
+                    active_app,
+                    idle_s,
+                };
+                self.focus.push(now_ms(), state.clone());
+                self.journal.log(
+                    "desktop.signal",
+                    serde_json::json!({
+                        "focused": state.focused, "dnd": state.dnd,
+                        "calendar_busy": state.calendar_busy,
+                        "active_app": state.active_app, "idle_s": state.idle_s,
+                        "cost": cost_for(&state, &self.cfg.gate),
+                    }),
+                );
+                CtlResponse::ok(serde_json::json!({
+                    "accepted": true,
+                    "cost": cost_for(&state, &self.cfg.gate),
+                    "breakpoint": state.at_breakpoint(),
+                }))
             }
             CtlRequest::DigestGet => {
                 let cards = crate::notify::build_digest(
@@ -802,6 +860,7 @@ mod daemon_pipeline_tests {
                 cost: 40,
                 quiet_hours: None,
                 always_push: vec!["security.alert".into()],
+                ..GateConfig::default()
             },
             spawn: SpawnConfig {
                 max_concurrent: 0,
@@ -1089,6 +1148,104 @@ mod daemon_pipeline_tests {
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0]["class"], "channel.draft");
         assert_eq!(cards[0]["count"], 1);
+    }
+
+    #[test]
+    fn desktop_signal_sets_the_cost_and_defers_pushes_to_the_breakpoint() {
+        // P7-6: a pushed signal changes the effective cost, and a push
+        // decided while the user is focused lands in the inbox instead.
+        let root = tmpdir("desktop");
+        let mut d = new_daemon(root.clone(), Some(&pipeline_config()));
+        // No signal yet: the pre-P7 route applies (security.alert pushes).
+        d.process(TriggerEvent::new("ids", "security.alert", "intrusion?"));
+        assert_eq!(d.counts.pushed, 1);
+
+        let resp = d.handle_ctl(CtlRequest::DesktopSignal {
+            focused: true,
+            dnd: false,
+            calendar_busy: false,
+            active_app: Some("iTerm".into()),
+            idle_s: Some(2),
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["data"]["accepted"], true);
+        assert_eq!(v["data"]["breakpoint"], false);
+        assert_eq!(v["data"]["cost"], 60, "40 base + 20 focus boost");
+        let recs = journal_records(&root);
+        assert!(has_kind(&recs, "desktop.signal"));
+        let signal = recs
+            .iter()
+            .find(|r| r.get("kind").and_then(|k| k.as_str()) == Some("desktop.signal"))
+            .unwrap();
+        assert_eq!(signal["active_app"], "iTerm");
+        assert_eq!(signal["cost"], 60);
+
+        // A high-benefit event that would have pushed now defers: focused
+        // is not a breakpoint, so a *non-bypass* class waits.
+        let mut cfg = pipeline_config();
+        cfg.triage.push(TriageRule {
+            class: "job.heavy.notify".into(),
+            decision: TriageDecision::Notify,
+            benefit: 90,
+            act_prompt: None,
+        });
+        let root2 = tmpdir("desktop-defer");
+        let mut d2 = new_daemon(root2.clone(), Some(&cfg));
+        d2.handle_ctl(CtlRequest::DesktopSignal {
+            focused: true,
+            dnd: false,
+            calendar_busy: false,
+            active_app: None,
+            idle_s: Some(1),
+        });
+        d2.process(TriggerEvent::new("watch", "job.heavy.notify", "worth saying"));
+        assert_eq!(d2.counts.pushed, 0, "focused: deferred");
+        assert_eq!(d2.counts.inboxed, 1);
+        let route = journal_records(&root2)
+            .into_iter()
+            .find(|r| r.get("kind").and_then(|k| k.as_str()) == Some("route"))
+            .unwrap();
+        assert_eq!(route["route"], "inbox");
+
+        // DND is as expensive as quiet hours: even always_push's neighbours
+        // are held, and the bypass class still escapes (its contract).
+        let root3 = tmpdir("desktop-dnd");
+        let mut d3 = new_daemon(root3.clone(), Some(&cfg));
+        d3.handle_ctl(CtlRequest::DesktopSignal {
+            focused: true,
+            dnd: true,
+            calendar_busy: false,
+            active_app: None,
+            idle_s: None,
+        });
+        d3.process(TriggerEvent::new("watch", "job.heavy.notify", "held"));
+        assert_eq!(d3.counts.inboxed, 1);
+        let pushes_before = d3.counts.pushed;
+        d3.process(TriggerEvent::new("ids", "security.alert", "intrusion"));
+        assert_eq!(
+            d3.counts.pushed,
+            pushes_before + 1,
+            "always_push still escapes"
+        );
+        // The notification itself was recorded by the notifier backend.
+        assert!(has_kind(&journal_records(&root3), "desktop.notify"));
+        let notify = std::fs::read_to_string(root3.join("notify.jsonl")).unwrap_or_default();
+        assert!(notify.contains("security.alert") || notify.is_empty());
+        // An away user releases the deferral.
+        d3.handle_ctl(CtlRequest::DesktopSignal {
+            focused: true,
+            dnd: false,
+            calendar_busy: false,
+            active_app: None,
+            idle_s: Some(9_999),
+        });
+        d3.process(TriggerEvent::new("watch", "job.heavy.notify", "at a breakpoint"));
+        assert_eq!(
+            d3.counts.pushed,
+            pushes_before + 2,
+            "away is a breakpoint"
+        );
     }
 
     #[test]
