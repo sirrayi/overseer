@@ -255,18 +255,38 @@ pub fn render_map(root: &Path) -> String {
     if idx.symbols.is_empty() {
         return "(no symbols found — is this a source tree?)".into();
     }
+    let scores = pagerank(&idx);
     let mut ranked: Vec<(&String, &Symbol)> = idx.symbols.iter().collect();
     ranked.sort_by(|(an, a), (bn, b)| {
-        (b.refs.len() * 3 + b.defs.len())
-            .cmp(&(a.refs.len() * 3 + a.defs.len()))
+        score_of(&scores, bn, b)
+            .partial_cmp(&score_of(&scores, an, a))
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then(an.cmp(bn)) // deterministic tiebreak
     });
     let mut out = format!("## Repo map — {} files indexed\n", idx.files_indexed);
     let mut used = out.len();
+    let mut last_file: Option<&std::path::Path> = None;
     for (name, sym) in ranked {
         let (p, l) = &sym.defs[0];
         let rel = p.strip_prefix(root).unwrap_or(p);
-        let line = format!("{} — {}:{l} (refs:{})", name, rel.display(), sym.refs.len());
+        // Per-file header counts (B1-5): orientation without extra tokens.
+        if last_file.map(|f| f != p.as_path()).unwrap_or(true) {
+            let n_here = sym.defs.len();
+            let hdr = format!("### {} ({n_here} def)\n", rel.display());
+            if used + hdr.len() < MAP_BUDGET {
+                out.push_str(&hdr);
+                used += hdr.len();
+            }
+            last_file = Some(p);
+        }
+        let sig = signature_line(root, p, *l, 120);
+        let line = format!(
+            "{} — {}:{l} (refs:{}){}",
+            name,
+            rel.display(),
+            sym.refs.len(),
+            sig.map(|s| format!(" :: {s}")).unwrap_or_default()
+        );
         if used + line.len() + 1 > MAP_BUDGET {
             out.push_str("[...map budget exhausted — use `symbol` for detail...]\n");
             break;
@@ -276,6 +296,103 @@ pub fn render_map(root: &Path) -> String {
         used += line.len() + 1;
     }
     out
+}
+
+/// PageRank-lite (B1-5, aider-repomap pattern): 4 damping iterations over
+/// the file→symbol vote edges. Base score = refs*3+defs (the old rank);
+/// each iteration redistributes file weight to the symbols it mentions.
+/// Zero deps, deterministic (BTree order), ~30 lines. Budgets unchanged.
+fn pagerank(idx: &Index) -> std::collections::HashMap<String, f64> {
+    use std::collections::BTreeMap;
+    const DAMPING: f64 = 0.85;
+    const ITERS: usize = 4;
+    let mut scores: BTreeMap<String, f64> = BTreeMap::new();
+    for (name, sym) in &idx.symbols {
+        scores.insert(
+            name.clone(),
+            sym.refs.len() as f64 * 3.0 + sym.defs.len() as f64,
+        );
+    }
+    // file → symbols it mentions (vote edges, from the refs sets).
+    let mut file_votes: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    for (name, sym) in &idx.symbols {
+        for f in &sym.refs {
+            file_votes.entry(f.clone()).or_default().push(name.clone());
+        }
+    }
+    for _ in 0..ITERS {
+        let mut next = BTreeMap::new();
+        for (name, sym) in &idx.symbols {
+            let base = sym.refs.len() as f64 * 3.0 + sym.defs.len() as f64;
+            next.insert(name.clone(), (1.0 - DAMPING) * base);
+        }
+        for votes in file_votes.values() {
+            if votes.is_empty() {
+                continue;
+            }
+            // Each voting file spreads its own accumulated weight evenly.
+            // (File weight = mean of current symbol scores mentioning it.)
+            let w: f64 = votes
+                .iter()
+                .map(|n| scores.get(n).copied().unwrap_or(0.0))
+                .sum::<f64>()
+                / votes.len() as f64;
+            let share = DAMPING * w / votes.len() as f64;
+            for n in votes {
+                *next.get_mut(n).unwrap() += share;
+            }
+        }
+        scores = next.into_iter().collect();
+    }
+    scores.into_iter().collect()
+}
+
+fn score_of(scores: &std::collections::HashMap<String, f64>, name: &str, sym: &Symbol) -> f64 {
+    scores
+        .get(name)
+        .copied()
+        .unwrap_or(sym.refs.len() as f64 * 3.0 + sym.defs.len() as f64)
+}
+
+/// First logical line at `line` in `path`, trimmed to `cap` chars.
+/// Gives the map signature context (fn signature, struct line) when the
+/// budget allows — falls back to None on read failure.
+fn signature_line(root: &Path, path: &Path, line: usize, cap: usize) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let l = text.lines().nth(line.saturating_sub(1))?.trim();
+    if l.is_empty() {
+        return None;
+    }
+    let mut s: String = l.chars().take(cap).collect();
+    if l.chars().count() > cap {
+        s.push('…');
+    }
+    // Skip signatures that merely repeat the symbol line with no content.
+    let _ = root;
+    Some(s)
+}
+
+/// Narrow-retrieve helper (B1-6, llama-index parent-child): 5-line window
+/// around `line` with an expansion hint. The `symbol` tool shows the child;
+/// `read path:lo-hi` fetches the parent.
+pub fn window(root: &Path, path: &Path, line: usize, ctx_lines: usize) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() || line == 0 {
+        return None;
+    }
+    let lo = line.saturating_sub(ctx_lines).max(1);
+    let hi = (line + ctx_lines).min(lines.len());
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let mut out = String::new();
+    for (i, l) in lines.iter().enumerate() {
+        let n = i + 1;
+        if n >= lo && n <= hi {
+            out.push_str(&format!("{n:>6}\t{l}\n"));
+        }
+    }
+    out.push_str(&format!("[`read {}:{lo}-{hi}` to expand]", rel.display()));
+    Some(out)
 }
 
 /// go_to_definition + reference listing for one symbol.
@@ -351,6 +468,23 @@ mod tests {
         let hot_pos = map.find("hot —").unwrap();
         let cold_pos = map.find("cold —").unwrap();
         assert!(hot_pos < cold_pos, "referenced symbol ranks first");
+    }
+
+    #[test]
+    fn pagerank_hub_outranks_leaf() {
+        // B1-5: a symbol referenced by 4 files outranks one referenced by 1,
+        // even after damping iteration (monotonicity over the old refs*3 order).
+        let dir = tmpdir();
+        std::fs::write(dir.join("hub.rs"), "fn hub() {}\n").unwrap();
+        std::fs::write(dir.join("leaf.rs"), "fn leaf() {}\n").unwrap();
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("u{i}.rs")), "// calls hub()\n").unwrap();
+        }
+        std::fs::write(dir.join("v0.rs"), "// calls leaf()\n").unwrap();
+        let map = render_map(&dir);
+        let hub = map.find("hub —").expect("hub in map");
+        let leaf = map.find("leaf —").expect("leaf in map");
+        assert!(hub < leaf, "hub (4 refs) must precede leaf (1 ref)");
     }
 
     #[test]

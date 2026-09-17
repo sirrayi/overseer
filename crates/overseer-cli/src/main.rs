@@ -188,6 +188,7 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
         verify_block_cap: flags.verify_cap,
         sandbox_bash: flags.sandbox,
         disabled_tools: flags.no_tools.clone(),
+        reflect: flags.reflect,
         ask_handler: None,
         // --bare: no persisted rules — a CI run must not inherit or
         // mutate the operator's allow-list. Ask verdicts still
@@ -520,6 +521,8 @@ fn usage() {
          \x20 --verify <cmd>      Definition-of-done check; blocks finish on\n\
          \x20                     failure (stop-hook gate)\n\
          \x20 --verify-cap <n>    Max consecutive verify blocks (default: 8)\n\
+         \x20 --reflect <mode>    off | reflexion (default: reflexion)\n\
+         \x20                     aux-tier self-critique on verify blocks\n\
          \x20 --best-of <n>       N parallel attempts in git worktrees (2-4);\n\
          \x20                     first attempt passing --verify wins\n\
          \x20 --no-sandbox        Run bash unsandboxed (default: sandbox-exec/\n\
@@ -564,6 +567,7 @@ struct ExecFlags {
     keep_results: usize,
     verify: Option<String>,
     verify_cap: u32,
+    reflect: overseer_core::agent::ReflectMode,
     /// `--best-of N`: N parallel attempts in isolated git worktrees;
     /// first attempt whose verify command exits 0 wins.
     best_of: u32,
@@ -599,6 +603,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         keep_results: 5,
         verify: None,
         verify_cap: 8,
+        reflect: overseer_core::agent::ReflectMode::Reflexion,
         best_of: 0,
         sandbox: true,
         memory: false,
@@ -659,6 +664,13 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
             "--best-of" => f.best_of = take(&mut i)?.parse().map_err(|_| "bad --best-of")?,
             "--verify-cap" => {
                 f.verify_cap = take(&mut i)?.parse().map_err(|_| "bad --verify-cap")?
+            }
+            "--reflect" => {
+                f.reflect = match take(&mut i)?.as_str() {
+                    "off" => overseer_core::agent::ReflectMode::Off,
+                    "reflexion" => overseer_core::agent::ReflectMode::Reflexion,
+                    other => return Err(format!("bad --reflect '{other}' (off|reflexion)")),
+                }
             }
             "--no-sandbox" => f.sandbox = false,
             "--memory" => f.memory = true,

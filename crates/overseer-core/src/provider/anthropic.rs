@@ -293,10 +293,12 @@ mod tests {
     fn cache_breakpoints_on_tails() {
         let system = vec![
             SystemSegment {
+                name: "test",
                 text: "static".into(),
                 cacheable: true,
             },
             SystemSegment {
+                name: "test",
                 text: "dynamic".into(),
                 cacheable: false,
             },
@@ -342,6 +344,7 @@ mod tests {
     #[test]
     fn prefix_stable_across_turns() {
         let system = vec![SystemSegment {
+            name: "test",
             text: "static system".into(),
             cacheable: true,
         }];

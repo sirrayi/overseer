@@ -72,6 +72,10 @@ pub struct ToolSpec {
 /// goes on the last one (stable-prefix discipline — Invariant 2).
 #[derive(Debug, Clone)]
 pub struct SystemSegment {
+    /// Section name for the B1-10 order lint + prefix fingerprint.
+    /// Structural only — adapters render `text`, never `name`, so the
+    /// wire is unchanged by naming.
+    pub name: &'static str,
     pub text: String,
     /// Whether this segment sits above the static/dynamic boundary.
     /// `true` → must be byte-identical across sessions (no timestamps,

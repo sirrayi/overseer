@@ -369,6 +369,7 @@ mod tests {
     #[test]
     fn body_shape_and_tool_decls() {
         let system = vec![SystemSegment {
+            name: "test",
             text: "sys".into(),
             cacheable: true,
         }];
@@ -459,6 +460,7 @@ mod tests {
     #[test]
     fn effort_maps_to_thinking_budget() {
         let system = vec![SystemSegment {
+            name: "test",
             text: "s".into(),
             cacheable: true,
         }];

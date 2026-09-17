@@ -49,5 +49,24 @@ pub fn run_symbol(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         Ok(n) => n,
         Err(e) => return e,
     };
-    ToolOutput::ok(crate::repomap::lookup(&ctx.cwd, name))
+    // B1-6 (llama-index parent-child): narrow-retrieve — the definition
+    // plus a 5-line window per site, with a `read path:lo-hi` hint to
+    // expand. Whole-file dumps are the token-wasteful failure this kills.
+    let base = crate::repomap::lookup(&ctx.cwd, name);
+    let idx = crate::repomap::build(&ctx.cwd);
+    let Some(sym) = idx.symbols.get(name) else {
+        return ToolOutput::ok(base);
+    };
+    let mut out = base;
+    out.push_str("\nWindows:\n");
+    for (path, line) in sym.defs.iter().take(5) {
+        match crate::repomap::window(&ctx.cwd, path, *line, 2) {
+            Some(w) => {
+                let rel = path.strip_prefix(&ctx.cwd).unwrap_or(path);
+                out.push_str(&format!("--- {}:{line}\n{w}\n", rel.display()));
+            }
+            None => continue,
+        }
+    }
+    ToolOutput::ok(out)
 }

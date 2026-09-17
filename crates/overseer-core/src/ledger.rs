@@ -141,6 +141,7 @@ impl Ledger {
         if s.input_tokens > 0 {
             s.cache_hit_rate = s.cache_read_tokens as f64 / s.input_tokens as f64;
         }
+        s.cache_alert = s.input_tokens > 0 && s.cache_hit_rate < 0.90;
         s
     }
 }
@@ -155,5 +156,50 @@ pub struct Summary {
     pub total_cost_usd: f64,
     /// Σcache_read / Σtotal_input — the SEV metric (target ≥0.90).
     pub cache_hit_rate: f64,
+    /// B1-10: true when `cache_hit_rate < 0.90` — the prefix-discipline
+    /// alert. Computed in `summarize`, read by dashboards/CI.
+    pub cache_alert: bool,
     pub latency_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_alert_threshold() {
+        // B1-10: alert fires below 0.90, silent at/above.
+        let low = vec![UsageRecord {
+            ts_ms: 0,
+            model: "m".into(),
+            fresh_input: 50,
+            cache_write: 0,
+            cache_read: 10,
+            output: 0,
+            reasoning: 0,
+            request_bytes: 0,
+            latency_ms: 0,
+            tool_calls: 0,
+            cost_usd: 0.0,
+            cache_hit_rate: 0.0,
+        }];
+        let s = Ledger::summarize(&low);
+        assert!(s.cache_alert, "0.167 hit rate must alert");
+        let high = vec![UsageRecord {
+            ts_ms: 0,
+            model: "m".into(),
+            fresh_input: 5,
+            cache_write: 0,
+            cache_read: 95,
+            output: 0,
+            reasoning: 0,
+            request_bytes: 0,
+            latency_ms: 0,
+            tool_calls: 0,
+            cost_usd: 0.0,
+            cache_hit_rate: 0.0,
+        }];
+        let s2 = Ledger::summarize(&high);
+        assert!(!s2.cache_alert, "0.95 hit rate must not alert");
+    }
 }

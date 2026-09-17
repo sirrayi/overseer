@@ -66,6 +66,34 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     let mut matches: Vec<String> = Vec::new();
     let mut files_seen = 0usize;
 
+    // B1-4: ripgrep fast path — `rg --json` when on PATH (10-50x, correct
+    // ignore/binary semantics free). Same capped `file:line:content` token
+    // shape; rg absent → embedded scanner below. Never surfaces raw JSON.
+    if let Some(lines) = rg_json(
+        &base,
+        pattern,
+        ignore_case,
+        input.get("glob").and_then(|g| g.as_str()),
+    ) {
+        let mut out: Vec<String> = Vec::new();
+        for l in lines {
+            if out.len() >= MAX_MATCHES {
+                break;
+            }
+            out.push(truncate_line(&l));
+        }
+        if out.is_empty() {
+            return ToolOutput::ok(format!("No matches for '{pattern}'."));
+        }
+        let mut text = out.join("\n");
+        if out.len() >= MAX_MATCHES {
+            text.push_str(&format!(
+                "\n[match cap reached: {MAX_MATCHES} shown — narrow with `glob` or `path`]"
+            ));
+        }
+        return ToolOutput::ok(text);
+    }
+
     let mut search_file = |path: &std::path::Path, matches: &mut Vec<String>| {
         if let Some(gf) = &glob_filter {
             if let Some(name) = path.file_name() {
@@ -124,5 +152,162 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
             ));
         }
         ToolOutput::ok(text)
+    }
+}
+
+/// Try `rg --json -n` for the query. `None` = rg absent/unusable → caller
+/// falls back to the embedded scanner. Caps and truncation are applied by
+/// the caller; this only parses match events into `path:line:content`.
+fn rg_json(
+    base: &std::path::Path,
+    pattern: &str,
+    ignore_case: bool,
+    glob: Option<&str>,
+) -> Option<Vec<String>> {
+    let rg = which_rg()?;
+    let mut cmd = std::process::Command::new(rg);
+    cmd.arg("--json")
+        .arg("-n")
+        .arg("--max-count")
+        .arg(MAX_MATCHES.to_string());
+    if ignore_case {
+        cmd.arg("-i");
+    }
+    if let Some(g) = glob {
+        cmd.arg("-g").arg(g);
+    }
+    cmd.arg("-e").arg(pattern).arg(base);
+    let out = cmd.output().ok()?;
+    if !out.status.success() && out.stdout.is_empty() {
+        // rg exits 1 on no-match — but then stdout carries no events.
+        // An empty stdout with failure = no matches (valid empty result).
+        // A missing binary never reaches here (which_rg failed first).
+        return Some(Vec::new());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if ev.get("type").and_then(|t| t.as_str()) != Some("match") {
+            continue;
+        }
+        let path = ev
+            .pointer("/data/path/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let no = ev
+            .pointer("/data/line_number")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let content = ev
+            .pointer("/data/lines/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim_end()
+            .to_string();
+        lines.push(format!("{path}:{no}:{content}"));
+        if lines.len() >= MAX_MATCHES {
+            break;
+        }
+    }
+    Some(lines)
+}
+
+/// Resolve `rg` on PATH (respects the caller's PATH, so tests can scrub it
+/// to force the fallback). No caching — PATH can change per call.
+fn which_rg() -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for name in ["rg", "rg.exe"] {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+fn truncate_line(l: &str) -> String {
+    // Cap the overlong line at MAX_LINE bytes (char-boundary safe).
+    if l.len() > MAX_LINE + 64 {
+        let head: String = l.chars().take(MAX_LINE + 64).collect();
+        format!("{head}…")
+    } else {
+        l.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{ToolCtx, ToolRegistry};
+
+    fn tmpdir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("overseer-grep-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn ctx(dir: &std::path::Path) -> ToolCtx<'static> {
+        ToolCtx {
+            cwd: dir.to_path_buf(),
+            session_dir: dir.join("session"),
+            spill_seq: 0,
+            provider: None,
+            agent_config: None,
+            subagent_seq: 0,
+            checkpoint: None,
+            sandbox: false,
+        }
+    }
+
+    fn seed(dir: &std::path::Path) {
+        std::fs::write(dir.join("a.rs"), "fn needle() {}\n// nothing\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "hay\nneedle here\n").unwrap();
+    }
+
+    #[test]
+    fn rg_path_and_fallback_agree_on_shape() {
+        // With rg on PATH the fast path runs; results keep file:line:content.
+        let dir = tmpdir();
+        seed(&dir);
+        let mut c = ctx(&dir);
+        let out = run(&serde_json::json!({"pattern": "needle"}), &mut c);
+        assert!(!out.is_error);
+        assert!(out.text.contains("needle"), "got: {}", out.text);
+        assert!(out.text.contains(':'));
+    }
+
+    #[test]
+    fn fallback_without_rg_on_path() {
+        // Scrubbed PATH forces the embedded scanner — same contract.
+        let dir = tmpdir();
+        seed(&dir);
+        let mut c = ctx(&dir);
+        let old = std::env::var_os("PATH");
+        std::env::set_var("PATH", "/nonexistent-no-rg-here");
+        let out = run(&serde_json::json!({"pattern": "needle"}), &mut c);
+        if let Some(p) = old {
+            std::env::set_var("PATH", p);
+        }
+        assert!(!out.is_error);
+        assert!(out.text.contains("needle"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn respects_match_cap() {
+        let dir = tmpdir();
+        let big: String = (0..500).map(|i| format!("hit {i}\n")).collect();
+        std::fs::write(dir.join("big.txt"), big).unwrap();
+        let mut c = ctx(&dir);
+        let _ = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let out = run(&serde_json::json!({"pattern": "hit"}), &mut c);
+        assert!(out.text.contains("match cap reached"));
     }
 }

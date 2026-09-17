@@ -119,6 +119,10 @@ pub fn write(
             "bytes": prompt_text.len(),
             "scope": "session_start",
             "file": "system_prompt.txt",
+            // B1-10: structural fingerprint of the prompt prefix (ordered
+            // name:cacheable pairs) — reorder/rename changes it even when
+            // content hashes match by coincidence.
+            "prefix_fingerprint": crate::prompt::prefix_fingerprint(&system),
         },
         "tools": {
             "sha256": hex_sha256(tools_json.as_bytes()),
