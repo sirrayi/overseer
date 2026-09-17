@@ -83,10 +83,12 @@ fn seg(name: &'static str, text: &str) -> SystemSegment {
 }
 
 /// Frozen section order (B1-10, vLLM/SGLang prefix discipline): the
-/// static sections assemble identity→contract→safety→memory→skills.
-/// Absent optionals (memory/skills) are skipped; order among the present
-/// must be preserved. Reordering a cacheable section breaks prefix-cache
-/// hits and must be deliberate.
+/// static sections assemble identity→contract→safety→memory→skills→
+/// persona→computer. Absent optionals (memory/skills/persona/computer)
+/// are skipped; order among the present must be preserved. Reordering a
+/// cacheable section breaks prefix-cache hits and must be deliberate.
+/// P6 adds only the persona segment; P7 adds only computer — the ORDER
+/// line is the union value on both branches (merge-safe).
 ///
 /// Boundary lint used by tests and future assemblers: every cacheable
 /// segment must precede every non-cacheable one.
@@ -100,8 +102,16 @@ pub fn boundary_ok(segments: &[SystemSegment]) -> bool {
             return false;
         }
     }
-    // Frozen static order.
-    const ORDER: &[&str] = &["identity", "contract", "safety", "memory", "skills"];
+    // Frozen static order (union value — identical on P6/P7).
+    const ORDER: &[&str] = &[
+        "identity",
+        "contract",
+        "safety",
+        "memory",
+        "skills",
+        "persona",
+        "computer",
+    ];
     let mut last_rank: Option<usize> = None;
     for s in segments {
         if !s.cacheable {
@@ -194,8 +204,24 @@ mod tests {
         cfg.memory_dir = Some(dir);
         let segs = assemble(&cfg);
         assert!(boundary_ok(&segs));
-        assert_eq!(segs.len(), 4); // 3 static + memory index
-                                   // Nothing volatile may live above the boundary.
+        // Names ⊆ ORDER (union value, identical on P6/P7) + boundary holds.
+        const ORDER: &[&str] = &[
+            "identity",
+            "contract",
+            "safety",
+            "memory",
+            "skills",
+            "persona",
+            "computer",
+        ];
+        for s in segs.iter().filter(|s| s.cacheable) {
+            assert!(
+                ORDER.contains(&s.name),
+                "segment `{}` not in frozen ORDER",
+                s.name
+            );
+        }
+        // Nothing volatile may live above the boundary.
         for s in &segs[..3] {
             for needle in ["ts_ms", "timestamp", "session_id", "uuid"] {
                 assert!(
