@@ -39,12 +39,20 @@ class Store:
             f.write(json.dumps(record) + "\n")
 
     def load(self) -> list[dict]:
+        """All parseable rows. The store is append-only, so a crashed
+        writer can leave a truncated tail line — skip bad lines and count
+        them (`skipped_lines`) rather than aborting every reader."""
+        self.skipped_lines = 0
         if not self.path.exists():
             return []
         rows = []
         for line in self.path.read_text().splitlines():
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
                 rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                self.skipped_lines += 1
         return rows
 
     def runs(self, **eq) -> list[dict]:
