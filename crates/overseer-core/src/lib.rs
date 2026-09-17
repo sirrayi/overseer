@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod compact;
 pub mod control;
+pub mod cred;
 pub mod event;
 pub mod ir;
 pub mod ledger;

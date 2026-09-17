@@ -57,6 +57,10 @@ pub struct AgentConfig {
     /// `task` subagents see only entries at or below this tier (Secret
     /// hidden by default). The parent always sees the full index.
     pub memory_filter: crate::memory::Sensitivity,
+    /// P6-3 credential broker: process-side secret store. The agent
+    /// hands it to each turn's ToolCtx for bash injection + result
+    /// sanitization. Default-empty (no creds); P6-4 adds persistence.
+    pub broker: crate::cred::Broker,
     /// P1.2 stale tool-result clearing: this many most-recent ToolResult
     /// blocks stay verbatim; older ones render as a placeholder in the view
     /// (events untouched). 0 disables clearing.
@@ -124,6 +128,7 @@ impl Default for AgentConfig {
             compact_at: None,
             memory_dir: None,
             memory_filter: crate::memory::Sensitivity::Personal,
+            broker: crate::cred::Broker::new(),
             keep_tool_results: 5,
             verify_cmd: None,
             verify_block_cap: 8,
@@ -634,6 +639,7 @@ impl Agent {
                 subagent_seq: 0,
                 checkpoint: checkpoint.as_mut(),
                 sandbox: self.config.sandbox_bash,
+                broker: Some(self.config.broker.clone()),
             };
             let mut results = Vec::new();
             for (idx, (call_id, name, input)) in calls.iter().enumerate() {
@@ -2088,5 +2094,60 @@ mod tests {
         assert_eq!(e, Effort::Max, "bounded at Max");
         assert_eq!(Effort::parse("med"), Some(Effort::Medium));
         assert_eq!(Effort::parse("bogus"), None);
+    }
+
+    /// P6-3 accept (no-plaintext-in-events): a tool that returns a mapped
+    /// real lands in events.jsonl with the sentinel, never the real.
+    #[test]
+    fn broker_secret_never_reaches_events_jsonl() {
+        let dir = tmpdir();
+        let mut broker = crate::cred::Broker::new();
+        let sentinel = broker.issue_capability(
+            "db",
+            "DB_PASS",
+            "pw-real-9",
+            vec![],
+            vec!["read".into()],
+            None,
+        );
+        let mut cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            sandbox_bash: false,
+            ..AgentConfig::default()
+        };
+        cfg.broker = broker;
+        // The real enters via file bytes (not the call input — inputs log
+        // raw in ToolCallStart, so a real in argv would leak by design).
+        std::fs::write(dir.join("secret.txt"), "password is pw-real-9 ok\n").unwrap();
+        let bash_call = crate::provider::Response {
+            blocks: vec![Block::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "secret.txt"}),
+            }],
+            stop_reason: crate::provider::StopReason::ToolUse,
+            usage: crate::ir::Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        };
+        let provider = Mock::new(vec![
+            bash_call,
+            crate::provider::Response {
+                blocks: vec![Block::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: crate::provider::StopReason::EndTurn,
+                usage: crate::ir::Usage::default(),
+                request_bytes: 0,
+                latency_ms: 0,
+            },
+        ]);
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        agent.run_turn("go", &mut sink).unwrap();
+        let raw = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert!(!raw.contains("pw-real-9"), "events.jsonl leaked the real");
+        assert!(raw.contains(&sentinel), "events.jsonl must carry the sentinel");
     }
 }

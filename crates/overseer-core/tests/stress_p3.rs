@@ -76,6 +76,7 @@ fn task_ctx_at(cwd: &Path, session_dir: PathBuf, delay_ms: u64) -> ToolCtx<'stat
         subagent_seq: 0,
         checkpoint: None,
         sandbox: false,
+        broker: None,
     }
 }
 
@@ -626,6 +627,7 @@ fn spill_1mb_tool_output() {
         subagent_seq: 0,
         checkpoint: None,
         sandbox: false,
+        broker: None,
     };
     let big = "x".repeat(1_000_000);
     let out = tools::enforce_budget(
