@@ -19,14 +19,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
+use crate::channels;
+use crate::channels::threads::ThreadRoutes;
 use crate::config::{load, DaemonConfig, DaemonDirs, TriageDecision};
 use crate::ctl::{listen, CtlRequest, CtlResponse};
 use crate::event::{now_ms, Dedup, TriggerEvent};
-use crate::gate::{in_quiet_hours, route, Route};
+use crate::gate::{cost_for, FocusState, PushedFocus};
+use crate::gate::{in_quiet_hours, route_desktop, Route};
 use crate::inbox::{Inbox, InboxItem, ItemState};
 use crate::journal::Journal;
 use crate::notify::PushQueue;
-use crate::spawn::{reap, spawn_run, Spawned};
+use crate::outbox::{LogSender, Outbox, Sender as OutboxSender};
+use crate::spawn::Origin;
+use crate::spawn::{reap, spawn_run_from, Spawned};
 use crate::triage::classify;
 use crate::trigger::Trigger;
 
@@ -62,6 +67,14 @@ fn install_signal_flag() {
 fn install_signal_flag() {}
 
 pub struct Daemon {
+    /// P7-4: thread → session routing for messaging channels.
+    routes: ThreadRoutes,
+    /// P7-5: outbound drafts (draft → approve → send).
+    outbox: Outbox,
+    /// P7-6: the desktop's last pushed attention state.
+    focus: PushedFocus,
+    /// P7-6: the notifier this build uses (per-OS CLI, else the log).
+    notifier: Box<dyn crate::notify::Notifier>,
     dirs: DaemonDirs,
     cfg: DaemonConfig,
     cfg_mtime: u64,
@@ -106,8 +119,31 @@ impl Daemon {
         let inbox = Inbox::new(dirs.inbox()).map_err(|e| e.to_string())?;
         let push = PushQueue::new(dirs.push_log());
         let dedup = Dedup::new(cfg.dedup_window_s);
-        let triggers = cfg.triggers.iter().map(Trigger::from_spec).collect();
+        let triggers: Vec<Trigger> = cfg
+            .triggers
+            .iter()
+            // Webhook spools default to the daemon's own directory; a spec
+            // that names its own dir is taken as written.
+            .map(|spec| Trigger::from_spec(&resolve_spec(spec, &dirs)))
+            .collect();
+        // A channel that cannot run (unset token, bad cron) is journaled
+        // once at startup: misconfiguration stays visible.
+        for trigger in &triggers {
+            if let Some(reason) = trigger.unconfigured_reason() {
+                journal.log(
+                    "channel.unconfigured",
+                    serde_json::json!({"reason": reason}),
+                );
+            }
+        }
+        let routes = ThreadRoutes::open(&dirs.channels()).map_err(|e| e.to_string())?;
+        let outbox = Outbox::new(dirs.outbox()).map_err(|e| e.to_string())?;
+        let notifier = crate::notify::platform_notifier(dirs.notify_log());
         Ok(Self {
+            routes,
+            outbox,
+            focus: PushedFocus::default(),
+            notifier,
             cfg_mtime: file_mtime(&cfg_path),
             dirs,
             cfg,
@@ -139,7 +175,11 @@ impl Daemon {
         match load(&self.dirs.config()) {
             Ok(cfg) => {
                 self.dedup = Dedup::new(cfg.dedup_window_s);
-                self.triggers = cfg.triggers.iter().map(Trigger::from_spec).collect();
+                self.triggers = cfg
+                    .triggers
+                    .iter()
+                    .map(|spec| Trigger::from_spec(&resolve_spec(spec, &self.dirs)))
+                    .collect();
                 self.cfg_mtime = m;
                 self.cfg = cfg;
                 self.journal.log("config_reload", serde_json::json!({}));
@@ -165,7 +205,23 @@ impl Daemon {
                 .log("dedup_drop", serde_json::json!({"id": ev.id}));
             return;
         }
-        let triage = classify(&self.cfg, &ev);
+        let mut triage = classify(&self.cfg, &ev);
+        // P7-4: inbound channel content is never acted on, whatever the
+        // rule table says. An `Act` rule is downgraded to DraftForReview
+        // (the template survives for an approval to run), and the session
+        // below starts armed with the external-approval floor. Notify
+        // stays Notify — a notification is not an execution.
+        if ev.untrusted_source && triage.decision == TriageDecision::Act {
+            self.journal.log(
+                "channel.act_downgraded",
+                serde_json::json!({
+                    "id": ev.id,
+                    "source": ev.source,
+                    "class": ev.class,
+                }),
+            );
+            triage.decision = TriageDecision::DraftForReview;
+        }
         self.counts.triaged += 1;
         self.journal.log(
             "triage",
@@ -184,11 +240,33 @@ impl Daemon {
                     .act_prompt
                     .clone()
                     .unwrap_or_else(|| ev.payload.clone());
-                self.spawn_for(prompt, None);
+                // Defensive: an untrusted event must never reach the act
+                // tier (the downgrade above is the only path here).
+                let origin = self.origin_for(&ev);
+                self.spawn_for(prompt, None, origin);
             }
             TriageDecision::Notify | TriageDecision::DraftForReview => {
+                if let Some(origin) = &ev.origin {
+                    // Route the thread to its own session dir (creating it
+                    // on first sight) — two conversations never share one.
+                    let dir = self.routes.route(&origin.channel, origin.thread.as_deref());
+                    self.journal.log(
+                        "channel.route",
+                        serde_json::json!({
+                            "id": ev.id,
+                            "channel": origin.channel,
+                            "sender": origin.sender,
+                            "thread": origin.thread,
+                            "intent": origin.intent,
+                            "session_dir": dir.display().to_string(),
+                        }),
+                    );
+                }
                 let quiet = in_quiet_hours(&self.cfg.gate);
-                let r = route(&self.cfg.gate, &ev.class, &triage, quiet);
+                // P7-6: the pushed desktop state refines the cost — a
+                // focused user defers pushes to the next breakpoint.
+                let focus = Some(crate::gate::FocusSource::state(&self.focus, now_ms()));
+                let r = route_desktop(&self.cfg.gate, &ev.class, &triage, quiet, focus.as_ref());
                 self.journal.log(
                     "route",
                     serde_json::json!({"id": ev.id, "route": format!("{r:?}").to_lowercase()}),
@@ -202,6 +280,34 @@ impl Daemon {
                     Route::Push => {
                         self.counts.pushed += 1;
                         let ok = self.push.push(&ev.class, &ev.source, &ev.payload);
+                        // P7-6: the OS notification is fire-and-forget; a
+                        // failure is journaled, never retried forever.
+                        let card = crate::notify::Card {
+                            id: ev.class.clone(),
+                            class: ev.class.clone(),
+                            title: format!("{} · {}", ev.class, ev.source),
+                            lines: vec![ev.payload.clone()],
+                            count: 1,
+                            created_ms: now_ms(),
+                            expires_ms: now_ms() + crate::notify::CARD_TTL_MS,
+                            benefit: triage.benefit as i16,
+                        };
+                        let delivered = self.notifier.notify(
+                            &card,
+                            &[
+                                crate::notify::NotifyAction::Approve,
+                                crate::notify::NotifyAction::Reject,
+                                crate::notify::NotifyAction::Snooze,
+                            ],
+                        );
+                        self.journal.log(
+                            "desktop.notify",
+                            serde_json::json!({
+                                "id": ev.id, "backend": self.notifier.backend(),
+                                "delivered": delivered.is_ok(),
+                                "error": delivered.err(),
+                            }),
+                        );
                         self.journal
                             .log("push", serde_json::json!({"id": ev.id, "delivered": ok}));
                         // Pushes also leave an inbox trace for audit.
@@ -234,8 +340,55 @@ impl Daemon {
         }
     }
 
+    /// The transport for one draft. `local` is the daemon's own outbox log
+    /// (frontends tail it); Telegram is a real send when its token is
+    /// configured. Anything else fails honestly — an unconfigured channel
+    /// never silently "succeeds".
+    fn sender_for(&self, id: &str) -> Box<dyn OutboxSender> {
+        let channel = self
+            .outbox
+            .get(id)
+            .map(|d| d.channel)
+            .unwrap_or_else(|| "local".to_string());
+        match channel.as_str() {
+            "telegram" => {
+                let spec = self.cfg.triggers.iter().find_map(|t| match t {
+                    crate::config::TriggerSpec::Telegram(s) => Some(s.clone()),
+                    _ => None,
+                });
+                match spec.and_then(|s| {
+                    crate::channels::telegram::Telegram::from_env(&s.token_env)
+                        .ok()
+                        .map(|c| c.with_base(s.base.clone()))
+                }) {
+                    Some(tg) => Box::new(TelegramSender { tg }),
+                    None => Box::new(UnconfiguredSender {
+                        channel,
+                        detail: "no telegram trigger with a configured token".into(),
+                    }),
+                }
+            }
+            "local" => Box::new(LogSender::new(self.dirs.outbox().join("sent.jsonl"))),
+            other => Box::new(UnconfiguredSender {
+                channel: other.to_string(),
+                detail: "no transport for this channel".into(),
+            }),
+        }
+    }
+
+    /// The origin a spawn inherits from its event: a channel event carries
+    /// the untrusted marker (and therefore the autonomy floor); everything
+    /// else is a local run.
+    fn origin_for(&self, ev: &TriggerEvent) -> Origin {
+        match (&ev.origin, ev.untrusted_source) {
+            (Some(origin), _) => Origin::Untrusted(channels::untrusted_marker(origin)),
+            (None, true) => Origin::Untrusted(format!("trigger:{}", ev.source)),
+            (None, false) => Origin::Local,
+        }
+    }
+
     /// Spawn an `overseer exec` run (the only way the daemon does work).
-    fn spawn_for(&mut self, prompt: String, inbox_id: Option<String>) {
+    fn spawn_for(&mut self, prompt: String, inbox_id: Option<String>, origin: Origin) {
         if self.spawned.len() >= self.cfg.spawn.max_concurrent {
             self.journal.log(
                 "spawn_deferred",
@@ -257,12 +410,13 @@ impl Daemon {
             let _ = self.inbox.open(&self.journal, item);
             return;
         }
-        match spawn_run(
+        match spawn_run_from(
             &self.cfg.spawn,
             self.dirs.runs().as_path(),
             &prompt,
             inbox_id,
             &self.overseer_bin,
+            &origin,
         ) {
             Ok(sp) => {
                 self.counts.spawned += 1;
@@ -271,6 +425,10 @@ impl Daemon {
                     serde_json::json!({
                         "id": sp.id, "inbox_id": sp.inbox_id,
                         "prompt": sp.prompt, "log": sp.log_path,
+                        "origin": match &origin {
+                            Origin::Local => "local".to_string(),
+                            Origin::Untrusted(m) => format!("untrusted:{m}"),
+                        },
                     }),
                 );
                 self.spawned.push(sp);
@@ -326,35 +484,68 @@ impl Daemon {
                 CtlResponse::ok(serde_json::json!({"stopping": true}))
             }
             CtlRequest::InboxList => {
-                let items: Vec<serde_json::Value> = self
-                    .inbox
-                    .list()
-                    .into_iter()
-                    .map(|i| {
-                        serde_json::json!({
-                            "id": i.id, "state": i.state, "class": i.class,
-                            "source": i.source, "title": i.title, "body": i.body,
-                            "act_prompt": i.act_prompt, "created_ms": i.created_ms,
-                            "until_ms": i.until_ms,
-                        })
-                    })
-                    .collect();
-                CtlResponse::ok(serde_json::json!({"items": items}))
+                // One builder for the inbox view (P7-6): the CLI, the
+                // desktop and the digest all read the same shape.
+                CtlResponse::ok(crate::notify::inbox_view(&self.inbox.list()))
             }
             CtlRequest::InboxDecide {
                 id,
                 decision,
                 snooze_ms,
             } => match self.inbox.decide(&self.journal, &id, &decision, snooze_ms) {
-                Ok(item) => CtlResponse::ok(serde_json::json!({
-                    "id": item.id, "state": item.state,
-                })),
+                Ok(item) => {
+                    // P7-5: approving a channel draft is the send trigger —
+                    // the ladder's external → Ask is what put it there.
+                    if item.class == "channel.draft" && decision == "approve" {
+                        let outcome = self.outbox.approve_and_send(
+                            &self.journal,
+                            &item.id,
+                            &self.sender_for(&item.id),
+                        );
+                        return match outcome {
+                            Ok(o) => CtlResponse::ok(serde_json::json!({
+                                "id": o.draft.id, "state": o.draft.state,
+                                "sent": o.sent, "retried": o.retried,
+                            })),
+                            Err(e) => CtlResponse::err(e),
+                        };
+                    }
+                    CtlResponse::ok(serde_json::json!({
+                        "id": item.id, "state": item.state,
+                    }))
+                }
                 Err(e) => CtlResponse::err(e),
             },
             CtlRequest::InboxAct { id } => match self.inbox.get(&id) {
+                // A channel draft is not agent work: acting on it sends the
+                // message (still through the outbox, still once).
+                Some(item) if item.class == "channel.draft" => {
+                    match self.outbox.approve_and_send(
+                        &self.journal,
+                        &item.id,
+                        &self.sender_for(&item.id),
+                    ) {
+                        Ok(o) => {
+                            let _ = self.inbox.mark_acted(&self.journal, &item.id);
+                            CtlResponse::ok(serde_json::json!({
+                                "id": o.draft.id, "state": o.draft.state, "sent": o.sent,
+                            }))
+                        }
+                        Err(e) => CtlResponse::err(e),
+                    }
+                }
                 Some(item) => {
                     let prompt = item.act_prompt.clone().unwrap_or_else(|| item.body.clone());
-                    self.spawn_for(prompt, Some(item.id.clone()));
+                    // An approval is the human's decision, but an item
+                    // that came from a channel keeps its untrusted origin
+                    // (and therefore the autonomy floor).
+                    let origin = match item.class.as_str() {
+                        c if c.starts_with("msg.inbound") => {
+                            Origin::Untrusted(format!("channel:approved:{}", item.source))
+                        }
+                        _ => Origin::Local,
+                    };
+                    self.spawn_for(prompt, Some(item.id.clone()), origin);
                     let _ = self.inbox.mark_acted(&self.journal, &item.id);
                     CtlResponse::ok(serde_json::json!({"id": item.id, "spawned": true}))
                 }
@@ -368,12 +559,92 @@ impl Daemon {
                 self.process(TriggerEvent::new(source, class, payload));
                 CtlResponse::ok(serde_json::json!({"fired": true}))
             }
+            CtlRequest::ChannelSend {
+                to,
+                thread,
+                text,
+                channel,
+            } => {
+                // Draft only: the message waits for an inbox approval.
+                let channel = channel.unwrap_or_else(|| "local".to_string());
+                match self
+                    .outbox
+                    .draft(&self.journal, &channel, &to, thread.as_deref(), &text)
+                {
+                    Ok(draft) => {
+                        let item = InboxItem {
+                            id: draft.id.clone(),
+                            created_ms: draft.created_ms,
+                            class: "channel.draft".into(),
+                            source: format!("{channel}:{to}"),
+                            title: format!("outbound {channel} → {to}"),
+                            body: draft.text.clone(),
+                            // No act_prompt: approval *sends*, it never runs
+                            // a prompt on the model's behalf.
+                            act_prompt: None,
+                            state: ItemState::Open,
+                            until_ms: None,
+                        };
+                        if let Err(e) = self.inbox.open(&self.journal, item) {
+                            return CtlResponse::err(e.to_string());
+                        }
+                        CtlResponse::ok(serde_json::json!({
+                            "id": draft.id, "state": draft.state,
+                            "channel": draft.channel, "to": draft.to,
+                        }))
+                    }
+                    Err(e) => CtlResponse::err(e),
+                }
+            }
+            CtlRequest::DesktopSignal {
+                focused,
+                dnd,
+                calendar_busy,
+                active_app,
+                idle_s,
+            } => {
+                let state = FocusState {
+                    focused,
+                    dnd,
+                    calendar_busy,
+                    active_app,
+                    idle_s,
+                };
+                self.focus.push(now_ms(), state.clone());
+                self.journal.log(
+                    "desktop.signal",
+                    serde_json::json!({
+                        "focused": state.focused, "dnd": state.dnd,
+                        "calendar_busy": state.calendar_busy,
+                        "active_app": state.active_app, "idle_s": state.idle_s,
+                        "cost": cost_for(&state, &self.cfg.gate),
+                    }),
+                );
+                CtlResponse::ok(serde_json::json!({
+                    "accepted": true,
+                    "cost": cost_for(&state, &self.cfg.gate),
+                    "breakpoint": state.at_breakpoint(),
+                }))
+            }
+            CtlRequest::DigestGet => {
+                let cards = crate::notify::build_digest(
+                    &self.inbox.list(),
+                    now_ms(),
+                    in_quiet_hours(&self.cfg.gate),
+                );
+                let cards = crate::notify::expire(cards, now_ms());
+                CtlResponse::ok(crate::notify::digest_view(&cards))
+            }
             CtlRequest::Reload => {
                 let m = file_mtime(&self.dirs.config());
                 match load(&self.dirs.config()) {
                     Ok(cfg) => {
                         self.dedup = Dedup::new(cfg.dedup_window_s);
-                        self.triggers = cfg.triggers.iter().map(Trigger::from_spec).collect();
+                        self.triggers = cfg
+                            .triggers
+                            .iter()
+                            .map(|spec| Trigger::from_spec(&resolve_spec(spec, &self.dirs)))
+                            .collect();
                         self.cfg_mtime = m;
                         self.cfg = cfg;
                         CtlResponse::ok(serde_json::json!({"reloaded": true}))
@@ -466,7 +737,51 @@ impl Daemon {
     }
 }
 
-/// Resolve the overseer binary: same dir as this exe (installed
+/// The Telegram transport: one plain-text send per approved draft.
+struct TelegramSender {
+    tg: crate::channels::telegram::Telegram,
+}
+
+impl OutboxSender for TelegramSender {
+    fn send(&self, draft: &crate::outbox::Draft) -> Result<(), String> {
+        self.tg.send(&draft.to, &draft.text)
+    }
+}
+
+/// A channel with no usable transport. Refusing is the honest answer: a
+/// draft that cannot be delivered must stay approved-and-unsent.
+struct UnconfiguredSender {
+    channel: String,
+    detail: String,
+}
+
+impl OutboxSender for UnconfiguredSender {
+    fn send(&self, _draft: &crate::outbox::Draft) -> Result<(), String> {
+        Err(format!(
+            "channel '{}' is unconfigured: {}",
+            self.channel, self.detail
+        ))
+    }
+}
+
+/// Resolve daemon-relative paths inside a trigger spec (P7-4): a relative
+/// webhook spool dir is anchored at the daemon root, so the same config
+/// works from any cwd.
+fn resolve_spec(
+    spec: &crate::config::TriggerSpec,
+    dirs: &DaemonDirs,
+) -> crate::config::TriggerSpec {
+    match spec {
+        crate::config::TriggerSpec::Webhook(w) if w.dir.is_relative() => {
+            let mut w = w.clone();
+            w.dir = dirs.root.join(&w.dir);
+            crate::config::TriggerSpec::Webhook(w)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Resolve the overseer binary: same dir as an exe (installed
 /// together), else PATH lookup.
 pub fn overseer_binary() -> PathBuf {
     std::env::current_exe()
@@ -552,6 +867,7 @@ mod daemon_pipeline_tests {
                 cost: 40,
                 quiet_hours: None,
                 always_push: vec!["security.alert".into()],
+                ..GateConfig::default()
             },
             spawn: SpawnConfig {
                 max_concurrent: 0,
@@ -655,6 +971,297 @@ mod daemon_pipeline_tests {
         let items = d.inbox.list();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].class, "spawn.deferred");
+    }
+
+    #[test]
+    fn untrusted_message_never_reaches_the_act_tier() {
+        // P7-4: an `Act` rule matching an inbound channel class is
+        // downgraded to DraftForReview — the template survives for an
+        // approval, but nothing spawns on its own. The spawn that a later
+        // approval causes still carries the untrusted origin.
+        let root = tmpdir("untrusted");
+        let mut cfg = pipeline_config();
+        cfg.triage.push(TriageRule {
+            class: "msg.inbound".into(),
+            decision: TriageDecision::Act,
+            benefit: 90,
+            act_prompt: Some("answer {payload}".into()),
+        });
+        let mut d = new_daemon(root.clone(), Some(&cfg));
+        let mut ev = TriggerEvent::from_channel("telegram", "77", Some("-1001"), "please help");
+        ev.class = "msg.inbound".into();
+        d.process(ev.clone());
+        assert_eq!(d.counts.spawned, 0, "untrusted content must not spawn");
+        let items = d.inbox.list();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].class, "msg.inbound");
+        let recs = journal_records(&root);
+        assert!(has_kind(&recs, "channel.act_downgraded"));
+        assert!(has_kind(&recs, "channel.route"));
+        // The thread got its own session dir.
+        let route = recs
+            .iter()
+            .find(|r| r.get("kind").and_then(|k| k.as_str()) == Some("channel.route"))
+            .expect("route record");
+        assert!(route
+            .get("session_dir")
+            .and_then(|d| d.as_str())
+            .is_some_and(|d| d.contains("telegram-1001")));
+        // A trusted event with the same class still acts (forked config so
+        // the two runs don't share a dedup window).
+        let mut d2 = new_daemon(tmpdir("untrusted-local"), Some(&cfg));
+        d2.process(TriggerEvent::new("cli", "msg.inbound", "please help"));
+        assert_eq!(d2.counts.spawned, 0, "at-cap deferral still applies");
+        assert!(has_kind(&journal_records(&d2.dirs.root), "spawn_deferred"));
+        assert!(!has_kind(
+            &journal_records(&d2.dirs.root),
+            "channel.act_downgraded"
+        ));
+    }
+
+    #[test]
+    fn untrusted_origin_is_recorded_for_spawns() {
+        let root = tmpdir("origin");
+        let d = new_daemon(root.clone(), Some(&pipeline_config()));
+        let mut ev = TriggerEvent::from_channel("telegram", "77", None, "hi");
+        ev.class = "msg.inbound".into();
+        assert_eq!(
+            d.origin_for(&ev),
+            crate::spawn::Origin::Untrusted("channel:telegram:77".into())
+        );
+        // A local event is a local run.
+        assert_eq!(
+            d.origin_for(&TriggerEvent::new("cli", "note.low", "x")),
+            crate::spawn::Origin::Local
+        );
+        // An event that is untrusted without a channel envelope still gets
+        // a floor (defensive: the flag alone must never mean "act").
+        let mut bare = TriggerEvent::new("relay", "note.low", "x");
+        bare.untrusted_source = true;
+        assert_eq!(
+            d.origin_for(&bare),
+            crate::spawn::Origin::Untrusted("trigger:relay".into())
+        );
+    }
+
+    #[test]
+    fn channel_triggers_are_journaled_when_unconfigured() {
+        // A channel trigger that cannot run says so once at startup —
+        // never a silent no-op.
+        let root = tmpdir("unconfigured");
+        let mut cfg = pipeline_config();
+        cfg.triggers.push(crate::config::TriggerSpec::Telegram(
+            crate::config::TelegramSpec {
+                id: "tg".into(),
+                token_env: "OVERSEER_TELEGRAM_TOKEN_UNSET_4ab".into(),
+                allow_senders: vec!["77".into()],
+                rate_per_min: 5,
+                base: "http://127.0.0.1:1".into(),
+            },
+        ));
+        let _d = new_daemon(root.clone(), Some(&cfg));
+        let recs = journal_records(&root);
+        assert!(has_kind(&recs, "channel.unconfigured"));
+    }
+
+    #[test]
+    fn channel_send_drafts_then_approval_sends_exactly_once() {
+        // P7-5: the socket call drafts; approval sends; a second approval
+        // does not send again. External comms never bypass the ladder.
+        let root = tmpdir("channel-send");
+        let mut d = new_daemon(root.clone(), Some(&pipeline_config()));
+        let resp = d.handle_ctl(CtlRequest::ChannelSend {
+            to: "ops".into(),
+            thread: Some("t1".into()),
+            text: "deploy is done".into(),
+            channel: None,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["data"]["state"], "draft");
+        let id = v["data"]["id"].as_str().unwrap().to_string();
+        assert!(root.join("outbox").join(format!("{id}.json")).exists());
+
+        // The draft is an inbox approval with no act prompt: approving
+        // sends, it never runs a prompt as agent work.
+        let items = d.inbox.list();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].class, "channel.draft");
+        assert!(items[0].act_prompt.is_none());
+        assert!(!root.join("outbox").join("sent.jsonl").exists());
+
+        let first = d.handle_ctl(CtlRequest::InboxDecide {
+            id: id.clone(),
+            decision: "approve".into(),
+            snooze_ms: None,
+        });
+        let first = serde_json::to_value(&first).unwrap();
+        assert_eq!(first["data"]["sent"], true, "{first}");
+        let second = d.handle_ctl(CtlRequest::InboxDecide {
+            id: id.clone(),
+            decision: "approve".into(),
+            snooze_ms: None,
+        });
+        let second = serde_json::to_value(&second).unwrap();
+        assert_eq!(second["data"]["sent"], false, "double approve sends once");
+        let sent = std::fs::read_to_string(root.join("outbox").join("sent.jsonl")).unwrap();
+        assert_eq!(sent.lines().count(), 1);
+        let rec: serde_json::Value = serde_json::from_str(sent.lines().next().unwrap()).unwrap();
+        assert_eq!(rec["text"], "deploy is done");
+        assert_eq!(rec["channel"], "local");
+        assert!(rec["idempotency_key"]
+            .as_str()
+            .is_some_and(|k| !k.is_empty()));
+
+        // An unconfigured transport refuses honestly and stays retryable.
+        let resp = d.handle_ctl(CtlRequest::ChannelSend {
+            to: "ops".into(),
+            thread: None,
+            text: "escalate".into(),
+            channel: Some("carrier-pigeon".into()),
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        let pigeon = v["data"]["id"].as_str().unwrap().to_string();
+        let r = d.handle_ctl(CtlRequest::InboxDecide {
+            id: pigeon.clone(),
+            decision: "approve".into(),
+            snooze_ms: None,
+        });
+        let r = serde_json::to_value(&r).unwrap();
+        assert_eq!(r["ok"], false);
+        assert!(r["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("unconfigured") && e.contains("carrier-pigeon")));
+        assert_eq!(
+            d.outbox.get(&pigeon).unwrap().state,
+            crate::outbox::DraftState::Approved,
+            "a failed send stays approved, never lost or faked"
+        );
+
+        // The digest is a protocol view over the same inbox: resolved items
+        // leave no cards…
+        let digest = serde_json::to_value(d.handle_ctl(CtlRequest::DigestGet)).unwrap();
+        assert_eq!(digest["data"]["source"], "inbox");
+        assert!(
+            digest["data"]["cards"]
+                .as_array()
+                .is_some_and(|c| c.is_empty()),
+            "decided items are not pending: {digest}"
+        );
+        // …and a fresh draft shows up as a pending card.
+        let _ = d.handle_ctl(CtlRequest::ChannelSend {
+            to: "ops".into(),
+            thread: None,
+            text: "still pending".into(),
+            channel: None,
+        });
+        let digest = serde_json::to_value(d.handle_ctl(CtlRequest::DigestGet)).unwrap();
+        let cards = digest["data"]["cards"].as_array().unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0]["class"], "channel.draft");
+        assert_eq!(cards[0]["count"], 1);
+    }
+
+    #[test]
+    fn desktop_signal_sets_the_cost_and_defers_pushes_to_the_breakpoint() {
+        // P7-6: a pushed signal changes the effective cost, and a push
+        // decided while the user is focused lands in the inbox instead.
+        let root = tmpdir("desktop");
+        let mut d = new_daemon(root.clone(), Some(&pipeline_config()));
+        // No signal yet: the pre-P7 route applies (security.alert pushes).
+        d.process(TriggerEvent::new("ids", "security.alert", "intrusion?"));
+        assert_eq!(d.counts.pushed, 1);
+
+        let resp = d.handle_ctl(CtlRequest::DesktopSignal {
+            focused: true,
+            dnd: false,
+            calendar_busy: false,
+            active_app: Some("iTerm".into()),
+            idle_s: Some(2),
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["data"]["accepted"], true);
+        assert_eq!(v["data"]["breakpoint"], false);
+        assert_eq!(v["data"]["cost"], 60, "40 base + 20 focus boost");
+        let recs = journal_records(&root);
+        assert!(has_kind(&recs, "desktop.signal"));
+        let signal = recs
+            .iter()
+            .find(|r| r.get("kind").and_then(|k| k.as_str()) == Some("desktop.signal"))
+            .unwrap();
+        assert_eq!(signal["active_app"], "iTerm");
+        assert_eq!(signal["cost"], 60);
+
+        // A high-benefit event that would have pushed now defers: focused
+        // is not a breakpoint, so a *non-bypass* class waits.
+        let mut cfg = pipeline_config();
+        cfg.triage.push(TriageRule {
+            class: "job.heavy.notify".into(),
+            decision: TriageDecision::Notify,
+            benefit: 90,
+            act_prompt: None,
+        });
+        let root2 = tmpdir("desktop-defer");
+        let mut d2 = new_daemon(root2.clone(), Some(&cfg));
+        d2.handle_ctl(CtlRequest::DesktopSignal {
+            focused: true,
+            dnd: false,
+            calendar_busy: false,
+            active_app: None,
+            idle_s: Some(1),
+        });
+        d2.process(TriggerEvent::new(
+            "watch",
+            "job.heavy.notify",
+            "worth saying",
+        ));
+        assert_eq!(d2.counts.pushed, 0, "focused: deferred");
+        assert_eq!(d2.counts.inboxed, 1);
+        let route = journal_records(&root2)
+            .into_iter()
+            .find(|r| r.get("kind").and_then(|k| k.as_str()) == Some("route"))
+            .unwrap();
+        assert_eq!(route["route"], "inbox");
+
+        // DND is as expensive as quiet hours: even always_push's neighbours
+        // are held, and the bypass class still escapes (its contract).
+        let root3 = tmpdir("desktop-dnd");
+        let mut d3 = new_daemon(root3.clone(), Some(&cfg));
+        d3.handle_ctl(CtlRequest::DesktopSignal {
+            focused: true,
+            dnd: true,
+            calendar_busy: false,
+            active_app: None,
+            idle_s: None,
+        });
+        d3.process(TriggerEvent::new("watch", "job.heavy.notify", "held"));
+        assert_eq!(d3.counts.inboxed, 1);
+        let pushes_before = d3.counts.pushed;
+        d3.process(TriggerEvent::new("ids", "security.alert", "intrusion"));
+        assert_eq!(
+            d3.counts.pushed,
+            pushes_before + 1,
+            "always_push still escapes"
+        );
+        // The notification itself was recorded by the notifier backend.
+        assert!(has_kind(&journal_records(&root3), "desktop.notify"));
+        let notify = std::fs::read_to_string(root3.join("notify.jsonl")).unwrap_or_default();
+        assert!(notify.contains("security.alert") || notify.is_empty());
+        // An away user releases the deferral.
+        d3.handle_ctl(CtlRequest::DesktopSignal {
+            focused: true,
+            dnd: false,
+            calendar_busy: false,
+            active_app: None,
+            idle_s: Some(9_999),
+        });
+        d3.process(TriggerEvent::new(
+            "watch",
+            "job.heavy.notify",
+            "at a breakpoint",
+        ));
+        assert_eq!(d3.counts.pushed, pushes_before + 2, "away is a breakpoint");
     }
 
     #[test]

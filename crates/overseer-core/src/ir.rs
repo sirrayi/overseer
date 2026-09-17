@@ -27,6 +27,22 @@ pub enum Block {
     Reasoning {
         raw: serde_json::Value,
     },
+    /// Screenshot / framebuffer capture (P7 computer-use): pixels plus the
+    /// scaling metadata needed for coordinate discipline. `sent_w/sent_h`
+    /// are the dimensions the model saw; `px_w/px_h` the native framebuffer.
+    /// Coordinate mapping (sent→native) lives in `tools::computer`.
+    /// Residual (documented): pixel-embedded secrets exfiltrating inside
+    /// image bytes to vendor endpoints is accepted residual — mitigated by
+    /// egress-deny + the no-creds invariant + takeover suppression; OCR
+    /// scanning is explicitly deferred, not silent.
+    Image {
+        media_type: String,
+        data_b64: String,
+        px_w: u32,
+        px_h: u32,
+        sent_w: u32,
+        sent_h: u32,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -143,5 +159,25 @@ mod tests {
         assert_eq!(calls[0].1, "read");
         assert!(m.has_tool_calls());
         assert_eq!(m.text(), "hi");
+    }
+
+    #[test]
+    fn image_block_roundtrips_with_scaling_metadata() {
+        // P7-1: scaling metadata is the coordinate-discipline contract —
+        // sent dims are what the model saw, px dims the native framebuffer.
+        let block = Block::Image {
+            media_type: "image/png".into(),
+            data_b64: "aGVsbG8=".into(),
+            px_w: 2560,
+            px_h: 1600,
+            sent_w: 1280,
+            sent_h: 800,
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "image");
+        assert_eq!(json["sent_w"], 1280);
+        assert_eq!(json["px_w"], 2560);
+        let back: Block = serde_json::from_value(json).unwrap();
+        assert_eq!(back, block);
     }
 }

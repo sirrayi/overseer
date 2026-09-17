@@ -14,6 +14,7 @@ use std::time::SystemTime;
 use serde_json::{json, Value};
 
 pub mod bash;
+pub mod computer;
 pub mod edit;
 pub mod glob;
 pub mod grep;
@@ -166,8 +167,9 @@ struct ReadRecord {
 /// caller path can skip it (Invariant 3).
 /// All tool names the core registry can emit — the validation set for
 /// `--no-tools` ablations (typo'd names fail fast, not silently no-op).
-pub const TOOL_NAMES: [&str; 11] = [
+pub const TOOL_NAMES: [&str; 12] = [
     "bash", "read", "write", "edit", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol",
+    "computer",
 ];
 
 pub struct ToolRegistry {
@@ -176,7 +178,7 @@ pub struct ToolRegistry {
     read_paths: HashSet<PathBuf>,
     /// Read history for dedup: canonical path → (mtime, line range) list.
     read_log: HashMap<PathBuf, Vec<ReadRecord>>,
-    policy: crate::perm::Policy,
+    pub policy: crate::perm::Policy,
     /// Rule-of-Two latch notices (P3.10): drained by the agent loop and
     /// emitted as `Tainted` events.
     pub taint_notices: Vec<String>,
@@ -201,6 +203,7 @@ impl ToolRegistry {
             skill::spec(),
             repomap::spec_map(),
             repomap::spec_symbol(),
+            computer::spec(),
         ];
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         ToolRegistry {
@@ -374,8 +377,9 @@ impl ToolRegistry {
             "skill" => skill::run(input, ctx),
             "repo_map" => repomap::run_map(input, ctx),
             "symbol" => repomap::run_symbol(input, ctx),
+            "computer" => computer::run(input, ctx),
             other => ToolOutput::err(format!(
-                "Unknown tool '{other}'. Available tools: bash, read, write, edit, grep, glob, plan, task, skill, repo_map, symbol."
+                "Unknown tool '{other}'. Available tools: bash, read, write, edit, grep, glob, plan, task, skill, repo_map, symbol, computer."
             )),
         };
         // Rule-of-Two bookkeeping (P3.10): this result may carry untrusted

@@ -338,6 +338,8 @@ pub fn feed(ev: &Event) -> Feed {
             style: theme::error(),
             text: format!("⛨ {detail} — side effects now need confirmation"),
         }]),
+        // P7-3 audit-only computer-use record — no transcript cell.
+        EventKind::ComputerAct { .. } => Feed::Ignore,
         EventKind::StuckDetected { pattern } => Feed::NewCells(vec![Cell::Meta {
             style: theme::error(),
             text: format!("⚠ stuck: {pattern}"),
