@@ -21,4 +21,6 @@ pub mod rewind;
 pub mod session;
 pub mod skills;
 pub mod stuck;
+pub mod tokens;
 pub mod tools;
+pub mod toon;

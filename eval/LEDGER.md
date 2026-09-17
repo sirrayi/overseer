@@ -193,3 +193,34 @@ uv run python run.py --benchmark lcb --release-version v6
 External checkouts: `OVERSEER_TAU2_DIR`, `OVERSEER_LCB_DIR` (defaults
 `eval/vendor/tau2-bench`, `eval/vendor/LiveCodeBench`; vendor/ is
 gitignored).
+
+## OTel GenAI projection (B1-8)
+
+`overseer-core::event::otel_spans(&events)` maps `events.jsonl` to
+OpenTelemetry GenAI attributes (openllmetry naming, zero deps). The export
+mutates nothing — `events.jsonl` stays the source of truth (asserted by
+`event::tests::otel_projection_maps_gen_ai_aliases`, including a no-mutation
+check and an exported-key snapshot).
+
+| Overseer field | `gen_ai.*` attribute |
+|---|---|
+| `SessionStart.session_id` | `gen_ai.trace.id` |
+| `Event.id` | `gen_ai.span.id` |
+| `ModelResponse` event | `gen_ai.span.kind = "llm"` |
+| `SessionStart.model` | `gen_ai.request.model` |
+| `ModelResponse.stop_reason` | `gen_ai.response.stop_reason` |
+| `Usage.fresh_input` | `gen_ai.usage.input_tokens` |
+| `Usage.cache_write` | `gen_ai.usage.cache_write_tokens` |
+| `Usage.cache_read` | `gen_ai.usage.cache_read_tokens` |
+| `Usage.output` | `gen_ai.usage.output_tokens` |
+| `Usage.reasoning` | `gen_ai.usage.reasoning_tokens` |
+| `ModelResponse.latency_ms` | `gen_ai.latency_ms` |
+| `ModelResponse.cost_usd` | `gen_ai.cost_usd` |
+| tool-call block count | `gen_ai.tool_calls` |
+| `ToolCallStart`/`ToolResult` event | `gen_ai.span.kind = "tool"` |
+| `ToolCallStart.call_id`/`name` | `gen_ai.tool.call_id` / `gen_ai.tool.name` |
+| `ToolResult.is_error`/`denied`/`raw_bytes` | `gen_ai.tool.is_error` / `gen_ai.tool.denied` / `gen_ai.tool.raw_bytes` |
+
+Manual backend check (non-gating): point any OTLP collector at the exported
+JSON (e.g. Jaeger `localhost:4317`) and confirm spans ingest with zero
+parsers. events.jsonl is never rewritten by export.
