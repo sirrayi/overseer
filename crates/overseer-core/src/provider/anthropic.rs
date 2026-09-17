@@ -156,7 +156,9 @@ impl Anthropic {
                         .get("source")
                         .map(|s| {
                             (
-                                s.get("media_type").and_then(Value::as_str).unwrap_or("image/png"),
+                                s.get("media_type")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("image/png"),
                                 s.get("data").and_then(Value::as_str).unwrap_or(""),
                             )
                         })
@@ -521,7 +523,12 @@ mod tests {
         }];
         let msgs = vec![Message::user_text("hi")];
         let body = Anthropic::build_body(&sample_req(&system, &tools, &msgs));
-        let keys: Vec<&str> = body.as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert!(keys.contains(&"model"));
         assert!(keys.contains(&"max_tokens"));
         assert!(keys.contains(&"system"));

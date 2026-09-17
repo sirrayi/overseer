@@ -65,12 +65,7 @@ impl TriggerEvent {
 
     /// An inbound channel message: `source = <channel>:<sender>`,
     /// `class = msg.inbound`, always untrusted (P7-4).
-    pub fn from_channel(
-        channel: &str,
-        sender: &str,
-        thread: Option<&str>,
-        text: &str,
-    ) -> Self {
+    pub fn from_channel(channel: &str, sender: &str, thread: Option<&str>, text: &str) -> Self {
         let mut ev = TriggerEvent::new(format!("{channel}:{sender}"), "msg.inbound", text);
         ev.untrusted_source = true;
         ev.origin = Some(ChannelOrigin {

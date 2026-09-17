@@ -148,7 +148,11 @@ impl OpenAiCompatible {
                         input["pending_safety_checks"] = checks.clone();
                     }
                     blocks.push(Block::ToolCall {
-                        id: c.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                        id: c
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
                         name: "computer".into(),
                         input,
                     });
@@ -241,9 +245,11 @@ pub fn safety_ack_complete(input: &Value) -> bool {
     if !pending {
         return true;
     }
-    input.get("safety_ack").and_then(Value::as_bool).unwrap_or(false)
+    input
+        .get("safety_ack")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
-
 
 /// One IR message → one or more wire messages (tool results fan out into
 /// individual `tool` role messages — OpenAI's pairing rule).
@@ -281,7 +287,11 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
                     Block::Text { text } => out.push(json!({
                         "role": "user", "content": text
                     })),
-                    Block::Image { media_type, data_b64, .. } => out.push(json!({
+                    Block::Image {
+                        media_type,
+                        data_b64,
+                        ..
+                    } => out.push(json!({
                         "role": "user",
                         "content": [{
                             "type": "image_url",
@@ -584,7 +594,9 @@ mod tests {
             &json!({"action": "click", "pending_safety_checks": [{"id": "s1"}], "safety_ack": true})
         ));
         assert!(safety_ack_complete(&json!({"action": "click"})));
-        assert!(safety_ack_complete(&json!({"action": "click", "pending_safety_checks": []})));
+        assert!(safety_ack_complete(
+            &json!({"action": "click", "pending_safety_checks": []})
+        ));
     }
 
     #[test]

@@ -163,11 +163,7 @@ pub fn route_desktop(
     let Some(state) = focus else {
         return route(gate, class, triage, quiet);
     };
-    let cost = if quiet {
-        100
-    } else {
-        cost_for(state, gate)
-    } as i16;
+    let cost = if quiet { 100 } else { cost_for(state, gate) } as i16;
     if triage.benefit as i16 - cost > gate.theta {
         if state.at_breakpoint() {
             Route::Push
@@ -264,7 +260,11 @@ impl PushedFocus {
     /// The most recent state, if any (a stale push is still the best
     /// information available — the frontend owns freshness).
     pub fn latest(&self) -> Option<FocusState> {
-        self.state.lock().ok().and_then(|s| s.clone()).map(|(_, st)| st)
+        self.state
+            .lock()
+            .ok()
+            .and_then(|s| s.clone())
+            .map(|(_, st)| st)
     }
 }
 
@@ -290,8 +290,6 @@ impl CalendarSource for BusyWindows {
             .any(|(start, end)| now_ms >= *start && now_ms < *end)
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -446,7 +444,13 @@ mod tests {
             ..FocusState::default()
         };
         assert_eq!(
-            route_desktop(&cfg, "security.alert.mild", &triage(100), false, Some(&busy)),
+            route_desktop(
+                &cfg,
+                "security.alert.mild",
+                &triage(100),
+                false,
+                Some(&busy)
+            ),
             Route::Inbox
         );
         // Unfocused desktop → push as usual.
@@ -462,13 +466,7 @@ mod tests {
         let mut bypass = cfg.clone();
         bypass.always_push.push("security.alert".into());
         assert_eq!(
-            route_desktop(
-                &bypass,
-                "security.alert",
-                &triage(5),
-                false,
-                Some(&focused)
-            ),
+            route_desktop(&bypass, "security.alert", &triage(5), false, Some(&focused)),
             Route::Push
         );
         // Quiet hours keep their meaning with a state present too.

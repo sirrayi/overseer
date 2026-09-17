@@ -57,7 +57,7 @@ pub fn spawn_run(
     runs_dir: &Path,
     prompt: &str,
     inbox_id: Option<String>,
-    overseer_bin: &PathBuf,
+    overseer_bin: &Path,
 ) -> Result<Spawned, String> {
     spawn_run_from(
         cfg,
@@ -92,10 +92,7 @@ fn build_command(
         cmd.args(channels::UNTRUSTED_AUTONOMY_FLOOR);
         cmd.env(channels::UNTRUSTED_ENV, marker);
     }
-    cmd.arg(prompt)
-        .stdout(out)
-        .stderr(err)
-        .stdin(Stdio::null());
+    cmd.arg(prompt).stdout(out).stderr(err).stdin(Stdio::null());
     if let Some(cwd) = &cfg.cwd {
         cmd.current_dir(cwd);
     }
@@ -110,7 +107,7 @@ pub fn spawn_run_from(
     runs_dir: &Path,
     prompt: &str,
     inbox_id: Option<String>,
-    overseer_bin: &PathBuf,
+    overseer_bin: &Path,
     origin: &Origin,
 ) -> Result<Spawned, String> {
     let id = uuid::Uuid::now_v7().to_string();
@@ -251,7 +248,14 @@ mod tests {
             )]
         );
 
-        let local = build_command(&cfg, "do the thing", &Origin::Local, &bin, Stdio::null(), Stdio::null());
+        let local = build_command(
+            &cfg,
+            "do the thing",
+            &Origin::Local,
+            &bin,
+            Stdio::null(),
+            Stdio::null(),
+        );
         let local_args: Vec<String> = local
             .get_args()
             .map(|a| a.to_string_lossy().to_string())

@@ -82,7 +82,10 @@ mod tests {
             text: "hello".into(),
         };
         let ev = event_for(&chat);
-        assert!(ev.untrusted_source, "channel content is never operator input");
+        assert!(
+            ev.untrusted_source,
+            "channel content is never operator input"
+        );
         assert_eq!(ev.class, "msg.inbound");
         assert_eq!(ev.source, "telegram:77");
         assert_eq!(ev.payload, "hello");
@@ -99,10 +102,7 @@ mod tests {
         assert_eq!(ev.class, "msg.inbound.steer");
         assert_eq!(ev.payload, "look at the failing test");
         assert!(ev.untrusted_source);
-        assert_eq!(
-            ev.origin.as_ref().unwrap().intent.as_deref(),
-            Some("steer")
-        );
+        assert_eq!(ev.origin.as_ref().unwrap().intent.as_deref(), Some("steer"));
 
         // The floor is a fixed pair of argv tokens and a literal marker.
         assert_eq!(UNTRUSTED_AUTONOMY_FLOOR, ["--autonomy", "external=approve"]);

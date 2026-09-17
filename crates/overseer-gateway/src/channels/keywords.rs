@@ -83,14 +83,30 @@ mod tests {
     #[test]
     fn keyword_table_maps_each_verb() {
         for (text, want, body) in [
-            ("/steer focus on the failing test", Intent::Steer, "focus on the failing test"),
-            ("steer: focus on the failing test", Intent::Steer, "focus on the failing test"),
-            ("/queue later: bump the version", Intent::Queue, "later: bump the version"),
+            (
+                "/steer focus on the failing test",
+                Intent::Steer,
+                "focus on the failing test",
+            ),
+            (
+                "steer: focus on the failing test",
+                Intent::Steer,
+                "focus on the failing test",
+            ),
+            (
+                "/queue later: bump the version",
+                Intent::Queue,
+                "later: bump the version",
+            ),
             ("/approve-only ship it", Intent::ApproveOnly, "ship it"),
             ("/approve ship it", Intent::ApproveOnly, "ship it"),
             ("/APPROVE_ONLY ship it", Intent::ApproveOnly, "ship it"),
             ("/approve", Intent::ApproveOnly, ""),
-            ("just a normal message", Intent::Chat, "just a normal message"),
+            (
+                "just a normal message",
+                Intent::Chat,
+                "just a normal message",
+            ),
             ("/unknown verb", Intent::Chat, "/unknown verb"),
             ("", Intent::Chat, ""),
         ] {
@@ -102,9 +118,15 @@ mod tests {
         assert_eq!(Intent::Chat.event_class(), None);
         assert_eq!(Intent::Steer.event_class(), Some("msg.inbound.steer"));
         assert_eq!(Intent::Queue.event_class(), Some("msg.inbound.queue"));
-        assert_eq!(Intent::ApproveOnly.event_class(), Some("msg.inbound.approve"));
+        assert_eq!(
+            Intent::ApproveOnly.event_class(),
+            Some("msg.inbound.approve")
+        );
         let (intent, body, class) = classify("/queue hold this");
-        assert_eq!((intent, body.as_str(), class), (Intent::Queue, "hold this", "msg.inbound.queue"));
+        assert_eq!(
+            (intent, body.as_str(), class),
+            (Intent::Queue, "hold this", "msg.inbound.queue")
+        );
         let (_, _, class) = classify("hello");
         assert_eq!(class, "msg.inbound");
     }

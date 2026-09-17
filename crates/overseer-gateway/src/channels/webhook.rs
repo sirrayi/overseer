@@ -338,10 +338,7 @@ mod tests {
         );
         // RFC 4231 HMAC-SHA256 vectors (case 1 with a 20-byte key, case 2).
         assert_eq!(
-            hex(&hmac_sha256(
-                &[0x0bu8; 20],
-                b"Hi There"
-            )),
+            hex(&hmac_sha256(&[0x0bu8; 20], b"Hi There")),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
         assert_eq!(
@@ -354,7 +351,10 @@ mod tests {
     fn signature_verification_accepts_only_the_right_hmac() {
         let secret = "s3cret-signing-key";
         let body = r#"{"sender":"u1","text":"hi"}"#;
-        let sig = format!("sha256={}", hex(&hmac_sha256(secret.as_bytes(), body.as_bytes())));
+        let sig = format!(
+            "sha256={}",
+            hex(&hmac_sha256(secret.as_bytes(), body.as_bytes()))
+        );
         assert!(verify(secret, &sig, body));
         // Bare hex is accepted (some relays strip the prefix).
         assert!(verify(secret, sig.trim_start_matches("sha256="), body));
@@ -436,7 +436,14 @@ mod tests {
         assert!(err.contains("allowlist"), "got: {err}");
 
         // Allowed sender → trigger event, marked untrusted with its origin.
-        let ev = ingest(&spec("S", &["u1"], 2), Some(secret), &req, &mut limiter, 1_000).unwrap();
+        let ev = ingest(
+            &spec("S", &["u1"], 2),
+            Some(secret),
+            &req,
+            &mut limiter,
+            1_000,
+        )
+        .unwrap();
         assert_eq!(ev.class, "msg.inbound");
         assert_eq!(ev.source, "webhook:u1");
         assert!(ev.untrusted_source);
@@ -452,23 +459,47 @@ mod tests {
         );
 
         // Same sender again inside the window: admitted (limit is 2)…
-        assert!(ingest(&spec("S", &["u1"], 2), Some(secret), &req, &mut limiter, 1_500).is_ok());
+        assert!(ingest(
+            &spec("S", &["u1"], 2),
+            Some(secret),
+            &req,
+            &mut limiter,
+            1_500
+        )
+        .is_ok());
         // …then refused, and refused again even after the window slides
         // only partially.
-        let err =
-            ingest(&spec("S", &["u1"], 2), Some(secret), &req, &mut limiter, 2_000).unwrap_err();
+        let err = ingest(
+            &spec("S", &["u1"], 2),
+            Some(secret),
+            &req,
+            &mut limiter,
+            2_000,
+        )
+        .unwrap_err();
         assert!(err.contains("rate limit"), "got: {err}");
         // A different sender has its own budget.
         let other = WebhookRequest {
-            signature: hex(&hmac_sha256(
-                b"k",
-                br#"{"sender":"u2","text":"hi"}"#,
-            )),
+            signature: hex(&hmac_sha256(b"k", br#"{"sender":"u2","text":"hi"}"#)),
             body: r#"{"sender":"u2","text":"hi"}"#.into(),
         };
-        assert!(ingest(&spec("S", &["u2"], 2), Some(secret), &other, &mut limiter, 2_000).is_ok());
+        assert!(ingest(
+            &spec("S", &["u2"], 2),
+            Some(secret),
+            &other,
+            &mut limiter,
+            2_000
+        )
+        .is_ok());
         // Window expiry re-opens the budget.
-        assert!(ingest(&spec("S", &["u1"], 2), Some(secret), &req, &mut limiter, 61_000).is_ok());
+        assert!(ingest(
+            &spec("S", &["u1"], 2),
+            Some(secret),
+            &req,
+            &mut limiter,
+            61_000
+        )
+        .is_ok());
         // Zero means closed.
         let mut closed = RateLimiter::new(0);
         assert!(!closed.admit_at("k", 0));

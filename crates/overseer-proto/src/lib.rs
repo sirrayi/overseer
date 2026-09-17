@@ -110,7 +110,12 @@ mod tests {
             ),
             (Request::TurnInterrupt, "turn.interrupt"),
             (Request::TurnSteer { text: "go".into() }, "turn.steer"),
-            (Request::TurnQueue { text: "later".into() }, "turn.queue"),
+            (
+                Request::TurnQueue {
+                    text: "later".into(),
+                },
+                "turn.queue",
+            ),
             (Request::TurnQueueCancel { index: 2 }, "turn.queue_cancel"),
             (Request::SessionFork { at_event: None }, "session.fork"),
             (
@@ -139,8 +144,9 @@ mod tests {
     #[test]
     fn turn_submit_stays_wire_compatible() {
         // A pre-P7 client sends only `text` — it must still parse.
-        let old: Request = serde_json::from_str(r#"{"method":"turn.submit","params":{"text":"hi"}}"#)
-            .expect("old shape parses");
+        let old: Request =
+            serde_json::from_str(r#"{"method":"turn.submit","params":{"text":"hi"}}"#)
+                .expect("old shape parses");
         match old {
             Request::TurnSubmit {
                 text,

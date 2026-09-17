@@ -56,8 +56,20 @@ const MAX_BATCH: usize = 32;
 
 /// Every action the tool accepts. `batch` wraps the rest.
 const ACTIONS: &[&str] = &[
-    "screenshot", "observe", "click", "move", "scroll", "drag", "hover", "focus", "type", "key",
-    "paste", "submit", "send", "invoke",
+    "screenshot",
+    "observe",
+    "click",
+    "move",
+    "scroll",
+    "drag",
+    "hover",
+    "focus",
+    "type",
+    "key",
+    "paste",
+    "submit",
+    "send",
+    "invoke",
 ];
 
 /// Last observation's frame + digest, inside the session dir. Acts scale
@@ -333,7 +345,12 @@ fn call_helper(helper: &Path, request: &Value) -> Result<Value, String> {
             }
             // stdin drops here → the helper sees EOF.
         }
-        None => return Err(format!("computer: backend {} has no stdin", helper.display())),
+        None => {
+            return Err(format!(
+                "computer: backend {} has no stdin",
+                helper.display()
+            ))
+        }
     }
     let out = child
         .wait_with_output()
@@ -804,7 +821,8 @@ mod tests {
 
         // A structured request: only the structured tier serves it, and it
         // is preferred over the other configured tiers.
-        let api = json!({"action": "click", "api": "App.press", "name": "OK", "x": 10.0, "y": 20.0});
+        let api =
+            json!({"action": "click", "api": "App.press", "name": "OK", "x": 10.0, "y": 20.0});
         assert_eq!(
             need_of(&api),
             Need {
@@ -824,8 +842,14 @@ mod tests {
         // names the tiers that could have served it.
         let err = choose(need_of(&api), &pixel_only).unwrap_err();
         assert!(err.contains("unconfigured"), "got: {err}");
-        assert!(err.contains(ENV_STRUCTURED), "names the missing backend: {err}");
-        assert!(err.contains(ENV_A11Y), "names both served-tier misses: {err}");
+        assert!(
+            err.contains(ENV_STRUCTURED),
+            "names the missing backend: {err}"
+        );
+        assert!(
+            err.contains(ENV_A11Y),
+            "names both served-tier misses: {err}"
+        );
 
         // A named request: a11y beats pixel; with only pixel configured it
         // falls through to the last resort.
@@ -882,8 +906,12 @@ mod tests {
         let dir = tmpdir("unconfigured");
         let mut c = ctx(&dir);
         let none = Backends::default();
-        let err = run_with(&json!({"action": "click", "x": 1.0, "y": 2.0}), &mut c, &none)
-            .unwrap_err();
+        let err = run_with(
+            &json!({"action": "click", "x": 1.0, "y": 2.0}),
+            &mut c,
+            &none,
+        )
+        .unwrap_err();
         assert!(err.contains("unconfigured"), "got: {err}");
         assert!(err.contains(ENV_PIXEL), "names the pixel backend: {err}");
         let err = run_with(&json!({"action": "screenshot"}), &mut c, &none).unwrap_err();
@@ -954,7 +982,11 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("actions[1]"), "got: {err}");
         // Empty / oversized batches are refused before any backend runs.
-        let empty = run_with(&json!({"action": "batch", "actions": []}), &mut c, &backends);
+        let empty = run_with(
+            &json!({"action": "batch", "actions": []}),
+            &mut c,
+            &backends,
+        );
         assert!(empty.unwrap_err().contains("empty"));
     }
 
@@ -1047,7 +1079,11 @@ mod tests {
         assert!(err.contains("exited with"), "got: {err}");
         assert!(err.contains("no display"), "stderr tail: {err}");
         // ok:false.
-        let refusing = fixed(&dir, "refuse.sh", r#"{"ok":false,"error":"permission denied"}"#);
+        let refusing = fixed(
+            &dir,
+            "refuse.sh",
+            r#"{"ok":false,"error":"permission denied"}"#,
+        );
         let backends = Backends {
             structured: None,
             a11y: None,
@@ -1095,9 +1131,14 @@ mod tests {
         .unwrap();
         assert_eq!(out["native"], json!({"x": 1280, "y": 800}));
         assert_eq!(out["pre"], "sha256:before");
-        let call: Value =
-            serde_json::from_str(std::fs::read_to_string(&log).unwrap().lines().next().unwrap())
-                .unwrap();
+        let call: Value = serde_json::from_str(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(call["x_native"], 1280);
         assert_eq!(call["y_native"], 800);
         assert_eq!(call["frame"]["sent_w"], 1280);
