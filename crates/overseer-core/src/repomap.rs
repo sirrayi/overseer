@@ -374,7 +374,7 @@ fn signature_line(root: &Path, path: &Path, line: usize, cap: usize) -> Option<S
 
 /// Narrow-retrieve helper (B1-6, llama-index parent-child): 5-line window
 /// around `line` with an expansion hint. The `symbol` tool shows the child;
-/// `read path:lo-hi` fetches the parent.
+/// `read` with `offset`/`limit` fetches the parent.
 pub fn window(root: &Path, path: &Path, line: usize, ctx_lines: usize) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let lines: Vec<&str> = text.lines().collect();

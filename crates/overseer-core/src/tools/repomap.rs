@@ -50,7 +50,7 @@ pub fn run_symbol(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         Err(e) => return e,
     };
     // B1-6 (llama-index parent-child): narrow-retrieve — the definition
-    // plus a 5-line window per site, with a `read path:lo-hi` hint to
+    // plus a 5-line window per site, with a `read` offset/limit hint to
     // expand. Whole-file dumps are the token-wasteful failure this kills.
     let base = crate::repomap::lookup(&ctx.cwd, name);
     let idx = crate::repomap::build(&ctx.cwd);
