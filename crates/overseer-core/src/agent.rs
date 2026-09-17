@@ -1578,12 +1578,8 @@ mod tests {
             ..AgentConfig::default()
         };
         let dest = dir.join("sub-view");
-        let got = crate::tools::task::filtered_memory_dir(
-            &mem,
-            cfg.memory_filter,
-            &dest,
-        )
-        .expect("filtered view materializes");
+        let got = crate::tools::task::filtered_memory_dir(&mem, cfg.memory_filter, &dest)
+            .expect("filtered view materializes");
         assert_eq!(got, dest);
         let idx = std::fs::read_to_string(dest.join("INDEX.md")).unwrap();
         assert!(idx.contains("diary.md"), "{idx}");
@@ -2211,7 +2207,10 @@ mod tests {
         agent.run_turn("go", &mut sink).unwrap();
         let raw = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
         assert!(!raw.contains("pw-real-9"), "events.jsonl leaked the real");
-        assert!(raw.contains(&sentinel), "events.jsonl must carry the sentinel");
+        assert!(
+            raw.contains(&sentinel),
+            "events.jsonl must carry the sentinel"
+        );
     }
 
     /// P6-4 accept: consent grants are audited at session start and stay
@@ -2239,13 +2238,8 @@ mod tests {
             vec!["repo".into()],
             None,
         );
-        let agent = Agent::start(
-            Arc::new(Mock::new(vec![])),
-            cfg,
-            dir.clone(),
-            "s".into(),
-        )
-        .unwrap();
+        let agent =
+            Agent::start(Arc::new(Mock::new(vec![])), cfg, dir.clone(), "s".into()).unwrap();
         drop(agent);
 
         let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
@@ -2266,14 +2260,26 @@ mod tests {
         assert_eq!(granted[0].1, ["repo".to_string(), "read".to_string()]);
         assert_eq!(granted[0].2, "alice");
         let raw = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
-        assert!(!raw.contains("ghp_real_grant_1"), "audit event leaked a real");
-        assert!(!raw.contains(&sentinel), "audit event must not carry sentinels");
+        assert!(
+            !raw.contains("ghp_real_grant_1"),
+            "audit event leaked a real"
+        );
+        assert!(
+            !raw.contains(&sentinel),
+            "audit event must not carry sentinels"
+        );
 
         // Audit-only: no message view entry, no context injection.
         let msgs = crate::event::rehydrate_messages(&events);
         let view = format!("{msgs:?}");
-        assert!(!view.contains("alice"), "grant leaked into the view: {view}");
-        assert!(!view.contains("consent"), "grant leaked into the view: {view}");
+        assert!(
+            !view.contains("alice"),
+            "grant leaked into the view: {view}"
+        );
+        assert!(
+            !view.contains("consent"),
+            "grant leaked into the view: {view}"
+        );
     }
 
     /// P6-5 accept, at the engine boundary: an unapproved persona dir is

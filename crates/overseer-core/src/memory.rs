@@ -103,22 +103,30 @@ pub fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (k, v) = line.split_once(':').ok_or_else(|| {
-            format!("memory: bad frontmatter line `{line}` — want `key: value`")
-        })?;
+        let (k, v) = line
+            .split_once(':')
+            .ok_or_else(|| format!("memory: bad frontmatter line `{line}` — want `key: value`"))?;
         let v = v.trim().trim_matches('"').trim();
         match k.trim() {
             "provenance" => meta.provenance = v.to_string(),
             "confidence" => {
-                meta.confidence = v.parse::<f64>().map_err(|_| {
-                    format!("memory: bad confidence `{v}` — want a number in 0..1")
-                })?
+                meta.confidence = v
+                    .parse::<f64>()
+                    .map_err(|_| format!("memory: bad confidence `{v}` — want a number in 0..1"))?
             }
             "valid_from" => {
-                meta.valid_from = if v.is_empty() { None } else { Some(v.to_string()) }
+                meta.valid_from = if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
             }
             "valid_to" => {
-                meta.valid_to = if v.is_empty() { None } else { Some(v.to_string()) }
+                meta.valid_to = if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
             }
             "sensitivity" => meta.sensitivity = Sensitivity::parse(v)?,
             // Unknown keys are ignored (forward-compatible headers).
@@ -226,7 +234,7 @@ fn valid_rfc3339(s: &str) -> bool {
             return false;
         }
         let tm = digits(b, &mut i, 2);
-        if th.map_or(true, |v| v > 23) || tm.map_or(true, |v| v > 59) {
+        if th.is_none_or(|v| v > 23) || tm.is_none_or(|v| v > 59) {
             return false;
         }
     } else {
@@ -239,7 +247,7 @@ fn valid_rfc3339(s: &str) -> bool {
         (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) => (y, mo, d, h, mi, s),
         _ => return false,
     };
-    if mo < 1 || mo > 12 || d < 1 || d > 31 {
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
         return false;
     }
     if h > 23 || mi > 59 || s > 60 {
@@ -786,13 +794,11 @@ mod tests {
         assert!(parse_meta("---\nconfidence: -0.1\n---\nbody\n").is_err());
         assert!(parse_meta("---\nconfidence: nan\n---\nbody\n").is_err());
         assert!(parse_meta("---\nconfidence: lots\n---\nbody\n").is_err());
-        assert!(
-            validate_meta(&EntryMeta {
-                confidence: f64::INFINITY,
-                ..EntryMeta::default()
-            })
-            .is_err()
-        );
+        assert!(validate_meta(&EntryMeta {
+            confidence: f64::INFINITY,
+            ..EntryMeta::default()
+        })
+        .is_err());
         // Boundary values pass.
         assert!(validate_meta(&EntryMeta {
             confidence: 0.0,
@@ -895,7 +901,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            &dir.join(INDEX_NAME),
+            dir.join(INDEX_NAME),
             "# Memory Index\n\ndiary.md — lunch notes\ntoken.md — api token\n",
         )
         .unwrap();
@@ -943,8 +949,7 @@ mod tests {
                 self.seen.lock().unwrap().push(t);
                 Ok(crate::provider::Response {
                     blocks: vec![crate::ir::Block::Text {
-                        text: "---INDEX---\n# Memory Index\n\nfacts.md — kept\n---INDEX---"
-                            .into(),
+                        text: "---INDEX---\n# Memory Index\n\nfacts.md — kept\n---INDEX---".into(),
                     }],
                     stop_reason: crate::provider::StopReason::EndTurn,
                     usage: crate::ir::Usage::default(),

@@ -191,11 +191,7 @@ pub fn sentinel_for(id: &str, real: &str) -> String {
     h.update(id.as_bytes());
     h.update(b":");
     h.update(real.as_bytes());
-    let hex: String = h
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
     format!("{SENTINEL_PREFIX}{}", &hex[..SENTINEL_HEX_LEN])
 }
 
@@ -293,7 +289,14 @@ impl Broker {
         for (k, v) in &payload.secrets {
             // Payload grammar v1 declares no hosts/scopes per secret — a
             // `grant` line carries the scope authority instead.
-            self.issue_capability(k.clone(), k.clone(), v.clone(), Vec::new(), Vec::new(), None);
+            self.issue_capability(
+                k.clone(),
+                k.clone(),
+                v.clone(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
         }
         for g in &payload.grants {
             self.grants.add(g.clone());
@@ -755,7 +758,10 @@ impl Keychain {
                     .replace("{account}", &self.account)
             })
             .collect();
-        std::process::Command::new(program).args(&args).output().ok()
+        std::process::Command::new(program)
+            .args(&args)
+            .output()
+            .ok()
     }
 
     /// Read the single entry.
@@ -864,7 +870,11 @@ pub fn resolve_store_with(
                     payload: env,
                     note: format!(
                         "stale keychain entry{} — using env",
-                        if cleared { " cleared" } else { " (delete failed)" }
+                        if cleared {
+                            " cleared"
+                        } else {
+                            " (delete failed)"
+                        }
                     ),
                 }
             }
@@ -1002,7 +1012,10 @@ pub fn scan(text: &str) -> Vec<Redaction> {
         let s = from + rel;
         if let Some(end_rel) = text[s..].find("-----END") {
             let tail = &text[s + end_rel..];
-            let line_end = tail.find('\n').map(|n| s + end_rel + n).unwrap_or(text.len());
+            let line_end = tail
+                .find('\n')
+                .map(|n| s + end_rel + n)
+                .unwrap_or(text.len());
             let e = (s + end_rel + "-----END".len()).max(line_end.min(text.len()));
             let e = e.min(text.len());
             push!(s, e.max(s + 10), "pem-block");
@@ -1054,7 +1067,11 @@ fn is_token_char(c: u8) -> bool {
 
 fn is_fp(frag: &str) -> bool {
     let u = frag.to_uppercase();
-    u.contains("EXAMPLE") || u.contains("TEST-ONLY") || u.contains("TEST_ONLY") || frag.contains("...") || u.contains("XXX")
+    u.contains("EXAMPLE")
+        || u.contains("TEST-ONLY")
+        || u.contains("TEST_ONLY")
+        || frag.contains("...")
+        || u.contains("XXX")
 }
 
 /// Shannon entropy (bits/char) over the fragment's bytes.
@@ -1101,7 +1118,11 @@ pub fn redact(text: &str) -> (String, String) {
         last = r.end;
     }
     out.push_str(&text[last..]);
-    let notice = format!("[overseer] redacted {} secret span(s): {}", spans.len(), fams.join(", "));
+    let notice = format!(
+        "[overseer] redacted {} secret span(s): {}",
+        spans.len(),
+        fams.join(", ")
+    );
     (out, notice)
 }
 
@@ -1164,35 +1185,29 @@ mod tests {
     #[test]
     fn scan_families_fp_and_entropy() {
         // Each curated family fires.
-        assert!(scan("key AKIAIOSFODNN7QWERTY12 here").iter().any(|r| r.family == "aws-key"));
+        assert!(scan("key AKIAIOSFODNN7QWERTY12 here")
+            .iter()
+            .any(|r| r.family == "aws-key"));
         // …except the FP allowlist suppresses EXAMPLE-bearing spans.
         assert!(scan("key AKIAIOSFODNN7EXAMPLE here").is_empty());
-        assert!(
-            scan("token ghp_abcdefgh12345678 here")
-                .iter()
-                .any(|r| r.family == "github-token")
-        );
-        assert!(
-            scan("token xoxb-123456789012-abcdefgh here")
-                .iter()
-                .any(|r| r.family == "slack-token")
-        );
-        assert!(
-            scan("key sk-live-abcdefgh12345678 here")
-                .iter()
-                .any(|r| r.family == "api-key")
-        );
+        assert!(scan("token ghp_abcdefgh12345678 here")
+            .iter()
+            .any(|r| r.family == "github-token"));
+        assert!(scan("token xoxb-123456789012-abcdefgh here")
+            .iter()
+            .any(|r| r.family == "slack-token"));
+        assert!(scan("key sk-live-abcdefgh12345678 here")
+            .iter()
+            .any(|r| r.family == "api-key"));
         assert!(
             scan("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----")
                 .iter()
                 .any(|r| r.family == "pem-block")
         );
         // High entropy ≥3.5 fires; low-entropy runs don't.
-        assert!(
-            scan("tok aB3dE5gH7jK9mN2pQ4rS6tU8vW here")
-                .iter()
-                .any(|r| r.family == "high-entropy")
-        );
+        assert!(scan("tok aB3dE5gH7jK9mN2pQ4rS6tU8vW here")
+            .iter()
+            .any(|r| r.family == "high-entropy"));
         assert!(scan("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_empty());
         assert!(scan("hello world, nothing secret here").is_empty());
         // FPfamilies: TEST-ONLY / xxx / ... suppress.
@@ -1509,10 +1524,18 @@ mod tests {
         assert_eq!(live.store, CredentialStore::Keychain);
         assert_eq!(live.payload.as_deref(), Some("API_TOKEN=k"));
         // Missing entry (backend ran, nothing stored) → env too.
-        let missing =
-            resolve_store_with(CredentialStore::Keychain, &kc, KeychainOutcome::Missing, env);
+        let missing = resolve_store_with(
+            CredentialStore::Keychain,
+            &kc,
+            KeychainOutcome::Missing,
+            env,
+        );
         assert_eq!(missing.store, CredentialStore::Env);
-        assert!(missing.note.contains("no keychain entry"), "{}", missing.note);
+        assert!(
+            missing.note.contains("no keychain entry"),
+            "{}",
+            missing.note
+        );
         // Single-entry contract: one service/account per backend.
         assert_eq!(kc.entry(), (KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT));
     }
@@ -1546,7 +1569,10 @@ mod tests {
             &["delete-generic-password", "{service}", "{account}"],
         );
         let outcome = kc.fetch();
-        assert_eq!(outcome, KeychainOutcome::Found("total garbage, not a payload".into()));
+        assert_eq!(
+            outcome,
+            KeychainOutcome::Found("total garbage, not a payload".into())
+        );
         assert!(!marker.exists());
         let r = resolve_store_with(
             CredentialStore::Auto,

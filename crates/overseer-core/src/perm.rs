@@ -187,7 +187,12 @@ const SENSITIVE_CONTENT: &[&str] = &["-----BEGIN", "PRIVATE KEY-----"];
 
 /// P6-5: persona file names — a `grep`/`glob` pattern naming one of these is
 /// a targeted read of the (possibly unapproved) persona dir.
-const PERSONA_MARKERS: &[&str] = &["identity.md", "relationships.md", "preferences.md", "SOUL.md"];
+const PERSONA_MARKERS: &[&str] = &[
+    "identity.md",
+    "relationships.md",
+    "preferences.md",
+    "SOUL.md",
+];
 
 // Rules are evaluated in order — deny, then ask, then allow — over
 // (tool × resource). First match inside each class wins; unmatched
@@ -1453,9 +1458,7 @@ mod tests {
         assert!(p.memory_gate_hit("memory/episodic/diary.md"));
         // Absolute paths hit the same gate (the containment helper keeps
         // the path anchor; a stripped root silently never matched).
-        assert!(p.memory_gate_hit(
-            &mem.join("episodic/diary.md").to_string_lossy().to_string()
-        ));
+        assert!(p.memory_gate_hit(mem.join("episodic/diary.md").to_string_lossy().as_ref()));
         let v = p.check(
             "write",
             &json!({"path": "memory/episodic/diary.md", "content": "x"}),
@@ -1568,10 +1571,7 @@ mod tests {
             p.check("grep", &json!({"pattern": "x", "path": "src"})),
             Verdict::Allow
         );
-        assert_eq!(
-            p.check("bash", &json!({"command": "ls"})),
-            Verdict::Allow
-        );
+        assert_eq!(p.check("bash", &json!({"command": "ls"})), Verdict::Allow);
     }
 
     /// P6-5 accept: approval flips the same calls to Allow, and no gate is
@@ -1582,10 +1582,7 @@ mod tests {
         let inside = persona.join("identity.md").to_string_lossy().to_string();
         assert_eq!(p.check("read", &json!({"path": inside})), Verdict::Allow);
         assert_eq!(
-            p.check(
-                "write",
-                &json!({"path": inside, "content": "x"})
-            ),
+            p.check("write", &json!({"path": inside, "content": "x"})),
             Verdict::Allow
         );
         assert_eq!(
@@ -1615,7 +1612,10 @@ mod tests {
             Verdict::Allow
         );
         assert!(matches!(
-            p.check("write", &json!({"path": "persona/identity.md", "content": "x"})),
+            p.check(
+                "write",
+                &json!({"path": "persona/identity.md", "content": "x"})
+            ),
             Verdict::Deny { .. }
         ));
         // Full access bypasses the gate (the environment is the sandbox).

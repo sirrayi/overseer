@@ -111,9 +111,7 @@ pub fn filtered_memory_dir(
         // Preserve non-pointer lines (headers, blanks) verbatim.
         let mut named: Option<String> = None;
         for tok in line.split_whitespace() {
-            let t = tok.trim_matches(|c| {
-                c == '`' || c == '"' || c == '\'' || c == ',' || c == ';'
-            });
+            let t = tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';');
             if t.ends_with(".md") && !t.contains('/') && !t.contains('\\') {
                 named = Some(t.to_string());
                 break;
@@ -140,11 +138,7 @@ pub fn filtered_memory_dir(
         };
         if crate::memory::admits(filter, tier) {
             kept_lines.push(line.to_string());
-            if let Some(rel) = src
-                .strip_prefix(parent_mem)
-                .ok()
-                .and_then(|r| r.parent())
-            {
+            if let Some(rel) = src.strip_prefix(parent_mem).ok().and_then(|r| r.parent()) {
                 std::fs::create_dir_all(dest.join(rel)).ok()?;
             }
             if let Ok(rel) = src.strip_prefix(parent_mem) {
@@ -296,11 +290,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     // P6-2 filtered view: the subagent's memory dir is a reduced copy —
     // Secret entries never reach the quarantined context. A copy failure
     // falls back to no memory view (never the full parent dir).
-    if let Some(parent_mem) = ctx
-        .agent_config
-        .as_ref()
-        .and_then(|c| c.memory_dir.clone())
-    {
+    if let Some(parent_mem) = ctx.agent_config.as_ref().and_then(|c| c.memory_dir.clone()) {
         let dest = subagents_dir.join(format!("{id}.filtered"));
         match filtered_memory_dir(&parent_mem, cfg.memory_filter, &dest) {
             Some(d) => cfg.memory_dir = Some(d),

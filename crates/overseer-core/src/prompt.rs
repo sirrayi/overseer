@@ -116,13 +116,7 @@ pub fn boundary_ok(segments: &[SystemSegment]) -> bool {
     }
     // Frozen static order (union value — identical on P6/P7).
     const ORDER: &[&str] = &[
-        "identity",
-        "contract",
-        "safety",
-        "memory",
-        "skills",
-        "persona",
-        "computer",
+        "identity", "contract", "safety", "memory", "skills", "persona", "computer",
     ];
     let mut last_rank: Option<usize> = None;
     for s in segments {
@@ -218,13 +212,7 @@ mod tests {
         assert!(boundary_ok(&segs));
         // Names ⊆ ORDER (union value, identical on P6/P7) + boundary holds.
         const ORDER: &[&str] = &[
-            "identity",
-            "contract",
-            "safety",
-            "memory",
-            "skills",
-            "persona",
-            "computer",
+            "identity", "contract", "safety", "memory", "skills", "persona", "computer",
         ];
         for s in segs.iter().filter(|s| s.cacheable) {
             assert!(
@@ -264,8 +252,10 @@ mod tests {
             1,
         )
         .unwrap();
-        let mut cfg = AgentConfig::default();
-        cfg.persona_dir = Some(persona.clone());
+        let cfg = AgentConfig {
+            persona_dir: Some(persona.clone()),
+            ..Default::default()
+        };
 
         let segs = assemble(&cfg);
         assert!(boundary_ok(&segs), "persona must respect the ORDER union");

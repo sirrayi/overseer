@@ -895,11 +895,7 @@ mod tests {
         let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
         let mut c = ctx(&dir);
         c.broker = Some(br);
-        let out = reg.call(
-            "read",
-            &serde_json::json!({"path": "secret.txt"}),
-            &mut c,
-        );
+        let out = reg.call("read", &serde_json::json!({"path": "secret.txt"}), &mut c);
         assert!(!out.is_error, "got: {}", out.text);
         assert!(!out.text.contains("pw-real-9"), "got: {}", out.text);
         assert!(out.text.contains(&sentinel), "got: {}", out.text);
