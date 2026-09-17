@@ -144,10 +144,17 @@ impl Gemini {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                let mut input = fc.get("args").cloned().unwrap_or(json!({}));
+                // P7-2 CU: per-step `safety_decision` rides alongside the
+                // functionCall — the gate maps require_approval→Ask,
+                // deny→Deny (fail-closed); absence means no safety hold.
+                if let Some(sd) = p.get("safety_decision").or_else(|| fc.get("safety_decision")) {
+                    input["safety_decision"] = sd.clone();
+                }
                 blocks.push(Block::ToolCall {
                     id: name.clone(), // pairing is by name on Gemini
                     name,
-                    input: fc.get("args").cloned().unwrap_or(json!({})),
+                    input,
                 });
                 continue;
             }
@@ -261,6 +268,21 @@ pub fn effort_to_budget(e: Effort) -> u32 {
     }
 }
 
+/// P7-2 CU safety gate: map a per-step `safety_decision` to a gate verdict
+/// (incl. absent) → None (existing rules decide). Pure + tested.
+pub fn safety_gate(input: &Value) -> Option<crate::perm::Verdict> {
+    let d = input.get("safety_decision").and_then(Value::as_str)?;
+    match d.to_ascii_lowercase().as_str() {
+        "require_approval" | "ask" | "approval_required" => Some(crate::perm::Verdict::Ask {
+            reason: "gemini computer-use: safety check requires approval".into(),
+        }),
+        "deny" | "block" | "blocked" => Some(crate::perm::Verdict::Deny {
+            reason: "gemini computer-use: safety check denied the action".into(),
+        }),
+        _ => None,
+    }
+}
+
 /// One IR message → one wire content (role user|model). Tool results
 /// join the SAME user content as functionResponse parts — Gemini wants
 /// them grouped per turn, not fanned out like OpenAI's `tool` role.
@@ -304,7 +326,13 @@ impl Provider for Gemini {
     fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
         let body = Self::build_body(req);
         let request_bytes = body.to_string().len() as u64;
-
+        // P7-2 fail-closed: a CU request without credentials never reaches
+        // the wire — honest error, never a silent skip.
+        if req.tools.iter().any(|t| t.name == "computer") && self.api_key.trim().is_empty() {
+            return Err(ProviderError::Transport(
+                "gemini computer-use: no API key — refusing to send CU request".into(),
+            ));
+        }
         let started = Instant::now();
         let mut resp = self
             .agent
@@ -518,5 +546,50 @@ mod tests {
         });
         let r = Gemini::parse_response(&body, 0, 0).unwrap();
         assert_eq!(r.stop_reason, StopReason::Refusal);
+    }
+
+    #[test]
+    fn function_call_with_safety_decision_routes_to_gate() {
+        // P7-2: per-step function_call + safety_decision → Ask/Deny.
+        let body = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [
+                    {"functionCall": {"name": "computer", "args": {"action": "click"}},
+                     "safety_decision": "require_approval"}
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 5}
+        });
+        let r = Gemini::parse_response(&body, 0, 0).unwrap();
+        let input = match &r.blocks[0] {
+            Block::ToolCall { input, .. } => input.clone(),
+            _ => panic!("expected ToolCall"),
+        };
+        assert_eq!(input["safety_decision"], "require_approval");
+        assert!(matches!(
+            safety_gate(&input),
+            Some(crate::perm::Verdict::Ask { .. })
+        ));
+        assert!(matches!(
+            safety_gate(&json!({"safety_decision": "deny"})),
+            Some(crate::perm::Verdict::Deny { .. })
+        ));
+        assert!(safety_gate(&json!({"action": "click"})).is_none());
+    }
+
+    #[test]
+    fn unconfigured_cu_request_errors_honestly() {
+        // P7-2 fail-closed: empty key + computer tool → Transport, no wire.
+        let g = Gemini::new("", "http://127.0.0.1:9/v1beta");
+        let tools = vec![ToolSpec {
+            name: "computer".into(),
+            description: "cu".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let msgs = vec![Message::user_text("hi")];
+        let system = vec![];
+        let err = g.complete(&sample_req(&system, &tools, &msgs)).unwrap_err();
+        assert!(matches!(err, ProviderError::Transport(_)));
     }
 }
