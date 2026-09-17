@@ -99,6 +99,12 @@ def mcnemar_exact(b01: int, b10: int) -> float:
 # ---------- record-level summaries ----------
 
 
+def _is_num(v) -> bool:
+    return (
+        isinstance(v, (int, float)) and not isinstance(v, bool) and v == v  # noqa: PLR0124 — NaN check
+    )
+
+
 def _is_trial(r: dict) -> bool:
     """Infra failures are not agent trials — excluded from n/c but counted."""
     return not r.get("infra_error")
@@ -109,8 +115,11 @@ def task_cells(records: list[dict]) -> dict[str, dict]:
     (non-infra) count toward n/c."""
     cells: dict[str, dict] = {}
     for r in records:
+        tid = r.get("task_id")
+        if not isinstance(tid, str) or not tid:
+            continue  # malformed store row — skip, never crash the report
         cell = cells.setdefault(
-            r["task_id"],
+            tid,
             {
                 "n": 0,
                 "c": 0,
@@ -133,7 +142,7 @@ def task_cells(records: list[dict]) -> dict[str, dict]:
             ("wall_s", "walls"),
         ):
             v = r.get(key)
-            if v is not None:
+            if _is_num(v):  # drop str/NaN junk
                 cell[field].append(v)
     return cells
 
@@ -155,15 +164,19 @@ def summarize(
     )
 
     eligible = [t for t in task_ids if cells[t]["n"] >= k]
-    trials = [r for r in records if _is_trial(r)]
-    costs = [r["cost_usd"] for r in trials if r.get("cost_usd") is not None]
-    steps = [r["steps"] for r in trials if r.get("steps") is not None]
-    tokens = [
-        r["tokens_in"] + (r.get("tokens_out") or 0)
-        for r in trials
-        if r.get("tokens_in") is not None
+    trials = [
+        r
+        for r in records
+        if _is_trial(r) and isinstance(r.get("task_id"), str) and r["task_id"]
     ]
-    walls = [r["wall_s"] for r in trials if r.get("wall_s") is not None]
+    costs = [r["cost_usd"] for r in trials if _is_num(r.get("cost_usd"))]
+    steps = [r["steps"] for r in trials if _is_num(r.get("steps"))]
+    tokens = [
+        r["tokens_in"] + (r.get("tokens_out") if _is_num(r.get("tokens_out")) else 0)
+        for r in trials
+        if _is_num(r.get("tokens_in"))
+    ]
+    walls = [r["wall_s"] for r in trials if _is_num(r.get("wall_s"))]
 
     out = {
         "tasks": len(task_ids),
