@@ -330,7 +330,28 @@ impl ToolRegistry {
         }
         match self.policy.gate(name, input) {
             crate::perm::Gate::Allow => {}
-            crate::perm::Gate::Deny(reason) => return ToolOutput::denied(reason),
+            crate::perm::Gate::Deny(reason) => {
+                // F2: memory-gate quarantine — a denied memory write still
+                // preserves its payload under memory/proposals/ for human
+                // review (Ask headless-denies; the content must not drop).
+                // Only fires when the reason names a quarantine redirect.
+                if (name == "write" || name == "edit") && reason.contains("quarantined to ") {
+                    if let Some(dest) = self.policy.proposal_path() {
+                        let payload = input
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| input.get("new_string").and_then(|v| v.as_str()))
+                            .unwrap_or("");
+                        if !payload.is_empty() {
+                            if let Some(parent) = dest.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = std::fs::write(&dest, payload);
+                        }
+                    }
+                }
+                return ToolOutput::denied(reason);
+            }
         }
         // B1-2 (Instructor/FastMCP): hand-rolled required/type check against
         // the advertised `input_schema` before dispatch. Zero-dep (serde_json
@@ -619,6 +640,44 @@ mod tests {
             sandbox: false,
             broker: None,
         }
+    }
+
+    #[test]
+    fn memory_gate_quarantine_preserves_payload() {
+        // F2: headless Ask→Deny on a memory write still lands the payload
+        // under memory/proposals/ for human review (nothing dropped).
+        use serde_json::json;
+        let dir = tmpdir();
+        let mem = dir.join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let mut pol = crate::perm::Policy::headless(dir.clone());
+        pol.memory_dir = Some(mem.clone());
+        pol.note_result("task", &json!({}), "some task digest");
+        pol.note_result("read", &json!({"path": ".env"}), "export KEY=1");
+        assert!(pol.taint_armed());
+        let mut reg = ToolRegistry::core(pol);
+        let mut c = ctx(&dir);
+        let out = reg.call(
+            "write",
+            &json!({"path": "memory/episodic/diary.md", "content": "UNTRUSTED-NOTE-42"}),
+            &mut c,
+        );
+        assert!(
+            out.denied,
+            "memory write must deny headless, got: {}",
+            out.text
+        );
+        let props = mem.join("proposals");
+        let found: Vec<_> = std::fs::read_dir(&props)
+            .expect("proposals dir must exist")
+            .flatten()
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one quarantined payload");
+        let body = std::fs::read_to_string(found[0].path()).unwrap();
+        assert!(
+            body.contains("UNTRUSTED-NOTE-42"),
+            "payload preserved, got: {body}"
+        );
     }
 
     #[test]

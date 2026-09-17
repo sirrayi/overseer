@@ -817,7 +817,7 @@ impl Policy {
             return None;
         }
         let dir = self.persona_dir.as_ref()?;
-        if !matches!(tool, "read" | "write" | "edit" | "glob" | "grep") {
+        if !matches!(tool, "read" | "write" | "edit" | "glob" | "grep" | "bash") {
             return None;
         }
         let deny = |how: &str| {
@@ -849,6 +849,18 @@ impl Policy {
         // directory, which contains the dir — fail closed.
         if matches!(tool, "glob" | "grep") && input.get("path").is_none() {
             return deny("a working-directory search traverses it");
+        }
+        // `bash` has no path field — match the command string against the
+        // dir path and persona file markers (same targeted-read rule).
+        if tool == "bash" {
+            if let Some(cmd) = input.get("command").and_then(Value::as_str) {
+                let literal = dir.to_string_lossy().to_string();
+                let named = PERSONA_MARKERS.iter().any(|m| cmd.contains(m));
+                if cmd.contains(&literal) || named {
+                    return deny("command targets it");
+                }
+            }
+            return None;
         }
         None
     }
@@ -1473,6 +1485,39 @@ mod tests {
         let dest = p.proposal_path().expect("proposal path");
         assert_eq!(dest.parent().unwrap().file_name().unwrap(), "proposals");
         assert!(dest.starts_with(&mem));
+    }
+
+    #[test]
+    fn draft_deny_covers_bash_commands() {
+        // F1: `bash cat persona/identity.md` is a targeted draft read.
+        let root = std::env::temp_dir().join(format!("overseer-draft-{}", uuid::Uuid::now_v7()));
+        let persona = root.join("persona");
+        std::fs::create_dir_all(&persona).unwrap();
+        let mut p = Policy::headless(root.clone());
+        p.persona_dir = Some(persona.clone());
+        p.persona_approved = false;
+        let v = p.check(
+            "bash",
+            &json!({"command": format!("cat {}/identity.md", persona.display())}),
+        );
+        assert!(
+            matches!(v, Verdict::Deny { .. }),
+            "bash draft read must deny, got {v:?}"
+        );
+        // Benign commands still pass.
+        assert_eq!(
+            p.check("bash", &json!({"command": "cargo test"})),
+            Verdict::Allow
+        );
+        // Approved dir re-opens.
+        p.persona_approved = true;
+        assert_eq!(
+            p.check(
+                "bash",
+                &json!({"command": format!("cat {}/identity.md", persona.display())}),
+            ),
+            Verdict::Allow
+        );
     }
 
     #[test]
