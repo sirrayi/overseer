@@ -772,9 +772,35 @@ impl Agent {
              List the 2 most likely defects and the single most useful next fix. \
              Keep it under 300 tokens, actionable and specific."
         );
-        let critique = match self.aux_call(&prompt) {
-            Ok(c) => {
-                let t: String = c.chars().take(1200).collect();
+        // D2: small tier DIRECTLY — never aux_call (which escalates to the
+        // main model on small-tier failure/empty, bypassing ledger). A
+        // failed/empty small critique fail-softs to no-critique; the verify
+        // Nudge remains. Zero main-model spend, by construction.
+        let small = self.config.small_model.clone().expect("checked above");
+        let msgs = [Message::user_text(prompt)];
+        let req = Request {
+            model: &small,
+            system: &[],
+            tools: &[],
+            messages: &msgs,
+            max_tokens: 1_024,
+            thinking_budget: None,
+            effort: Some(crate::provider::Effort::Min),
+            cache_breakpoints: false,
+        };
+        let critique = match self.provider.complete(&req) {
+            Ok(r) => {
+                let t: String = r
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+                    .chars()
+                    .take(1200)
+                    .collect();
                 if t.trim().is_empty() {
                     return Ok(());
                 }
@@ -793,29 +819,29 @@ impl Agent {
 
     /// Prune older `[reflection]`-tagged user messages, keeping the last 1.
     /// Live-view half of the B1-7 dual eviction (rehydrate mirrors it).
-    /// Superseded critiques are blanked in place (indices stable).
-    fn prune_reflections(messages: &mut [Message]) {
+    /// Superseded critiques are DRAINED (removed), not blanked — after two
+    /// verify blocks the live message list holds exactly 1 tagged critique,
+    /// byte-identical to what rehydrate replays. Nudges carry no
+    /// tool_use/tool_result blocks, so provider pairing is unaffected.
+    fn prune_reflections(messages: &mut Vec<Message>) {
         use crate::ir::Block;
-        let mut seen_last = false;
-        for m in messages.iter_mut().rev() {
-            let is_ref = m.content.iter().any(|b| match b {
+        let last = messages.iter().rposition(|m| {
+            m.content.iter().any(|b| match b {
                 Block::Text { text } => text.starts_with(Self::REFLECTION_TAG),
                 _ => false,
+            })
+        });
+        if let Some(keep) = last {
+            let mut idx = 0;
+            messages.retain(|m| {
+                let is_ref = m.content.iter().any(|b| match b {
+                    Block::Text { text } => text.starts_with(Self::REFLECTION_TAG),
+                    _ => false,
+                });
+                let cur = idx;
+                idx += 1;
+                !is_ref || cur == keep
             });
-            if !is_ref {
-                continue;
-            }
-            if !seen_last {
-                seen_last = true;
-            } else {
-                for b in m.content.iter_mut() {
-                    if let Block::Text { text } = b {
-                        if text.starts_with(Self::REFLECTION_TAG) {
-                            *text = format!("{} (superseded)", Self::REFLECTION_TAG);
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -1532,12 +1558,55 @@ mod tests {
         let live_refs = agent3
             .messages()
             .iter()
-            .filter(|m| {
-                let t = m.text();
-                t.starts_with(Agent::REFLECTION_TAG) && !t.contains("(superseded)")
-            })
+            .filter(|m| m.text().starts_with(Agent::REFLECTION_TAG))
             .count();
         assert_eq!(live_refs, 1, "live view keeps last-1 reflection");
+        // D3: live == rehydrate byte-for-byte on the tagged stream — no
+        // superseded stubs linger in either view.
+        let live_texts: Vec<String> = agent3.messages().iter().map(|m| m.text()).collect();
+        let re_texts: Vec<String> = re.iter().map(|m| m.text()).collect();
+        let live_tagged: Vec<&str> = live_texts
+            .iter()
+            .filter(|t| t.starts_with(Agent::REFLECTION_TAG))
+            .map(|s| s.as_str())
+            .collect();
+        let re_tagged: Vec<&str> = re_texts
+            .iter()
+            .filter(|t| t.starts_with(Agent::REFLECTION_TAG))
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            live_tagged, re_tagged,
+            "live and rehydrate tagged streams must match exactly"
+        );
+
+        // D2: small-tier failure → no critique AND no main-model call.
+        // (aux_call would escalate; reflect() must not.)
+        let dir5 = tmpdir();
+        let cfg5 = AgentConfig {
+            cwd: dir5.clone(),
+            full_access: true,
+            verify_cmd: Some("false".into()),
+            verify_block_cap: 2,
+            small_model: Some("tiny-1".into()),
+            ..AgentConfig::default()
+        };
+        // tiny-1 always fails; main model would serve done() if called.
+        let provider5 = Arc::new(Mock::failing_on(&["tiny-1"], vec![done()]));
+        let mut agent5 = Agent::start(provider5.clone(), cfg5, dir5.clone(), "s".into()).unwrap();
+        let mut sink5 = |_: &Event| {};
+        let _ = agent5.run_turn("finish fast", &mut sink5).unwrap();
+        let models5 = provider5.seen_models.lock().unwrap();
+        let main_calls = models5.iter().filter(|m| *m == "claude-sonnet-5").count();
+        assert_eq!(
+            main_calls, 2,
+            "loop turns only (2 blocks); reflect must add zero main-model calls, saw: {models5:?}"
+        );
+        let events5 = EventLog::replay(dir5.join("events.jsonl")).unwrap();
+        assert!(
+            !events5.iter().any(|e| matches!(&e.kind, EventKind::Nudge { text } if text.starts_with(Agent::REFLECTION_TAG))),
+            "failed small critique → no reflection Nudge"
+        );
 
         // B1-7: --reflect=off disables critiques entirely.
         let dir4 = tmpdir();

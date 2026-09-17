@@ -178,11 +178,15 @@ fn rg_json(
     }
     cmd.arg("-e").arg(pattern).arg(base);
     let out = cmd.output().ok()?;
-    if !out.status.success() && out.stdout.is_empty() {
-        // rg exits 1 on no-match — but then stdout carries no events.
-        // An empty stdout with failure = no matches (valid empty result).
-        // A missing binary never reaches here (which_rg failed first).
-        return Some(Vec::new());
+    match out.status.code() {
+        // rg exit 1 = clean no-match (summary-only stdout, zero match
+        // events) → valid empty result, parsed below.
+        // rg exit 2 = hard error (bad regex, unreadable path): return None
+        // so the caller falls back to the embedded scanner, which reports
+        // the honest `does not exist` / `Invalid regex` error. Swallowing
+        // exit 2 as "no matches" would lie about hard failures.
+        Some(2..) | None => return None,
+        _ => {}
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut lines = Vec::new();
@@ -298,6 +302,22 @@ mod tests {
         }
         assert!(!out.is_error);
         assert!(out.text.contains("needle"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn rg_hard_error_falls_back_to_honest_error() {
+        // D1: rg exit 2 (bad regex) → embedded fallback error, not "No matches".
+        // (Runs only when rg is installed; otherwise the fallback runs anyway.)
+        let dir = tmpdir();
+        seed(&dir);
+        let mut c = ctx(&dir);
+        let out = run(&serde_json::json!({"pattern": "["}), &mut c);
+        assert!(out.is_error, "bad regex must error, got: {}", out.text);
+        assert!(
+            out.text.contains("Invalid regex"),
+            "honest regex error, got: {}",
+            out.text
+        );
     }
 
     #[test]

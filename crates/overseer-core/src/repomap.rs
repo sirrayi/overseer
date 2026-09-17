@@ -391,7 +391,11 @@ pub fn window(root: &Path, path: &Path, line: usize, ctx_lines: usize) -> Option
             out.push_str(&format!("{n:>6}\t{l}\n"));
         }
     }
-    out.push_str(&format!("[`read {}:{lo}-{hi}` to expand]", rel.display()));
+    out.push_str(&format!(
+        "[`read` {rel} with offset={lo} limit={} to expand]",
+        hi - lo + 1,
+        rel = rel.display()
+    ));
     Some(out)
 }
 

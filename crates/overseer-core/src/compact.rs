@@ -144,15 +144,11 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
     }
     if !modified.is_empty() {
         out.push_str("\n## Files modified\n");
-        for p in modified.iter().take(MAX_LISTED_FILES) {
-            out.push_str(&format!("- {p}\n"));
-        }
+        out.push_str(&file_list_block(&modified));
     }
     if !read_only.is_empty() {
         out.push_str("\n## Files read\n");
-        for p in read_only.iter().take(MAX_LISTED_FILES) {
-            out.push_str(&format!("- {p}\n"));
-        }
+        out.push_str(&file_list_block(&read_only));
     }
     if !notes.is_empty() {
         out.push_str("\n## Recent assistant notes (verbatim)\n");
@@ -172,6 +168,34 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
         ));
     }
     out
+}
+
+/// Render a file list for the compaction summary (B1-3 TOON path).
+/// Bullet list below 10 entries (header overhead would not pay); TOON
+/// single-column table at 10+ (header once + rows, ~40% byte cut).
+fn file_list_block(files: &[String]) -> String {
+    let listed: Vec<&String> = files.iter().take(MAX_LISTED_FILES).collect();
+    if listed.len() < 10 {
+        let mut out = String::new();
+        for p in listed {
+            out.push_str(&format!("- {p}\n"));
+        }
+        return out;
+    }
+    let rows: Vec<serde_json::Value> = listed
+        .iter()
+        .map(|p| serde_json::json!({"path": p}))
+        .collect();
+    match crate::toon::encode_table(&rows) {
+        Some(t) => t,
+        None => {
+            let mut out = String::new();
+            for p in listed {
+                out.push_str(&format!("- {p}\n"));
+            }
+            out
+        }
+    }
 }
 
 fn truncate(s: &str, cap: usize) -> String {
@@ -324,6 +348,21 @@ mod tests {
         assert!(s.contains("editing parser now"));
         // Events >= tail_from are not folded into the summary.
         assert!(!s.contains("/f/6.txt"));
+    }
+
+    #[test]
+    fn file_list_block_toon_threshold() {
+        // B1-3: <10 files → bullets; >=10 → TOON table with every path.
+        let few: Vec<String> = (0..3).map(|i| format!("src/a{i}.rs")).collect();
+        let b = file_list_block(&few);
+        assert!(b.contains("- src/a0.rs"), "bullets below threshold");
+        assert!(!b.contains("TOON"), "no table below threshold");
+        let many: Vec<String> = (0..12).map(|i| format!("src/a{i}.rs")).collect();
+        let t = file_list_block(&many);
+        assert!(t.contains("TOON"), "table at threshold, got:\n{t}");
+        for i in 0..12 {
+            assert!(t.contains(&format!("src/a{i}.rs")), "path {i} survives");
+        }
     }
 
     #[test]
