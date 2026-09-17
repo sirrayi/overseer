@@ -332,6 +332,10 @@ pub struct Policy {
     rules_path: Option<PathBuf>,
     /// Rule-of-Two latches (P3.10) — interior-mutable like session_allow.
     taint: Mutex<Taint>,
+    /// Memory root for the P6-2 untrusted write-gate: untrusted-sourced
+    /// writes (taint armed) landing under this dir are Ask-gated and
+    /// redirected to `memory/proposals/<ts>.md`. None = gate off.
+    pub memory_dir: Option<PathBuf>,
 }
 
 impl Policy {
@@ -347,6 +351,7 @@ impl Policy {
             rules_path: None,
             autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
+            memory_dir: None,
         }
     }
 
@@ -361,6 +366,7 @@ impl Policy {
             rules_path: None,
             autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
+            memory_dir: None,
         }
     }
 
@@ -376,6 +382,7 @@ impl Policy {
             rules_path: None,
             autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
+            memory_dir: None,
         }
     }
 
@@ -606,15 +613,33 @@ impl Policy {
                 } else {
                     self.root.join(p)
                 };
-                let canon = resolved
-                    .parent()
-                    .and_then(|d| d.canonicalize().ok())
-                    .map(|d| d.join(resolved.file_name().unwrap_or_default()))
-                    .unwrap_or_else(|| resolved.clone());
-                let root = self
-                    .root
-                    .canonicalize()
-                    .unwrap_or_else(|_| self.root.clone());
+                // Canonicalize the longest existing ancestor + re-append
+                // the remainder (same helper as the memory gate): parent
+                // dirs that don't exist yet can't canonicalize, and the
+                // raw TMPDIR path vs the /private symlink would compare
+                // unequal without it.
+                fn canon_deep(p: &Path) -> PathBuf {
+                    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+                    let mut cur = p.to_path_buf();
+                    loop {
+                        if let Ok(c) = cur.canonicalize() {
+                            let mut out = c;
+                            for comp in missing.iter().rev() {
+                                out.push(comp);
+                            }
+                            return out;
+                        }
+                        match cur.file_name() {
+                            Some(name) => {
+                                missing.push(name.to_os_string());
+                                cur.pop();
+                            }
+                            None => return p.to_path_buf(),
+                        }
+                    }
+                }
+                let canon = canon_deep(&resolved);
+                let root = canon_deep(&self.root);
                 if canon.starts_with(&root) {
                     None
                 } else {
@@ -676,6 +701,24 @@ impl Policy {
             // hard_deny above (deny wins). Remaining: the Rule-of-Two
             // taint Ask, else Allow.
             "write" | "edit" => {
+                // P6-2 memory gate: untrusted-sourced writes into the
+                // memory dir quarantine to proposals/ for human review
+                // (Ask; headless denies). Runs before the generic
+                // Rule-of-Two Ask so the redirect path is named.
+                if let Some(p) = input.get("path").and_then(Value::as_str) {
+                    if self.memory_gate_hit(p) {
+                        let dest = self
+                            .proposal_path()
+                            .map(|d| d.display().to_string())
+                            .unwrap_or_else(|| "memory/proposals/".into());
+                        return Verdict::Ask {
+                            reason: format!(
+                                "{tool}: untrusted content in context — memory write \
+                                 quarantined to {dest}; needs human confirmation"
+                            ),
+                        };
+                    }
+                }
                 // Rule-of-Two latch (P3.10): contained writes are
                 // still an exfil/exfil-prep channel when both
                 // untrusted content and secrets are in context.
@@ -731,6 +774,96 @@ impl Policy {
             },
         }
     }
+}
+
+impl Policy {
+    /// P6-2 untrusted memory write-gate: true when the taint triangle is
+    /// armed AND `path` resolves under `memory_dir`. Read-class tools are
+    /// never gated (reads under memory stay Ask-free).
+    pub fn memory_gate_hit(&self, path: &str) -> bool {
+        if !self.taint_armed() {
+            return false;
+        }
+        let Some(mem) = &self.memory_dir else {
+            return false;
+        };
+        under_dir(&self.root, mem, path)
+    }
+
+    /// Quarantine redirect for a gated memory write: `proposals/<ts>.md`
+    /// under the memory dir. The proposal preserves the content for human
+    /// review instead of dropping it.
+    pub fn proposal_path(&self) -> Option<PathBuf> {
+        let mem = self.memory_dir.as_ref()?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        Some(mem.join("proposals").join(format!("{ts}.md")))
+    }
+}
+
+/// True when `path` (absolute or root-relative) resolves under `mem`
+/// (itself root-relative-or-absolute). Pure path-prefix check on
+/// normalized components — `..` escapes fail closed (return false).
+/// Both roots canonicalize when they exist; missing dirs compare lexically.
+fn under_dir(root: &Path, mem: &Path, path: &str) -> bool {
+    fn norm(base: &Path, p: &str) -> Option<PathBuf> {
+        let mut out = if Path::new(p).is_absolute() {
+            PathBuf::new()
+        } else {
+            base.to_path_buf()
+        };
+        for c in Path::new(p).components() {
+            use std::path::Component;
+            match c {
+                Component::RootDir | Component::Prefix(_) => {}
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !out.pop() {
+                        return None;
+                    }
+                }
+                Component::Normal(s) => out.push(s),
+            }
+        }
+        Some(out)
+    }
+    fn canon(p: &Path) -> PathBuf {
+        // Canonicalize the longest existing ancestor, then re-append the
+        // remainder lexically: existing and not-yet-created paths under
+        // the same tree compare equal even across symlinked tmp dirs.
+        let mut missing: Vec<std::ffi::OsString> = Vec::new();
+        let mut cur = p.to_path_buf();
+        loop {
+            if let Ok(c) = cur.canonicalize() {
+                let mut out = c;
+                for comp in missing.iter().rev() {
+                    out.push(comp);
+                }
+                return out;
+            }
+            match cur.file_name() {
+                Some(name) => {
+                    missing.push(name.to_os_string());
+                    cur.pop();
+                }
+                None => return p.to_path_buf(),
+            }
+        }
+    }
+    let (norm_target, norm_mem) = match (norm(root, path), {
+        let m = if mem.is_absolute() {
+            mem.to_path_buf()
+        } else {
+            root.join(mem)
+        };
+        Some(m)
+    }) {
+        (Some(t), Some(m)) => (canon(&t), canon(&m)),
+        _ => return false,
+    };
+    norm_target.starts_with(&norm_mem)
 }
 
 /// Glob match over a command string: `*` = any run of characters,
@@ -1228,5 +1361,65 @@ mod tests {
         assert!(p.note_result("task", &json!({}), "digest").is_some());
         // Second task result: latch already set, no new notice.
         assert!(p.note_result("task", &json!({}), "more").is_none());
+    }
+
+    #[test]
+    fn memory_gate_armed_asks_with_proposal() {
+        // P6-2 accept (armed→Ask+proposal file): taint armed + write
+        // under memory_dir → Ask naming the quarantine redirect.
+        let root = std::env::temp_dir().join(format!("overseer-memgate-{}", uuid::Uuid::now_v7()));
+        let mem = root.join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let mut p = Policy::headless(root.clone());
+        p.memory_dir = Some(mem.clone());
+        // Arm both latches.
+        p.note_result("task", &json!({}), "some task digest");
+        p.note_result("read", &json!({"path": ".env"}), "export KEY=1");
+        assert!(p.taint_armed());
+        assert!(p.memory_gate_hit("memory/episodic/diary.md"));
+        let v = p.check(
+            "write",
+            &json!({"path": "memory/episodic/diary.md", "content": "x"}),
+        );
+        match v {
+            Verdict::Ask { reason } => assert!(
+                reason.contains("quarantined"),
+                "Ask must name the redirect: {reason}"
+            ),
+            other => panic!("expected Ask, got {other:?}"),
+        }
+        let dest = p.proposal_path().expect("proposal path");
+        assert_eq!(dest.parent().unwrap().file_name().unwrap(), "proposals");
+        assert!(dest.starts_with(&mem));
+    }
+
+    #[test]
+    fn memory_gate_clean_allows_and_reads_free() {
+        // P6-2 accept (clean→Allow): same write with no taint passes,
+        // and reads under memory never trip the gate.
+        let root = std::env::temp_dir().join(format!("overseer-memgate-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        let mut p = Policy::headless(root.clone());
+        p.memory_dir = Some(root.join("memory"));
+        assert!(!p.taint_armed());
+        assert!(!p.memory_gate_hit("memory/episodic/diary.md"));
+        assert_eq!(
+            p.check(
+                "write",
+                &json!({"path": "memory/episodic/diary.md", "content": "x"}),
+            ),
+            Verdict::Allow
+        );
+        // Armed but outside memory → generic taint Ask, not the gate.
+        p.note_result("task", &json!({}), "digest");
+        p.note_result("read", &json!({"path": ".env"}), "KEY=1");
+        assert!(!p.memory_gate_hit("src/main.rs"));
+        // Reads under memory stay free even when armed (read-class).
+        assert_eq!(
+            p.check("read", &json!({"path": "memory/INDEX.md"})),
+            Verdict::Allow
+        );
+        // `..` escape out of memory is not a gate hit (fails closed).
+        assert!(!p.memory_gate_hit("memory/../outside.md"));
     }
 }

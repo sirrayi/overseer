@@ -53,6 +53,10 @@ pub struct AgentConfig {
     /// the end of the static prompt region each turn. None = memory off.
     /// Must sit under `cwd` for the permission gate to allow writes.
     pub memory_dir: Option<PathBuf>,
+    /// P6-2 sensitivity ceiling for the quarantined subagent memory view:
+    /// `task` subagents see only entries at or below this tier (Secret
+    /// hidden by default). The parent always sees the full index.
+    pub memory_filter: crate::memory::Sensitivity,
     /// P1.2 stale tool-result clearing: this many most-recent ToolResult
     /// blocks stay verbatim; older ones render as a placeholder in the view
     /// (events untouched). 0 disables clearing.
@@ -119,6 +123,7 @@ impl Default for AgentConfig {
             auto_compact: true,
             compact_at: None,
             memory_dir: None,
+            memory_filter: crate::memory::Sensitivity::Personal,
             keep_tool_results: 5,
             verify_cmd: None,
             verify_block_cap: 8,
@@ -730,8 +735,14 @@ impl Agent {
             self.log.flush()?;
             // Git-version memory at the durable-tail point (playbook: free
             // history/diff/rollback). Engine-made commit, best-effort.
-            if let Some(dir) = &self.config.memory_dir {
+            // P6-2 audit: a dirty worktree at the boundary emits a
+            // log-only MemoryUpdated event (never injected into context).
+            if let Some(dir) = &self.config.memory_dir.clone() {
                 crate::memory::commit(dir, &format!("turn {steps}"));
+                let files = crate::memory::dirty_files(dir);
+                if !files.is_empty() {
+                    self.emit(EventKind::MemoryUpdated { files }, on_event)?;
+                }
             }
         }
     }
@@ -1027,6 +1038,7 @@ impl Agent {
             let mut p = crate::perm::Policy::preset(config.policy_preset, config.cwd.clone());
             p.ask_handler = config.ask_handler.clone();
             p.autonomy = config.autonomy.clone();
+            p.memory_dir = config.memory_dir.clone();
             if let Some(path) = &config.rules_path {
                 p.load_rules(path.clone());
             }
@@ -1465,6 +1477,134 @@ mod tests {
         let ro = crate::tools::ToolRegistry::readonly(crate::perm::Policy::allow_all());
         let names: Vec<&str> = ro.specs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["read", "grep", "glob"]);
+    }
+
+    /// P6-2 accept (Secret hidden from subagent view): parent memory with
+    /// a Secret topic → the spawned subagent's filtered dir keeps the
+    /// Personal pointer and drops the Secret one (body and bytes).
+    #[test]
+    fn subagent_memory_view_hides_secret() {
+        let dir = tmpdir();
+        let mem = dir.join("memory");
+        crate::memory::ensure(&mem).unwrap();
+        std::fs::write(
+            mem.join("episodic").join("diary.md"),
+            "---\nsensitivity: personal\n---\nhad lunch\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem.join("semantic").join("token.md"),
+            "---\nsensitivity: secret\n---\nsk-live-abc\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem.join("INDEX.md"),
+            "# Memory Index\n\ndiary.md — lunch notes\ntoken.md — api token\n",
+        )
+        .unwrap();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            memory_dir: Some(mem.clone()),
+            ..AgentConfig::default()
+        };
+        let dest = dir.join("sub-view");
+        let got = crate::tools::task::filtered_memory_dir(
+            &mem,
+            cfg.memory_filter,
+            &dest,
+        )
+        .expect("filtered view materializes");
+        assert_eq!(got, dest);
+        let idx = std::fs::read_to_string(dest.join("INDEX.md")).unwrap();
+        assert!(idx.contains("diary.md"), "{idx}");
+        assert!(!idx.contains("token.md"), "{idx}");
+        assert!(dest.join("episodic").join("diary.md").exists());
+        assert!(!dest.join("semantic").join("token.md").exists());
+        // Default ceiling is Personal.
+        assert_eq!(cfg.memory_filter, crate::memory::Sensitivity::Personal);
+    }
+
+    /// P6-2 accept (consolidate no rewrite-smaller): a consolidation that
+    /// drops a stale pointer leaves topic bodies byte-identical — only
+    /// INDEX.md is rewritten.
+    #[test]
+    fn consolidate_never_rewrites_topic_bodies() {
+        let dir = tmpdir();
+        let mem = dir.join("memory");
+        crate::memory::ensure(&mem).unwrap();
+        let topic = mem.join("episodic").join("diary.md");
+        std::fs::write(&topic, "---\nsensitivity: personal\n---\nhad lunch\n").unwrap();
+        std::fs::write(
+            mem.join("INDEX.md"),
+            "# Memory Index\n\ndiary.md — lunch\ndupe.md — stale\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&topic).unwrap();
+        struct Fixed {
+            reply: String,
+        }
+        impl crate::provider::Provider for Fixed {
+            fn complete(
+                &self,
+                _: &crate::provider::Request,
+            ) -> Result<crate::provider::Response, crate::provider::ProviderError> {
+                Ok(crate::provider::Response {
+                    blocks: vec![Block::Text {
+                        text: self.reply.clone(),
+                    }],
+                    stop_reason: crate::provider::StopReason::EndTurn,
+                    usage: crate::ir::Usage::default(),
+                    request_bytes: 0,
+                    latency_ms: 0,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "fixed"
+            }
+        }
+        let p = Fixed {
+            reply: "---INDEX---\n# Memory Index\n\ndiary.md — lunch\n---INDEX---".into(),
+        };
+        crate::memory::consolidate(&p, "tiny", &mem).unwrap();
+        assert_eq!(std::fs::read(&topic).unwrap(), before);
+        let new_idx = std::fs::read_to_string(mem.join("INDEX.md")).unwrap();
+        assert!(!new_idx.contains("dupe.md"));
+    }
+
+    /// P6-2 accept (dirty→event, clean→none): `dirty_files` reports the
+    /// post-commit residue and is empty on a clean tree.
+    #[test]
+    fn memory_audit_dirty_and_clean() {
+        let dir = tmpdir();
+        let mem = dir.join("memory");
+        crate::memory::ensure(&mem).unwrap();
+        crate::memory::commit(&mem, "seed");
+        // Clean tree → no files.
+        assert!(crate::memory::dirty_files(&mem).is_empty());
+        // New file → porcelain names it. (Committed at the boundary in
+        // run_turn; here we observe the pre-commit residue directly.)
+        std::fs::write(mem.join("episodic").join("note.md"), "hi\n").unwrap();
+        let dirty = crate::memory::dirty_files(&mem);
+        assert!(
+            dirty.iter().any(|f| f.contains("note.md")),
+            "dirty files: {dirty:?}"
+        );
+        // The event round-trips through the log (audit-only shape).
+        let log_path = dir.join("audit.jsonl");
+        let mut log = EventLog::create(&log_path).unwrap();
+        log.append(EventKind::MemoryUpdated {
+            files: dirty.clone(),
+        })
+        .unwrap();
+        log.flush().unwrap();
+        let events = EventLog::replay(&log_path).unwrap();
+        assert!(matches!(
+            &events[0].kind,
+            EventKind::MemoryUpdated { files } if files == &dirty
+        ));
+        // Audit-only: never rehydrates into messages.
+        assert!(crate::event::rehydrate_messages(&events).is_empty());
     }
 
     /// P1.10 verification gate: a failing DoD check blocks the finish and

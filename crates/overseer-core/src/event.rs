@@ -107,6 +107,10 @@ pub enum EventKind {
         summary: String,
         tail_from: u64,
     },
+    /// Memory changed on disk at a turn boundary (P6-2 audit signal):
+    /// dirty git status in the memory dir after the engine commit.
+    /// Audit-only — never rehydrates into messages, never injected.
+    MemoryUpdated { files: Vec<String> },
     Error {
         message: String,
     },
