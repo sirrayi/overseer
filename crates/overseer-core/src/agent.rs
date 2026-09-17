@@ -86,11 +86,63 @@ pub struct AgentConfig {
     /// defaults (internal: existing rules decide; external/money/identity:
     /// approval). Merged into the Policy at agent start.
     pub autonomy: std::collections::HashMap<String, crate::perm::Autonomy>,
+    /// P7-1 computer-use containment (appended at struct end; Default at end).
+    /// `takeover_pause`: credential-field focus or watch-mode suppresses
+    /// pixel capture (metadata-only obs). `watch_mode`: treat every capture
+    /// as takeover-suppressed. `egress_deny`: block networked sends from
+    /// computer-driven turns (defense alongside the no-creds invariant —
+    /// child envs never carry `*_KEY`/`*_TOKEN` secrets).
+    pub computer: ComputerConfig,
     /// B1-7 Reflexion hook (Reflexion post-episode pattern): on a verify
     /// block, ask the aux tier for a ≤300-token self-critique appended as a
     /// `[reflection]`-tagged Nudge. `Off` disables; `Reflexion` reflects on
     /// verify blocks only (never on success). Default: Reflexion.
     pub reflect: ReflectMode,
+}
+
+/// P7-1 computer-use containment flags. All default off except
+/// `takeover_pause` (fail-closed: a cred-field capture suppresses pixels
+/// unless explicitly disabled).
+#[derive(Debug, Clone)]
+pub struct ComputerConfig {
+    /// Suppress pixel capture on credential-field focus (metadata-only obs).
+    pub takeover_pause: bool,
+    /// Treat every capture as takeover-suppressed (metadata-only obs).
+    pub watch_mode: bool,
+    /// Deny networked sends from computer-driven turns.
+    pub egress_deny: bool,
+}
+
+impl Default for ComputerConfig {
+    fn default() -> Self {
+        ComputerConfig {
+            takeover_pause: true,
+            watch_mode: false,
+            egress_deny: false,
+        }
+    }
+}
+
+impl ComputerConfig {
+    /// P7-1 containment: child envs never carry secrets. `computer`-driven
+    /// turns (and untrusted-originated spawns) strip `*_KEY`/`*_TOKEN`
+    /// plus the known provider-key names — the no-creds invariant.
+    /// Pure predicate over one env key (the bash spawn filters on it).
+    pub fn env_allowed(key: &str) -> bool {
+        let upper = key.to_ascii_uppercase();
+        if upper.ends_with("_KEY") || upper.ends_with("_TOKEN") {
+            return false;
+        }
+        !matches!(
+            upper.as_str(),
+            "ANTHROPIC_API_KEY"
+                | "OPENAI_API_KEY"
+                | "GOOGLE_API_KEY"
+                | "GEMINI_API_KEY"
+                | "OVERSEER_API_KEY"
+                | "LEK_API_KEY"
+        )
+    }
 }
 
 /// B1-7: when the Reflexion hook fires.
@@ -127,6 +179,7 @@ impl Default for AgentConfig {
             rules_path: None,
             disabled_tools: Vec::new(),
             autonomy: Default::default(),
+            computer: ComputerConfig::default(),
             reflect: ReflectMode::Reflexion,
         }
     }
@@ -247,15 +300,18 @@ impl Agent {
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
         }
-        let cwd = agent.config.cwd.display().to_string();
-        agent.log.append(EventKind::SessionStart {
-            session_id: session_id.clone(),
-            cwd,
-            model: agent.config.model.clone(),
-            harness_version: env!("CARGO_PKG_VERSION").to_string(),
-            parent: None,
-        })?;
-        agent.log.flush()?;
+        // P7-4 messaging env-arm (disjoint from P6 fields): an untrusted-
+        // originated spawn exports OVERSEER_UNTRUSTED_SOURCE=channel:<sender>;
+        // `start` pre-arms taint.untrusted and emits an auditable Tainted
+        // event so the first external call already Asks with zero prior
+        // tool use. Value format is informational only (never parsed).
+        if let Ok(src) = std::env::var("OVERSEER_UNTRUSTED_SOURCE") {
+            if !src.is_empty() {
+                if let Some(notice) = agent.tools.policy.arm_untrusted(&src) {
+                    agent.log.append(EventKind::Tainted { detail: notice })?;
+                }
+            }
+        }
         // Run manifest (P4.5): provenance record for the reporting
         // standard — written once, never rewritten by resume.
         crate::manifest::write(
@@ -1071,6 +1127,9 @@ fn prompt_text_for_estimate(messages: &[Message]) -> String {
                 Block::Text { text } => out.push_str(text),
                 Block::ToolResult { content, .. } => out.push_str(content),
                 Block::ToolCall { name, .. } => out.push_str(name),
+                // Screenshots are pixels, not tokens of text — the estimate
+                // counts nothing for them (image cost lands in P7-2 usage).
+                Block::Image { .. } => {}
                 Block::Reasoning { .. } => {}
             }
         }
@@ -1948,5 +2007,37 @@ mod tests {
         assert_eq!(e, Effort::Max, "bounded at Max");
         assert_eq!(Effort::parse("med"), Some(Effort::Medium));
         assert_eq!(Effort::parse("bogus"), None);
+    }
+    #[test]
+    fn computer_takeover_suppression_metadata_only() {
+        // P7-1: cred-field focus or watch_mode suppresses pixel capture —
+        // the obs carries metadata only, never pixel bytes.
+        let cfg = AgentConfig::default();
+        assert!(cfg.computer.takeover_pause, "fail-closed default");
+        assert!(crate::computer_obs::is_suppressed(&cfg.computer, true, "capture"));
+        assert!(!crate::computer_obs::is_suppressed(&cfg.computer, false, "capture"));
+        let mut watch = cfg.computer.clone();
+        watch.watch_mode = true;
+        assert!(crate::computer_obs::is_suppressed(&watch, false, "capture"));
+        let obs = crate::computer_obs::metadata_obs(2560, 1600, 1280, 800, "cred-field focus");
+        assert!(!obs.contains("aGVsbG8"), "metadata obs carries no pixel bytes");
+        assert!(obs.contains("2560x1600"));
+    }
+
+    #[test]
+    fn computer_containment_strips_secret_env() {
+        // P7-1: child envs never carry secrets (no-creds invariant).
+        for k in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "SOME_SERVICE_KEY",
+            "BOT_TOKEN",
+            "session_token",
+        ] {
+            assert!(!ComputerConfig::env_allowed(k), "{k} must be stripped");
+        }
+        for k in ["PATH", "HOME", "OVERSEER_UNTRUSTED_SOURCE", "TMPDIR"] {
+            assert!(ComputerConfig::env_allowed(k), "{k} must pass through");
+        }
     }
 }

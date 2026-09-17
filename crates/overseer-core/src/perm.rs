@@ -282,7 +282,40 @@ const IDENTITY_MARKERS: &[&str] = &[
 
 /// Classify a tool call into the irreversibility taxonomy (P5-B).
 /// Pure function of (tool, input) — deterministic, zero deps.
+/// P7-1 computer-use arms: `computer` dispatches on `action` —
+/// screenshot observes (Read); click/move/scroll mutate local UI state
+/// (InternalWrite); type/submit/send emit content outward
+/// (ExternalComms); any credential-field focus escalates to Identity.
+/// Unknown actions default up (InternalWrite), never down.
 pub fn classify(tool: &str, input: &Value) -> Irreversibility {
+    if tool == "computer" {
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_lowercase();
+        // Credential-field focus is an identity touch regardless of the
+        // physical action — keystrokes near secrets outrank the click.
+        if input
+            .get("cred_field")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || action.contains("password")
+            || action.contains("credential")
+        {
+            return Irreversibility::Identity;
+        }
+        if action == "screenshot" || action == "observe" {
+            return Irreversibility::Read;
+        }
+        if ["click", "move", "scroll", "drag", "hover", "focus"].contains(&action.as_str()) {
+            return Irreversibility::InternalWrite;
+        }
+        if ["type", "key", "submit", "send", "paste"].contains(&action.as_str()) {
+            return Irreversibility::ExternalComms;
+        }
+        return Irreversibility::InternalWrite; // future actions default up
+    }
     match tool {
         t if READ_TOOLS.contains(&t) => Irreversibility::Read,
         "write" | "edit" => Irreversibility::InternalWrite,
@@ -441,6 +474,10 @@ impl Policy {
     /// Record a completed tool call's result/input against the taint
     /// latches. Returns a human-readable notice when a latch newly flips
     /// (the agent emits it as an auditable event).
+    /// P7-1 `screen_screenshot`: ANY screenshot-sourced context latches
+    /// `untrusted` by default — pixels are opaque to text scanning, so a
+    /// benign-looking capture still latches. Phrase matching is retained
+    /// as an additional signal, not the gate.
     pub fn note_result(&self, tool: &str, input: &Value, text: &str) -> Option<String> {
         let lower = text.to_lowercase();
         let input_s = input.to_string().to_lowercase();
@@ -449,6 +486,7 @@ impl Policy {
         if !t.untrusted
             && (tool == "task"
                 || tool == "skill"
+                || Self::is_screenshot_context(tool, input)
                 || INJECTION_MARKERS.iter().any(|m| lower.contains(m)))
         {
             t.untrusted = true;
@@ -467,12 +505,36 @@ impl Policy {
         None
     }
 
+    /// P7-1 screenshot-context detector: the `computer` screenshot/observe
+    /// action latches regardless of result text (pixels bypass text scan).
+    fn is_screenshot_context(tool: &str, input: &Value) -> bool {
+        if tool != "computer" {
+            return false;
+        }
+        matches!(
+            input.get("action").and_then(Value::as_str),
+            Some(a) if a.eq_ignore_ascii_case("screenshot") || a.eq_ignore_ascii_case("observe")
+        )
+    }
+
     /// Both Rule-of-Two latches are set — the exfil triangle is armed.
     pub fn taint_armed(&self) -> bool {
         self.taint
             .lock()
             .map(|t| t.untrusted && t.sensitive)
             .unwrap_or(false)
+    }
+
+    /// P7-4 messaging env-arm: pre-arm the untrusted latch at session start
+    /// for untrusted-originated spawns. Returns a notice when the latch
+    /// newly flips (the engine emits it as an auditable event).
+    pub fn arm_untrusted(&self, origin: &str) -> Option<String> {
+        let mut t = self.taint.lock().ok()?;
+        if t.untrusted {
+            return None;
+        }
+        t.untrusted = true;
+        Some(format!("untrusted origin armed at start (via {origin})"))
     }
 
     /// The verdict the dispatcher acts on: `check` first, then — for Ask —
@@ -812,6 +874,71 @@ mod tests {
             classify("bash", &json!({"command": "gpg --sign doc"})),
             Irreversibility::Identity
         );
+    }
+    #[test]
+    fn computer_classify_table() {
+        // P7-1: computer action → irreversibility class.
+        assert_eq!(
+            classify("computer", &json!({"action": "screenshot"})),
+            Irreversibility::Read
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "click", "x": 10, "y": 20})),
+            Irreversibility::InternalWrite
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "move", "x": 1, "y": 2})),
+            Irreversibility::InternalWrite
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "scroll", "dy": -3})),
+            Irreversibility::InternalWrite
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "type", "text": "hello"})),
+            Irreversibility::ExternalComms
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "submit"})),
+            Irreversibility::ExternalComms
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "send"})),
+            Irreversibility::ExternalComms
+        );
+        // Credential-field focus escalates to Identity regardless of action.
+        assert_eq!(
+            classify("computer", &json!({"action": "click", "cred_field": true})),
+            Irreversibility::Identity
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "type", "cred_field": true})),
+            Irreversibility::Identity
+        );
+        // Unknown actions default up, never down.
+        assert_eq!(
+            classify("computer", &json!({"action": "frobnicate"})),
+            Irreversibility::InternalWrite
+        );
+    }
+
+    #[test]
+    fn screenshot_context_always_latches_untrusted() {
+        // P7-1: pixels are opaque to text scanning — ANY screenshot context
+        // latches untrusted, even with benign result text.
+        let p = pol();
+        let notice = p.note_result(
+            "computer",
+            &json!({"action": "screenshot"}),
+            "capture ok, 1280x800",
+        );
+        assert!(notice.is_some(), "benign screenshot must still latch");
+        assert!(p.taint.lock().map(|t| t.untrusted).unwrap_or(false));
+        // Non-screenshot computer actions with benign text do not latch.
+        let p2 = pol();
+        assert!(p2
+            .note_result("computer", &json!({"action": "click"}), "clicked ok")
+            .is_none());
     }
 
     #[test]

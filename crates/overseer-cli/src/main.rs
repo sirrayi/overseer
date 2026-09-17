@@ -206,6 +206,8 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
             m
         },
         reflect: flags.reflect,
+        // P7-1 computer-use containment: engine defaults (takeover_pause on).
+        computer: Default::default(),
         ask_handler: None,
         // --bare: no persisted rules — a CI run must not inherit or
         // mutate the operator's allow-list. Ask verdicts still

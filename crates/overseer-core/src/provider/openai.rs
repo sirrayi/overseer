@@ -226,6 +226,15 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
                     Block::Text { text } => out.push(json!({
                         "role": "user", "content": text
                     })),
+                    // P7-1: screenshots ride as image_url blocks; other
+                    // variants (Reasoning/ToolCall) never appear user-side.
+                    Block::Image { media_type, data_b64, .. } => out.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "image_url",
+                            "image_url": {"url": format!("data:{media_type};base64,{data_b64}")}
+                        }]
+                    })),
                     _ => {}
                 }
             }
@@ -252,6 +261,8 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
                     // Reasoning is never echoed back on this API family.
                     Block::Reasoning { .. } => {}
                     Block::ToolResult { .. } => {}
+                    // Screenshots never appear assistant-side; skip.
+                    Block::Image { .. } => {}
                 }
             }
             if text.is_empty() && calls.is_empty() {

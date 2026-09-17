@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod compact;
+pub mod computer_obs;
 pub mod control;
 pub mod event;
 pub mod ir;

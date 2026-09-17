@@ -276,6 +276,10 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
             // Opaque reasoning/thought parts echo back verbatim —
             // thoughtSignature continuity is load-bearing on tool turns.
             Block::Reasoning { raw } => parts.push(raw.clone()),
+            // P7-1: screenshots ride as inline_data parts (native CU shape).
+            Block::Image { media_type, data_b64, .. } => parts.push(json!({
+                "inline_data": {"mime_type": media_type, "data": data_b64}
+            })),
             Block::ToolCall { name, input, .. } => parts.push(json!({
                 "functionCall": {"name": name, "args": input}
             })),

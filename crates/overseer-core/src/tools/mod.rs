@@ -173,7 +173,7 @@ pub struct ToolRegistry {
     read_paths: HashSet<PathBuf>,
     /// Read history for dedup: canonical path → (mtime, line range) list.
     read_log: HashMap<PathBuf, Vec<ReadRecord>>,
-    policy: crate::perm::Policy,
+    pub policy: crate::perm::Policy,
     /// Rule-of-Two latch notices (P3.10): drained by the agent loop and
     /// emitted as `Tainted` events.
     pub taint_notices: Vec<String>,
