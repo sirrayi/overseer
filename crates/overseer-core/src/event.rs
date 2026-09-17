@@ -90,6 +90,20 @@ pub enum EventKind {
     Tainted {
         detail: String,
     },
+    /// A computer-use act (P7-3): which tier served it and the pre/post
+    /// observation digests — the act's diff record. Audit-only, like
+    /// `Tainted`; `suppressed` marks a metadata-only capture (credential
+    /// field / watch mode), where no pixels were taken at all.
+    ComputerAct {
+        action: String,
+        tier: String,
+        #[serde(default)]
+        pre: Option<String>,
+        #[serde(default)]
+        post: Option<String>,
+        #[serde(default)]
+        suppressed: bool,
+    },
     /// Stuck detector tripped — records which of the five patterns fired.
     StuckDetected {
         pattern: String,
