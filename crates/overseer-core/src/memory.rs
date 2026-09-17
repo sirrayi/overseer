@@ -357,6 +357,129 @@ pub fn index_segment(dir: &Path) -> String {
     )
 }
 
+/// Sensitivity-filtered index view (P6-2): the quarantined subagent
+/// context shows only entries at or below `filter`. `Secret` topic
+/// files stay in the index body only when the filter admits them;
+/// `index_segment` is the unfiltered (Personal-default parent) path.
+/// Filtering is line-scoped: a line names a layer file; its header
+/// decides. Unresolvable lines pass through (fail-open for pointers,
+/// fail-closed for bodies — the subagent has no write tools anyway).
+pub fn index_segment_filtered(dir: &Path, filter: Sensitivity) -> String {
+    let idx = dir.join(INDEX_NAME);
+    let text = std::fs::read_to_string(&idx).unwrap_or_default();
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            let Some(name) = topic_name(line) else {
+                return true;
+            };
+            match entry_sensitivity(dir, name) {
+                // Missing/unreadable headers default to Personal.
+                None => admits(filter, Sensitivity::Personal),
+                Some(s) => admits(filter, s),
+            }
+        })
+        .collect();
+    let body = kept.join("\n");
+    let (body, note) = if body.len() > INDEX_CAP {
+        let cut = body
+            .char_indices()
+            .map(|(i, c)| i + c.len_utf8())
+            .take_while(|end| *end <= INDEX_CAP)
+            .last()
+            .unwrap_or(0);
+        (
+            body[..cut].to_string(),
+            "\n\n[overseer] INDEX.md exceeds 25KB — prune it: keep only \
+             one-line pointers and move detail into topic files.",
+        )
+    } else {
+        (body, "")
+    };
+    format!(
+        "## Memory index\n\
+         `{}/` is your persistent memory — read and update it with ordinary \
+         file tools. {INDEX_NAME} holds one-line pointers (≤25KB); details \
+         live in topic files you create there.\n\n{body}{note}\n\n{MEMORY_LEGEND}",
+        dir.display()
+    )
+}
+
+/// Ordering on sensitivity tiers: Public < Personal < Secret. A filter
+/// admits every entry at or below its own tier.
+pub fn admits(filter: Sensitivity, entry: Sensitivity) -> bool {
+    rank(entry) <= rank(filter)
+}
+
+fn rank(s: Sensitivity) -> u8 {
+    match s {
+        Sensitivity::Public => 0,
+        Sensitivity::Personal => 1,
+        Sensitivity::Secret => 2,
+    }
+}
+
+/// First `*.md` token on an index line, if any.
+fn topic_name(line: &str) -> Option<&str> {
+    line.split_whitespace()
+        .find(|tok| tok.ends_with(".md"))
+        .map(|tok| tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';'))
+        .filter(|tok| !tok.is_empty() && !tok.contains('/') && !tok.contains('\\'))
+}
+
+/// Sensitivity of a topic file from its frontmatter header. Searches
+/// the layer subdirs as well as the memory root. None when the file
+/// is missing or its header is unreadable (caller defaults).
+fn entry_sensitivity(dir: &Path, name: &str) -> Option<Sensitivity> {
+    let mut cands = vec![dir.join(name)];
+    for layer in Layer::ALL {
+        cands.push(dir.join(layer.name()).join(name));
+    }
+    for cand in cands {
+        if let Ok(text) = std::fs::read_to_string(&cand) {
+            if let Ok((meta, _)) = parse_meta(&text) {
+                // A bare file (no frontmatter) parses to the default —
+                // only trust an explicit header.
+                if text.lines().next().map(|l| l.trim()) == Some("---") {
+                    return Some(meta.sensitivity);
+                }
+                return None;
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Quarantine a memory entry without overwriting it (P6-2 ADD-only):
+/// appends a `superseded_by <name>` trailer line to `path`. The old
+/// content stays on disk and in git — consolidation never rewrites a
+/// topic file smaller or deletes one.
+pub fn invalidate(path: &Path, superseded_by: &str) -> std::io::Result<()> {
+    let mut text = std::fs::read_to_string(path).unwrap_or_default();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("superseded_by {superseded_by}\n"));
+    std::fs::write(path, text)
+}
+
+/// Locate a topic file by name: memory root first, then each layer
+/// subdir. None when no backing file exists.
+pub fn layer_path(dir: &Path, name: &str) -> Option<PathBuf> {
+    let root = dir.join(name);
+    if root.is_file() {
+        return Some(root);
+    }
+    for layer in Layer::ALL {
+        let p = dir.join(layer.name()).join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Git-version the memory dir. Runs `git init` once, then commits any dirty
 /// state. Best-effort: memory works without history, so failures are
 /// swallowed (no git binary, read-only fs) rather than killing the turn.
@@ -389,6 +512,42 @@ pub fn commit(dir: &Path, msg: &str) {
         "-qm",
         msg,
     ]);
+}
+
+/// Files changed in the memory dir since the last engine commit (P6-2
+/// audit signal): `git status --porcelain` paths, empty when clean or
+/// when git is unavailable. Best-effort like `commit` — never errors.
+pub fn dirty_files(dir: &Path) -> Vec<String> {
+    if !dir.join(".git").exists() {
+        return Vec::new();
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        // -uall: expand untracked dirs to file paths (`episodic/` →
+        // `episodic/note.md`) so the audit event names real files.
+        .args(["status", "--porcelain=v1", "-uall"])
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            // Porcelain v1: `XY <path>[ -> <orig>]`.
+            let path = l.get(3..)?.trim();
+            let path = path.split(" -> ").last().unwrap_or(path).trim();
+            let path = path.trim_matches('"');
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        })
+        .collect()
 }
 
 /// Sleep-time consolidation (P3.8): a small-tier call that dedupes and
@@ -431,6 +590,11 @@ pub fn consolidate(
          topic file is gone, keep one line per topic in the form \
          `name.md — what it's about`. Validity: if a topic's content says \
          it expired or was superseded, drop its pointer.\n\
+         ADD-only rules (no destructive rewrites): only append deltas or \
+         drop stale pointers — never rewrite a topic file smaller and \
+         never overwrite a quarantined entry; mark superseded entries \
+         with a `superseded_by` trailer instead of deleting them; keep \
+         entries whose validity window still covers now.\n\
          Reply with the full new index between ---INDEX--- markers.\n\n\
          == CURRENT INDEX.md ==\n{old_index}\n== TOPIC HEADS =={topics}"
     );
@@ -714,5 +878,92 @@ mod tests {
         let dir = tmpdir();
         ensure(&dir).unwrap();
         assert!(index_segment(&dir).contains(MEMORY_LEGEND));
+    }
+
+    #[test]
+    fn filtered_view_hides_secret() {
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        std::fs::write(
+            dir.join("episodic").join("diary.md"),
+            "---\nsensitivity: personal\n---\nhad lunch\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("semantic").join("token.md"),
+            "---\nsensitivity: secret\n---\nsk-abc\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &dir.join(INDEX_NAME),
+            "# Memory Index\n\ndiary.md — lunch notes\ntoken.md — api token\n",
+        )
+        .unwrap();
+        let personal = index_segment_filtered(&dir, Sensitivity::Personal);
+        assert!(personal.contains("diary.md"), "{personal}");
+        assert!(!personal.contains("token.md"), "{personal}");
+        let secret = index_segment_filtered(&dir, Sensitivity::Secret);
+        assert!(secret.contains("diary.md"));
+        assert!(secret.contains("token.md"));
+        let public = index_segment_filtered(&dir, Sensitivity::Public);
+        assert!(!public.contains("diary.md"), "{public}");
+        assert!(!public.contains("token.md"), "{public}");
+    }
+
+    #[test]
+    fn invalidate_appends_trailer() {
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        let p = dir.join("episodic").join("old.md");
+        std::fs::write(&p, "old content\n").unwrap();
+        invalidate(&p, "new.md").unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("old content"), "history preserved: {text}");
+        assert!(text.contains("superseded_by new.md"), "{text}");
+    }
+
+    #[test]
+    fn consolidate_prompt_carries_add_only_rules() {
+        // ADD-only is a prompt contract: the consolidation instruction
+        // must forbid rewrite-smaller/quarantine-overwrite. The live
+        // behavior half is covered by the audit accept tests (dirty→
+        // event, clean→none) in the agent suite.
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        // Capture the prompt the engine sends.
+        struct Spy {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+        impl crate::provider::Provider for Spy {
+            fn complete(
+                &self,
+                req: &crate::provider::Request,
+            ) -> Result<crate::provider::Response, crate::provider::ProviderError> {
+                let t: String = req.messages.iter().map(|m| m.text()).collect();
+                self.seen.lock().unwrap().push(t);
+                Ok(crate::provider::Response {
+                    blocks: vec![crate::ir::Block::Text {
+                        text: "---INDEX---\n# Memory Index\n\nfacts.md — kept\n---INDEX---"
+                            .into(),
+                    }],
+                    stop_reason: crate::provider::StopReason::EndTurn,
+                    usage: crate::ir::Usage::default(),
+                    request_bytes: 0,
+                    latency_ms: 0,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "spy"
+            }
+        }
+        let spy = Spy {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        consolidate(&spy, "tiny", &dir).unwrap();
+        let seen = spy.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].contains("ADD-only"), "{}", seen[0]);
+        assert!(seen[0].contains("superseded_by"), "{}", seen[0]);
+        assert!(seen[0].contains("quarantine"), "{}", seen[0]);
     }
 }
