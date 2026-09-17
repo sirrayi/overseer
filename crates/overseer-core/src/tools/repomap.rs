@@ -92,6 +92,7 @@ mod tests {
             subagent_seq: 0,
             checkpoint: None,
             sandbox: false,
+            broker: None,
         }
     }
 

@@ -82,6 +82,10 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
                     | "CI"
             ) || k.starts_with("LC_")
         }))
+        // P6-3 broker injection: declared secrets enter the child's env
+        // (selector → real). The model never sees these values — tool
+        // results sanitize back to sentinels in `call()`.
+        .envs(broker_env(ctx))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -150,6 +154,15 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     let mut o = ToolOutput::ok(text);
     o.is_error = is_error;
     o
+}
+
+/// Declared broker secrets as (selector, real) env pairs for the child.
+/// Empty without a broker — the allowlisted env above is untouched.
+fn broker_env(ctx: &ToolCtx) -> Vec<(String, String)> {
+    ctx.broker
+        .as_ref()
+        .map(|br| br.inject_env())
+        .unwrap_or_default()
 }
 
 /// Pick the exec backend for a bash call. Returns (program, argv, warning):
@@ -271,6 +284,7 @@ mod tests {
             subagent_seq: 0,
             checkpoint: None,
             sandbox,
+            broker: None,
         }
     }
 
@@ -318,5 +332,31 @@ mod tests {
             &mut c,
         );
         assert!(out.text.contains("ok"), "{}", out.text);
+    }
+
+    #[test]
+    fn broker_env_injects_real_not_sentinel() {
+        // P6-3 accept (injection): the child env carries the real via
+        // inject_env; the sentinel never appears in the injected pairs.
+        let mut br = crate::cred::Broker::new();
+        let sentinel = br.issue_capability(
+            "api",
+            "API_TOKEN",
+            "tok-real-123",
+            vec!["api.example.com".into()],
+            vec!["read".into()],
+            None,
+        );
+        let dir = std::env::temp_dir();
+        let c = ctx(&dir, false);
+        assert!(broker_env(&c).is_empty());
+        let mut c2 = ctx(&dir, false);
+        c2.broker = Some(br);
+        let env = broker_env(&c2);
+        assert_eq!(
+            env,
+            vec![("API_TOKEN".to_string(), "tok-real-123".to_string())]
+        );
+        assert!(!env.iter().any(|(_, v)| v.contains(&sentinel)));
     }
 }
