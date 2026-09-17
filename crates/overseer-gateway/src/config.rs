@@ -45,9 +45,19 @@ impl DaemonDirs {
     pub fn runs(&self) -> PathBuf {
         self.root.join("runs")
     }
+    /// P7-4: channel routing + spools live here.
+    pub fn channels(&self) -> PathBuf {
+        self.root.join("channels")
+    }
+    /// P7-4: default webhook spool (a spec may name its own dir).
+    pub fn webhook_spool(&self) -> PathBuf {
+        self.root.join("webhook")
+    }
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.inbox())?;
-        std::fs::create_dir_all(self.runs())
+        std::fs::create_dir_all(self.runs())?;
+        std::fs::create_dir_all(self.channels())?;
+        std::fs::create_dir_all(self.webhook_spool())
     }
 }
 
@@ -80,6 +90,81 @@ pub enum TriggerSpec {
     /// Periodic check-in turn: the daemon emits a heartbeat event at
     /// `every_s`; whether it becomes anything is the triage layer's call.
     Heartbeat { id: String, every_s: u64 },
+    /// Wall-clock cron schedule (P7-4): 5 fields — `minute hour dom month
+    /// dow` — with `*`, `*/n`, `n`, `a-b`, `a-b/n`, and comma lists. Fires
+    /// at most once per matching minute.
+    Cron {
+        id: String,
+        expr: String,
+        /// Prompt passed to the act tier, or body of the notification.
+        body: String,
+        #[serde(default)]
+        class: String,
+    },
+    /// Inbound webhook spool (P7-4): a relay drops `{signature, body}`
+    /// records into `dir`; the daemon verifies and ingests them.
+    Webhook(WebhookSpec),
+    /// Telegram long-poll in, send out (P7-4).
+    Telegram(TelegramSpec),
+}
+
+/// Inbound webhook ingress config (P7-4). Fields are serde-defaulted so a
+/// minimal `{"kind":"webhook","id":"wf","secret_env":"..."}` config works.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebhookSpec {
+    pub id: String,
+    /// Environment variable holding the signing secret — never the secret
+    /// itself (config is not a secret store).
+    #[serde(default = "default_webhook_secret_env")]
+    pub secret_env: String,
+    /// Senders allowed to reach the agent. Empty denies everyone: an
+    /// ingress that has not named its senders is misconfigured, not open.
+    #[serde(default)]
+    pub allow_senders: Vec<String>,
+    /// Messages per sender per minute; 0 denies everyone.
+    #[serde(default = "default_rate")]
+    pub rate_per_min: u32,
+    /// Spool directory for inbound records, relative to the daemon root.
+    #[serde(default = "default_spool")]
+    pub dir: PathBuf,
+    /// Optional body used when the record carries only a payload.
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub class: String,
+}
+
+/// Telegram channel config (P7-4). The bot token is environment-only; the
+/// allowlist and rate limit apply to inbound senders exactly as they do
+/// for the webhook ingress (empty allowlist denies everyone).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelegramSpec {
+    pub id: String,
+    #[serde(default = "default_telegram_token_env")]
+    pub token_env: String,
+    #[serde(default)]
+    pub allow_senders: Vec<String>,
+    #[serde(default = "default_rate")]
+    pub rate_per_min: u32,
+    /// API base — overridable for tests and self-hosted Bot-API servers.
+    #[serde(default = "default_telegram_base")]
+    pub base: String,
+}
+
+fn default_webhook_secret_env() -> String {
+    "OVERSEER_WEBHOOK_SECRET".to_string()
+}
+fn default_telegram_token_env() -> String {
+    "OVERSEER_TELEGRAM_BOT_TOKEN".to_string()
+}
+fn default_telegram_base() -> String {
+    "https://api.telegram.org".to_string()
+}
+fn default_rate() -> u32 {
+    20
+}
+fn default_spool() -> PathBuf {
+    PathBuf::from("webhook")
 }
 
 /// One deterministic triage rule: match on event class/source → decision.
