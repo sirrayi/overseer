@@ -199,6 +199,16 @@ fn ir_message_to_wire(m: &crate::ir::Message) -> Value {
         .map(|b| match b {
             Block::Text { text } => json!({"type": "text", "text": text}),
             Block::Reasoning { raw } => raw.clone(),
+            // P7-1: screenshots ride as Anthropic image blocks (base64 source);
+            // text-only test doubles never emit Image so the prefix is stable.
+            Block::Image {
+                media_type,
+                data_b64,
+                ..
+            } => json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data_b64}
+            }),
             Block::ToolCall { id, name, input } => json!({
                 "type": "tool_use", "id": id, "name": name, "input": input
             }),
