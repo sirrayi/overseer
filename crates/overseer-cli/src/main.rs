@@ -191,6 +191,20 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
         verify_block_cap: flags.verify_cap,
         sandbox_bash: flags.sandbox,
         disabled_tools: flags.no_tools.clone(),
+        autonomy: {
+            let mut m = std::collections::HashMap::new();
+            for (d, l) in &flags.autonomy {
+                let level = match l.as_str() {
+                    "observe" => overseer_core::perm::Autonomy::Observe,
+                    "suggest" => overseer_core::perm::Autonomy::Suggest,
+                    "approve" => overseer_core::perm::Autonomy::ActWithApproval,
+                    "report" => overseer_core::perm::Autonomy::ActAndReport,
+                    _ => overseer_core::perm::Autonomy::ActSilently,
+                };
+                m.insert(d.clone(), level);
+            }
+            m
+        },
         reflect: flags.reflect,
         ask_handler: None,
         // --bare: no persisted rules — a CI run must not inherit or
@@ -531,6 +545,12 @@ fn usage() {
          \x20 --no-sandbox        Run bash unsandboxed (default: sandbox-exec/\n\
          \x20                     bwrap wrapper when available)\n\
          \x20 --memory            Enable file memory at <cwd>/memory\n\
+         \x20 --autonomy <d=l>    Per-domain autonomy, repeatable (P5-B):
+\
+         \x20                     domains internal|external|money|identity;
+\
+         \x20                     levels observe|suggest|approve|report|silent
+\
          \x20 --no-tools <list>   Ablation: comma-separated tool names removed\n\
          \x20                     from the spec list and refused at dispatch\n\
          \n\
@@ -579,6 +599,11 @@ struct ExecFlags {
     /// `--no-tools a,b,c` — P4.3 ablation: named tools are removed from the
     /// spec list and refused at dispatch.
     no_tools: Vec<String>,
+    /// `--autonomy external=suggest` — P5-B per-domain autonomy overrides
+    /// (repeatable). Domains: internal, external, money, identity. Levels:
+    /// observe, suggest, approve (act-with-approval), report (act+report),
+    /// silent (act-silently).
+    autonomy: Vec<(String, String)>,
     prompt: Option<String>,
 }
 
@@ -611,6 +636,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         sandbox: true,
         memory: false,
         no_tools: Vec::new(),
+        autonomy: Vec::new(),
         prompt: None,
     };
     let mut i = 0;
@@ -677,6 +703,26 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
             }
             "--no-sandbox" => f.sandbox = false,
             "--memory" => f.memory = true,
+            "--autonomy" => {
+                let v = take(&mut i)?;
+                let (domain, level) = v
+                    .split_once('=')
+                    .ok_or("bad --autonomy (want domain=level, e.g. external=suggest)")?;
+                if !["internal", "external", "money", "identity"].contains(&domain) {
+                    return Err(format!(
+                        "bad --autonomy domain '{domain}' (internal|external|money|identity)"
+                    ));
+                }
+                match level {
+                    "observe" | "suggest" | "approve" | "report" | "silent" => {}
+                    _ => {
+                        return Err(format!(
+                            "bad --autonomy level '{level}' (observe|suggest|approve|report|silent)"
+                        ))
+                    }
+                }
+                f.autonomy.push((domain.to_string(), level.to_string()));
+            }
             "--no-tools" => {
                 let v = take(&mut i)?;
                 for name in v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -1185,6 +1231,46 @@ mod daemon_arg_tests {
                 "abc".into()
             ]),
             vec!["approve", "abc"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod autonomy_flag_tests {
+    use super::*;
+
+    #[test]
+    fn autonomy_flag_parses_domains_and_levels() {
+        let f = parse_exec(&["--autonomy".into(), "external=suggest".into(), "x".into()]).unwrap();
+        assert_eq!(
+            f.autonomy,
+            vec![("external".to_string(), "suggest".to_string())]
+        );
+        let f = parse_exec(&[
+            "--autonomy".into(),
+            "money=observe".into(),
+            "--autonomy".into(),
+            "identity=silent".into(),
+            "x".into(),
+        ])
+        .unwrap();
+        assert_eq!(f.autonomy.len(), 2);
+    }
+
+    #[test]
+    fn autonomy_flag_rejects_bad_domain_and_level() {
+        assert!(parse_exec(&["--autonomy".into(), "bogus=approve".into(), "x".into()]).is_err());
+        assert!(parse_exec(&["--autonomy".into(), "external=bogus".into(), "x".into()]).is_err());
+        assert!(parse_exec(&["--autonomy".into(), "external".into(), "x".into()]).is_err());
+    }
+
+    #[test]
+    fn autonomy_flag_flows_into_agent_config() {
+        let f = parse_exec(&["--autonomy".into(), "external=suggest".into(), "x".into()]).unwrap();
+        let cfg = agent_config(&f);
+        assert_eq!(
+            cfg.autonomy.get("external"),
+            Some(&overseer_core::perm::Autonomy::Suggest)
         );
     }
 }

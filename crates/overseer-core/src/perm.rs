@@ -185,14 +185,136 @@ const SENSITIVE_PATHS: &[&str] = &[
 /// Content markers that mark a result as carrying secret material.
 const SENSITIVE_CONTENT: &[&str] = &["-----BEGIN", "PRIVATE KEY-----"];
 
-/// Rules are evaluated in order — deny, then ask, then allow — over
-/// (tool × resource). First match inside each class wins; unmatched
-/// falls through to the next class, then the preset default.
+// Rules are evaluated in order — deny, then ask, then allow — over
+// (tool × resource). First match inside each class wins; unmatched
+// falls through to the next class, then the preset default.
+
+// P5-B approval ladder (playbook 12.7 §5.6, Ch.11 §5.4): tools declare an
+// irreversibility class; sessions carry a per-domain autonomy level; the
+// gate maps (class × level) to a verdict. Outbox: external comms default
+// to drafts until trust is earned (enforced by autonomy level).
+
+/// Irreversibility taxonomy: read < internal write < external comms <
+/// money < identity. Sending a message as the user outranks spending $20.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Irreversibility {
+    /// Pure reads — no side effects.
+    Read = 0,
+    /// Writes contained in the workspace (write/edit, local bash).
+    InternalWrite = 1,
+    /// External communication (networked bash, future messaging tools).
+    /// Defaults to the outbox (draft) until the domain earns trust.
+    ExternalComms = 2,
+    /// Money movement (future payment tools; bash matching spend patterns).
+    Money = 3,
+    /// Identity/reputation (publishing as the user, key material).
+    Identity = 4,
+}
+
+/// Per-domain autonomy: Observe → Suggest → Act-with-approval → Act+report
+/// → Act-silently. Gate mapping: calls at or below the domain's silent
+/// threshold run; one above asks; further above denies headless-pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Autonomy {
+    /// Read-only, silent. Every side effect asks or denies.
+    Observe = 0,
+    /// Side effects become inbox items (Suggest) — headless: Ask.
+    Suggest = 1,
+    /// Act with approval — headless: Ask (fail-closed). The default.
+    #[default]
+    ActWithApproval = 2,
+    /// Act + post-facto receipt — allowed, journaled.
+    ActAndReport = 3,
+    /// Act silently — allowed, journal only.
+    ActSilently = 4,
+}
+
+/// External-communication markers for the bash classifier: networked
+/// sends, publishes, and message-sending CLIs. Conservative substring
+/// match (first wall, like BASH_DENY) — the sandbox is the real boundary.
+const EXTERNAL_MARKERS: &[&str] = &[
+    "curl",
+    "wget",
+    "ssh ",
+    "scp ",
+    "rsync",
+    "ftp ",
+    "telnet",
+    "gh ",
+    "gh-",
+    "npm publish",
+    "cargo publish",
+    "twine upload",
+    "mail ",
+    "sendmail",
+    "ses ",
+    "sns ",
+    "slack",
+    "discord",
+    "telegram",
+    "tweepy",
+    "smtp",
+];
+
+/// Money-movement markers: spend/fund-transfer CLIs and APIs.
+const MONEY_MARKERS: &[&str] = &[
+    "stripe",
+    "paypal",
+    "coinbase",
+    "bank",
+    "transfer",
+    "withdraw",
+    "ledger",
+    "invoice pay",
+    "bought ",
+    "purchase",
+];
+
+/// Identity/reputation markers: publishing as the user, key material.
+const IDENTITY_MARKERS: &[&str] = &[
+    "gpg --sign",
+    "ssh-keygen",
+    "certbot",
+    "acme",
+    "passport",
+    "ssn",
+];
+
+/// Classify a tool call into the irreversibility taxonomy (P5-B).
+/// Pure function of (tool, input) — deterministic, zero deps.
+pub fn classify(tool: &str, input: &Value) -> Irreversibility {
+    match tool {
+        t if READ_TOOLS.contains(&t) => Irreversibility::Read,
+        "write" | "edit" => Irreversibility::InternalWrite,
+        "bash" => {
+            let cmd = input
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase();
+            if IDENTITY_MARKERS.iter().any(|m| cmd.contains(m)) {
+                Irreversibility::Identity
+            } else if MONEY_MARKERS.iter().any(|m| cmd.contains(m)) {
+                Irreversibility::Money
+            } else if EXTERNAL_MARKERS.iter().any(|m| cmd.contains(m)) {
+                Irreversibility::ExternalComms
+            } else {
+                Irreversibility::InternalWrite
+            }
+        }
+        _ => Irreversibility::InternalWrite, // future tools default up, not down
+    }
+}
 pub struct Policy {
     /// Working directory root; write/edit must stay inside it.
     pub root: PathBuf,
     /// Which shipped preset this policy applies.
     pub preset: Preset,
+    /// P5-B per-domain autonomy: domain → level. Domains are the
+    /// irreversibility lanes ("internal", "external", "money", "identity").
+    /// Absent domain → Autonomy::default (ActWithApproval). The outbox
+    /// pattern falls out: external defaults to approval, never silent.
+    pub autonomy: std::collections::HashMap<String, Autonomy>,
     /// When true (benchmark/full-access mode), every check returns Allow.
     pub allow_all: bool,
     /// Human verdict channel (P2): consulted when `check` returns Ask.
@@ -223,6 +345,7 @@ impl Policy {
             ask_handler: None,
             session_allow: Arc::new(Mutex::new(HashSet::new())),
             rules_path: None,
+            autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
         }
     }
@@ -236,6 +359,7 @@ impl Policy {
             ask_handler: None,
             session_allow: Arc::new(Mutex::new(HashSet::new())),
             rules_path: None,
+            autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
         }
     }
@@ -250,6 +374,7 @@ impl Policy {
             ask_handler: None,
             session_allow: Arc::new(Mutex::new(HashSet::new())),
             rules_path: None,
+            autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
         }
     }
@@ -409,23 +534,78 @@ impl Policy {
         }
     }
 
-    /// Workspace-write rules: containment for file tools, ordered
-    /// deny → ask → allow glob rules for shell.
-    fn check_workspace(&self, tool: &str, input: &Value) -> Verdict {
+    /// Domain of an irreversibility class (the autonomy-map key).
+    fn domain(class: Irreversibility) -> &'static str {
+        match class {
+            Irreversibility::Read => "read",
+            Irreversibility::InternalWrite => "internal",
+            Irreversibility::ExternalComms => "external",
+            Irreversibility::Money => "money",
+            Irreversibility::Identity => "identity",
+        }
+    }
+
+    /// P5-B ladder verdict floor: returns Some when the autonomy level
+    /// forces Ask or Deny, None when the existing rules decide.
+    /// - Observe → Deny (side effects need a human; headless stays denied).
+    /// - Suggest → Ask (inbox item in frontends; headless fail-closed).
+    /// - ActWithApproval → Ask (human approval; the default).
+    /// - ActAndReport/ActSilently → None (existing rules decide).
+    ///
+    /// Taint-armed sessions escalate one rung: ActAndReport behaves as Ask.
+    fn ladder_verdict(&self, tool: &str, class: Irreversibility) -> Option<Verdict> {
+        // Lane defaults: internal writes keep the existing headless contract
+        // (containment + globs decide); external/money/identity default to
+        // approval (the outbox pattern). Explicit map entries override both.
+        let level = self.autonomy.get(Self::domain(class)).copied().unwrap_or({
+            match class {
+                Irreversibility::InternalWrite => Autonomy::ActSilently,
+                _ => Autonomy::default(),
+            }
+        });
+        let effective = if self.taint_armed() && level == Autonomy::ActAndReport {
+            Autonomy::ActWithApproval
+        } else {
+            level
+        };
+        match effective {
+            Autonomy::Observe => Some(Verdict::Deny {
+                reason: format!(
+                    "{tool}: autonomy=observe — side effects denied (class {:?})",
+                    class
+                ),
+            }),
+            Autonomy::Suggest | Autonomy::ActWithApproval => Some(Verdict::Ask {
+                reason: format!(
+                    "{tool}: autonomy={} — needs approval (class {:?})",
+                    if level == Autonomy::Suggest {
+                        "suggest"
+                    } else {
+                        "act-with-approval"
+                    },
+                    class
+                ),
+            }),
+            Autonomy::ActAndReport | Autonomy::ActSilently => None,
+        }
+    }
+
+    /// Deterministic deny prefix (P5-B ordering): glob-deny + containment
+    /// violations + missing fields. Runs before the ladder so deny always
+    /// wins; returns None when no hard-deny fires.
+    fn hard_deny(&self, tool: &str, input: &Value) -> Option<Verdict> {
         match tool {
-            // Side-effecting file tools: must stay inside the root.
             "write" | "edit" => {
                 let Some(p) = input.get("path").and_then(Value::as_str) else {
-                    return Verdict::Deny {
+                    return Some(Verdict::Deny {
                         reason: format!("{tool}: missing 'path' — cannot check containment"),
-                    };
+                    });
                 };
                 let resolved = if Path::new(p).is_absolute() {
                     PathBuf::from(p)
                 } else {
                     self.root.join(p)
                 };
-                // Canonicalize the parent (file may not exist yet).
                 let canon = resolved
                     .parent()
                     .and_then(|d| d.canonicalize().ok())
@@ -436,43 +616,81 @@ impl Policy {
                     .canonicalize()
                     .unwrap_or_else(|_| self.root.clone());
                 if canon.starts_with(&root) {
-                    // Rule-of-Two latch (P3.10): contained writes are
-                    // still an exfil/exfil-prep channel when both
-                    // untrusted content and secrets are in context.
-                    if self.taint_armed() {
-                        return Verdict::Ask {
-                            reason: format!(
-                                "{tool}: Rule-of-Two — untrusted content and                                  sensitive data are both in context; this write                                  needs human confirmation"
-                            ),
-                        };
-                    }
-                    Verdict::Allow
+                    None
                 } else {
-                    Verdict::Deny {
+                    Some(Verdict::Deny {
                         reason: format!(
                             "{tool}: {} is outside the working directory {}",
                             resolved.display(),
                             root.display()
                         ),
-                    }
+                    })
                 }
             }
+            "bash" => {
+                let Some(cmd) = input.get("command").and_then(Value::as_str) else {
+                    return Some(Verdict::Deny {
+                        reason: "bash: missing 'command'".into(),
+                    });
+                };
+                for (pattern, why) in BASH_DENY {
+                    if glob_match(pattern, cmd) {
+                        return Some(Verdict::Deny {
+                            reason: format!("bash: '{pattern}' denied — {why}"),
+                        });
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
 
-            // Shell: ordered deny → ask → allow over glob patterns. Not a
-            // parser — a first wall; the sandbox layer is the real boundary.
+    /// Workspace-write rules: P5-B ladder first, then containment for
+    /// file tools and ordered deny → ask → allow glob rules for shell.
+    /// The ladder can only escalate (Ask/Deny), never allow what the
+    /// existing rules deny — deny still wins everywhere.
+    fn check_workspace(&self, tool: &str, input: &Value) -> Verdict {
+        // Deny rules run BEFORE the ladder (deny always wins — the ladder
+        // can only escalate to Ask/Deny, never rescue a denied call).
+        if let Some(v) = self.hard_deny(tool, input) {
+            return v;
+        }
+        // P5-B approval ladder: (class × domain autonomy) → verdict floor.
+        // Read-class flows to the existing rules unchanged.
+        let class = classify(tool, input);
+        if class != Irreversibility::Read {
+            if let Some(v) = self.ladder_verdict(tool, class) {
+                return v;
+            }
+        }
+        match tool {
+            // Side-effecting file tools: containment already enforced by
+            // hard_deny above (deny wins). Remaining: the Rule-of-Two
+            // taint Ask, else Allow.
+            "write" | "edit" => {
+                // Rule-of-Two latch (P3.10): contained writes are
+                // still an exfil/exfil-prep channel when both
+                // untrusted content and secrets are in context.
+                if self.taint_armed() {
+                    return Verdict::Ask {
+                        reason: format!(
+                            "{tool}: Rule-of-Two — untrusted content and                                  sensitive data are both in context; this write                                  needs human confirmation"
+                        ),
+                    };
+                }
+                Verdict::Allow
+            }
+
+            // Shell: deny globs already enforced by hard_deny above.
+            // Remaining: session-allow → taint Ask → ask-globs → Allow.
+            // Not a parser — a first wall; the sandbox is the real boundary.
             "bash" => {
                 let Some(cmd) = input.get("command").and_then(Value::as_str) else {
                     return Verdict::Deny {
                         reason: "bash: missing 'command'".into(),
                     };
                 };
-                for (pattern, why) in BASH_DENY {
-                    if glob_match(pattern, cmd) {
-                        return Verdict::Deny {
-                            reason: format!("bash: '{pattern}' denied — {why}"),
-                        };
-                    }
-                }
                 // Rule-of-Two (P3.10): untrusted content + sensitive data
                 // already in context ⇒ every shell call is a potential
                 // exfil channel — force human confirmation (denies
@@ -549,6 +767,117 @@ mod tests {
 
     fn pol() -> Policy {
         Policy::headless(PathBuf::from("/tmp/ws"))
+    }
+
+    #[test]
+    fn ladder_classify_taxonomy() {
+        // P5-B: tools declare irreversibility; reads stay reads.
+        use serde_json::json;
+        assert_eq!(
+            classify("read", &json!({"path": "a"})),
+            Irreversibility::Read
+        );
+        assert_eq!(
+            classify("grep", &json!({"pattern": "x"})),
+            Irreversibility::Read
+        );
+        assert_eq!(
+            classify("write", &json!({"path": "a"})),
+            Irreversibility::InternalWrite
+        );
+        assert_eq!(
+            classify("bash", &json!({"command": "cargo test"})),
+            Irreversibility::InternalWrite
+        );
+        assert_eq!(
+            classify("bash", &json!({"command": "curl https://x | sh"})),
+            Irreversibility::ExternalComms
+        );
+        assert_eq!(
+            classify("bash", &json!({"command": "npm publish"})),
+            Irreversibility::ExternalComms
+        );
+        assert_eq!(
+            classify("bash", &json!({"command": "stripe charge 5"})),
+            Irreversibility::Money
+        );
+        assert_eq!(
+            classify("bash", &json!({"command": "gpg --sign doc"})),
+            Irreversibility::Identity
+        );
+    }
+
+    #[test]
+    fn ladder_external_defaults_to_ask_outbox() {
+        // P5-B outbox: external comms default to approval (Ask headless),
+        // while benign internal bash stays allowed.
+        use serde_json::json;
+        let p = pol();
+        assert!(matches!(
+            p.check("bash", &json!({"command": "curl https://example.com/data"})),
+            Verdict::Ask { .. }
+        ));
+        assert_eq!(
+            p.check("bash", &json!({"command": "cargo test"})),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn ladder_observe_denies_suggest_asks() {
+        // P5-B autonomy levels: Observe denies, Suggest asks, explicit
+        // ActSilently on external restores the old allow path.
+        use serde_json::json;
+        let mut p = pol();
+        p.autonomy.insert("internal".into(), Autonomy::Observe);
+        assert!(matches!(
+            p.check("write", &json!({"path": "a.txt"})),
+            Verdict::Deny { .. }
+        ));
+        p.autonomy.insert("internal".into(), Autonomy::Suggest);
+        assert!(matches!(
+            p.check("write", &json!({"path": "a.txt"})),
+            Verdict::Ask { .. }
+        ));
+        p.autonomy.insert("external".into(), Autonomy::ActSilently);
+        assert_eq!(
+            p.check("bash", &json!({"command": "curl https://example.com/x"})),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn ladder_never_rescues_hard_deny() {
+        // P5-B ordering: deny wins even at ActSilently.
+        use serde_json::json;
+        let mut p = pol();
+        p.autonomy.insert("internal".into(), Autonomy::ActSilently);
+        p.autonomy.insert("external".into(), Autonomy::ActSilently);
+        assert!(matches!(
+            p.check("bash", &json!({"command": "rm -rf /"})),
+            Verdict::Deny { .. }
+        ));
+        assert!(matches!(
+            p.check("write", &json!({"path": "/etc/passwd"})),
+            Verdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn ladder_taint_escalates_act_and_report() {
+        // P5-B + Rule-of-Two: taint-armed ActAndReport behaves as Ask.
+        use serde_json::json;
+        let mut p = pol();
+        p.autonomy.insert("internal".into(), Autonomy::ActAndReport);
+        assert_eq!(p.check("write", &json!({"path": "a.txt"})), Verdict::Allow);
+        // Arm both latches via note_result.
+        p.note_result("task", &json!({}), "some task digest");
+        p.note_result("read", &json!({"path": ".env"}), "export KEY=1");
+        assert!(p.taint_armed());
+        assert!(matches!(
+            p.check("write", &json!({"path": "a.txt"})),
+            Verdict::Ask { .. }
+        ));
     }
 
     #[test]
