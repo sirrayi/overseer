@@ -111,6 +111,18 @@ pub enum EventKind {
     /// dirty git status in the memory dir after the engine commit.
     /// Audit-only — never rehydrates into messages, never injected.
     MemoryUpdated { files: Vec<String> },
+    /// A user consent grant was loaded for this session (P6-4): the OAuth
+    /// shape's paper trail — who may exercise which scopes until when, and
+    /// which human approved it. Audit-only, like `MemoryUpdated`; carries
+    /// no secret material (client/scope metadata only).
+    ConsentGranted {
+        client: String,
+        scopes: Vec<String>,
+        /// Absolute expiry, ms since the unix epoch; 0 = no expiry.
+        expires_ms: u64,
+        actor: String,
+        approved_by: String,
+    },
     Error {
         message: String,
     },

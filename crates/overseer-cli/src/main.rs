@@ -97,7 +97,8 @@ fn cmd_tui(args: &[String]) -> i32 {
         }
     };
     let (session_dir, resume) = resolve_session(&flags);
-    let config = agent_config(&flags);
+    let mut config = agent_config(&flags);
+    apply_credentials(&mut config);
     let cfg = overseer_tui::TuiConfig {
         provider,
         agent: config,
@@ -186,6 +187,11 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
         auto_compact: flags.auto_compact,
         compact_at: flags.compact_at,
         memory_dir: flags.memory.then(|| cwd_canonical.join("memory")),
+        // P6-2: the parent agent sees the full index; the ceiling applies
+        // to the quarantined subagent view only.
+        memory_filter: overseer_core::memory::Sensitivity::Personal,
+        // P6-4: filled by `apply_credentials` (store resolution + payload).
+        broker: overseer_core::cred::Broker::new(),
         keep_tool_results: flags.keep_results,
         verify_cmd: flags.verify.clone(),
         verify_block_cap: flags.verify_cap,
@@ -206,6 +212,7 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
             m
         },
         reflect: flags.reflect,
+        credential_store: flags.credential_store,
         ask_handler: None,
         // --bare: no persisted rules — a CI run must not inherit or
         // mutate the operator's allow-list. Ask verdicts still
@@ -215,6 +222,38 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
         } else {
             Some(dirs_home().join("rules"))
         },
+    }
+}
+
+/// P6-4: resolve the credential store against this machine and load the
+/// secrets it holds into the broker. The keychain read is prefetched so
+/// its subprocess spawn overlaps the env read; the *effective* store is
+/// written back onto the config, so `manifest.json` records what actually
+/// held the secret (a fallback must be visible, not silent). Never prints
+/// secret material — only the store and the fallback note.
+fn apply_credentials(config: &mut overseer_core::agent::AgentConfig) {
+    use overseer_core::cred;
+    let configured = config.credential_store;
+    let kc = cred::Keychain::detect();
+    let prefetch = kc.prefetch();
+    let env = cred::env_payload();
+    let res = cred::resolve_store_with(configured, &kc, prefetch.resolve(), env);
+    config.credential_store = res.store;
+    if res.store != configured {
+        eprintln!("overseer: credentials — {}", res.note);
+    }
+    let Some(text) = res.payload else {
+        return;
+    };
+    match cred::parse_payload(&text) {
+        Ok(p) if !p.is_empty() => {
+            let (secrets, grants) = config.broker.install_payload(&p);
+            if secrets > 0 || grants > 0 {
+                eprintln!("overseer: credentials — {secrets} secret(s), {grants} grant(s) loaded");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("overseer: credentials — {e} (ignored)"),
     }
 }
 
@@ -553,13 +592,17 @@ fn usage() {
 \
          \x20 --no-tools <list>   Ablation: comma-separated tool names removed\n\
          \x20                     from the spec list and refused at dispatch\n\
+         \x20 --credential-store <s>  env | keychain | auto (default: auto —\n\
+         \x20                     keychain first, env fallback)\n\
          \n\
          ENV:\n\
          \x20 OVERSEER_API_KEY    Provider key (preferred, any provider)\n\
          \x20 ANTHROPIC_API_KEY   Anthropic key\n\
          \x20 OPENAI_API_KEY      OpenAI-compatible key\n\
          \x20 GOOGLE_API_KEY      Gemini key (GEMINI_API_KEY also works)\n\
-         \x20 OVERSEER_API_KEY         Fleet key (fallback)"
+         \x20 OVERSEER_API_KEY         Fleet key (fallback)\n\
+         \x20 OVERSEER_CREDENTIALS  credential payload for --credential-store env\n\
+         \x20                     (`NAME=value` lines, `grant …` lines)"
     );
 }
 
@@ -604,6 +647,10 @@ struct ExecFlags {
     /// observe, suggest, approve (act-with-approval), report (act+report),
     /// silent (act-silently).
     autonomy: Vec<(String, String)>,
+    /// `--credential-store env|keychain|auto` — P6-4: where secrets are
+    /// read from. Auto (default) tries the OS keychain and falls back to
+    /// the environment; the effective store lands in the manifest.
+    credential_store: overseer_core::cred::CredentialStore,
     prompt: Option<String>,
 }
 
@@ -637,6 +684,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         memory: false,
         no_tools: Vec::new(),
         autonomy: Vec::new(),
+        credential_store: overseer_core::cred::CredentialStore::Auto,
         prompt: None,
     };
     let mut i = 0;
@@ -723,6 +771,10 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
                 }
                 f.autonomy.push((domain.to_string(), level.to_string()));
             }
+            "--credential-store" => {
+                f.credential_store = overseer_core::cred::CredentialStore::parse(take(&mut i)?)
+                    .map_err(|e| format!("bad --credential-store ({e})"))?
+            }
             "--no-tools" => {
                 let v = take(&mut i)?;
                 for name in v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -780,7 +832,8 @@ fn cmd_exec(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let config = agent_config(&flags);
+    let mut config = agent_config(&flags);
+    apply_credentials(&mut config);
 
     if flags.best_of >= 2 {
         return run_best_of(&flags, provider, config, session_dir);
@@ -1232,6 +1285,66 @@ mod daemon_arg_tests {
             ]),
             vec!["approve", "abc"]
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_flag_tests {
+    use super::*;
+    use overseer_core::cred::CredentialStore;
+
+    #[test]
+    fn credential_store_flag_parses_and_defaults_to_auto() {
+        // Default: Auto — keychain first, env fallback.
+        let f = parse_exec(&["x".into()]).unwrap();
+        assert_eq!(f.credential_store, CredentialStore::Auto);
+        assert_eq!(agent_config(&f).credential_store, CredentialStore::Auto);
+
+        for (arg, want) in [
+            ("env", CredentialStore::Env),
+            ("keychain", CredentialStore::Keychain),
+            ("auto", CredentialStore::Auto),
+        ] {
+            let f = parse_exec(&["--credential-store".into(), arg.into(), "x".into()]).unwrap();
+            assert_eq!(f.credential_store, want);
+            // The flag flows through to the run config (and the manifest).
+            assert_eq!(agent_config(&f).credential_store, want);
+        }
+    }
+
+    #[test]
+    fn credential_store_flag_rejects_unknown_and_missing_value() {
+        let e = parse_exec(&["--credential-store".into(), "bogus".into(), "x".into()])
+            .err()
+            .expect("bogus store must be rejected");
+        assert!(e.contains("bad --credential-store"), "{e}");
+        assert!(parse_exec(&["--credential-store".into()]).is_err());
+    }
+
+    /// P6-4: the resolved (effective) store is what the manifest records —
+    /// a keychain fallback must not be reported as a keychain run.
+    #[test]
+    fn resolved_store_replaces_the_configured_one_on_fallback() {
+        let flags =
+            parse_exec(&["--credential-store".into(), "keychain".into(), "x".into()]).unwrap();
+        let mut cfg = agent_config(&flags);
+        assert_eq!(cfg.credential_store, CredentialStore::Keychain);
+        let kc = overseer_core::cred::Keychain::new(
+            Some("overseer-definitely-not-a-keychain-binary"),
+            &["find-generic-password"],
+            &["delete-generic-password"],
+        );
+        let res = overseer_core::cred::resolve_store_with(
+            cfg.credential_store,
+            &kc,
+            kc.fetch(),
+            Some("API_TOKEN=from-env".into()),
+        );
+        cfg.credential_store = res.store;
+        assert_eq!(cfg.credential_store, CredentialStore::Env);
+        // The env payload the fallback carried is usable as-is.
+        let payload = overseer_core::cred::parse_payload(res.payload.as_deref().unwrap()).unwrap();
+        assert_eq!(payload.secrets.len(), 1);
     }
 }
 
