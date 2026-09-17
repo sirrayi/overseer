@@ -302,7 +302,17 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     let policy = if cfg.full_access {
         crate::perm::Policy::allow_all()
     } else {
-        crate::perm::Policy::preset(cfg.policy_preset, sub_cwd.clone())
+        let mut pol = crate::perm::Policy::preset(cfg.policy_preset, sub_cwd.clone());
+        // F1: draft gate propagates — a read-mode subagent inherits the
+        // parent's persona verdict so unapproved drafts stay closed there too.
+        if let Some(parent_cfg) = ctx.agent_config.as_ref() {
+            pol.persona_dir = parent_cfg.persona_dir.clone();
+            pol.persona_approved = parent_cfg
+                .persona_dir
+                .as_deref()
+                .is_some_and(crate::onboard::all_approved);
+        }
+        pol
     };
     let mut registry = if write_mode {
         ToolRegistry::core(policy)
@@ -507,5 +517,47 @@ mod tests {
         let out = run(&json!({"prompt": "x", "mode": "write"}), &mut c);
         assert!(out.is_error);
         assert!(out.text.contains("git worktree"));
+    }
+
+    #[test]
+    fn subagent_inherits_persona_draft_gate() {
+        // F1: a read-mode subagent of a persona-gated parent denies draft reads.
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!("overseer-subdraft-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join("persona")).unwrap();
+        let persona = dir.join("persona");
+        let parent_cfg = crate::agent::AgentConfig {
+            cwd: dir.clone(),
+            persona_dir: Some(persona.clone()),
+            ..Default::default()
+        };
+        let ctx = ToolCtx {
+            cwd: dir.clone(),
+            session_dir: dir.join("session"),
+            spill_seq: 0,
+            provider: None,
+            agent_config: Some(parent_cfg),
+            subagent_seq: 0,
+            checkpoint: None,
+            sandbox: false,
+            broker: None,
+        };
+        let sub = sub_cfg(&ctx, &json!({}), &dir);
+        let pol = if sub.full_access {
+            crate::perm::Policy::allow_all()
+        } else {
+            let mut pol = crate::perm::Policy::preset(sub.policy_preset, dir.clone());
+            pol.persona_dir = sub.persona_dir.clone();
+            pol.persona_approved = sub
+                .persona_dir
+                .as_deref()
+                .is_some_and(crate::onboard::all_approved);
+            pol
+        };
+        let v = pol.check("read", &json!({"path": "persona/identity.md"}));
+        assert!(
+            matches!(v, crate::perm::Verdict::Deny { .. }),
+            "subagent draft read must deny, got {v:?}"
+        );
     }
 }
