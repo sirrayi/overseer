@@ -55,6 +55,9 @@ fn real_main() -> i32 {
         "consolidate" => cmd_consolidate(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
         "rewind" => cmd_rewind(&args[1..]),
+        "daemon" => cmd_daemon(&args[1..]),
+        "inbox" => cmd_inbox(&args[1..]),
+        "trigger" => cmd_trigger(&args[1..]),
         other => {
             eprintln!("overseer: unknown command '{other}'");
             usage();
@@ -910,6 +913,225 @@ fn dirs_home() -> PathBuf {
         .join(".overseer")
 }
 
+// ---------- gateway daemon (playbook 12.7 §5.1–5.3) ----------
+
+fn daemon_dirs(args: &[String]) -> overseer_gateway::config::DaemonDirs {
+    let dir = args
+        .windows(2)
+        .find(|w| w[0] == "--dir")
+        .map(|w| PathBuf::from(&w[1]))
+        .unwrap_or_else(|| dirs_home().join("daemon"));
+    overseer_gateway::config::DaemonDirs::new(dir)
+}
+
+/// Positional args with `--dir <value>` pairs removed — so
+/// `daemon --dir $DD status` detects `status`, not `$DD`. Only `--dir`
+/// takes a value on the daemon/inbox/trigger surface; every other flag
+/// is boolean.
+fn positionals(args: &[String]) -> Vec<&String> {
+    let mut out = Vec::new();
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a == "--dir" {
+            skip_next = true;
+            continue;
+        }
+        if a.starts_with('-') {
+            continue;
+        }
+        out.push(a);
+    }
+    out
+}
+
+fn ctl_call(
+    dirs: &overseer_gateway::config::DaemonDirs,
+    req: overseer_gateway::ctl::CtlRequest,
+) -> Result<overseer_gateway::ctl::CtlResponse, String> {
+    overseer_gateway::ctl::call(&dirs.socket(), &req)
+}
+
+/// `overseer daemon` — run the always-on gateway in the foreground
+/// (launchd/systemd supervision comes with the release packaging).
+/// Subcommands status/kill/reload go through the unix socket.
+fn cmd_daemon(args: &[String]) -> i32 {
+    let dirs = daemon_dirs(args);
+    use overseer_gateway::ctl::CtlRequest;
+    let pos = positionals(args);
+    match pos.first().map(|s| s.as_str()) {
+        Some("status") => match ctl_call(&dirs, CtlRequest::Status) {
+            Ok(r) => {
+                println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+                if r.ok {
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(e) => {
+                eprintln!("overseer daemon: {e}");
+                1
+            }
+        },
+        Some("kill") => match ctl_call(&dirs, CtlRequest::Kill) {
+            Ok(r) if r.ok => {
+                println!("daemon stopping");
+                0
+            }
+            Ok(r) => {
+                eprintln!("overseer daemon: {}", r.error.unwrap_or_default());
+                1
+            }
+            Err(e) => {
+                eprintln!("overseer daemon: {e}");
+                1
+            }
+        },
+        Some("reload") => match ctl_call(&dirs, CtlRequest::Reload) {
+            Ok(r) if r.ok => {
+                println!("config reloaded");
+                0
+            }
+            Ok(r) => {
+                eprintln!("overseer daemon: {}", r.error.unwrap_or_default());
+                1
+            }
+            Err(e) => {
+                eprintln!("overseer daemon: {e}");
+                1
+            }
+        },
+        Some(other) => {
+            eprintln!("overseer daemon: unknown subcommand '{other}' (run|status|kill|reload)");
+            2
+        }
+        // Bare `overseer daemon` = run in foreground.
+        None => {
+            let bin = overseer_gateway::daemon::overseer_binary();
+            match overseer_gateway::daemon::Daemon::new(dirs, bin) {
+                Ok(mut d) => {
+                    eprintln!(
+                        "overseer daemon: running (kill: `overseer daemon kill` or touch STOP)"
+                    );
+                    d.run()
+                }
+                Err(e) => {
+                    eprintln!("overseer daemon: {e}");
+                    1
+                }
+            }
+        }
+    }
+}
+
+/// `overseer inbox` — the Agent Inbox surface: list/decide/act.
+fn cmd_inbox(args: &[String]) -> i32 {
+    let dirs = daemon_dirs(args);
+    use overseer_gateway::ctl::CtlRequest;
+    let rest: Vec<&String> = positionals(args);
+    let sub = rest.first().map(|s| s.as_str());
+    let req = match sub {
+        Some("list") | None => CtlRequest::InboxList,
+        Some("approve") | Some("reject") => {
+            let Some(id) = rest.get(1) else {
+                eprintln!("overseer inbox {sub:?}: needs an item id");
+                return 2;
+            };
+            CtlRequest::InboxDecide {
+                id: id.to_string(),
+                decision: sub.unwrap().to_string(),
+                snooze_ms: None,
+            }
+        }
+        Some("snooze") => {
+            let Some(id) = rest.get(1) else {
+                eprintln!("overseer inbox snooze: needs an item id");
+                return 2;
+            };
+            let ms = rest.get(2).and_then(|s| s.parse::<u64>().ok()).map(|v| {
+                if v < 10_000 {
+                    v * 1000
+                } else {
+                    v
+                }
+            });
+            CtlRequest::InboxDecide {
+                id: id.to_string(),
+                decision: "snooze".into(),
+                snooze_ms: ms,
+            }
+        }
+        Some("act") => {
+            let Some(id) = rest.get(1) else {
+                eprintln!("overseer inbox act: needs an item id");
+                return 2;
+            };
+            CtlRequest::InboxAct { id: id.to_string() }
+        }
+        Some(other) => {
+            eprintln!(
+                "overseer inbox: unknown subcommand '{other}' (list|approve|reject|snooze|act)"
+            );
+            return 2;
+        }
+    };
+    match ctl_call(&dirs, req) {
+        Ok(r) if r.ok => {
+            if let Some(d) = r.data {
+                println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default());
+            }
+            0
+        }
+        Ok(r) => {
+            eprintln!("overseer inbox: {}", r.error.unwrap_or_default());
+            1
+        }
+        Err(e) => {
+            eprintln!("overseer inbox: {e}");
+            1
+        }
+    }
+}
+
+/// `overseer trigger fire` — inject an event (testing + webhook shim).
+fn cmd_trigger(args: &[String]) -> i32 {
+    let dirs = daemon_dirs(args);
+    if args.first().map(String::as_str) != Some("fire") {
+        eprintln!("overseer trigger: only 'fire' is supported");
+        return 2;
+    }
+    let val = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+    let (Some(source), Some(class), Some(payload)) =
+        (val("--source"), val("--class"), val("--payload"))
+    else {
+        eprintln!("overseer trigger fire: needs --source --class --payload");
+        return 2;
+    };
+    let req = overseer_gateway::ctl::CtlRequest::TriggerFire {
+        source,
+        class,
+        payload,
+    };
+    match ctl_call(&dirs, req) {
+        Ok(r) if r.ok => {
+            println!("fired");
+            0
+        }
+        Ok(r) => {
+            eprintln!("overseer trigger: {}", r.error.unwrap_or_default());
+            1
+        }
+        Err(e) => {
+            eprintln!("overseer trigger: {e}");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,5 +1157,34 @@ mod tests {
         let cfg = agent_config(&f);
         assert!(cfg.sandbox_bash, "--bare must not weaken the sandbox");
         assert!(cfg.rules_path.is_none(), "--bare loads no user rules");
+    }
+}
+
+#[cfg(test)]
+mod daemon_arg_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_dir_flag_order_independent() {
+        // The live-smoke bug: `daemon --dir $DD status` read `$DD` as the
+        // subcommand. --dir pairs strip before subcommand detection.
+        assert_eq!(
+            positionals(&["--dir".into(), "/tmp/x".into(), "status".into()]),
+            vec!["status"]
+        );
+        assert_eq!(
+            positionals(&["status".into(), "--dir".into(), "/tmp/x".into()]),
+            vec!["status"]
+        );
+        assert!(positionals(&["--dir".into(), "/tmp/x".into()]).is_empty());
+        assert_eq!(
+            positionals(&[
+                "approve".into(),
+                "--dir".into(),
+                "/tmp/x".into(),
+                "abc".into()
+            ]),
+            vec!["approve", "abc"]
+        );
     }
 }
