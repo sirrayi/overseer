@@ -110,7 +110,9 @@ pub enum EventKind {
     /// Memory changed on disk at a turn boundary (P6-2 audit signal):
     /// dirty git status in the memory dir after the engine commit.
     /// Audit-only — never rehydrates into messages, never injected.
-    MemoryUpdated { files: Vec<String> },
+    MemoryUpdated {
+        files: Vec<String>,
+    },
     /// A user consent grant was loaded for this session (P6-4): the OAuth
     /// shape's paper trail — who may exercise which scopes until when, and
     /// which human approved it. Audit-only, like `MemoryUpdated`; carries

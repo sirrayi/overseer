@@ -335,7 +335,10 @@ mod tests {
         // No secret material anywhere in the manifest.
         let raw = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
         assert!(!raw.contains("ghp_real_secret"), "manifest leaked a real");
-        assert!(!raw.contains("ovsent_"), "manifest must not carry sentinels");
+        assert!(
+            !raw.contains("ovsent_"),
+            "manifest must not carry sentinels"
+        );
         // Default config: store is the configured Auto with no grants.
         let d = tmpdir();
         write(&d, "s2", &AgentConfig::default(), &Stub, &tools).unwrap();

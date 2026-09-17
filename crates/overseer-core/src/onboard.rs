@@ -24,7 +24,12 @@ use std::path::{Path, PathBuf};
 
 /// The four persona files, in load order. `SOUL.md` is the line that must
 /// survive every compaction.
-pub const PERSONA_FILES: [&str; 4] = ["identity.md", "relationships.md", "preferences.md", "SOUL.md"];
+pub const PERSONA_FILES: [&str; 4] = [
+    "identity.md",
+    "relationships.md",
+    "preferences.md",
+    "SOUL.md",
+];
 
 /// Soft cap on the assembled persona segment (static, cacheable bytes).
 pub const PERSONA_CAP: usize = 8_000;
@@ -112,16 +117,16 @@ pub fn parse_frontmatter(text: &str) -> Result<(PersonaMeta, String), String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (k, v) = line.split_once(':').ok_or_else(|| {
-            format!("onboard: bad frontmatter line `{line}` — want `key: value`")
-        })?;
+        let (k, v) = line
+            .split_once(':')
+            .ok_or_else(|| format!("onboard: bad frontmatter line `{line}` — want `key: value`"))?;
         let v = v.trim();
         match k.trim() {
             "status" => meta.status = Status::parse(v)?,
             "source_answers" => {
-                meta.source_answers = v.parse().map_err(|_| {
-                    format!("onboard: bad source_answers `{v}` — want a number")
-                })?
+                meta.source_answers = v
+                    .parse()
+                    .map_err(|_| format!("onboard: bad source_answers `{v}` — want a number"))?
             }
             // Unknown keys are ignored (forward-compatible headers).
             _ => {}
@@ -332,7 +337,10 @@ fn split_insight(line: &str) -> Result<Insight, String> {
 
 /// Render one insight as a bullet line with its trailer.
 fn insight_line(i: &Insight) -> String {
-    format!("- {} <!-- source: {}{} -->", i.text, ANSWER_PREFIX, i.source)
+    format!(
+        "- {} <!-- source: {}{} -->",
+        i.text, ANSWER_PREFIX, i.source
+    )
 }
 
 /// Parse an aux-tier draft reply: `== <file> ==` sections, one bullet
@@ -376,7 +384,11 @@ pub fn parse_draft_response(text: &str) -> Result<Vec<(String, Vec<Insight>)>, S
 /// under draft frontmatter claiming `source_answers`. Returns insights
 /// written. This is the one writer of a draft — the model has no tool path
 /// here, by design.
-pub fn write_drafts(dir: &Path, drafts: &[(String, Vec<Insight>)], source_answers: usize) -> std::io::Result<usize> {
+pub fn write_drafts(
+    dir: &Path,
+    drafts: &[(String, Vec<Insight>)],
+    source_answers: usize,
+) -> std::io::Result<usize> {
     let mut wrote = 0usize;
     for (file, insights) in drafts {
         if !PERSONA_FILES.contains(&file.as_str()) {
@@ -540,7 +552,9 @@ pub fn draft_from_answers(
         effort: Some(crate::provider::Effort::Min),
         cache_breakpoints: false,
     };
-    let resp = provider.complete(&req).map_err(|e| format!("onboard: {e}"))?;
+    let resp = provider
+        .complete(&req)
+        .map_err(|e| format!("onboard: {e}"))?;
     let text: String = resp
         .blocks
         .iter()
@@ -586,8 +600,11 @@ mod tests {
         assert_eq!(statuses(&dir).len(), 4);
         assert!(!all_approved(&dir));
         // Idempotent: an existing file is never overwritten.
-        std::fs::write(dir.join("identity.md"), "---\nstatus: approved\nsource_answers: 1\n---\nkept\n")
-            .unwrap();
+        std::fs::write(
+            dir.join("identity.md"),
+            "---\nstatus: approved\nsource_answers: 1\n---\nkept\n",
+        )
+        .unwrap();
         ensure_persona_dir(&dir).unwrap();
         assert!(std::fs::read_to_string(dir.join("identity.md"))
             .unwrap()
@@ -672,7 +689,9 @@ mod tests {
 
         let changed = approve(&dir).unwrap();
         assert_eq!(changed.len(), 4, "every draft flips, seeded files included");
-        assert!(statuses(&dir).iter().all(|(_, m)| m.status == Status::Approved));
+        assert!(statuses(&dir)
+            .iter()
+            .all(|(_, m)| m.status == Status::Approved));
         let body = persona_body(&dir);
         assert!(body.contains("Rust systems engineer"), "{body}");
         assert!(body.contains("Prefer boring, verified work"), "{body}");
@@ -722,13 +741,22 @@ mod tests {
             .unwrap();
         // The reported line really is the orphan's line.
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap().lines().nth(line - 1),
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .nth(line - 1),
             Some("- unsourced claim")
         );
 
         // A trailer naming an answer that does not exist is an orphan too.
-        let text = std::fs::read_to_string(&path).unwrap().replace("- unsourced claim\n", "");
-        std::fs::write(&path, format!("{text}- wild claim <!-- source: answer-9 -->\n")).unwrap();
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("- unsourced claim\n", "");
+        std::fs::write(
+            &path,
+            format!("{text}- wild claim <!-- source: answer-9 -->\n"),
+        )
+        .unwrap();
         let orphans = verify_trace(&dir, 2).unwrap_err();
         assert_eq!(orphans.len(), 1, "{orphans:?}");
         assert!(orphans[0].contains("out of range"), "{orphans:?}");
@@ -739,12 +767,26 @@ mod tests {
 
         // A file claiming more answers than were recorded is an orphan.
         let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, text.replace("source_answers: 2", "source_answers: 5")).unwrap();
+        std::fs::write(
+            &path,
+            text.replace("source_answers: 2", "source_answers: 5"),
+        )
+        .unwrap();
         let orphans = verify_trace(&dir, 2).unwrap_err();
         assert!(orphans[0].contains("only 2 were recorded"), "{orphans:?}");
 
         // Clean again after repair (frontmatter included).
-        std::fs::write(&path, render(&PersonaMeta { status: Status::Draft, source_answers: 1 }, "# Identity\n\n- ok <!-- source: answer-1 -->\n")).unwrap();
+        std::fs::write(
+            &path,
+            render(
+                &PersonaMeta {
+                    status: Status::Draft,
+                    source_answers: 1,
+                },
+                "# Identity\n\n- ok <!-- source: answer-1 -->\n",
+            ),
+        )
+        .unwrap();
         assert_eq!(verify_trace(&dir, 1).unwrap(), 1);
     }
 
@@ -799,13 +841,9 @@ mod tests {
             persona_dir: Some(persona.clone()),
             ..crate::agent::AgentConfig::default()
         };
-        let agent = crate::agent::Agent::start(
-            std::sync::Arc::new(Stub),
-            cfg,
-            session.clone(),
-            "s".into(),
-        )
-        .unwrap();
+        let agent =
+            crate::agent::Agent::start(std::sync::Arc::new(Stub), cfg, session.clone(), "s".into())
+                .unwrap();
         (agent, persona, session)
     }
 

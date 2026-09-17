@@ -314,7 +314,8 @@ fn cmd_onboard(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let model = std::env::var("OVERSEER_ONBOARD_MODEL").unwrap_or_else(|_| "claude-sonnet-5".into());
+    let model =
+        std::env::var("OVERSEER_ONBOARD_MODEL").unwrap_or_else(|_| "claude-sonnet-5".into());
     base_flags.model = model.clone();
     let provider: std::sync::Arc<dyn Provider> = match build_provider(&base_flags) {
         Ok(p) => p.into(),
@@ -337,7 +338,12 @@ fn cmd_onboard(args: &[String]) -> i32 {
         disabled_tools: vec!["write".into(), "edit".into()],
         ..overseer_core::agent::AgentConfig::default()
     };
-    let mut agent = match Agent::start(provider.clone(), config, session_dir.clone(), format!("onboard-{ts}")) {
+    let mut agent = match Agent::start(
+        provider.clone(),
+        config,
+        session_dir.clone(),
+        format!("onboard-{ts}"),
+    ) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("overseer onboard: session {} — {e}", session_dir.display());
@@ -438,7 +444,11 @@ fn parse_onboard(args: &[String]) -> Result<OnboardFlags, String> {
                 f.dir = Some(PathBuf::from(v));
             }
             "--approve" => f.approve = true,
-            other => return Err(format!("unknown flag '{other}' (want --dir <d> | --approve)")),
+            other => {
+                return Err(format!(
+                    "unknown flag '{other}' (want --dir <d> | --approve)"
+                ))
+            }
         }
         i += 1;
     }
@@ -1571,7 +1581,12 @@ mod onboard_flag_tests {
         let dir = std::env::temp_dir().join(format!("overseer-cli-persona-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let f = parse_exec(&["--cwd".into(), dir.to_string_lossy().to_string(), "x".into()]).unwrap();
+        let f = parse_exec(&[
+            "--cwd".into(),
+            dir.to_string_lossy().to_string(),
+            "x".into(),
+        ])
+        .unwrap();
         assert!(
             agent_config(&f).persona_dir.is_none(),
             "no persona dir → no gate armed"
@@ -1637,7 +1652,9 @@ mod onboard_flag_tests {
         assert!(msg.contains("approved 4 file(s)"), "{msg}");
         assert!(overseer_core::onboard::all_approved(&persona));
         // Idempotent: a second approve reports the already-approved state.
-        assert!(approve_persona(&persona).unwrap().contains("already approved"));
+        assert!(approve_persona(&persona)
+            .unwrap()
+            .contains("already approved"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

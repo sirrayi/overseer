@@ -159,7 +159,10 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
 /// Declared broker secrets as (selector, real) env pairs for the child.
 /// Empty without a broker — the allowlisted env above is untouched.
 fn broker_env(ctx: &ToolCtx) -> Vec<(String, String)> {
-    ctx.broker.as_ref().map(|br| br.inject_env()).unwrap_or_default()
+    ctx.broker
+        .as_ref()
+        .map(|br| br.inject_env())
+        .unwrap_or_default()
 }
 
 /// Pick the exec backend for a bash call. Returns (program, argv, warning):
@@ -350,7 +353,10 @@ mod tests {
         let mut c2 = ctx(&dir, false);
         c2.broker = Some(br);
         let env = broker_env(&c2);
-        assert_eq!(env, vec![("API_TOKEN".to_string(), "tok-real-123".to_string())]);
+        assert_eq!(
+            env,
+            vec![("API_TOKEN".to_string(), "tok-real-123".to_string())]
+        );
         assert!(!env.iter().any(|(_, v)| v.contains(&sentinel)));
     }
 }
