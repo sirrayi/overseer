@@ -105,6 +105,12 @@ pub fn write(
             "sandbox_bash": config.sandbox_bash,
             "ask_channel": if config.ask_handler.is_some() { "human" } else { "headless" },
             "disabled_tools": config.disabled_tools,
+            // P5-B: per-domain autonomy overrides (empty = lane defaults).
+            "autonomy": config
+                .autonomy
+                .iter()
+                .map(|(d, l)| (d.clone(), format!("{l:?}")))
+                .collect::<std::collections::BTreeMap<_, _>>(),
         },
         "context": {
             "auto_compact": config.auto_compact,
@@ -251,5 +257,21 @@ mod tests {
                 .unwrap();
         assert_eq!(ma["system_prompt"]["sha256"], mb["system_prompt"]["sha256"]);
         assert_eq!(ma["tools"]["sha256"], mb["tools"]["sha256"]);
+        // P5-B: autonomy map recorded (empty default here).
+        assert_eq!(ma["policy"]["autonomy"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn autonomy_overrides_recorded() {
+        let a = tmpdir();
+        let mut cfg = AgentConfig::default();
+        cfg.autonomy
+            .insert("external".into(), crate::perm::Autonomy::Suggest);
+        let tools = ToolRegistry::readonly(crate::perm::Policy::allow_all());
+        write(&a, "s1", &cfg, &Stub, &tools).unwrap();
+        let ma: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(a.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(ma["policy"]["autonomy"]["external"], "Suggest");
     }
 }

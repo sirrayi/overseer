@@ -82,6 +82,10 @@ pub struct AgentConfig {
     /// P4.3 ablation: tool names removed from the spec list and refused at
     /// dispatch (`--no-tools`). Validated against tools::TOOL_NAMES.
     pub disabled_tools: Vec<String>,
+    /// P5-B per-domain autonomy overrides (domain → level). Empty = lane
+    /// defaults (internal: existing rules decide; external/money/identity:
+    /// approval). Merged into the Policy at agent start.
+    pub autonomy: std::collections::HashMap<String, crate::perm::Autonomy>,
     /// B1-7 Reflexion hook (Reflexion post-episode pattern): on a verify
     /// block, ask the aux tier for a ≤300-token self-critique appended as a
     /// `[reflection]`-tagged Nudge. `Off` disables; `Reflexion` reflects on
@@ -122,6 +126,7 @@ impl Default for AgentConfig {
             ask_handler: None,
             rules_path: None,
             disabled_tools: Vec::new(),
+            autonomy: Default::default(),
             reflect: ReflectMode::Reflexion,
         }
     }
@@ -1021,6 +1026,7 @@ impl Agent {
         } else {
             let mut p = crate::perm::Policy::preset(config.policy_preset, config.cwd.clone());
             p.ask_handler = config.ask_handler.clone();
+            p.autonomy = config.autonomy.clone();
             if let Some(path) = &config.rules_path {
                 p.load_rules(path.clone());
             }
