@@ -656,6 +656,13 @@ impl Policy {
         if let Some(v) = self.hard_deny(tool, input) {
             return v;
         }
+        // Explicit user grants beat the ladder (AllowSession/AllowAlways
+        // recorded by gate(), or loaded from the rules file). Deny already
+        // won above, so honoring an allow here cannot rescue a denied call.
+        // (session_key exists for bash only; other tools skip.)
+        if self.session_allowed(tool, input) {
+            return Verdict::Allow;
+        }
         // P5-B approval ladder: (class × domain autonomy) → verdict floor.
         // Read-class flows to the existing rules unchanged.
         let class = classify(tool, input);
@@ -861,6 +868,46 @@ mod tests {
             p.check("write", &json!({"path": "/etc/passwd"})),
             Verdict::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn ladder_ask_honors_session_allow() {
+        // S-A1: an AllowSession grant silences repeat ladder Asks (explicit
+        // user grant beats the ladder — same rule as the taint latch).
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls2 = calls.clone();
+        let handler = AskHandler(Arc::new(move |_| {
+            *calls2.lock().unwrap() += 1;
+            AskDecision::AllowSession
+        }));
+        let mut pol = Policy::preset(Preset::WorkspaceWrite, PathBuf::from("/tmp/ws"));
+        pol.ask_handler = Some(handler);
+        let input = json!({"command": "curl https://example.com/x"});
+        assert!(matches!(pol.gate("bash", &input), Gate::Allow));
+        assert!(matches!(pol.gate("bash", &input), Gate::Allow));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "2nd identical call must not re-prompt"
+        );
+    }
+
+    #[test]
+    fn ladder_ask_honors_persisted_allow() {
+        // S-A1: rules-file grants (AllowAlways) are honored for ladder lanes.
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!("overseer-rules-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules");
+        std::fs::write(&path, "bash:curl https://example.com/x\n").unwrap();
+        let mut pol = Policy::preset(Preset::WorkspaceWrite, PathBuf::from("/tmp/ws"));
+        pol.load_rules(path);
+        assert_eq!(
+            pol.check("bash", &json!({"command": "curl https://example.com/x"})),
+            Verdict::Allow
+        );
     }
 
     #[test]
