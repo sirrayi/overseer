@@ -131,12 +131,20 @@ impl Ledger {
     pub fn summarize(records: &[UsageRecord]) -> Summary {
         let mut s = Summary::default();
         for r in records {
+            // FAIL-3: saturating accumulation — a corrupt/hand-edited ledger
+            // row (u64::MAX fields) must not panic the dashboard.
             s.calls += 1;
-            s.input_tokens += r.fresh_input + r.cache_write + r.cache_read;
-            s.cache_read_tokens += r.cache_read;
-            s.output_tokens += r.output + r.reasoning;
+            s.input_tokens = s.input_tokens.saturating_add(
+                r.fresh_input
+                    .saturating_add(r.cache_write)
+                    .saturating_add(r.cache_read),
+            );
+            s.cache_read_tokens = s.cache_read_tokens.saturating_add(r.cache_read);
+            s.output_tokens = s
+                .output_tokens
+                .saturating_add(r.output.saturating_add(r.reasoning));
             s.total_cost_usd += r.cost_usd;
-            s.latency_ms += r.latency_ms;
+            s.latency_ms = s.latency_ms.saturating_add(r.latency_ms);
         }
         if s.input_tokens > 0 {
             s.cache_hit_rate = s.cache_read_tokens as f64 / s.input_tokens as f64;
@@ -165,6 +173,28 @@ pub struct Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summarize_saturates_on_overflow() {
+        // FAIL-3: u64::MAX ledger rows must not panic.
+        let rec = UsageRecord {
+            ts_ms: 0,
+            model: "m".into(),
+            fresh_input: u64::MAX,
+            cache_write: u64::MAX,
+            cache_read: u64::MAX,
+            output: u64::MAX,
+            reasoning: u64::MAX,
+            request_bytes: 0,
+            latency_ms: u64::MAX,
+            tool_calls: 0,
+            cost_usd: 0.0,
+            cache_hit_rate: 0.0,
+        };
+        let s = Ledger::summarize(&[rec]);
+        assert_eq!(s.input_tokens, u64::MAX);
+        assert_eq!(s.output_tokens, u64::MAX);
+    }
 
     #[test]
     fn cache_alert_threshold() {

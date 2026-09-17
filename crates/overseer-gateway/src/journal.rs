@@ -45,8 +45,25 @@ impl Journal {
         if let Ok(mut f) = OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .open(&self.path)
         {
+            // S-G1 torn-tail repair: a crashed writer may have left a partial
+            // line without trailing newline; appending directly would fuse it
+            // with this record into one unparseable line and LOSE this append.
+            // Terminate the partial tail first so each record stays one line.
+            use std::io::{Read, Seek, SeekFrom};
+            if let Ok(len) = f.metadata().map(|m| m.len()) {
+                if len > 0 {
+                    let mut last = [0u8; 1];
+                    if f.seek(SeekFrom::End(-1)).is_ok()
+                        && f.read_exact(&mut last).is_ok()
+                        && last[0] != b'\n'
+                    {
+                        let _ = f.write_all(b"\n");
+                    }
+                }
+            }
             let _ = f.write_all(line.as_bytes());
         }
     }
@@ -123,5 +140,30 @@ mod tests {
         assert_eq!(hearts.len(), 2);
         assert_eq!(hearts[0]["note"], "one");
         assert_eq!(hearts[1]["note"], "two");
+    }
+
+    #[test]
+    fn torn_tail_followed_by_append_keeps_next_record() {
+        // S-G1 crash-restart shape: torn bytes then the next log() call.
+        // Without the repair the torn prefix fuses with the new record and
+        // the post-crash append is silently lost.
+        let dir = tmpdir("torn-tail-append");
+        let path = dir.join("daemon.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let j = Journal::new(path.clone());
+        j.log("heartbeat", serde_json::json!({"note": "one"}));
+        j.log("heartbeat", serde_json::json!({"note": "two"}));
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).expect("open");
+            f.write_all(b"{\"kind\": \"torn").expect("write partial");
+        }
+        j.log("heartbeat", serde_json::json!({"note": "three"}));
+        let entries = read_kinds(&dir);
+        let hearts: Vec<&serde_json::Value> = entries
+            .iter()
+            .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("heartbeat"))
+            .collect();
+        assert_eq!(hearts.len(), 3, "post-crash append must survive");
+        assert_eq!(hearts[2]["note"], "three");
     }
 }

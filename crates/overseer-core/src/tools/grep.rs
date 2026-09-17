@@ -108,8 +108,14 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         files_seen += 1;
         for (i, line) in content.lines().enumerate() {
             if re.is_match(line) {
-                let l = if line.len() > MAX_LINE {
-                    &line[..MAX_LINE]
+                // FAIL-1: byte-slicing panics on multibyte lines (byte 500
+                // inside a char boundary). Char-safe truncation instead.
+                let l: &str = if line.len() > MAX_LINE {
+                    line.char_indices()
+                        .take_while(|(b, _)| *b < MAX_LINE)
+                        .last()
+                        .map(|(b, c)| &line[..b + c.len_utf8()])
+                        .unwrap_or("")
                 } else {
                     line
                 };
@@ -318,6 +324,22 @@ mod tests {
             "honest regex error, got: {}",
             out.text
         );
+    }
+
+    #[test]
+    fn multibyte_long_line_truncates_without_panic() {
+        // FAIL-1: byte 500 inside a multibyte char must not panic.
+        let dir = tmpdir();
+        std::fs::write(dir.join("uni.txt"), format!("needle {}\n", "é".repeat(600))).unwrap();
+        let mut c = ctx(&dir);
+        let old = std::env::var_os("PATH");
+        std::env::set_var("PATH", "/nonexistent-no-rg-here");
+        let out = run(&serde_json::json!({"pattern": "needle"}), &mut c);
+        if let Some(p) = old {
+            std::env::set_var("PATH", p);
+        }
+        assert!(!out.is_error, "must not panic/error: {}", out.text);
+        assert!(out.text.contains("needle"));
     }
 
     #[test]
