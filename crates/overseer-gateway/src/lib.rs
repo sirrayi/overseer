@@ -31,6 +31,7 @@ pub mod gate;
 pub mod inbox;
 pub mod journal;
 pub mod notify;
+pub mod outbox;
 pub mod spawn;
 pub mod triage;
 pub mod trigger;

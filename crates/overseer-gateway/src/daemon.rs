@@ -30,6 +30,7 @@ use crate::spawn::{reap, spawn_run_from, Spawned};
 use crate::triage::classify;
 use crate::channels;
 use crate::channels::threads::ThreadRoutes;
+use crate::outbox::{LogSender, Outbox, Sender as OutboxSender};
 use crate::spawn::Origin;
 use crate::trigger::Trigger;
 
@@ -67,6 +68,8 @@ fn install_signal_flag() {}
 pub struct Daemon {
     /// P7-4: thread → session routing for messaging channels.
     routes: ThreadRoutes,
+    /// P7-5: outbound drafts (draft → approve → send).
+    outbox: Outbox,
     dirs: DaemonDirs,
     cfg: DaemonConfig,
     cfg_mtime: u64,
@@ -126,8 +129,10 @@ impl Daemon {
             }
         }
         let routes = ThreadRoutes::open(&dirs.channels()).map_err(|e| e.to_string())?;
+        let outbox = Outbox::new(dirs.outbox()).map_err(|e| e.to_string())?;
         Ok(Self {
             routes,
+            outbox,
             cfg_mtime: file_mtime(&cfg_path),
             dirs,
             cfg,
@@ -293,6 +298,42 @@ impl Daemon {
         }
     }
 
+    /// The transport for one draft. `local` is the daemon's own outbox log
+    /// (frontends tail it); Telegram is a real send when its token is
+    /// configured. Anything else fails honestly — an unconfigured channel
+    /// never silently "succeeds".
+    fn sender_for(&self, id: &str) -> Box<dyn OutboxSender> {
+        let channel = self
+            .outbox
+            .get(id)
+            .map(|d| d.channel)
+            .unwrap_or_else(|| "local".to_string());
+        match channel.as_str() {
+            "telegram" => {
+                let spec = self.cfg.triggers.iter().find_map(|t| match t {
+                    crate::config::TriggerSpec::Telegram(s) => Some(s.clone()),
+                    _ => None,
+                });
+                match spec.and_then(|s| {
+                    crate::channels::telegram::Telegram::from_env(&s.token_env)
+                        .ok()
+                        .map(|c| c.with_base(s.base.clone()))
+                }) {
+                    Some(tg) => Box::new(TelegramSender { tg }),
+                    None => Box::new(UnconfiguredSender {
+                        channel,
+                        detail: "no telegram trigger with a configured token".into(),
+                    }),
+                }
+            }
+            "local" => Box::new(LogSender::new(self.dirs.outbox().join("sent.jsonl"))),
+            other => Box::new(UnconfiguredSender {
+                channel: other.to_string(),
+                detail: "no transport for this channel".into(),
+            }),
+        }
+    }
+
     /// The origin a spawn inherits from its event: a channel event carries
     /// the untrusted marker (and therefore the autonomy floor); everything
     /// else is a local run.
@@ -421,12 +462,46 @@ impl Daemon {
                 decision,
                 snooze_ms,
             } => match self.inbox.decide(&self.journal, &id, &decision, snooze_ms) {
-                Ok(item) => CtlResponse::ok(serde_json::json!({
-                    "id": item.id, "state": item.state,
-                })),
+                Ok(item) => {
+                    // P7-5: approving a channel draft is the send trigger —
+                    // the ladder's external → Ask is what put it there.
+                    if item.class == "channel.draft" && decision == "approve" {
+                        let outcome = self.outbox.approve_and_send(
+                            &self.journal,
+                            &item.id,
+                            &self.sender_for(&item.id),
+                        );
+                        return match outcome {
+                            Ok(o) => CtlResponse::ok(serde_json::json!({
+                                "id": o.draft.id, "state": o.draft.state,
+                                "sent": o.sent, "retried": o.retried,
+                            })),
+                            Err(e) => CtlResponse::err(e),
+                        };
+                    }
+                    CtlResponse::ok(serde_json::json!({
+                        "id": item.id, "state": item.state,
+                    }))
+                }
                 Err(e) => CtlResponse::err(e),
             },
             CtlRequest::InboxAct { id } => match self.inbox.get(&id) {
+                // A channel draft is not agent work: acting on it sends the
+                // message (still through the outbox, still once).
+                Some(item) if item.class == "channel.draft" => {
+                    match self
+                        .outbox
+                        .approve_and_send(&self.journal, &item.id, &self.sender_for(&item.id))
+                    {
+                        Ok(o) => {
+                            let _ = self.inbox.mark_acted(&self.journal, &item.id);
+                            CtlResponse::ok(serde_json::json!({
+                                "id": o.draft.id, "state": o.draft.state, "sent": o.sent,
+                            }))
+                        }
+                        Err(e) => CtlResponse::err(e),
+                    }
+                }
                 Some(item) => {
                     let prompt = item.act_prompt.clone().unwrap_or_else(|| item.body.clone());
                     // An approval is the human's decision, but an item
@@ -451,6 +526,52 @@ impl Daemon {
             } => {
                 self.process(TriggerEvent::new(source, class, payload));
                 CtlResponse::ok(serde_json::json!({"fired": true}))
+            }
+            CtlRequest::ChannelSend {
+                to,
+                thread,
+                text,
+                channel,
+            } => {
+                // Draft only: the message waits for an inbox approval.
+                let channel = channel.unwrap_or_else(|| "local".to_string());
+                match self
+                    .outbox
+                    .draft(&self.journal, &channel, &to, thread.as_deref(), &text)
+                {
+                    Ok(draft) => {
+                        let item = InboxItem {
+                            id: draft.id.clone(),
+                            created_ms: draft.created_ms,
+                            class: "channel.draft".into(),
+                            source: format!("{channel}:{to}"),
+                            title: format!("outbound {channel} → {to}"),
+                            body: draft.text.clone(),
+                            // No act_prompt: approval *sends*, it never runs
+                            // a prompt on the model's behalf.
+                            act_prompt: None,
+                            state: ItemState::Open,
+                            until_ms: None,
+                        };
+                        if let Err(e) = self.inbox.open(&self.journal, item) {
+                            return CtlResponse::err(e.to_string());
+                        }
+                        CtlResponse::ok(serde_json::json!({
+                            "id": draft.id, "state": draft.state,
+                            "channel": draft.channel, "to": draft.to,
+                        }))
+                    }
+                    Err(e) => CtlResponse::err(e),
+                }
+            }
+            CtlRequest::DigestGet => {
+                let cards = crate::notify::build_digest(
+                    &self.inbox.list(),
+                    now_ms(),
+                    in_quiet_hours(&self.cfg.gate),
+                );
+                let cards = crate::notify::expire(cards, now_ms());
+                CtlResponse::ok(crate::notify::digest_view(&cards))
             }
             CtlRequest::Reload => {
                 let m = file_mtime(&self.dirs.config());
@@ -551,6 +672,33 @@ impl Daemon {
         let _ = std::fs::remove_file(self.dirs.killswitch());
         let _ = std::fs::remove_file(self.dirs.pidfile());
         0
+    }
+}
+
+/// The Telegram transport: one plain-text send per approved draft.
+struct TelegramSender {
+    tg: crate::channels::telegram::Telegram,
+}
+
+impl OutboxSender for TelegramSender {
+    fn send(&self, draft: &crate::outbox::Draft) -> Result<(), String> {
+        self.tg.send(&draft.to, &draft.text)
+    }
+}
+
+/// A channel with no usable transport. Refusing is the honest answer: a
+/// draft that cannot be delivered must stay approved-and-unsent.
+struct UnconfiguredSender {
+    channel: String,
+    detail: String,
+}
+
+impl OutboxSender for UnconfiguredSender {
+    fn send(&self, _draft: &crate::outbox::Draft) -> Result<(), String> {
+        Err(format!(
+            "channel '{}' is unconfigured: {}",
+            self.channel, self.detail
+        ))
     }
 }
 
@@ -845,6 +993,102 @@ mod daemon_pipeline_tests {
         let _d = new_daemon(root.clone(), Some(&cfg));
         let recs = journal_records(&root);
         assert!(has_kind(&recs, "channel.unconfigured"));
+    }
+
+    #[test]
+    fn channel_send_drafts_then_approval_sends_exactly_once() {
+        // P7-5: the socket call drafts; approval sends; a second approval
+        // does not send again. External comms never bypass the ladder.
+        let root = tmpdir("channel-send");
+        let mut d = new_daemon(root.clone(), Some(&pipeline_config()));
+        let resp = d.handle_ctl(CtlRequest::ChannelSend {
+            to: "ops".into(),
+            thread: Some("t1".into()),
+            text: "deploy is done".into(),
+            channel: None,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["data"]["state"], "draft");
+        let id = v["data"]["id"].as_str().unwrap().to_string();
+        assert!(root.join("outbox").join(format!("{id}.json")).exists());
+
+        // The draft is an inbox approval with no act prompt: approving
+        // sends, it never runs a prompt as agent work.
+        let items = d.inbox.list();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].class, "channel.draft");
+        assert!(items[0].act_prompt.is_none());
+        assert!(root.join("outbox").join("sent.jsonl").exists() == false);
+
+        let first = d.handle_ctl(CtlRequest::InboxDecide {
+            id: id.clone(),
+            decision: "approve".into(),
+            snooze_ms: None,
+        });
+        let first = serde_json::to_value(&first).unwrap();
+        assert_eq!(first["data"]["sent"], true, "{first}");
+        let second = d.handle_ctl(CtlRequest::InboxDecide {
+            id: id.clone(),
+            decision: "approve".into(),
+            snooze_ms: None,
+        });
+        let second = serde_json::to_value(&second).unwrap();
+        assert_eq!(second["data"]["sent"], false, "double approve sends once");
+        let sent = std::fs::read_to_string(root.join("outbox").join("sent.jsonl")).unwrap();
+        assert_eq!(sent.lines().count(), 1);
+        let rec: serde_json::Value = serde_json::from_str(sent.lines().next().unwrap()).unwrap();
+        assert_eq!(rec["text"], "deploy is done");
+        assert_eq!(rec["channel"], "local");
+        assert!(rec["idempotency_key"].as_str().is_some_and(|k| !k.is_empty()));
+
+        // An unconfigured transport refuses honestly and stays retryable.
+        let resp = d.handle_ctl(CtlRequest::ChannelSend {
+            to: "ops".into(),
+            thread: None,
+            text: "escalate".into(),
+            channel: Some("carrier-pigeon".into()),
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        let pigeon = v["data"]["id"].as_str().unwrap().to_string();
+        let r = d.handle_ctl(CtlRequest::InboxDecide {
+            id: pigeon.clone(),
+            decision: "approve".into(),
+            snooze_ms: None,
+        });
+        let r = serde_json::to_value(&r).unwrap();
+        assert_eq!(r["ok"], false);
+        assert!(r["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("unconfigured") && e.contains("carrier-pigeon")));
+        assert_eq!(
+            d.outbox.get(&pigeon).unwrap().state,
+            crate::outbox::DraftState::Approved,
+            "a failed send stays approved, never lost or faked"
+        );
+
+        // The digest is a protocol view over the same inbox: resolved items
+        // leave no cards…
+        let digest = serde_json::to_value(&d.handle_ctl(CtlRequest::DigestGet)).unwrap();
+        assert_eq!(digest["data"]["source"], "inbox");
+        assert!(
+            digest["data"]["cards"]
+                .as_array()
+                .is_some_and(|c| c.is_empty()),
+            "decided items are not pending: {digest}"
+        );
+        // …and a fresh draft shows up as a pending card.
+        let _ = d.handle_ctl(CtlRequest::ChannelSend {
+            to: "ops".into(),
+            thread: None,
+            text: "still pending".into(),
+            channel: None,
+        });
+        let digest = serde_json::to_value(&d.handle_ctl(CtlRequest::DigestGet)).unwrap();
+        let cards = digest["data"]["cards"].as_array().unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0]["class"], "channel.draft");
+        assert_eq!(cards[0]["count"], 1);
     }
 
     #[test]
