@@ -739,6 +739,17 @@ impl Agent {
                 )?;
 
                 let out = self.tools.call(name, input, &mut ctx);
+                // P7-3: computer-use acts are auditable — the tool's
+                // envelope carries the serving tier and the pre/post
+                // observation digests (audit-only; never rehydrated).
+                // Only this tool's results are parsed (a bash echo of a
+                // similar object must not forge an audit record), and
+                // error/unconfigured results skip.
+                if name == "computer" {
+                    if let Some(kind) = crate::tools::computer::audit_event(&out.text) {
+                        self.emit(kind, on_event)?;
+                    }
+                }
                 self.emit(
                     EventKind::ToolResult {
                         call_id: call_id.clone(),
@@ -1433,12 +1444,23 @@ mod tests {
         agent.run_turn("hi", &mut sink).unwrap();
 
         let seen = provider.seen_systems.lock().unwrap();
-        // identity + contract + safety + memory index (last static slot).
-        assert_eq!(seen[0].len(), 4);
-        assert!(seen[0][3].contains("## Memory index"));
-        assert!(seen[0][3].contains("facts.md — user facts"));
-        // Static sections stay first and byte-stable.
+        // identity + contract + safety + memory index, plus the P7-3
+        // computer segment (union ORDER). The count is branch-local, so it
+        // is not pinned here — the *order* is what matters.
+        assert!(seen[0].len() >= 4);
         assert!(seen[0][0].contains("Overseer"));
+        let idx = seen[0]
+            .iter()
+            .position(|s| s.contains("## Memory index"))
+            .expect("memory index segment present");
+        assert!(idx >= 3, "memory index sits after the fixed sections");
+        assert!(seen[0][idx].contains("facts.md — user facts"));
+        assert!(
+            seen[0]
+                .last()
+                .is_some_and(|s| s.starts_with("Computer use is tiered")),
+            "computer segment is the static tail"
+        );
         // Git-versioned: a commit landed at the turn boundary.
         assert!(memdir.join(".git").exists());
     }
