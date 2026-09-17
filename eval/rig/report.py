@@ -17,15 +17,21 @@ from collections import defaultdict
 from . import stats
 
 
+def _scalar(v):
+    """Identity fields must be hashable — a malformed row with a
+    dict-shaped `model` must not crash report grouping."""
+    return v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
+
+
 def group_key(r: dict) -> tuple:
     # run_set_id is part of the arm identity: two matrices of the same arm
     # are separate measurements, never silently pooled. A report that wants
     # cross-matrix aggregation must say so explicitly.
     return (
-        r.get("benchmark"),
-        r.get("harness"),
-        r.get("model"),
-        r.get("run_set_id"),
+        _scalar(r.get("benchmark")),
+        _scalar(r.get("harness")),
+        _scalar(r.get("model")),
+        _scalar(r.get("run_set_id")),
     )
 
 
@@ -66,8 +72,8 @@ def paired_sections(
     )
     for r in records:
         if r.get("kind") == "run":
-            by_set[(r.get("benchmark"), r.get("run_set_id"))][
-                (r.get("harness"), r.get("model"))
+            by_set[(_scalar(r.get("benchmark")), _scalar(r.get("run_set_id")))][
+                (_scalar(r.get("harness")), _scalar(r.get("model")))
             ].append(r)
     out = []
     for (bench, rs), arms in sorted(by_set.items(), key=lambda kv: _sort_key(kv[0])):
