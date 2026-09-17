@@ -351,10 +351,7 @@ impl CliNotifier {
         } else {
             &[]
         };
-        let program = candidates
-            .iter()
-            .map(PathBuf::from)
-            .find(|p| p.exists())?;
+        let program = candidates.iter().map(PathBuf::from).find(|p| p.exists())?;
         Some(CliNotifier {
             program,
             log_fallback: LogNotifier::new(log_path),
@@ -551,8 +548,12 @@ mod tests {
         assert_eq!(snooze["decision"], "snooze");
         assert_eq!(snooze["snooze_ms"], DEFAULT_SNOOZE_MS);
         assert_eq!(
-            [NotifyAction::Approve, NotifyAction::Reject, NotifyAction::Snooze]
-                .map(|a| a.label()),
+            [
+                NotifyAction::Approve,
+                NotifyAction::Reject,
+                NotifyAction::Snooze
+            ]
+            .map(|a| a.label()),
             ["Approve", "Reject", "Snooze"]
         );
 
@@ -583,9 +584,10 @@ mod tests {
         // Every build has a backend, and it names itself.
         let chosen = platform_notifier(dir.join("notify2.jsonl"));
         assert!(!chosen.backend().is_empty());
-        assert!(chosen
-            .notify(&card, &[NotifyAction::Approve])
-            .is_ok(), "the chosen backend must be usable on this host");
+        assert!(
+            chosen.notify(&card, &[NotifyAction::Approve]).is_ok(),
+            "the chosen backend must be usable on this host"
+        );
 
         // The inbox view is the same shape the ctl surface serves.
         let items = vec![item("1", "note.low", 5, "body")];

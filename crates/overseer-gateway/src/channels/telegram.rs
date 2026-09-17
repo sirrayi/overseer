@@ -54,7 +54,12 @@ impl Telegram {
     }
 
     fn url(&self, method: &str) -> String {
-        format!("{}/bot{}/{}", self.base.trim_end_matches('/'), self.token, method)
+        format!(
+            "{}/bot{}/{}",
+            self.base.trim_end_matches('/'),
+            self.token,
+            method
+        )
     }
 
     /// Long-poll URL for `getUpdates`. `timeout_s` is the *server* hold
@@ -140,13 +145,12 @@ pub fn next_offset(v: &Value, current: Option<i64>) -> Option<i64> {
     let max = v
         .get("result")
         .and_then(Value::as_array)
-        .map(|updates| {
+        .and_then(|updates| {
             updates
                 .iter()
                 .filter_map(|u| u.get("update_id").and_then(Value::as_i64))
                 .max()
-        })
-        .flatten()?;
+        })?;
     let next = max + 1;
     Some(match current {
         Some(c) if c > next => c,
@@ -163,14 +167,20 @@ pub fn parse_updates(v: &Value) -> Vec<Inbound> {
     };
     let mut out = Vec::new();
     for u in updates {
-        let Some(msg) = u.get("message") else { continue };
+        let Some(msg) = u.get("message") else {
+            continue;
+        };
         let Some(text) = msg.get("text").and_then(Value::as_str) else {
             continue;
         };
         if text.trim().is_empty() {
             continue;
         }
-        let Some(chat_id) = msg.get("chat").and_then(|c| c.get("id")).and_then(Value::as_i64) else {
+        let Some(chat_id) = msg
+            .get("chat")
+            .and_then(|c| c.get("id"))
+            .and_then(Value::as_i64)
+        else {
             continue;
         };
         let sender = msg
@@ -212,7 +222,10 @@ mod tests {
         );
         // A trailing slash on the base must not double up.
         let tg = Telegram::new("T").with_base("http://127.0.0.1:9/");
-        assert_eq!(tg.get_updates_url(None, 0), "http://127.0.0.1:9/botT/getUpdates?timeout=0");
+        assert_eq!(
+            tg.get_updates_url(None, 0),
+            "http://127.0.0.1:9/botT/getUpdates?timeout=0"
+        );
     }
 
     #[test]

@@ -160,7 +160,9 @@ impl Trigger {
                 "telegram trigger '{}': {} is unset — no bot token",
                 spec.id, spec.token_env
             )),
-            Trigger::Cron { id, expr, .. } => expr.error().map(|e| format!("cron trigger '{id}': {e}")),
+            Trigger::Cron { id, expr, .. } => {
+                expr.error().map(|e| format!("cron trigger '{id}': {e}"))
+            }
             _ => None,
         }
     }
@@ -569,7 +571,10 @@ impl CronExpr {
     /// follow cron's OR rule when both are restricted (Vixie cron), which
     /// is what operators expect from `0 9 1 * mon`.
     pub fn matches(&self, t: &CivilTime) -> bool {
-        if !self.minute.contains(t.minute) || !self.hour.contains(t.hour) || !self.month.contains(t.month) {
+        if !self.minute.contains(t.minute)
+            || !self.hour.contains(t.hour)
+            || !self.month.contains(t.month)
+        {
             return false;
         }
         let dom_any = (1..=31).all(|d| self.dom.contains(d));
@@ -620,7 +625,6 @@ impl CivilTime {
             dow: ((days + 4) % 7) as u32,
         })
     }
-
 }
 
 /// Days-since-epoch → (year, month, day). Howard Hinnant's `civil_from_days`
@@ -753,7 +757,10 @@ mod tests {
         }
         assert!(CronExpr::parse("* * * * *").is_ok());
         assert!(CronExpr::parse("0 0 1 1 0").is_ok());
-        assert!(CronExpr::parse("0 9 * * SUN").is_ok(), "names are case-insensitive");
+        assert!(
+            CronExpr::parse("0 9 * * SUN").is_ok(),
+            "names are case-insensitive"
+        );
         // Wrong arity / values / ranges / emptiness all fail closed.
         for bad in [
             "",
@@ -789,13 +796,19 @@ mod tests {
         let next_day = CivilTime::from_epoch_ms(at + 86_400_000).unwrap();
         assert_eq!((next_day.hour, next_day.minute), (t.hour, t.minute));
         assert_eq!((t.dow + 1) % 7, next_day.dow);
-        assert_eq!(CivilTime::from_epoch_ms(0).unwrap().dow, 4, "1970-01-01 was a Thursday (UTC)");
+        assert_eq!(
+            CivilTime::from_epoch_ms(0).unwrap().dow,
+            4,
+            "1970-01-01 was a Thursday (UTC)"
+        );
 
         let expr = CronExpr::parse(&format!("{} {} * * *", t.minute, t.hour)).unwrap();
         assert!(expr.matches(&t));
-        assert!(!CronExpr::parse(&format!("{} {} * * *", (t.minute + 1) % 60, t.hour))
-            .unwrap()
-            .matches(&t));
+        assert!(
+            !CronExpr::parse(&format!("{} {} * * *", (t.minute + 1) % 60, t.hour))
+                .unwrap()
+                .matches(&t)
+        );
 
         // The runtime latch: one event per matching minute, no repeats.
         let spec = TriggerSpec::Cron {
@@ -813,7 +826,11 @@ mod tests {
         assert!(trigger.poll_at(at + 1_000).is_empty(), "same minute");
         assert!(trigger.poll_at(at + 59_999).is_empty(), "same minute");
         assert!(trigger.poll_at(at + 60_000).is_empty(), "minute after");
-        assert_eq!(trigger.poll_at(at + 86_400_000).len(), 1, "next day, same minute");
+        assert_eq!(
+            trigger.poll_at(at + 86_400_000).len(),
+            1,
+            "next day, same minute"
+        );
 
         // Invalid expressions never fire and report why.
         let mut bad = Trigger::from_spec(&TriggerSpec::Cron {
@@ -826,9 +843,27 @@ mod tests {
         assert!(bad.unconfigured_reason().is_some());
         // Day-of-month OR day-of-week (Vixie rule).
         let e = CronExpr::parse("0 0 1 * mon").unwrap();
-        assert!(e.matches(&CivilTime { minute: 0, hour: 0, day: 1, month: 9, dow: 2 }));
-        assert!(e.matches(&CivilTime { minute: 0, hour: 0, day: 7, month: 9, dow: 1 }));
-        assert!(!e.matches(&CivilTime { minute: 0, hour: 0, day: 7, month: 9, dow: 2 }));
+        assert!(e.matches(&CivilTime {
+            minute: 0,
+            hour: 0,
+            day: 1,
+            month: 9,
+            dow: 2
+        }));
+        assert!(e.matches(&CivilTime {
+            minute: 0,
+            hour: 0,
+            day: 7,
+            month: 9,
+            dow: 1
+        }));
+        assert!(!e.matches(&CivilTime {
+            minute: 0,
+            hour: 0,
+            day: 7,
+            month: 9,
+            dow: 2
+        }));
     }
 
     #[test]
@@ -865,13 +900,23 @@ mod tests {
         let mut limiter = webhook::RateLimiter::new(5);
         let events = poll_webhook(&spool, &spec, Some("k"), &mut limiter, 1_000);
         assert_eq!(events.len(), 2);
-        let ok = events.iter().find(|e| e.class != "channel.rejected").unwrap();
+        let ok = events
+            .iter()
+            .find(|e| e.class != "channel.rejected")
+            .unwrap();
         assert!(ok.untrusted_source);
         assert_eq!(ok.class, "msg.inbound.queue");
         assert_eq!(ok.source, "webhook:u1");
-        let rejected = events.iter().find(|e| e.class == "channel.rejected").unwrap();
+        let rejected = events
+            .iter()
+            .find(|e| e.class == "channel.rejected")
+            .unwrap();
         assert!(rejected.untrusted_source);
-        assert!(rejected.payload.contains("signature"), "got {}", rejected.payload);
+        assert!(
+            rejected.payload.contains("signature"),
+            "got {}",
+            rejected.payload
+        );
         // Records are moved aside: the next tick sees nothing (no replay).
         assert!(poll_webhook(&spool, &spec, Some("k"), &mut limiter, 2_000).is_empty());
         assert!(spool.join("a.done").exists());
@@ -889,7 +934,11 @@ mod tests {
         };
         let events = poll_webhook(&spool, &spec_unset, None, &mut limiter, 3_000);
         assert_eq!(events.len(), 1);
-        assert!(events[0].payload.contains("unset"), "got {}", events[0].payload);
+        assert!(
+            events[0].payload.contains("unset"),
+            "got {}",
+            events[0].payload
+        );
     }
 
     #[test]
@@ -904,7 +953,10 @@ mod tests {
         assert!(trigger
             .unconfigured_reason()
             .is_some_and(|r| r.contains("OVERSEER_TELEGRAM_TOKEN_UNSET_77b")));
-        assert!(trigger.poll_at(1_000).is_empty(), "no token, no network call");
+        assert!(
+            trigger.poll_at(1_000).is_empty(),
+            "no token, no network call"
+        );
         // Configured but unreachable: the failure is an event, not a panic
         // — and it carries no token.
         let mut live = Trigger::from_spec(&TriggerSpec::Telegram(TelegramSpec {

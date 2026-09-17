@@ -57,14 +57,16 @@ fn entropy16() -> [u8; 16] {
         .unwrap_or(0);
     let mut state = nanos
         ^ (u64::from(std::process::id()) << 32)
-        ^ SEQ.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ SEQ
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
         ^ (&buf as *const _ as usize as u64);
-    for i in 0..16 {
+    for b in buf.iter_mut() {
         // xorshift64*: one byte per step, decorrelated across the seed.
         state ^= state >> 12;
         state ^= state << 25;
         state ^= state >> 27;
-        buf[i] = (state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 24) as u8;
+        *b = (state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 24) as u8;
     }
     buf
 }
@@ -103,9 +105,15 @@ mod tests {
         // The P6/P7 shared contract: `ovsent_` + exactly 32 lowercase hex.
         for _ in 0..64 {
             let s = new_sentinel();
-            assert!(is_sentinel(&s), "generated sentinel must satisfy the contract: {s}");
+            assert!(
+                is_sentinel(&s),
+                "generated sentinel must satisfy the contract: {s}"
+            );
             assert_eq!(s.len(), SENTINEL_PREFIX.len() + SENTINEL_HEX);
-            assert!(s.chars().skip(SENTINEL_PREFIX.len()).all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+            assert!(s
+                .chars()
+                .skip(SENTINEL_PREFIX.len())
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
         }
         // Near-misses fail closed.
         assert!(!is_sentinel("ovsent_"));
@@ -129,10 +137,7 @@ mod tests {
         assert!(!out.contains("other-secret-9"));
         // One sentinel per secret: 4 occurrences of the first, 1 of the
         // second, but only two distinct sentinels.
-        let sentinels: Vec<&str> = out
-            .split_whitespace()
-            .filter(|w| is_sentinel(w))
-            .collect();
+        let sentinels: Vec<&str> = out.split_whitespace().filter(|w| is_sentinel(w)).collect();
         assert_eq!(sentinels.len(), 4);
         assert_eq!(sentinels[0], sentinels[1]);
         assert_eq!(sentinels[0], sentinels[3]);

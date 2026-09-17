@@ -15,9 +15,9 @@ use crate::provider::{Provider, Request, StopReason};
 use crate::stuck::StuckDetector;
 use crate::tools::{ToolCtx, ToolRegistry};
 
-/// Static system prompt — assembled per turn by `prompt::assemble` as an
-/// ordered section pipeline with an explicit STATIC/DYNAMIC boundary
-/// (Invariant 2: nothing volatile lives above it).
+// Static system prompt — assembled per turn by `prompt::assemble` as an
+// ordered section pipeline with an explicit STATIC/DYNAMIC boundary
+// (Invariant 2: nothing volatile lives above it).
 
 /// P7-4: the marker an untrusted-originated spawn exports
 /// (`channel:<channel>:<sender>`). Absent/empty = a locally-originated run.
@@ -284,7 +284,9 @@ impl Agent {
         session_dir: PathBuf,
         session_id: String,
     ) -> std::io::Result<Self> {
-        Self::start_with_env(provider, config, session_dir, session_id, |k| std::env::var(k).ok())
+        Self::start_with_env(provider, config, session_dir, session_id, |k| {
+            std::env::var(k).ok()
+        })
     }
 
     /// `start` with the environment injected — the untrusted-origin marker
@@ -2068,13 +2070,24 @@ mod tests {
         // the obs carries metadata only, never pixel bytes.
         let cfg = AgentConfig::default();
         assert!(cfg.computer.takeover_pause, "fail-closed default");
-        assert!(crate::computer_obs::is_suppressed(&cfg.computer, true, "capture"));
-        assert!(!crate::computer_obs::is_suppressed(&cfg.computer, false, "capture"));
+        assert!(crate::computer_obs::is_suppressed(
+            &cfg.computer,
+            true,
+            "capture"
+        ));
+        assert!(!crate::computer_obs::is_suppressed(
+            &cfg.computer,
+            false,
+            "capture"
+        ));
         let mut watch = cfg.computer.clone();
         watch.watch_mode = true;
         assert!(crate::computer_obs::is_suppressed(&watch, false, "capture"));
         let obs = crate::computer_obs::metadata_obs(2560, 1600, 1280, 800, "cred-field focus");
-        assert!(!obs.contains("aGVsbG8"), "metadata obs carries no pixel bytes");
+        assert!(
+            !obs.contains("aGVsbG8"),
+            "metadata obs carries no pixel bytes"
+        );
         assert!(obs.contains("2560x1600"));
     }
 
@@ -2142,20 +2155,15 @@ mod tests {
                 done(),
             ]));
             let marker = armed.then(|| "channel:telegram:u1".to_string());
-            let mut agent = Agent::start_with_env(
-                provider,
-                cfg,
-                dir.to_path_buf(),
-                "s".into(),
-                |k| {
+            let mut agent =
+                Agent::start_with_env(provider, cfg, dir.to_path_buf(), "s".into(), |k| {
                     if k == UNTRUSTED_ENV {
                         marker.clone()
                     } else {
                         None
                     }
-                },
-            )
-            .unwrap();
+                })
+                .unwrap();
             let mut sink = |_: &Event| {};
             agent.run_turn("go", &mut sink).unwrap();
             let events = EventLog::replay(dir.join("events.jsonl")).unwrap();

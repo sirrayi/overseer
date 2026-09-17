@@ -148,7 +148,10 @@ impl Gemini {
                 // P7-2 CU: per-step `safety_decision` rides alongside the
                 // functionCall — the gate maps require_approval→Ask,
                 // deny→Deny (fail-closed); absence means no safety hold.
-                if let Some(sd) = p.get("safety_decision").or_else(|| fc.get("safety_decision")) {
+                if let Some(sd) = p
+                    .get("safety_decision")
+                    .or_else(|| fc.get("safety_decision"))
+                {
                     input["safety_decision"] = sd.clone();
                 }
                 blocks.push(Block::ToolCall {
@@ -299,7 +302,11 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
             // thoughtSignature continuity is load-bearing on tool turns.
             Block::Reasoning { raw } => parts.push(raw.clone()),
             // P7-1: screenshots ride as inline_data parts (native CU shape).
-            Block::Image { media_type, data_b64, .. } => parts.push(json!({
+            Block::Image {
+                media_type,
+                data_b64,
+                ..
+            } => parts.push(json!({
                 "inline_data": {"mime_type": media_type, "data": data_b64}
             })),
             Block::ToolCall { name, input, .. } => parts.push(json!({

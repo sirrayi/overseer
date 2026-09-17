@@ -103,13 +103,7 @@ fn seg(name: &'static str, text: &str) -> SystemSegment {
 /// preserved. Reordering a cacheable section breaks prefix-cache hits and
 /// must be deliberate.
 pub const ORDER: &[&str] = &[
-    "identity",
-    "contract",
-    "safety",
-    "memory",
-    "skills",
-    "persona",
-    "computer",
+    "identity", "contract", "safety", "memory", "skills", "persona", "computer",
 ];
 
 /// Boundary lint used by tests and future assemblers: every cacheable
@@ -225,7 +219,11 @@ mod tests {
         assert!(segs.iter().any(|s| s.name == "computer"));
         for s in &segs {
             if s.cacheable {
-                assert!(ORDER.contains(&s.name), "static section '{}' not in ORDER", s.name);
+                assert!(
+                    ORDER.contains(&s.name),
+                    "static section '{}' not in ORDER",
+                    s.name
+                );
             }
         }
         // Nothing volatile may live above the boundary.

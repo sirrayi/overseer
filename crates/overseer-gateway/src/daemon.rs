@@ -19,20 +19,20 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
+use crate::channels;
+use crate::channels::threads::ThreadRoutes;
 use crate::config::{load, DaemonConfig, DaemonDirs, TriageDecision};
 use crate::ctl::{listen, CtlRequest, CtlResponse};
 use crate::event::{now_ms, Dedup, TriggerEvent};
+use crate::gate::{cost_for, FocusState, PushedFocus};
 use crate::gate::{in_quiet_hours, route_desktop, Route};
 use crate::inbox::{Inbox, InboxItem, ItemState};
 use crate::journal::Journal;
 use crate::notify::PushQueue;
-use crate::spawn::{reap, spawn_run_from, Spawned};
-use crate::triage::classify;
-use crate::channels;
-use crate::channels::threads::ThreadRoutes;
-use crate::gate::{cost_for, FocusState, PushedFocus};
 use crate::outbox::{LogSender, Outbox, Sender as OutboxSender};
 use crate::spawn::Origin;
+use crate::spawn::{reap, spawn_run_from, Spawned};
+use crate::triage::classify;
 use crate::trigger::Trigger;
 
 /// Control-channel pair between the socket thread and the daemon loop.
@@ -130,7 +130,10 @@ impl Daemon {
         // once at startup: misconfiguration stays visible.
         for trigger in &triggers {
             if let Some(reason) = trigger.unconfigured_reason() {
-                journal.log("channel.unconfigured", serde_json::json!({"reason": reason}));
+                journal.log(
+                    "channel.unconfigured",
+                    serde_json::json!({"reason": reason}),
+                );
             }
         }
         let routes = ThreadRoutes::open(&dirs.channels()).map_err(|e| e.to_string())?;
@@ -517,10 +520,11 @@ impl Daemon {
                 // A channel draft is not agent work: acting on it sends the
                 // message (still through the outbox, still once).
                 Some(item) if item.class == "channel.draft" => {
-                    match self
-                        .outbox
-                        .approve_and_send(&self.journal, &item.id, &self.sender_for(&item.id))
-                    {
+                    match self.outbox.approve_and_send(
+                        &self.journal,
+                        &item.id,
+                        &self.sender_for(&item.id),
+                    ) {
                         Ok(o) => {
                             let _ = self.inbox.mark_acted(&self.journal, &item.id);
                             CtlResponse::ok(serde_json::json!({
@@ -763,7 +767,10 @@ impl OutboxSender for UnconfiguredSender {
 /// Resolve daemon-relative paths inside a trigger spec (P7-4): a relative
 /// webhook spool dir is anchored at the daemon root, so the same config
 /// works from any cwd.
-fn resolve_spec(spec: &crate::config::TriggerSpec, dirs: &DaemonDirs) -> crate::config::TriggerSpec {
+fn resolve_spec(
+    spec: &crate::config::TriggerSpec,
+    dirs: &DaemonDirs,
+) -> crate::config::TriggerSpec {
     match spec {
         crate::config::TriggerSpec::Webhook(w) if w.dir.is_relative() => {
             let mut w = w.clone();
@@ -1006,7 +1013,10 @@ mod daemon_pipeline_tests {
         d2.process(TriggerEvent::new("cli", "msg.inbound", "please help"));
         assert_eq!(d2.counts.spawned, 0, "at-cap deferral still applies");
         assert!(has_kind(&journal_records(&d2.dirs.root), "spawn_deferred"));
-        assert!(!has_kind(&journal_records(&d2.dirs.root), "channel.act_downgraded"));
+        assert!(!has_kind(
+            &journal_records(&d2.dirs.root),
+            "channel.act_downgraded"
+        ));
     }
 
     #[test]
@@ -1078,7 +1088,7 @@ mod daemon_pipeline_tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].class, "channel.draft");
         assert!(items[0].act_prompt.is_none());
-        assert!(root.join("outbox").join("sent.jsonl").exists() == false);
+        assert!(!root.join("outbox").join("sent.jsonl").exists());
 
         let first = d.handle_ctl(CtlRequest::InboxDecide {
             id: id.clone(),
@@ -1099,7 +1109,9 @@ mod daemon_pipeline_tests {
         let rec: serde_json::Value = serde_json::from_str(sent.lines().next().unwrap()).unwrap();
         assert_eq!(rec["text"], "deploy is done");
         assert_eq!(rec["channel"], "local");
-        assert!(rec["idempotency_key"].as_str().is_some_and(|k| !k.is_empty()));
+        assert!(rec["idempotency_key"]
+            .as_str()
+            .is_some_and(|k| !k.is_empty()));
 
         // An unconfigured transport refuses honestly and stays retryable.
         let resp = d.handle_ctl(CtlRequest::ChannelSend {
@@ -1128,7 +1140,7 @@ mod daemon_pipeline_tests {
 
         // The digest is a protocol view over the same inbox: resolved items
         // leave no cards…
-        let digest = serde_json::to_value(&d.handle_ctl(CtlRequest::DigestGet)).unwrap();
+        let digest = serde_json::to_value(d.handle_ctl(CtlRequest::DigestGet)).unwrap();
         assert_eq!(digest["data"]["source"], "inbox");
         assert!(
             digest["data"]["cards"]
@@ -1143,7 +1155,7 @@ mod daemon_pipeline_tests {
             text: "still pending".into(),
             channel: None,
         });
-        let digest = serde_json::to_value(&d.handle_ctl(CtlRequest::DigestGet)).unwrap();
+        let digest = serde_json::to_value(d.handle_ctl(CtlRequest::DigestGet)).unwrap();
         let cards = digest["data"]["cards"].as_array().unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0]["class"], "channel.draft");
@@ -1199,7 +1211,11 @@ mod daemon_pipeline_tests {
             active_app: None,
             idle_s: Some(1),
         });
-        d2.process(TriggerEvent::new("watch", "job.heavy.notify", "worth saying"));
+        d2.process(TriggerEvent::new(
+            "watch",
+            "job.heavy.notify",
+            "worth saying",
+        ));
         assert_eq!(d2.counts.pushed, 0, "focused: deferred");
         assert_eq!(d2.counts.inboxed, 1);
         let route = journal_records(&root2)
@@ -1240,12 +1256,12 @@ mod daemon_pipeline_tests {
             active_app: None,
             idle_s: Some(9_999),
         });
-        d3.process(TriggerEvent::new("watch", "job.heavy.notify", "at a breakpoint"));
-        assert_eq!(
-            d3.counts.pushed,
-            pushes_before + 2,
-            "away is a breakpoint"
-        );
+        d3.process(TriggerEvent::new(
+            "watch",
+            "job.heavy.notify",
+            "at a breakpoint",
+        ));
+        assert_eq!(d3.counts.pushed, pushes_before + 2, "away is a breakpoint");
     }
 
     #[test]

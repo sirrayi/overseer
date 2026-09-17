@@ -158,7 +158,10 @@ mod tests {
         assert_ne!(a, dm, "a DM is its own thread");
         assert_eq!(routes.len(), 3);
         // Both thread homes exist on disk from the first message.
-        assert!(a.is_dir() && b.is_dir() && dm.is_dir(), "session dirs exist");
+        assert!(
+            a.is_dir() && b.is_dir() && dm.is_dir(),
+            "session dirs exist"
+        );
         // Same thread, same dir — and the map survives a reopen.
         assert_eq!(routes.route("telegram", Some("-1001")), a);
         let mut reopened = ThreadRoutes::open(&root.join("channels")).unwrap();

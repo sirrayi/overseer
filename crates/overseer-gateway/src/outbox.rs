@@ -216,11 +216,15 @@ impl Outbox {
 
     /// Phase two, step one: mark approved (idempotent).
     pub fn approve(&self, journal: &Journal, id: &str) -> Result<Draft, String> {
-        let mut draft = self.get(id).ok_or_else(|| format!("outbox: no draft '{id}'"))?;
+        let mut draft = self
+            .get(id)
+            .ok_or_else(|| format!("outbox: no draft '{id}'"))?;
         match draft.state {
             DraftState::Approved | DraftState::Sent => return Ok(draft),
             DraftState::Rejected => {
-                return Err(format!("outbox: draft '{id}' was rejected — a new draft is needed"))
+                return Err(format!(
+                    "outbox: draft '{id}' was rejected — a new draft is needed"
+                ))
             }
             DraftState::Draft => {}
         }
@@ -234,7 +238,9 @@ impl Outbox {
     }
 
     pub fn reject(&self, journal: &Journal, id: &str) -> Result<Draft, String> {
-        let mut draft = self.get(id).ok_or_else(|| format!("outbox: no draft '{id}'"))?;
+        let mut draft = self
+            .get(id)
+            .ok_or_else(|| format!("outbox: no draft '{id}'"))?;
         if draft.state == DraftState::Sent {
             return Err(format!("outbox: draft '{id}' was already sent"));
         }
@@ -255,7 +261,9 @@ impl Outbox {
         id: &str,
         sender: &dyn Sender,
     ) -> Result<SendOutcome, String> {
-        let mut draft = self.get(id).ok_or_else(|| format!("outbox: no draft '{id}'"))?;
+        let mut draft = self
+            .get(id)
+            .ok_or_else(|| format!("outbox: no draft '{id}'"))?;
         match draft.state {
             DraftState::Sent => {
                 return Ok(SendOutcome {
@@ -269,9 +277,7 @@ impl Outbox {
                     "outbox: draft '{id}' is not approved — sending without approval is refused"
                 ))
             }
-            DraftState::Rejected => {
-                return Err(format!("outbox: draft '{id}' was rejected"))
-            }
+            DraftState::Rejected => return Err(format!("outbox: draft '{id}' was rejected")),
             DraftState::Approved => {}
         }
         let retried = draft.error.is_some();
@@ -394,13 +400,9 @@ mod tests {
         assert_eq!(outcome.draft.state, DraftState::Sent);
         assert_eq!(rec.sent.lock().unwrap().len(), 1);
         // A rejected draft never sends.
-        let second = outbox
-            .draft(&j, "local", "ops", None, "second")
-            .unwrap();
+        let second = outbox.draft(&j, "local", "ops", None, "second").unwrap();
         outbox.reject(&j, &second.id).unwrap();
-        let err = outbox
-            .approve_and_send(&j, &second.id, &rec)
-            .unwrap_err();
+        let err = outbox.approve_and_send(&j, &second.id, &rec).unwrap_err();
         assert!(err.contains("rejected"), "got: {err}");
         assert_eq!(rec.sent.lock().unwrap().len(), 1);
         // Receipts for every transition.
@@ -420,7 +422,9 @@ mod tests {
         let dir = tmpdir("idempotent");
         let j = journal(&dir);
         let outbox = Outbox::new(dir.join("outbox")).unwrap();
-        let draft = outbox.draft(&j, "telegram", "77", None, "on my way").unwrap();
+        let draft = outbox
+            .draft(&j, "telegram", "77", None, "on my way")
+            .unwrap();
         let key = draft.idempotency_key.clone();
         let rec = Recorder::default();
 
@@ -446,7 +450,10 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert!(files.iter().all(|f| !f.starts_with('.')), "no tmp left: {files:?}");
+        assert!(
+            files.iter().all(|f| !f.starts_with('.')),
+            "no tmp left: {files:?}"
+        );
         assert_eq!(files.len(), 1);
         // Empty messages are refused before anything is written.
         assert!(outbox.draft(&j, "local", "ops", None, "   ").is_err());
@@ -464,7 +471,9 @@ mod tests {
             sent: Mutex::new(Vec::new()),
             fail: true,
         };
-        let err = outbox.approve_and_send(&j, &draft.id, &failing).unwrap_err();
+        let err = outbox
+            .approve_and_send(&j, &draft.id, &failing)
+            .unwrap_err();
         assert!(err.contains("transport down"), "got: {err}");
         let after = outbox.get(&draft.id).unwrap();
         assert_eq!(after.state, DraftState::Approved, "retryable, not lost");
@@ -488,7 +497,9 @@ mod tests {
         let j = journal(&dir);
         let outbox = Outbox::new(dir.join("outbox")).unwrap();
         let sink = LogSender::new(dir.join("outbox/sent.jsonl"));
-        let draft = outbox.draft(&j, "local", "ops", Some("t1"), "first").unwrap();
+        let draft = outbox
+            .draft(&j, "local", "ops", Some("t1"), "first")
+            .unwrap();
         outbox.approve_and_send(&j, &draft.id, &sink).unwrap();
         let draft2 = outbox.draft(&j, "local", "ops", None, "second").unwrap();
         outbox.approve_and_send(&j, &draft2.id, &sink).unwrap();
@@ -500,6 +511,8 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["text"], "first");
         assert_eq!(lines[0]["channel"], "local");
-        assert!(lines[0]["idempotency_key"].as_str().is_some_and(|k| !k.is_empty()));
+        assert!(lines[0]["idempotency_key"]
+            .as_str()
+            .is_some_and(|k| !k.is_empty()));
     }
 }
