@@ -70,6 +70,18 @@ pub fn assemble(config: &AgentConfig) -> Vec<SystemSegment> {
             });
         }
     }
+    // Persona (P6-5): the approved identity/relationship/preference files,
+    // or a one-line pending notice while onboarding is unapproved — draft
+    // text never reaches the prompt. Static and cacheable: approval is a
+    // deliberate, rare event, and the slot sits between skills and computer
+    // in the frozen ORDER.
+    if let Some(dir) = &config.persona_dir {
+        segments.push(SystemSegment {
+            name: "persona",
+            text: crate::onboard::persona_body(dir),
+            cacheable: true,
+        });
+    }
     // --- DYNAMIC boundary: non-cacheable per-turn sections go below. ---
     segments
 }
@@ -230,5 +242,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// P6-5 prompt half of the draft gate: the persona segment sits in the
+    /// ORDER union slot and carries approved text only — a draft yields the
+    /// one-line pending notice instead.
+    #[test]
+    fn persona_segment_carries_approved_text_only() {
+        let dir = std::env::temp_dir().join(format!("overseer-prompt-{}", uuid::Uuid::now_v7()));
+        let persona = dir.join("persona");
+        crate::onboard::ensure_persona_dir(&persona).unwrap();
+        crate::onboard::write_drafts(
+            &persona,
+            &[(
+                "identity.md".to_string(),
+                vec![crate::onboard::Insight {
+                    text: "DRAFT_ONLY_INSIGHT".to_string(),
+                    source: 1,
+                }],
+            )],
+            1,
+        )
+        .unwrap();
+        let mut cfg = AgentConfig::default();
+        cfg.persona_dir = Some(persona.clone());
+
+        let segs = assemble(&cfg);
+        assert!(boundary_ok(&segs), "persona must respect the ORDER union");
+        let p = segs
+            .iter()
+            .find(|s| s.name == "persona")
+            .expect("persona segment present when the dir is configured");
+        assert!(p.cacheable, "persona is a static section");
+        assert!(!p.text.contains("DRAFT_ONLY_INSIGHT"), "{}", p.text);
+        assert_eq!(p.text.lines().count(), 1);
+        // Slot: after skills, before the dynamic boundary.
+        let names: Vec<&str> = segs.iter().map(|s| s.name).collect();
+        let pos = names.iter().position(|n| *n == "persona").unwrap();
+        assert!(pos + 1 == names.len(), "{names:?}");
+
+        // Approved → the real content renders, still boundary-clean.
+        crate::onboard::approve(&persona).unwrap();
+        let segs = assemble(&cfg);
+        assert!(boundary_ok(&segs));
+        let p = segs.iter().find(|s| s.name == "persona").unwrap();
+        assert!(p.text.contains("DRAFT_ONLY_INSIGHT"), "{}", p.text);
+        // No persona dir → no segment at all.
+        let segs = assemble(&AgentConfig::default());
+        assert!(segs.iter().all(|s| s.name != "persona"));
     }
 }
