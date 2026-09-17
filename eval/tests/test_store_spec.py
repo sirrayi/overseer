@@ -19,6 +19,55 @@ class TestStore:
         assert len(rows) == 2
         assert rows[0]["task_id"] == "t1"
 
+    def test_malformed_lines_skipped_not_fatal(self, tmp_path):
+        """A crashed writer can leave a truncated tail line — load must
+        skip it and count it, not abort every reader of the store."""
+        p = tmp_path / "s.jsonl"
+        p.write_text(
+            '{"kind": "run", "task_id": "ok"}\n'
+            "{not json\n"
+            '{"kind": "run", "task_id": "ok2"}\n'
+        )
+        st = store.Store(p)
+        rows = st.load()
+        assert [r["task_id"] for r in rows] == ["ok", "ok2"]
+        assert st.skipped_lines == 1
+
+    def test_malformed_rows_dont_crash_report(self, tmp_path):
+        """Store rows with missing/dict-shaped fields must not crash
+        stats or report grouping."""
+        from rig import report, stats
+
+        records = [
+            {
+                "kind": "run",
+                "task_id": "t1",
+                "pass": True,
+                "seed": 0,
+                "harness": "a",
+                "model": "m",
+                "run_set_id": "rs",
+                "benchmark": "local",
+            },
+            {"kind": "run"},  # everything missing
+            {
+                "kind": "run",
+                "task_id": "t1",
+                "pass": False,
+                "seed": 0,
+                "harness": "a",
+                "model": {"name": "dict"},
+                "run_set_id": "rs",
+                "benchmark": "local",
+                "cost_usd": "lots",
+                "tokens_in": -1,
+            },
+        ]
+        s = stats.summarize(records)
+        assert s["tasks"] == 1 and s["trials"] == 2
+        md, _ = report.render(records, k=1)
+        assert "overseer eval report" in md and "rs" in md
+
     def test_immutable_append_only(self, tmp_path):
         p = tmp_path / "s.jsonl"
         st = store.Store(p)
