@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod cache;
+pub mod cognee;
 pub mod compact;
 pub mod computer_obs;
 pub mod control;
@@ -13,6 +14,7 @@ pub mod cred;
 pub mod evalcfg;
 pub mod event;
 pub mod fuzzy;
+pub mod graph;
 pub mod hooks;
 pub mod ir;
 pub mod ledger;
@@ -24,6 +26,7 @@ pub mod observability;
 pub mod onboard;
 pub mod orchestration;
 pub mod perm;
+pub mod press;
 pub mod profile;
 pub mod prompt;
 pub mod provider;
