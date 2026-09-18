@@ -9,7 +9,9 @@ use crate::ir::{Message, Usage};
 
 pub mod anthropic;
 pub mod gemini;
+pub mod local;
 pub mod openai;
+pub mod router;
 
 /// Cross-provider effort ladder (P3.2). Each adapter maps the enum onto
 /// its native knob — Anthropic `thinking.budget_tokens`, OpenAI

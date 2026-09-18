@@ -40,10 +40,16 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => {
+            // P8-B (fzf lookup-miss hints): a missing path is usually a
+            // typo — rank the sibling names so the repair is one call away
+            // instead of a `glob` round trip.
+            let hint = sibling_hint(&path)
+                .map(|h| format!(" {h}"))
+                .unwrap_or_default();
             return ToolOutput::err(format!(
-                "Cannot read {}: {e}. Check the path with `glob` or `bash ls`.",
+                "Cannot read {}: {e}. Check the path with `glob` or `bash ls`.{hint}",
                 path.display()
-            ))
+            ));
         }
     };
 
@@ -101,6 +107,26 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
     ToolOutput::ok(out)
 }
 
+/// Bounded sibling-name hint for a failed read: at most `SIBLING_SCAN`
+/// directory entries are scanned (a directory with 100K files must not turn
+/// one typo into a stall), and only real subsequence matches are offered.
+const SIBLING_SCAN: usize = 64;
+
+fn sibling_hint(path: &std::path::Path) -> Option<String> {
+    let dir = path.parent()?;
+    let want = path.file_name()?.to_string_lossy().to_string();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .take(SIBLING_SCAN)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    crate::fuzzy::miss_hint(&want, &names, 3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +149,35 @@ mod tests {
             sandbox: false,
             broker: None,
         }
+    }
+
+    #[test]
+    fn missing_path_hints_the_nearest_sibling() {
+        // P8-B accept (fzf miss hints): a typo'd path gets a ranked hint,
+        // and an unrelated name gets none (no noise).
+        let dir = tmpdir();
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("main.txt"), "x\n").unwrap();
+        std::fs::write(dir.join("zzz.py"), "x\n").unwrap();
+        let mut reg = crate::tools::ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut c = ctx(&dir);
+
+        // `man.rs` is a subsequence of `main.rs` (a dropped letter — the
+        // typo shape a subsequence matcher can actually repair).
+        let miss = run(&serde_json::json!({"path": "man.rs"}), &mut c, &mut reg);
+        assert!(miss.is_error);
+        assert!(miss.text.contains("did you mean:"), "{}", miss.text);
+        assert!(miss.text.contains("main.rs"), "{}", miss.text);
+
+        let unrelated = run(&serde_json::json!({"path": "qqqq"}), &mut c, &mut reg);
+        assert!(unrelated.is_error);
+        assert!(
+            !unrelated.text.contains("did you mean:"),
+            "a non-subsequence must not hint: {}",
+            unrelated.text
+        );
+        // The hint is bounded and never turns into an error of its own.
+        assert!(sibling_hint(std::path::Path::new("/")).is_none());
     }
 
     #[test]

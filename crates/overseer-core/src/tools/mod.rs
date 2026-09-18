@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 
 pub mod bash;
 pub mod computer;
+pub mod diagnostics;
 pub mod edit;
 pub mod glob;
 pub mod grep;
@@ -167,12 +168,28 @@ struct ReadRecord {
 /// caller path can skip it (Invariant 3).
 /// All tool names the core registry can emit — the validation set for
 /// `--no-tools` ablations (typo'd names fail fast, not silently no-op).
-pub const TOOL_NAMES: [&str; 12] = [
-    "bash", "read", "write", "edit", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol",
+/// Sorted; `all_core_specs_deny_additional_properties` pins the count to
+/// the registry's spec list.
+pub const TOOL_NAMES: [&str; 13] = [
+    "bash",
     "computer",
+    "diagnostics",
+    "edit",
+    "glob",
+    "grep",
+    "plan",
+    "read",
+    "repo_map",
+    "skill",
+    "symbol",
+    "task",
+    "write",
 ];
 
 pub struct ToolRegistry {
+    /// Every spec resident in this registry — the set a mode or an
+    /// ablation filters down from. `specs` is the advertised view.
+    base_specs: Vec<crate::provider::ToolSpec>,
     pub specs: Vec<crate::provider::ToolSpec>,
     /// Paths the agent has read this session (canonicalized).
     read_paths: HashSet<PathBuf>,
@@ -185,6 +202,14 @@ pub struct ToolRegistry {
     /// P4.3 ablation: names removed via --no-tools. Hidden from the spec
     /// list AND refused at dispatch — defense in depth.
     disabled: HashSet<String>,
+    /// P8-B hooks (ECC pattern): data rules loaded from
+    /// `<root>/.overseer/hooks.json`. Pre rules block at the dispatch
+    /// boundary (before the gate); post rules annotate the result. Empty
+    /// when no file exists — hooks are an extra guardrail, never the gate.
+    pub hooks: Vec<crate::hooks::HookRule>,
+    /// P8-B session mode (roo pattern): the active posture's toolset and
+    /// edit globs. `None` = default posture (every resident tool).
+    pub mode: Option<&'static crate::modes::Mode>,
 }
 
 impl ToolRegistry {
@@ -204,15 +229,20 @@ impl ToolRegistry {
             repomap::spec_map(),
             repomap::spec_symbol(),
             computer::spec(),
+            diagnostics::spec(),
         ];
         specs.sort_by(|a, b| a.name.cmp(&b.name));
+        let hooks = crate::hooks::load(&policy.root);
         ToolRegistry {
+            base_specs: specs.clone(),
             specs,
             read_paths: HashSet::new(),
             read_log: HashMap::new(),
             policy,
             taint_notices: Vec::new(),
             disabled: HashSet::new(),
+            hooks,
+            mode: None,
         }
     }
 
@@ -220,13 +250,18 @@ impl ToolRegistry {
     /// writes stay single-threaded in the parent agent. No `task` either —
     /// subagents cannot spawn subagents.
     pub fn readonly(policy: crate::perm::Policy) -> Self {
+        let hooks = crate::hooks::load(&policy.root);
+        let specs = vec![read::spec(), grep::spec(), glob::spec()];
         ToolRegistry {
-            specs: vec![read::spec(), grep::spec(), glob::spec()],
+            base_specs: specs.clone(),
+            specs,
             read_paths: HashSet::new(),
             read_log: HashMap::new(),
             policy,
             taint_notices: Vec::new(),
             disabled: HashSet::new(),
+            hooks,
+            mode: None,
         }
     }
 
@@ -236,14 +271,54 @@ impl ToolRegistry {
     pub fn plan_mode(policy: crate::perm::Policy) -> Self {
         let mut specs = vec![read::spec(), grep::spec(), glob::spec(), plan::spec()];
         specs.sort_by(|a, b| a.name.cmp(&b.name));
+        let hooks = crate::hooks::load(&policy.root);
         ToolRegistry {
+            base_specs: specs.clone(),
             specs,
             read_paths: HashSet::new(),
             read_log: HashMap::new(),
             policy,
             taint_notices: Vec::new(),
             disabled: HashSet::new(),
+            hooks,
+            mode: None,
         }
+    }
+
+    /// Apply a session mode (roo pattern): every resident tool the mode
+    /// does not allow is removed — spec list AND dispatch, the same
+    /// capability-removal mechanism plan mode uses. The mode's complement
+    /// replaces any previous mode's removals (postures don't stack), and
+    /// `ablated` (`--no-tools`) is re-applied on top so an ablation is
+    /// never resurrected by a mode switch.
+    pub fn set_mode(&mut self, mode: &'static crate::modes::Mode, ablated: &[String]) {
+        self.mode = Some(mode);
+        self.disabled.clear();
+        for n in mode.disable_list_for(&self.base_specs) {
+            self.disabled.insert(n);
+        }
+        for n in ablated {
+            self.disabled.insert(n.clone());
+        }
+        self.rebuild_specs();
+    }
+
+    /// Recompute the advertised list from the resident set minus the
+    /// disabled set (one source of truth for ablation + mode removal).
+    fn rebuild_specs(&mut self) {
+        self.specs = self
+            .base_specs
+            .iter()
+            .filter(|s| !self.disabled.contains(&s.name))
+            .cloned()
+            .collect();
+    }
+
+    /// The active mode's edit-glob verdict for `path` (no mode or empty
+    /// globs → allowed). Called by the file tools so a mode's
+    /// `edit_globs` bound cannot be bypassed by skipping the CLI.
+    pub fn edit_allowed(&self, path: &str) -> bool {
+        self.mode.is_none_or(|m| m.edit_allowed(path))
     }
 
     /// P4.3 ablation: drop `names` from the advertised spec list and refuse
@@ -253,7 +328,7 @@ impl ToolRegistry {
         for n in names {
             self.disabled.insert(n.clone());
         }
-        self.specs.retain(|s| !self.disabled.contains(&s.name));
+        self.rebuild_specs();
     }
 
     pub fn mark_read(&mut self, path: &Path) {
@@ -331,6 +406,13 @@ impl ToolRegistry {
                 "Tool '{name}' is disabled for this run (--no-tools)."
             ));
         }
+        // P8-B hooks (ECC pattern): a pre_tool_use rule blocks the call
+        // BEFORE the gate — the first matching rule wins, and the verdict
+        // is one-way (a hook can only tighten, never widen). Hooks are
+        // data, not scripts: no subprocess, no second execution surface.
+        if let Some(reason) = crate::hooks::maybe_block(&self.hooks, name, input) {
+            return ToolOutput::denied(format!("hook `pre_tool_use` blocked it — {reason}"));
+        }
         // RT-4: a bash command mentioning a brokered selector can exfil
         // the secret (echo $TOKEN > /tmp/x) — latch sensitive BEFORE the
         // gate so the triangle arms for this and follow-up side effects.
@@ -394,9 +476,21 @@ impl ToolRegistry {
             "repo_map" => repomap::run_map(input, ctx),
             "symbol" => repomap::run_symbol(input, ctx),
             "computer" => computer::run(input, ctx),
+            "diagnostics" => diagnostics::run(input, ctx),
             other => ToolOutput::err(format!(
-                "Unknown tool '{other}'. Available tools: bash, read, write, edit, grep, glob, plan, task, skill, repo_map, symbol, computer."
+                "Unknown tool '{other}'. Available tools: {}.",
+                TOOL_NAMES.join(", ")
             )),
+        };
+        // P8-B post_tool_use hooks: annotate (never block) the result so
+        // the model sees the flagged property inline. Runs on the RAW text
+        // — same ordering rule as the taint latch, which reads below.
+        let out = match crate::hooks::post_notice(&self.hooks, name, &out.text) {
+            Some(reason) => ToolOutput {
+                text: format!("{}\n[hook] {reason}", out.text),
+                ..out
+            },
+            None => out,
         };
         // Rule-of-Two bookkeeping (P3.10): this result may carry untrusted
         // content or secret material — latch on the RAW text before any
@@ -819,6 +913,105 @@ mod tests {
             );
         }
         assert_eq!(reg.specs.len(), TOOL_NAMES.len());
+    }
+
+    #[test]
+    fn hook_rules_block_and_annotate_at_dispatch() {
+        // P8-B accept (ECC hooks): a pre rule denies before the gate (the
+        // call never runs), a post rule annotates the result text.
+        let dir = tmpdir();
+        std::fs::create_dir_all(dir.join(".overseer")).unwrap();
+        std::fs::write(
+            dir.join(crate::hooks::HOOKS_FILE),
+            r#"[
+              {"event":"pre_tool_use","tool":"bash","contains":"curl","reason":"no egress from this repo"},
+              {"event":"post_tool_use","tool":"read","contains":"SECRET_MARKER","reason":"file carries a marked value"}
+            ]"#,
+        )
+        .unwrap();
+        let mut reg = ToolRegistry::core(crate::perm::Policy::headless(dir.clone()));
+        assert_eq!(reg.hooks.len(), 2, "the rules file is loaded");
+        let mut c = ctx(&dir);
+
+        let blocked = reg.call(
+            "bash",
+            &json!({"command": "curl https://example.com"}),
+            &mut c,
+        );
+        assert!(blocked.denied, "pre-hook must deny the call");
+        assert!(
+            blocked.text.contains("no egress from this repo"),
+            "{}",
+            blocked.text
+        );
+        assert!(
+            blocked.text.contains("Permission denied"),
+            "a hook block is a gate-shaped deny: {}",
+            blocked.text
+        );
+
+        std::fs::write(dir.join("n.txt"), "SECRET_MARKER here\n").unwrap();
+        let annotated = reg.call("read", &json!({"path": "n.txt"}), &mut c);
+        assert!(!annotated.is_error);
+        assert!(
+            annotated
+                .text
+                .contains("[hook] file carries a marked value"),
+            "{}",
+            annotated.text
+        );
+        // A clean result is untouched.
+        std::fs::write(dir.join("m.txt"), "nothing to see\n").unwrap();
+        let clean = reg.call("read", &json!({"path": "m.txt"}), &mut c);
+        assert!(!clean.text.contains("[hook]"), "{}", clean.text);
+    }
+
+    #[test]
+    fn mode_removes_tools_and_a_later_mode_restores_them() {
+        // P8-B accept (roo modes): capability removal, reversible by a
+        // switch back — the resident set (`base_specs`) is the source.
+        let dir = tmpdir();
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        reg.set_mode(crate::modes::for_mode("architect").unwrap(), &[]);
+        let names: Vec<&str> = reg.specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"write") && !names.contains(&"bash"));
+        assert!(names.contains(&"read"));
+        let mut c = ctx(&dir);
+        let out = reg.call("write", &json!({"path": "a.txt", "content": "x"}), &mut c);
+        assert!(out.is_error, "a removed tool is refused at dispatch");
+        assert!(out.text.contains("disabled for this run"), "{}", out.text);
+
+        // Switching back to the default posture restores the full set —
+        // but re-applies an ablation passed alongside.
+        reg.set_mode(
+            crate::modes::for_mode("code").unwrap(),
+            &["computer".to_string()],
+        );
+        let names: Vec<&str> = reg.specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"write"));
+        assert!(
+            !names.contains(&"computer"),
+            "--no-tools survives a mode switch"
+        );
+    }
+
+    #[test]
+    fn diagnostics_is_resident_and_arg_checked() {
+        let dir = tmpdir();
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        assert!(
+            reg.specs.iter().any(|s| s.name == "diagnostics"),
+            "the diagnostics tool is advertised"
+        );
+        let mut c = ctx(&dir);
+        // A typo'd argument is refused before the tool runs (B1-2).
+        let out = reg.call("diagnostics", &json!({"bogus": 1}), &mut c);
+        assert!(out.is_error);
+        assert!(
+            out.text.contains("Unknown parameter 'bogus'"),
+            "{}",
+            out.text
+        );
     }
 
     #[test]

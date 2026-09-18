@@ -30,6 +30,156 @@ const MAX_LISTED_FILES: usize = 50;
 const MAX_NOTES: usize = 3;
 const MAX_ERRORS: usize = 3;
 
+/// Result of a salience pre-filter (selective-context pattern, arsenal B2):
+/// the kept text plus what it cost, so the caller can report the loss
+/// instead of hiding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Salient {
+    pub text: String,
+    pub kept: usize,
+    pub dropped: usize,
+}
+
+/// Sentence-level salience pre-filter: keep the most informative `ratio` of
+/// a long text before it enters the context, preserving the original order.
+///
+/// Score per sentence (deterministic, no model): the summed inverse document
+/// frequency of its tokens within this text (a token that appears once is
+/// what makes a sentence specific), plus a bonus for identifier-shaped
+/// tokens (digits, `_`, CamelCase, paths) and for a leading position.
+/// The first sentence is always kept — it is the one that says what the
+/// text is about.
+///
+/// `ratio >= 1.0`, a text with fewer than three sentences, or an empty text
+/// returns the input unchanged (a pre-filter that rewrites short text is
+/// all cost and no benefit). This is a *lossy* view: callers must treat
+/// `dropped > 0` as a signal worth surfacing, never as a silent trim.
+pub fn salience_filter(text: &str, ratio: f64) -> Salient {
+    let sentences = split_sentences(text);
+    if !ratio.is_finite() || ratio >= 1.0 || sentences.len() < 3 {
+        return Salient {
+            kept: sentences.len(),
+            dropped: 0,
+            text: text.to_string(),
+        };
+    }
+    let ratio = ratio.max(0.0);
+    let keep_n = (sentences.len() as f64 * ratio).ceil() as usize;
+    let keep_n = keep_n.clamp(1, sentences.len());
+    if keep_n == sentences.len() {
+        return Salient {
+            kept: sentences.len(),
+            dropped: 0,
+            text: text.to_string(),
+        };
+    }
+
+    // Document frequency over sentences (the whole "document" is `text`).
+    let toks: Vec<Vec<String>> = sentences.iter().map(|s| words(s)).collect();
+    let mut df: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for t in &toks {
+        let uniq: std::collections::HashSet<&str> = t.iter().map(String::as_str).collect();
+        for w in uniq {
+            *df.entry(w).or_insert(0) += 1;
+        }
+    }
+    let scored: Vec<(usize, f64)> = sentences
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let mut score = 0.0f64;
+            for w in &toks[i] {
+                let freq = df.get(w.as_str()).copied().unwrap_or(1).max(1);
+                score += 1.0 / freq as f64;
+                if is_identifier_like(w) {
+                    score += 0.5;
+                }
+            }
+            // Head bias: the opening sentence frames the rest.
+            if i == 0 {
+                score += 1.0;
+            }
+            (i, score)
+        })
+        .collect();
+    // Select the top `keep_n` by score; ties break on the earlier index so
+    // the result is stable (selection must never depend on map order).
+    let mut by_score = scored.clone();
+    by_score.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    by_score.truncate(keep_n);
+    // Always keep the first sentence, whatever the scoring said.
+    if !by_score.iter().any(|(i, _)| *i == 0) {
+        by_score.pop();
+        by_score.push((0, scored[0].1));
+    }
+    let mut keep: Vec<usize> = by_score.into_iter().map(|(i, _)| i).collect();
+    keep.sort_unstable();
+    let kept_text = keep
+        .iter()
+        .map(|i| sentences[*i].trim())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Salient {
+        text: kept_text,
+        kept: keep.len(),
+        dropped: sentences.len() - keep.len(),
+    }
+}
+
+/// Sentence-ish split: on `.`/`!`/`?` followed by whitespace or end, and on
+/// hard newlines. Blank fragments are dropped.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\n' {
+            if !cur.trim().is_empty() {
+                out.push(std::mem::take(&mut cur));
+            } else {
+                cur.clear();
+            }
+            continue;
+        }
+        cur.push(c);
+        if matches!(c, '.' | '!' | '?') {
+            let next_ws = chars.peek().is_none_or(|n| n.is_whitespace());
+            if next_ws {
+                chars.next_if(|n| *n == ' ');
+                if !cur.trim().is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Lowercased word tokens.
+fn words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
+/// Identifier-shaped token: has a digit, an underscore, a path separator, or
+/// an interior capital. These are the tokens a coding context must not lose.
+fn is_identifier_like(raw: &str) -> bool {
+    let has_digit = raw.chars().any(|c| c.is_ascii_digit());
+    let has_us = raw.contains('_');
+    let has_path = raw.contains('/') || raw.contains('.');
+    let has_inner_cap = raw.chars().skip(1).any(|c| c.is_ascii_uppercase());
+    has_digit || has_us || has_path || has_inner_cap
+}
+
 /// Choose the tail anchor: the event id of the `ModelResponse` that begins
 /// the last `keep` turns. Returns `None` when there aren't enough turns to
 /// make compaction worthwhile (dropping nothing is a no-op).

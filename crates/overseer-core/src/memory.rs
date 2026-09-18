@@ -13,6 +13,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const INDEX_NAME: &str = "INDEX.md";
+/// Resident core file (Letta's `core_memory` pattern, arsenal B2): a small
+/// `CORE.md` always in the prompt, next to the index. Where INDEX.md is a
+/// pointer table that grows, CORE.md is the fixed handful of lines that
+/// must never be paged out — identity and standing instructions.
+pub const CORE_NAME: &str = "CORE.md";
+/// Hard cap on the resident core block (2KB ≈ 500 tokens). Over the cap the
+/// block is truncated *with a repair note*, never silently.
+pub const CORE_CAP: usize = 2_048;
+/// Routing hint (LightRAG pattern, arsenal B2): level-aware retrieval is a
+/// prompt contract, not code — tell the model which layer answers which
+/// kind of question, and the local/global split falls out of the files.
+pub const ROUTING_HINT: &str = "Retrieval: answer specific questions from \
+    topic files (`read` them); answer overview questions from this index.";
+
+/// Ceiling on a declared per-asset TTL (100 years — a bound, not a policy).
+pub const MAX_TTL_DAYS: u64 = 36_500;
 /// Playbook cap: the index is a pointer table, not a document store.
 pub const INDEX_CAP: usize = 25_000;
 
@@ -53,9 +69,45 @@ impl Sensitivity {
     }
 }
 
+/// Retention class of one memory asset (TencentDB TTL-taxonomy pattern,
+/// arsenal B2): `private` is the default, `shared` may be read by anything
+/// the session is authorized to share with, and `regulated` is never
+/// served into a subagent/quarantined view regardless of its sensitivity
+/// tier — the column exists so an operator can mark an asset "keep on
+/// disk, never fan out" without deleting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Governance {
+    #[default]
+    Private,
+    Shared,
+    Regulated,
+}
+
+impl Governance {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Governance::Private => "private",
+            Governance::Shared => "shared",
+            Governance::Regulated => "regulated",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_lowercase().as_str() {
+            "private" => Ok(Governance::Private),
+            "shared" => Ok(Governance::Shared),
+            "regulated" => Ok(Governance::Regulated),
+            other => Err(format!(
+                "memory: bad governance `{other}` — want private|shared|regulated"
+            )),
+        }
+    }
+}
+
 /// File-convention header for one memory topic file (P6-1): frontmatter
 /// between `---` lines carrying provenance, a 0..1 confidence, an
-/// optional RFC3339 validity window, and a sensitivity tier. Files
+/// optional RFC3339 validity window, a sensitivity tier, and the B2 TTL
+/// taxonomy columns (`ttl_days` retention, `governance` class). Files
 /// without frontmatter read as the unvetted default.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntryMeta {
@@ -64,6 +116,13 @@ pub struct EntryMeta {
     pub valid_from: Option<String>,
     pub valid_to: Option<String>,
     pub sensitivity: Sensitivity,
+    /// Per-asset time-to-live in days, counted from the file's mtime (the
+    /// engine has no creation timestamp and refuses to invent one). `None`
+    /// = keep until superseded. `Some(0)` = expires immediately, which is
+    /// how a short-lived note is marked.
+    pub ttl_days: Option<u64>,
+    /// Retention class (see `Governance`).
+    pub governance: Governance,
 }
 
 impl Default for EntryMeta {
@@ -74,6 +133,8 @@ impl Default for EntryMeta {
             valid_from: None,
             valid_to: None,
             sensitivity: Sensitivity::Personal,
+            ttl_days: None,
+            governance: Governance::Private,
         }
     }
 }
@@ -129,6 +190,12 @@ pub fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
                 }
             }
             "sensitivity" => meta.sensitivity = Sensitivity::parse(v)?,
+            "ttl_days" => {
+                meta.ttl_days = Some(v.parse::<u64>().map_err(|_| {
+                    format!("memory: bad ttl_days `{v}` — want a whole number of days")
+                })?)
+            }
+            "governance" => meta.governance = Governance::parse(v)?,
             // Unknown keys are ignored (forward-compatible headers).
             _ => {}
         }
@@ -149,6 +216,13 @@ pub fn validate_meta(meta: &EntryMeta) -> Result<(), String> {
             "memory: confidence {} out of range — want 0..1",
             meta.confidence
         ));
+    }
+    if let Some(d) = meta.ttl_days {
+        if d > MAX_TTL_DAYS {
+            return Err(format!(
+                "memory: ttl_days {d} out of range — want 0..={MAX_TTL_DAYS}"
+            ));
+        }
     }
     for (name, v) in [
         ("valid_from", &meta.valid_from),
@@ -409,19 +483,168 @@ fn format_utc_stamp(secs: u64) -> String {
     )
 }
 
-/// True when the topic body carries a `superseded_by:` trailer pointing at a
-/// live successor (F9 — invalidate() appends these; the pointer is stale).
+/// True when the topic body carries a `superseded_by` trailer pointing at
+/// a live successor (F9 — `invalidate()` appends these; the pointer is
+/// stale). Both spellings are accepted: `superseded_by: name` (the
+/// frontmatter-ish form) and `superseded_by name` (exactly what
+/// `invalidate()` writes). Requiring only the colon was the F9 gap this
+/// port closes: an invalidated asset stayed "live" to every reader.
 fn meta_superseded(text: &str) -> bool {
     text.lines().any(|l| {
         let t = l.trim();
-        t.starts_with("superseded_by:") && t.len() > "superseded_by:".len()
+        if let Some(rest) = t.strip_prefix("superseded_by:") {
+            return !rest.trim().is_empty();
+        }
+        if let Some(rest) = t.strip_prefix("superseded_by ") {
+            return !rest.trim().is_empty();
+        }
+        false
     })
 }
 
+/// True when an asset's declared TTL has run out: `mtime + ttl_days` is
+/// at or before now. No creation timestamp is stored (the engine refuses
+/// to invent one), so the file's mtime is the retention clock — editing an
+/// asset renews it, which is the behavior an operator expects from a
+/// "keep this for N days" column. `mtime: None` (stat failed) → not
+/// expired: fail-open on liveness, fail-closed on bodies.
+fn meta_ttl_expired(meta: &EntryMeta, mtime: Option<std::time::SystemTime>) -> bool {
+    let Some(days) = meta.ttl_days else {
+        return false;
+    };
+    let Some(mtime) = mtime else {
+        return false;
+    };
+    let Ok(modified) = mtime.duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    modified
+        .as_secs()
+        .saturating_add(days.saturating_mul(86_400))
+        <= now
+}
+
+/// True when an entry's header says it is still current (validity window
+/// and TTL not elapsed, not superseded).
+fn meta_current(meta: &EntryMeta, text: &str, mtime: Option<std::time::SystemTime>) -> bool {
+    if meta_expired(meta) {
+        return false;
+    }
+    if meta_ttl_expired(meta, mtime) {
+        return false;
+    }
+    !meta_superseded(text)
+}
+
+/// One topic file's parse state — the single scanner every liveness,
+/// sensitivity, governance, and view decision reads.
+enum Topic {
+    /// No backing file (orphan pointer).
+    Missing,
+    /// File with no frontmatter: documented defaults apply (Personal /
+    /// Private) and the whole text is the body.
+    Bare(String),
+    /// File with a valid header.
+    Headed(EntryMeta, String),
+    /// File whose header does not parse: fail closed (Secret /
+    /// Regulated) — an unreadable header must not open anything up. The
+    /// body is deliberately not carried: nothing may serve it.
+    Malformed,
+}
+
+fn topic_of(dir: &Path, name: &str) -> (Topic, Option<std::time::SystemTime>) {
+    let Some(path) = layer_path(dir, name) else {
+        return (Topic::Missing, None);
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return (Topic::Missing, None);
+    };
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    if text.lines().next().map(|l| l.trim()) != Some("---") {
+        return (Topic::Bare(text), mtime);
+    }
+    match parse_meta(&text) {
+        Ok((meta, _)) => (Topic::Headed(meta, text), mtime),
+        Err(_) => (Topic::Malformed, mtime),
+    }
+}
+
+/// True when a topic body is still current: not expired (`valid_to` or the
+/// B2 `ttl_days` clock) and not superseded. This is the entry-level half
+/// of the zep validity-interval filter — the INDEX half (`pointer_live`)
+/// only drops pointers; bodies are what a fetch actually returns.
+pub fn entry_valid(text: &str, mtime: Option<std::time::SystemTime>) -> bool {
+    match parse_meta(text) {
+        Ok((meta, _)) => meta_current(&meta, text, mtime),
+        // Unparsable header: fail closed (not served as current).
+        Err(_) => false,
+    }
+}
+
+/// Read a topic file by name, refusing expired/superseded content.
+/// `None` when the file is missing or no longer current — the caller then
+/// behaves as if the pointer were stale.
+pub fn topic_text(dir: &Path, name: &str) -> Option<String> {
+    let (topic, mtime) = topic_of(dir, name);
+    match topic {
+        Topic::Bare(text) => entry_valid(&text, mtime).then_some(text),
+        Topic::Headed(meta, text) => meta_current(&meta, &text, mtime).then_some(text),
+        Topic::Missing | Topic::Malformed => None,
+    }
+}
+
+/// What a subagent view should do with one INDEX pointer line (P8-B).
+pub enum View {
+    /// Serve the pointer and copy this body into the filtered dir.
+    Admitted(String),
+    /// Keep the pointer line, copy nothing (orphan pointer — stale-pointer
+    /// hygiene belongs to `consolidate`, not the view).
+    PointerOnly,
+    /// Drop the pointer entirely: expired, superseded, above the
+    /// sensitivity ceiling, or `regulated`.
+    Hidden,
+}
+
+/// The one rule for what enters a quarantined (subagent) memory view: the
+/// asset must be current (`entry_valid`), its sensitivity at or below
+/// `filter`, and its governance class anything but `Regulated`. Written
+/// once and used by both the index view and the copied-body view so the
+/// two can never disagree.
+pub fn subagent_view(dir: &Path, name: &str, filter: Sensitivity) -> View {
+    let (topic, mtime) = topic_of(dir, name);
+    match topic {
+        // Missing file: orphan pointer — keep the line, copy nothing.
+        Topic::Missing => View::PointerOnly,
+        Topic::Bare(text) => {
+            if entry_valid(&text, mtime) {
+                View::Admitted(text)
+            } else {
+                View::Hidden
+            }
+        }
+        Topic::Headed(meta, text) => {
+            if !meta_current(&meta, &text, mtime) {
+                return View::Hidden;
+            }
+            if meta.governance == Governance::Regulated || !admits(filter, meta.sensitivity) {
+                View::Hidden
+            } else {
+                View::Admitted(text)
+            }
+        }
+        // Unparsable header: fail closed (Malformed never admits).
+        Topic::Malformed => View::Hidden,
+    }
+}
+
 /// True when an INDEX pointer still names live content: the topic file's
-/// own header must not say expired (valid_to past) or superseded
-/// (superseded_by trailer). Unresolvable lines pass through (F8 — the
-/// caller decides; bodies stay fail-closed elsewhere).
+/// own header must not say expired (valid_to past or TTL elapsed) or
+/// superseded (superseded_by trailer). Unresolvable lines pass through
+/// (F8 — the caller decides; bodies stay fail-closed elsewhere).
 fn pointer_live(dir: &Path, line: &str) -> bool {
     let Some(name) = topic_name(line) else {
         return true;
@@ -434,10 +657,11 @@ fn pointer_live(dir: &Path, line: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return true;
     };
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     // Unparsable headers fail closed elsewhere; for liveness, only an
     // affirmative expired/superseded signal drops the pointer.
     if let Ok((meta, _)) = parse_meta(&text) {
-        if meta_expired(&meta) || meta_superseded(&text) {
+        if !meta_current(&meta, &text, mtime) {
             return false;
         }
     }
@@ -478,9 +702,40 @@ pub fn index_segment(dir: &Path) -> String {
         "## Memory index\n\
          `{}/` is your persistent memory — read and update it with ordinary \
          file tools. {INDEX_NAME} holds one-line pointers (≤25KB); details \
-         live in topic files you create there.\n\n{body}{note}\n\n{MEMORY_LEGEND}",
-        dir.display()
+         live in topic files you create there.\n\n{ROUTING_HINT}\n\n{body}{note}\n\n{MEMORY_LEGEND}{core}",
+        dir.display(),
+        core = core_block(dir)
     )
+}
+
+/// The resident core block (Letta `CORE.md`): the always-in-context handful
+/// of lines, capped with a repair note when over budget. Empty when the
+/// file is absent — the block is opt-in by existence, like everything else
+/// in the memory dir. Parent view only: `index_segment_filtered` (the
+/// quarantined subagent view) never carries it — core memory is not
+/// scoped per entry, so there is no sensitivity ceiling to apply to it.
+fn core_block(dir: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(dir.join(CORE_NAME)) else {
+        return String::new();
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    if text.len() > CORE_CAP {
+        let cut = text
+            .char_indices()
+            .map(|(i, c)| i + c.len_utf8())
+            .take_while(|end| *end <= CORE_CAP)
+            .last()
+            .unwrap_or(0);
+        return format!(
+            "\n\n## Memory core ({CORE_NAME})\n{}\n\n[overseer] {CORE_NAME} exceeds \
+             2KB — keep it to the lines that must survive every compaction.",
+            &text[..cut]
+        );
+    }
+    format!("\n\n## Memory core ({CORE_NAME})\n{text}")
 }
 
 /// Sensitivity-filtered index view (P6-2): the quarantined subagent
@@ -500,20 +755,16 @@ pub fn index_segment_filtered(dir: &Path, filter: Sensitivity) -> String {
             if is_proposal_pointer(line) {
                 return false;
             }
-            // F9: expired/superseded pointers are not served as current.
-            if !pointer_live(dir, line) {
-                return false;
-            }
             let Some(name) = topic_name(line) else {
                 // F8: orphan/unresolvable pointer lines pass through
                 // (fail-open for pointers, fail-closed for bodies).
                 return true;
             };
-            match entry_sensitivity(dir, name) {
-                // Missing file (orphan pointer): pass through (F8 —
-                // fail-open for pointers, fail-closed for bodies).
-                None => true,
-                Some(s) => admits(filter, s),
+            // P8-B: one rule for the index view and the copied bodies —
+            // current, within the sensitivity ceiling, not regulated.
+            match subagent_view(dir, name, filter) {
+                View::Admitted(_) | View::PointerOnly => true,
+                View::Hidden => false,
             }
         })
         .collect();
@@ -562,52 +813,6 @@ fn topic_name(line: &str) -> Option<&str> {
         .find(|tok| tok.ends_with(".md"))
         .map(|tok| tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';'))
         .filter(|tok| !tok.is_empty() && !tok.contains('/') && !tok.contains('\\'))
-}
-
-/// Sensitivity of a topic file from its frontmatter header. Searches
-/// the layer subdirs as well as the memory root. None when the file
-/// is missing or its header is unreadable (caller defaults).
-fn entry_sensitivity(dir: &Path, name: &str) -> Option<Sensitivity> {
-    // Three cases, three answers (F3/F8): explicit header → its tier;
-    // bare file (no header) → Personal default; malformed header →
-    // Secret (fail closed); missing file → None (orphan pointer, the
-    // caller passes through per F8).
-    match entry_tier(dir, name) {
-        EntryTier::Tier(s) | EntryTier::BareDefault(s) => Some(s),
-        EntryTier::Missing => None,
-    }
-}
-
-/// Presence + parse state of a topic file backing an INDEX pointer.
-enum EntryTier {
-    /// Explicit valid header — trust its tier.
-    Tier(Sensitivity),
-    /// Bare file, no header — the documented Personal default.
-    BareDefault(Sensitivity),
-    /// No backing file — orphan pointer (F8: pass through).
-    Missing,
-}
-
-fn entry_tier(dir: &Path, name: &str) -> EntryTier {
-    let mut cands = vec![dir.join(name)];
-    for layer in Layer::ALL {
-        cands.push(dir.join(layer.name()).join(name));
-    }
-    for cand in cands {
-        if let Ok(text) = std::fs::read_to_string(&cand) {
-            if text.lines().next().map(|l| l.trim()) != Some("---") {
-                return EntryTier::BareDefault(Sensitivity::Personal);
-            }
-            match parse_meta(&text) {
-                Ok((meta, _)) => return EntryTier::Tier(meta.sensitivity),
-                // Malformed header: fail closed to Secret (F3) — a file
-                // whose header says secret (or cannot be parsed) is never
-                // admitted below the Secret ceiling.
-                Err(_) => return EntryTier::Tier(Sensitivity::Secret),
-            }
-        }
-    }
-    EntryTier::Missing
 }
 
 /// Quarantine a memory entry without overwriting it (P6-2 ADD-only):
@@ -709,6 +914,97 @@ pub fn dirty_files(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// A reconciliation plan over the memory dir (mem0 pattern, arsenal B2):
+/// what the index claims versus what the directory actually holds, decided
+/// before any model call. Three verdicts, no model involved:
+///
+/// - `drop` — a pointer whose asset is missing, expired, or superseded;
+/// - `add`  — a topic file that no pointer names;
+/// - `keep` — a pointer and its asset agree (counted, not listed).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReconcilePlan {
+    pub drop: Vec<String>,
+    pub add: Vec<String>,
+    pub keep: usize,
+}
+
+impl ReconcilePlan {
+    /// Render the plan for the consolidation prompt — the model sees
+    /// exactly what the engine already decided.
+    pub fn render(&self) -> String {
+        let list = |v: &[String]| {
+            if v.is_empty() {
+                "(none)".to_string()
+            } else {
+                v.join(", ")
+            }
+        };
+        format!(
+            "- drop (stale pointers): {}\n- add (untracked topics): {}\n- keep: {} pointer(s)",
+            list(&self.drop),
+            list(&self.add),
+            self.keep
+        )
+    }
+}
+
+/// Classify the index against the directory. `index_text` is passed in so
+/// callers can reconcile a proposed index as well as the live one.
+pub fn reconcile(dir: &Path, index_text: &str) -> ReconcilePlan {
+    let mut named: Vec<String> = Vec::new();
+    for line in index_text.lines() {
+        // Proposals are never part of the trusted index (RT-3).
+        if is_proposal_pointer(line) {
+            continue;
+        }
+        if let Some(n) = topic_name(line) {
+            named.push(n.to_string());
+        }
+    }
+    named.sort();
+    named.dedup();
+
+    let mut plan = ReconcilePlan::default();
+    for n in &named {
+        let (topic, mtime) = topic_of(dir, n);
+        let live = match topic {
+            Topic::Missing => false,
+            Topic::Bare(t) => entry_valid(&t, mtime),
+            Topic::Headed(meta, t) => meta_current(&meta, &t, mtime),
+            Topic::Malformed => false,
+        };
+        if live {
+            plan.keep += 1;
+        } else {
+            plan.drop.push(n.clone());
+        }
+    }
+
+    // Untracked topics: a file on disk no pointer names. Root and the layer
+    // subdirs both count (pointers are always bare file names).
+    let mut dirs = vec![dir.to_path_buf()];
+    for layer in Layer::ALL {
+        dirs.push(dir.join(layer.name()));
+    }
+    for d in dirs {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") || name == INDEX_NAME || name == CORE_NAME {
+                continue;
+            }
+            if !named.iter().any(|n| n == &name) {
+                plan.add.push(name);
+            }
+        }
+    }
+    plan.add.sort();
+    plan.add.dedup();
+    plan
+}
+
 /// Sleep-time consolidation (P3.8): a small-tier call that dedupes and
 /// tightens `INDEX.md`, then a git commit. Topic files are read for
 /// context but only the index is rewritten — merging topic bodies is the
@@ -740,8 +1036,21 @@ pub fn consolidate(
         };
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().is_some_and(|x| x == "md") && e.file_name() != INDEX_NAME {
-                if let Ok(t) = std::fs::read_to_string(&p) {
+            let is_topic = p.extension().is_some_and(|x| x == "md")
+                && e.file_name() != INDEX_NAME
+                && e.file_name() != CORE_NAME;
+            if is_topic {
+                // P8-B (zep validity, entry half): an expired or superseded
+                // body must not be re-summarized into the index — consolidation
+                // reads only what the reader would serve.
+                let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+                let Ok(t) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
+                if !entry_valid(&t, mtime) {
+                    continue;
+                }
+                {
                     let head: String = t.chars().take(2_000).collect();
                     let rel = p
                         .strip_prefix(dir)
@@ -753,9 +1062,15 @@ pub fn consolidate(
         }
     }
 
+    // P8-B (mem0 reconcile): a deterministic plan over pointers vs backing
+    // files, computed BEFORE the model call. It rides the prompt (so the
+    // model sees exactly what changed) and is enforced afterwards (so a
+    // stale pointer cannot survive a lazy reply).
+    let plan = reconcile(dir, &old_index);
     let prompt = format!(
         "You are consolidating an agent's file-based memory. Below is \
          INDEX.md (one-line pointers) and the heads of the topic files.\n\
+         Reconcile plan (computed deterministically — honor it):\n{}\n\
          Rewrite INDEX.md only: dedupe pointers, drop stale entries whose \
          topic file is gone, keep one line per topic in the form \
          `name.md — what it's about`. Validity: if a topic's content says \
@@ -766,7 +1081,8 @@ pub fn consolidate(
          with a `superseded_by` trailer instead of deleting them; keep \
          entries whose validity window still covers now.\n\
          Reply with the full new index between ---INDEX--- markers.\n\n\
-         == CURRENT INDEX.md ==\n{old_index}\n== TOPIC HEADS =={topics}"
+         == CURRENT INDEX.md ==\n{old_index}\n== TOPIC HEADS =={topics}",
+        plan.render()
     );
     let msgs = [crate::ir::Message::user_text(prompt)];
     let req = crate::provider::Request {
@@ -797,7 +1113,27 @@ pub fn consolidate(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "consolidate: model reply had no ---INDEX--- section".to_string())?;
-    let capped: String = new_index.chars().take(INDEX_CAP).collect();
+    let mut capped: String = new_index.chars().take(INDEX_CAP).collect();
+    // mem0 reconcile enforcement: pointers the plan marked stale never
+    // come back, whatever the model replied (ADD-only: this can only drop
+    // a pointer whose backing file is gone or whose asset expired).
+    let mut dropped_stale = 0usize;
+    if !plan.drop.is_empty() {
+        let kept: Vec<&str> = capped
+            .lines()
+            .filter(|l| {
+                let stale = plan
+                    .drop
+                    .iter()
+                    .any(|d| topic_name(l).is_some_and(|n| n == d.as_str()));
+                if stale {
+                    dropped_stale += 1;
+                }
+                !stale
+            })
+            .collect();
+        capped = kept.join("\n");
+    }
     std::fs::write(&idx, format!("{capped}\n")).map_err(|e| e.to_string())?;
     commit(dir, "consolidate");
 
@@ -807,9 +1143,12 @@ pub fn consolidate(
         .filter(|l| !new_index.contains(l.trim()))
         .count();
     Ok(format!(
-        "consolidated: {} → {} index lines, {dropped} pointers dropped",
+        "consolidated: {} → {} index lines, {dropped} pointers dropped \
+         (reconcile: {} stale, {} untracked, {dropped_stale} stale reclaimed)",
         old_index.lines().count(),
-        capped.lines().count()
+        capped.lines().count(),
+        plan.drop.len(),
+        plan.add.len()
     ))
 }
 
@@ -958,6 +1297,117 @@ mod tests {
         let p = FixedProvider::with_reply("no markers here");
         assert!(consolidate(&p, "tiny", &dir).is_err());
         assert_eq!(std::fs::read_to_string(&idx).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn reconcile_classifies_pointers_against_the_directory() {
+        // P8-B accept (mem0 reconcile): drop stale pointers, add untracked
+        // topics, count the ones that agree — all before any model call.
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        std::fs::write(dir.join("semantic").join("live.md"), "body\n").unwrap();
+        std::fs::write(
+            dir.join("semantic").join("gone.md"),
+            "---\nvalid_to: 2000-01-01T00:00:00Z\n---\nstale\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("untracked.md"), "not pointed at\n").unwrap();
+        std::fs::write(dir.join(CORE_NAME), "core lines\n").unwrap();
+        let index = "# Memory Index\n\nlive.md — fine\ngone.md — expired\nmissing.md — nowhere\n";
+
+        let plan = reconcile(&dir, index);
+        assert_eq!(plan.keep, 1, "live.md agrees");
+        assert_eq!(
+            plan.drop,
+            vec!["gone.md".to_string(), "missing.md".to_string()]
+        );
+        assert_eq!(plan.add, vec!["untracked.md".to_string()]);
+        // CORE.md is never a topic pointer target.
+        assert!(!plan.add.iter().any(|a| a == CORE_NAME));
+        // The rendered plan rides the consolidation prompt verbatim.
+        let rendered = plan.render();
+        assert!(rendered.contains("gone.md"), "{rendered}");
+        assert!(rendered.contains("untracked.md"), "{rendered}");
+        assert!(rendered.contains("keep: 1"), "{rendered}");
+
+        // An empty plan renders "(none)" rather than an empty line.
+        let empty = reconcile(&dir, "");
+        assert!(empty.render().contains("(none)"), "{}", empty.render());
+    }
+
+    #[test]
+    fn consolidate_enforces_the_reconcile_plan_and_skips_stale_bodies() {
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        std::fs::write(dir.join("facts.md"), "live facts\n").unwrap();
+        std::fs::write(
+            dir.join("dead.md"),
+            "---\nvalid_to: 2000-01-01T00:00:00Z\n---\nSTALE_BODY_MARKER\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(INDEX_NAME),
+            "# Memory Index\n\nfacts.md — facts\ndead.md — expired\n",
+        )
+        .unwrap();
+
+        // The model lazily keeps the stale pointer and drops the live one.
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\ndead.md — expired\nfacts.md — live facts\n---INDEX---",
+        );
+        let msg = consolidate(&p, "tiny", &dir).unwrap();
+        assert!(msg.contains("1 stale reclaimed"), "{msg}");
+        let new = std::fs::read_to_string(dir.join(INDEX_NAME)).unwrap();
+        assert!(
+            !new.contains("dead.md"),
+            "the engine reclaims a stale pointer the model kept: {new}"
+        );
+        assert!(new.contains("facts.md"), "{new}");
+
+        // The stale body never reached the prompt; the plan did.
+        let seen = p.seen.lock().map(|g| g.join("\n")).unwrap_or_default();
+        assert!(!seen.contains("STALE_BODY_MARKER"), "stale body was served");
+        assert!(seen.contains("Reconcile plan"), "{seen}");
+        assert!(seen.contains("dead.md"), "the plan names the stale pointer");
+    }
+
+    #[test]
+    fn core_block_is_resident_capped_and_parent_only() {
+        // P8-B accept (letta CORE.md): a small always-in-context block,
+        // capped with a repair note, and absent from the subagent view.
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        std::fs::write(dir.join(INDEX_NAME), "# Memory Index\n\nfacts.md — facts\n").unwrap();
+        std::fs::write(dir.join("facts.md"), "body\n").unwrap();
+
+        // Absent → no block at all (opt-in by existence).
+        let seg = index_segment(&dir);
+        assert!(!seg.contains("Memory core"), "{seg}");
+
+        std::fs::write(dir.join(CORE_NAME), "Never page me out.\n").unwrap();
+        let seg = index_segment(&dir);
+        assert!(seg.contains("## Memory core (CORE.md)"), "{seg}");
+        assert!(seg.contains("Never page me out."));
+        // Routing hint (lightrag): both halves of the local/global split.
+        assert!(seg.contains("answer specific questions from"), "{seg}");
+        assert!(seg.contains("overview questions from this index"), "{seg}");
+
+        // Over the cap → truncated with the repair note, and the bytes stay
+        // bounded (the block is resident, so it must not grow unbounded).
+        std::fs::write(dir.join(CORE_NAME), "y".repeat(CORE_CAP + 500)).unwrap();
+        let seg = index_segment(&dir);
+        assert!(seg.contains("exceeds"), "{seg}");
+        assert!(seg.len() < INDEX_CAP + CORE_CAP + 2_000, "{}", seg.len());
+
+        // CORE.md is not a topic: it never appears as a pointer, and the
+        // quarantined subagent view carries neither the block nor a pointer.
+        std::fs::write(dir.join(CORE_NAME), "core\n").unwrap();
+        let filtered = index_segment_filtered(&dir, Sensitivity::Personal);
+        assert!(!filtered.contains("Memory core"), "{filtered}");
+        assert!(!filtered.contains("CORE.md"), "{filtered}");
+        // CORE.md must never be reconciled as a topic file.
+        let plan = reconcile(&dir, "# Memory Index\n\nfacts.md — facts\n");
+        assert!(!plan.add.iter().any(|a| a == CORE_NAME));
     }
 
     #[test]
@@ -1118,6 +1568,141 @@ mod tests {
     }
 
     #[test]
+    fn ttl_taxonomy_columns_parse_and_expire() {
+        // P8-B accept (TencentDB TTL taxonomy): per-asset retention and
+        // governance are header columns with hard validation.
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        let (meta, _) = parse_meta(
+            "---\nprovenance: note\nconfidence: 0.9\nttl_days: 30\ngovernance: shared\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(meta.ttl_days, Some(30));
+        assert_eq!(meta.governance, Governance::Shared);
+        // Defaults when absent.
+        assert_eq!(EntryMeta::default().ttl_days, None);
+        assert_eq!(EntryMeta::default().governance, Governance::Private);
+        // Bad values name the fault; the TTL has a hard ceiling.
+        assert!(parse_meta("---\nttl_days: soon\n---\nbody\n")
+            .unwrap_err()
+            .contains("ttl_days"));
+        assert!(parse_meta("---\ngovernance: secretish\n---\nbody\n")
+            .unwrap_err()
+            .contains("governance"));
+        assert!(
+            parse_meta(&format!("---\nttl_days: {}\n---\nbody\n", MAX_TTL_DAYS + 1)).is_err(),
+            "ttl beyond the ceiling is rejected"
+        );
+
+        // TTL liveness runs off the file's mtime: a 30-day asset written
+        // now is current, a 0-day asset is expired at once.
+        std::fs::write(
+            dir.join("semantic").join("live.md"),
+            "---\nttl_days: 30\n---\nstill good\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("semantic").join("gone.md"),
+            "---\nttl_days: 0\n---\nshort lived\n",
+        )
+        .unwrap();
+        assert!(topic_text(&dir, "live.md").is_some());
+        assert!(
+            topic_text(&dir, "gone.md").is_none(),
+            "ttl_days=0 has expired"
+        );
+        assert!(topic_text(&dir, "missing.md").is_none());
+
+        // The INDEX drops the expired pointer but keeps the live one.
+        std::fs::write(
+            dir.join(INDEX_NAME),
+            "# Memory Index\n\nlive.md — good\ngone.md — expired\n",
+        )
+        .unwrap();
+        let seg = index_segment(&dir);
+        assert!(seg.contains("live.md"), "{seg}");
+        assert!(!seg.contains("gone.md"), "expired asset dropped: {seg}");
+    }
+
+    #[test]
+    fn subagent_view_hides_expired_superseded_and_regulated_assets() {
+        // P8-B accept (zep validity + TTL governance): the entry-level half
+        // of the filter — bodies, not just pointers — and the regulated
+        // column, which outranks the sensitivity ceiling.
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        std::fs::write(dir.join("semantic").join("ok.md"), "plain body\n").unwrap();
+        std::fs::write(
+            dir.join("semantic").join("expired.md"),
+            "---\nvalid_to: 2000-01-01T00:00:00Z\n---\nold\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("semantic").join("dead.md"),
+            "---\nttl_days: 0\n---\nshort\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("semantic").join("superseded.md"),
+            "---\nprovenance: x\n---\nold\nsuperseded_by ok.md\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("semantic").join("reg.md"),
+            "---\ngovernance: regulated\n---\ncompliance material\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("semantic").join("secret.md"),
+            "---\nsensitivity: secret\n---\nhush\n",
+        )
+        .unwrap();
+
+        let personal = Sensitivity::Personal;
+        assert!(matches!(
+            subagent_view(&dir, "ok.md", personal),
+            View::Admitted(_)
+        ));
+        for hidden in [
+            "expired.md",
+            "dead.md",
+            "superseded.md",
+            "reg.md",
+            "secret.md",
+        ] {
+            assert!(
+                matches!(subagent_view(&dir, hidden, personal), View::Hidden),
+                "{hidden} must not enter the quarantined view"
+            );
+        }
+        // Orphan pointer: keep the line, copy nothing.
+        assert!(matches!(
+            subagent_view(&dir, "orphan.md", personal),
+            View::PointerOnly
+        ));
+        // A Secret ceiling admits the secret (Regulated still hidden).
+        assert!(matches!(
+            subagent_view(&dir, "secret.md", Sensitivity::Secret),
+            View::Admitted(_)
+        ));
+        assert!(matches!(
+            subagent_view(&dir, "reg.md", Sensitivity::Secret),
+            View::Hidden
+        ));
+
+        // The index view agrees with the body view — one rule, two views.
+        std::fs::write(
+            dir.join(INDEX_NAME),
+            "# Memory Index\n\nok.md — fine\nreg.md — compliance\ndead.md — short\n",
+        )
+        .unwrap();
+        let seg = index_segment_filtered(&dir, personal);
+        assert!(seg.contains("ok.md"), "{seg}");
+        assert!(!seg.contains("reg.md"), "{seg}");
+        assert!(!seg.contains("dead.md"), "{seg}");
+    }
+
+    #[test]
     fn invalidate_appends_trailer() {
         let dir = tmpdir();
         ensure(&dir).unwrap();
@@ -1127,6 +1712,18 @@ mod tests {
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("old content"), "history preserved: {text}");
         assert!(text.contains("superseded_by new.md"), "{text}");
+        // The trailer `invalidate` writes must actually retire the asset —
+        // the reader accepts the space form, so the pointer drops and the
+        // body stops being served (F9: requiring a colon left it "live").
+        assert!(
+            topic_text(&dir, "old.md").is_none(),
+            "superseded body served"
+        );
+        std::fs::write(dir.join(INDEX_NAME), "# Memory Index\n\nold.md — stale\n").unwrap();
+        assert!(
+            !index_segment(&dir).contains("old.md"),
+            "superseded pointer survived the index view"
+        );
     }
 
     #[test]
