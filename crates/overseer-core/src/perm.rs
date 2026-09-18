@@ -183,7 +183,10 @@ const SENSITIVE_PATHS: &[&str] = &[
 ];
 
 /// Content markers that mark a result as carrying secret material.
-const SENSITIVE_CONTENT: &[&str] = &["-----BEGIN", "PRIVATE KEY-----"];
+/// Content markers that mark a result as carrying secret material.
+/// Lowercase: compared against lowercased text (RT-1: uppercase markers
+/// were dead code — lowercased text can never contain them).
+const SENSITIVE_CONTENT: &[&str] = &["-----begin", "private key-----"];
 
 /// P6-5: persona file names — a `grep`/`glob` pattern naming one of these is
 /// a targeted read of the (possibly unapproved) persona dir.
@@ -727,9 +730,43 @@ impl Policy {
         }
         match tool {
             // Side-effecting file tools: containment already enforced by
-            // hard_deny above (deny wins). Remaining: the Rule-of-Two
-            // taint Ask, else Allow.
+            // hard_deny above (deny wins). Remaining: memory LAYER bar
+            // (F5) → Rule-of-Two taint Ask, else Allow.
             "write" | "edit" => {
+                // F5: WRITE_BAR enforcement — identity-layer facts need
+                // approval even in a clean session. Maps the target path to
+                // its memory Layer (None outside memory_dir) and takes the
+                // max of the layer bar and the lane default already computed.
+                if let Some(p) = input.get("path").and_then(Value::as_str) {
+                    if let Some(need) =
+                        crate::memory::layer_bar_for_path(self.memory_dir.as_deref(), &self.root, p)
+                    {
+                        let lane_default = match class {
+                            Irreversibility::InternalWrite => Autonomy::ActSilently,
+                            _ => Autonomy::default(),
+                        };
+                        let level = self
+                            .autonomy
+                            .get(Self::domain(class))
+                            .copied()
+                            .unwrap_or(lane_default);
+                        let need_level = need.max(level);
+                        if need_level == Autonomy::Observe {
+                            return Verdict::Deny {
+                                reason: format!(
+                                    "{tool}: memory layer needs approval (class {class:?})"
+                                ),
+                            };
+                        }
+                        if matches!(need_level, Autonomy::Suggest | Autonomy::ActWithApproval) {
+                            return Verdict::Ask {
+                                reason: format!(
+                                    "{tool}: memory layer needs approval (class {class:?})"
+                                ),
+                            };
+                        }
+                    }
+                }
                 // P6-2 memory gate: untrusted-sourced writes into the
                 // memory dir quarantine to proposals/ for human review
                 // (Ask; headless denies). Runs before the generic
@@ -831,6 +868,7 @@ impl Policy {
             })
         };
         // An explicit path/pattern that names the dir (or a file inside it).
+        // Marker matching is case-insensitive (IDENTITY.MD == identity.md).
         if let Some(p) = input.get("path").and_then(Value::as_str) {
             if under_dir(&self.root, dir, p) {
                 return deny("path is inside it");
@@ -840,7 +878,10 @@ impl Policy {
             // A literal traversal of the dir, or a pattern that names a
             // persona file, is a targeted read even with the root elsewhere.
             let literal = dir.to_string_lossy().to_string();
-            let named = PERSONA_MARKERS.iter().any(|m| p.contains(m));
+            let pl = p.to_lowercase();
+            let named = PERSONA_MARKERS
+                .iter()
+                .any(|m| pl.contains(&m.to_lowercase()));
             if p.contains(&literal) || named {
                 return deny("pattern targets it");
             }
@@ -851,13 +892,51 @@ impl Policy {
             return deny("a working-directory search traverses it");
         }
         // `bash` has no path field — match the command string against the
-        // dir path and persona file markers (same targeted-read rule).
+        // dir path and persona file markers (same targeted-read rule). Plus
+        // wildcard containment (F4): glob metacharacters that could expand
+        // into the dir are denied while unapproved — `cat persona/*` must
+        // not bypass the gate via shell expansion. The engine interview
+        // writer uses fs directly and never needs shell globs here.
         if tool == "bash" {
             if let Some(cmd) = input.get("command").and_then(Value::as_str) {
                 let literal = dir.to_string_lossy().to_string();
-                let named = PERSONA_MARKERS.iter().any(|m| cmd.contains(m));
+                let cl = cmd.to_lowercase();
+                let named = PERSONA_MARKERS
+                    .iter()
+                    .any(|m| cl.contains(&m.to_lowercase()));
                 if cmd.contains(&literal) || named {
                     return deny("command targets it");
+                }
+                // Token containment (F4 hardened): split the command on
+                // shell metacharacters and resolve every path-looking token
+                // against the root — `tee persona/a.md`, `cp /tmp/evil
+                // persona/`, `ls persona/` all name the dir without globs.
+                // Plus a glob guard: any wildcard token alongside a persona
+                // stem may expand into the dir (`cat persona/*`).
+                for tok in cmd.split([
+                    ' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>', '`', '$', '\'', '"',
+                ]) {
+                    let tok = tok.trim().trim_matches(|c| c == '\'' || c == '"');
+                    if tok.is_empty() || tok.starts_with('-') {
+                        continue;
+                    }
+                    // Redirections attach to the next token (`> persona/x`);
+                    // the token itself is still path-checked below.
+                    if under_dir(&self.root, dir, tok) {
+                        return deny("command targets it");
+                    }
+                }
+                let lower = cmd.to_lowercase();
+                let dir_stem = dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let has_glob = cmd.contains(['*', '?', '[']);
+                if has_glob
+                    && !dir_stem.is_empty()
+                    && lower.contains(&dir_stem[..dir_stem.len().min(4)])
+                {
+                    return deny("command may expand into it");
                 }
             }
             return None;
@@ -869,7 +948,14 @@ impl Policy {
     /// armed AND `path` resolves under `memory_dir`. Read-class tools are
     /// never gated (reads under memory stay Ask-free).
     pub fn memory_gate_hit(&self, path: &str) -> bool {
-        if !self.taint_armed() {
+        // RT-2: untrusted content alone arms the memory gate. Requiring the
+        // full triangle (untrusted AND sensitive) left prompt-injection ->
+        // durable-memory writes ungated: one injection-marker read sets
+        // untrusted but not sensitive, and the poisoned write Allowed.
+        // Sensitive-only (no untrusted source) still flows to the generic
+        // Rule-of-Two Ask below — this gate is about untrusted provenance.
+        let untrusted = self.taint.lock().map(|t| t.untrusted).unwrap_or(false);
+        if !untrusted {
             return false;
         }
         let Some(mem) = &self.memory_dir else {
@@ -882,12 +968,16 @@ impl Policy {
     /// under the memory dir. The proposal preserves the content for human
     /// review instead of dropping it.
     pub fn proposal_path(&self) -> Option<PathBuf> {
+        // F2 (extreme): ms timestamps collide within a batch — append a
+        // process-wide monotonic counter so same-ms writes never overwrite.
+        static PROPOSAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mem = self.memory_dir.as_ref()?;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        Some(mem.join("proposals").join(format!("{ts}.md")))
+        let n = PROPOSAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(mem.join("proposals").join(format!("{ts}-{n}.md")))
     }
 }
 
@@ -1518,6 +1608,25 @@ mod tests {
             ),
             Verdict::Allow
         );
+        // F4 hardened matrix (unapproved): wildcards, copies, listings.
+        p.persona_approved = false;
+        for cmd in [
+            "cat persona/*".to_string(),
+            "cat persona/*.md".to_string(),
+            "tee persona/a.md".to_string(),
+            "cp /tmp/evil persona/".to_string(),
+            "mv /tmp/evil persona/new.md".to_string(),
+            "ls persona/".to_string(),
+            format!("head -c 40 {}/IDENTITY.MD", persona.display()),
+        ] {
+            let dir = std::env::current_dir().unwrap();
+            let _ = dir;
+            let v = p.check("bash", &json!({"command": cmd}));
+            assert!(
+                matches!(v, Verdict::Deny { .. }),
+                "{cmd} must deny while unapproved, got {v:?}"
+            );
+        }
     }
 
     #[test]

@@ -933,7 +933,12 @@ pub fn scan(text: &str) -> Vec<Redaction> {
     macro_rules! push {
         ($start:expr, $end:expr, $family:expr) => {{
             let (s, e): (usize, usize) = ($start, $end);
-            if e > s && e <= text.len() && !is_fp(&text[s..e]) {
+            if e > s
+                && e <= text.len()
+                && text.is_char_boundary(s)
+                && text.is_char_boundary(e)
+                && !is_fp(&text[s..e])
+            {
                 spans.push(Redaction {
                     start: s,
                     end: e,
@@ -942,11 +947,12 @@ pub fn scan(text: &str) -> Vec<Redaction> {
             }
         }};
     }
-    // AKIA + 16 uppercase alnum.
+    // AKIA + 16 uppercase alnum. Byte-indexed (F1): ASCII patterns only
+    // match at char boundaries, so pushed spans are always valid str slices.
     for i in 0..b.len().saturating_sub(20) {
-        if &text[i..i + 4] == "AKIA"
-            && text[i + 4..i + 20]
-                .chars()
+        if &b[i..i + 4] == b"AKIA"
+            && b[i + 4..i + 20]
+                .iter()
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
         {
             push!(i, i + 20, "aws-key");
@@ -1021,7 +1027,12 @@ pub fn scan(text: &str) -> Vec<Redaction> {
             push!(s, e.max(s + 10), "pem-block");
             from = e.max(s + 1);
         } else {
-            push!(s, text.len().min(s + 64), "pem-block");
+            // F1: s+64 can land mid-char — floor to the boundary.
+            let mut e = text.len().min(s + 64);
+            while e > s && !text.is_char_boundary(e) {
+                e -= 1;
+            }
+            push!(s, e.max(s + 10).min(text.len()), "pem-block");
             break;
         }
         if from >= b.len() {
@@ -1180,6 +1191,26 @@ mod tests {
         // so serde can't see it either without a manual impl).
         let cdbg = format!("{cred:?}");
         assert!(!cdbg.contains("super-secret-real"), "{cdbg}");
+    }
+
+    #[test]
+    fn scan_never_panics_on_multibyte() {
+        // F1 (extreme): byte-index loops must not slice inside multibyte chars.
+        for body in [
+            "é".repeat(30),
+            format!("café {} end", "é".repeat(100)),
+            format!("AKIA{} café", "É".repeat(30)),
+            "é".repeat(10_000),
+            format!("-----BEGIN X-----\n{}\n", "é".repeat(200)),
+        ] {
+            let spans = scan(&body);
+            let (red, _) = redact(&body);
+            assert!(
+                red.len() >= body.len() - body.len() / 2,
+                "no wild truncation"
+            );
+            let _ = spans.len();
+        }
     }
 
     #[test]
