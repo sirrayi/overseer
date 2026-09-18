@@ -1,0 +1,16 @@
+{
+  "id": "weekday-calc",
+  "version": 1,
+  "tags": ["script", "logic"],
+  "difficulty": "easy",
+  "instruction": "dates.txt holds one ISO date 'YYYY-MM-DD' per line. Write weekday.py printing the weekday name (e.g. Monday) for each date in order, no external dependencies. Run it.",
+  "setup": "printf '2026-09-18\\n2000-01-01\\n2024-02-29\\n1969-07-20\\n2038-01-19\\n' > dates.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 weekday.py > got.txt && printf 'Friday\\nSaturday\\nThursday\\nSunday\\nTuesday\\n' | diff - got.txt"
+  },
+  "oracle": {
+    "script": "cat > weekday.py <<'EOF'\nimport datetime\nfor ln in open('dates.txt'):\n    s = ln.strip()\n    if s:\n        y, m, d = map(int, s.split('-'))\n        print(datetime.date(y, m, d).strftime('%A'))\nEOF\npython3 weekday.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}

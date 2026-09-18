@@ -1,0 +1,16 @@
+{
+  "id": "isbn-check",
+  "version": 1,
+  "tags": ["script", "data"],
+  "difficulty": "med",
+  "instruction": "isbns.txt holds one candidate ISBN-13 per line. Write check.py printing 'valid' or 'invalid' per line: valid only for 13-digit all-numeric strings whose check digit matches the ISBN-13 rule (weights 1,3 alternating; check = (10 - sum(first 12 weighted) % 10) % 10). Run it.",
+  "setup": "printf '9780306406157\\n9780306406158\\n9783161484100\\n9780131103628\\n12345\\n978316148410X\\n' > isbns.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 check.py > got.txt && printf 'valid\\ninvalid\\nvalid\\ninvalid\\ninvalid\\ninvalid\\n' | diff - got.txt"
+  },
+  "oracle": {
+    "script": "cat > check.py <<'EOF'\nfor ln in open('isbns.txt'):\n    s = ln.strip()\n    if len(s) != 13 or not s.isdigit():\n        print('invalid')\n        continue\n    d = [int(x) for x in s]\n    check = (10 - sum(x * (1 if i % 2 == 0 else 3) for i, x in enumerate(d[:12])) % 10) % 10\n    print('valid' if check == d[12] else 'invalid')\nEOF\npython3 check.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}
