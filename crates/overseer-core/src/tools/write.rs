@@ -34,6 +34,18 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
         Err(e) => return e,
     };
     let path = resolve(ctx, path_str);
+    // P8-B mode edit_globs (roo pattern): a mode may bound the file tools
+    // to a path set — enforced in the tool so it cannot be bypassed.
+    if !reg.edit_allowed(path_str) {
+        let globs = reg
+            .mode
+            .map(|m| m.edit_globs.join(", "))
+            .unwrap_or_default();
+        return ToolOutput::err(format!(
+            "Refusing to write {}: the active mode allows only {globs}.",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             return ToolOutput::err(format!("Cannot create {}: {e}", parent.display()));

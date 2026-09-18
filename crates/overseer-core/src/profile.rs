@@ -23,6 +23,39 @@ pub struct ReasoningSpec {
     pub min_budget: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum EditFormat {
+    /// Anchored search/replace (the harness `edit` tool's native form).
+    SearchReplace,
+    /// Unified-diff edits: `edit` accepts `patch`, and an anchor that
+    /// differs only in leading whitespace still applies.
+    Diff,
+    /// Whole-file rewrites: `write` is the intended path, and the contract
+    /// segment says so instead of advertising an anchor that will miss.
+    WholeFile,
+}
+
+impl EditFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EditFormat::SearchReplace => "search_replace",
+            EditFormat::Diff => "diff",
+            EditFormat::WholeFile => "whole_file",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "search_replace" | "search-replace" => Ok(EditFormat::SearchReplace),
+            "diff" | "udiff" | "unified_diff" => Ok(EditFormat::Diff),
+            "whole_file" | "whole-file" => Ok(EditFormat::WholeFile),
+            other => Err(format!(
+                "profile: bad edit_format `{other}` — want search_replace|diff|whole_file"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelProfile {
     pub id: &'static str,
@@ -38,6 +71,10 @@ pub struct ModelProfile {
     /// window, not the advertised one (playbook Ch.3 §9.2: Claude ~0.83,
     /// Codex ~0.9–0.95, Gemini 0.5; tune down for weak-retrieval models).
     pub compact_at: f32,
+    /// Edit dialect the model is trained/known to emit (aider's edit-format
+    /// registry, arsenal B2). Drives the `edit` tool's anchor strategy and
+    /// the contract line that tells the model which tool to reach for.
+    pub edit_format: EditFormat,
     pub price: PriceTable,
 }
 
@@ -67,6 +104,7 @@ static PROFILES: &[ModelProfile] = &[
             min_budget: 1024,
         },
         compact_at: 0.83,
+        edit_format: EditFormat::SearchReplace,
         price: PriceTable {
             input: 10.0,
             cache_read: 1.0,
@@ -91,6 +129,7 @@ static PROFILES: &[ModelProfile] = &[
             min_budget: 1024,
         },
         compact_at: 0.83,
+        edit_format: EditFormat::SearchReplace,
         price: PriceTable {
             input: 5.0,
             cache_read: 0.5,
@@ -110,6 +149,7 @@ static PROFILES: &[ModelProfile] = &[
             min_budget: 1024,
         },
         compact_at: 0.83,
+        edit_format: EditFormat::SearchReplace,
         price: PriceTable {
             input: 2.0,
             cache_read: 0.2,
@@ -129,6 +169,7 @@ static PROFILES: &[ModelProfile] = &[
             min_budget: 1024,
         },
         compact_at: 0.83,
+        edit_format: EditFormat::SearchReplace,
         price: PriceTable {
             input: 3.0,
             cache_read: 0.3,
@@ -152,6 +193,7 @@ static PROFILES: &[ModelProfile] = &[
             min_budget: 0,
         },
         compact_at: 0.70,
+        edit_format: EditFormat::Diff,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -171,6 +213,7 @@ static PROFILES: &[ModelProfile] = &[
             min_budget: 0,
         },
         compact_at: 0.70,
+        edit_format: EditFormat::Diff,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -190,6 +233,7 @@ static PROFILES: &[ModelProfile] = &[
             min_budget: 0,
         },
         compact_at: 0.70,
+        edit_format: EditFormat::Diff,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -209,6 +253,7 @@ static PROFILES: &[ModelProfile] = &[
             min_budget: 0,
         },
         compact_at: 0.70,
+        edit_format: EditFormat::Diff,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -228,6 +273,7 @@ static PROFILES: &[ModelProfile] = &[
             min_budget: 0,
         },
         compact_at: 0.70,
+        edit_format: EditFormat::WholeFile,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -247,6 +293,7 @@ static PROFILES: &[ModelProfile] = &[
             min_budget: 1024,
         },
         compact_at: 0.83,
+        edit_format: EditFormat::SearchReplace,
         price: PriceTable {
             input: 1.0,
             cache_read: 0.1,
@@ -270,6 +317,7 @@ static FALLBACK: ModelProfile = ModelProfile {
         min_budget: 1024,
     },
     compact_at: 0.80,
+    edit_format: EditFormat::SearchReplace,
     price: PriceTable {
         input: 3.0,
         cache_read: 0.3,
@@ -296,6 +344,13 @@ pub fn known(model: &str) -> bool {
         .any(|p| p.match_prefixes.iter().any(|m| model.starts_with(m)))
 }
 
+/// The edit dialect for `model` (aider's edit-format registry): the `edit`
+/// tool's anchor strategy and the contract line that names the file-writing
+/// tool both read this. Unknown models get the FALLBACK profile's value.
+pub fn edit_format(model: &str) -> EditFormat {
+    lookup(model).edit_format
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +375,34 @@ mod tests {
         };
         // 1M fresh @ $2 + 10M read @ $0.2 + 100K out @ $10 = 2 + 2 + 1 = $5
         assert!((p.cost_usd(&u) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn edit_format_is_per_family_and_parses() {
+        // The edit dialect rides the profile: anchors for the Claude
+        // family, diffs for the vLLM fleet, whole-file for the small model.
+        assert_eq!(edit_format("claude-sonnet-5"), EditFormat::SearchReplace);
+        assert_eq!(
+            edit_format("claude-opus-4-8-20260301"),
+            EditFormat::SearchReplace
+        );
+        assert_eq!(edit_format("kimi-k3-turbo"), EditFormat::Diff);
+        assert_eq!(edit_format("glm-5-3"), EditFormat::Diff);
+        assert_eq!(edit_format("qwen3-8-27b"), EditFormat::WholeFile);
+        // Unknown model → the FALLBACK profile's dialect, never a panic.
+        assert_eq!(edit_format("some-future-model"), EditFormat::SearchReplace);
+
+        assert_eq!(EditFormat::parse("diff").unwrap(), EditFormat::Diff);
+        assert_eq!(
+            EditFormat::parse("Whole-File").unwrap(),
+            EditFormat::WholeFile
+        );
+        assert!(EditFormat::parse("telepathy")
+            .unwrap_err()
+            .contains("telepathy"));
+        // Every profile declares a dialect (the registry is exhaustive).
+        for p in PROFILES {
+            assert!(!p.edit_format.as_str().is_empty(), "{} has no format", p.id);
+        }
     }
 }
