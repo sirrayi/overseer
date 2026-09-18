@@ -126,6 +126,15 @@ pub struct AgentConfig {
     /// (approved bodies, or a one-line pending notice) and the draft gate
     /// closes file tools on an unapproved dir.
     pub persona_dir: Option<PathBuf>,
+    /// P8-C `--runtime` sandbox selector (the gVisor port's flag surface):
+    /// which backend bash calls run under. `None` keeps the pre-P8-C
+    /// behavior exactly — sandbox-exec on macOS, bwrap on Linux, unsandboxed
+    /// with a visible note when neither exists. `Some(name)` PINS the
+    /// backend: an unknown or unavailable runtime is reported to the model
+    /// by name and the call FAILS, because a run that asked for gVisor must
+    /// never end up executing unsandboxed just because `runsc` was missing.
+    /// Parsed/validated with `crate::backends::SandboxRuntime::parse`.
+    pub sandbox_runtime: Option<String>,
 }
 
 /// P7-1 computer-use containment flags. All default off except
@@ -213,6 +222,8 @@ impl Default for AgentConfig {
             reflect: ReflectMode::Reflexion,
             credential_store: crate::cred::CredentialStore::Auto,
             persona_dir: None,
+            // P8-C: unset = the platform default sandbox, exactly as before.
+            sandbox_runtime: None,
         }
     }
 }

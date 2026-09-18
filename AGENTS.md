@@ -36,6 +36,21 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   boundary + surviving checkpoints + fresh SessionStart); `rewind.rs` is
   the shared restore implementation used by `overseer rewind` and the
   TUI's `/rewind`.
+- arsenal modules (P8-B/P8-C ports — pure patterns, no servers/runtimes):
+  memory/graph (`memory.rs`, `graph.rs`, `cognee.rs`, `press.rs`,
+  `rag.rs`), retrieval (`tools/struct_search.rs` — ast-grep + semgrep
+  shell-out; `tsitter.rs`, feature `tree-sitter`, default-off, zero
+  dependencies: the grammar/query registry a real binding registers
+  against), search/scrape (`web.rs`, `extract.rs`, `crawl.rs`),
+  browser/agent surface (`browse.rs`, `webagent.rs`), sandboxes and
+  grants (`backends.rs` — e2b trait, provider enum, runtime selection,
+  toolhive grants, context-forge grants), `mcp.rs` (minimal stdio
+  JSON-RPC client), `refine.rs` (textgrad bounded loop),
+  `evalcfg.rs`/`observability.rs` (B2). `bash` honours `--runtime
+  <native|seatbelt|bubblewrap|gvisor>`: a pinned runtime that is
+  unavailable FAILS the call with the requirement named (never a silent
+  downgrade to unsandboxed exec); unset keeps the platform default.
+  Deferred sites are marked `// DEFERRED(owner)` in each module header.
 - `crates/overseer-cli` — `overseer exec` headless/CI surface; bare
   `overseer` / `overseer tui` launches the interactive TUI (same flags).
   `--continue`/`-c` resumes the newest session recorded for the cwd,
@@ -43,6 +58,8 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   `--bare` is hermetic CI mode: implies `--json`, throwaway session in
   the temp dir (never `~/.overseer`), no persisted rules, and rejects
   combination with `--resume`/`--continue`/`--last`/`--session`.
+  `--runtime <name>` pins the bash sandbox backend (validated at parse
+  time; an unavailable runtime fails the call rather than downgrading).
 - `crates/overseer-proto` — wire protocol types (request/notification)
 - `crates/overseer-tui` — ratatui/crossterm TUI (library). Agent runs on a
   worker thread; UI renders `Event`s over a channel. Fixed-height

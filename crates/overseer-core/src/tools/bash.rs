@@ -55,7 +55,21 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     // P1.5 sandbox v1: the command still runs via `sh -c`, but wrapped in
     // the platform sandbox when available (macOS sandbox-exec / Linux
     // bwrap) — deny-by-default network, writes confined to the workspace.
-    let (prog, args, note) = wrap_command(command, ctx);
+    // P8-C: an explicit `--runtime` (gVisor port) PINS the backend. An
+    // unavailable runtime fails the call with the requirement spelled out —
+    // a run that asked for gVisor must never execute unsandboxed because
+    // `runsc` was missing.
+    let (prog, args, note) = match ctx
+        .agent_config
+        .as_ref()
+        .and_then(|c| c.sandbox_runtime.as_deref())
+    {
+        Some(requested) => match pinned_wrap(requested, command, ctx) {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::err(e),
+        },
+        None => wrap_command(command, ctx),
+    };
 
     let mut child = match Command::new(&prog)
         .args(&args)
@@ -173,56 +187,78 @@ fn wrap_command(command: &str, ctx: &ToolCtx) -> (String, Vec<String>, Option<St
         return ("sh".into(), vec!["-c".into(), command.into()], None);
     }
     #[cfg(target_os = "macos")]
-    {
-        let exe = "/usr/bin/sandbox-exec";
-        if std::path::Path::new(exe).exists() {
-            return (
-                exe.into(),
-                vec![
-                    "-p".into(),
-                    macos_profile(&ctx.cwd),
-                    "sh".into(),
-                    "-c".into(),
-                    command.into(),
-                ],
-                None,
-            );
-        }
+    if let Some(inv) = seatbelt_invocation(command, ctx) {
+        return inv;
     }
     #[cfg(target_os = "linux")]
-    {
-        if bwrap_available() {
-            let root = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
-            return (
-                "bwrap".into(),
-                vec![
-                    "--ro-bind".into(),
-                    "/".into(),
-                    "/".into(),
-                    "--bind".into(),
-                    root.display().to_string(),
-                    root.display().to_string(),
-                    "--tmpfs".into(),
-                    "/tmp".into(),
-                    "--dev".into(),
-                    "/dev".into(),
-                    "--proc".into(),
-                    "/proc".into(),
-                    "--unshare-net".into(),
-                    "--die-with-parent".into(),
-                    "sh".into(),
-                    "-c".into(),
-                    command.into(),
-                ],
-                None,
-            );
-        }
+    if let Some(inv) = bubblewrap_invocation(command, ctx) {
+        return inv;
     }
     (
         "sh".into(),
         vec!["-c".into(), command.into()],
         Some("no sandbox backend (sandbox-exec/bwrap) — ran unsandboxed".into()),
     )
+}
+
+/// The macOS seatbelt invocation, or `None` when sandbox-exec is absent.
+/// One builder for both the platform default path and the pinned
+/// `--runtime seatbelt` path, so the two can never drift.
+#[cfg(target_os = "macos")]
+fn seatbelt_invocation(
+    command: &str,
+    ctx: &ToolCtx,
+) -> Option<(String, Vec<String>, Option<String>)> {
+    let exe = "/usr/bin/sandbox-exec";
+    std::path::Path::new(exe).exists().then(|| {
+        (
+            exe.into(),
+            vec![
+                "-p".into(),
+                macos_profile(&ctx.cwd),
+                "sh".into(),
+                "-c".into(),
+                command.into(),
+            ],
+            None,
+        )
+    })
+}
+
+/// The bwrap invocation, or `None` when bwrap is unavailable. Same reasoning
+/// as `seatbelt_invocation`: one builder, two callers.
+#[cfg(target_os = "linux")]
+fn bubblewrap_invocation(
+    command: &str,
+    ctx: &ToolCtx,
+) -> Option<(String, Vec<String>, Option<String>)> {
+    if !bwrap_available() {
+        return None;
+    }
+    let root = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
+    Some((
+        "bwrap".into(),
+        vec![
+            "--ro-bind".into(),
+            "/".into(),
+            "/".into(),
+            "--bind".into(),
+            root.display().to_string(),
+            root.display().to_string(),
+            "--tmpfs".into(),
+            "/tmp".into(),
+            "--dev".into(),
+            "/dev".into(),
+            "--proc".into(),
+            "/proc".into(),
+            "--unshare-net".into(),
+            "--die-with-parent".into(),
+            "sh".into(),
+            "-c".into(),
+            command.into(),
+        ],
+        None,
+    ))
 }
 
 /// macOS Seatbelt profile for `sandbox-exec -p` (P1.5): deny-by-default,
@@ -252,20 +288,106 @@ fn macos_profile(cwd: &std::path::Path) -> String {
     )
 }
 
+/// The pinned-runtime path (P8-C `--runtime`): build the invocation for the
+/// runtime the operator asked for, or fail with the requirement spelled out.
+///
+/// The contract is deliberately unforgiving: an unknown name, a runtime this
+/// platform cannot provide, or a missing binary is an ERROR naming what is
+/// missing and how to proceed. Silently falling back to the platform default
+/// (or to unsandboxed exec) would make `--runtime` a lie — and a sandbox that
+/// quietly is not there is worse than no sandbox at all, because the operator
+/// stops checking.
+fn pinned_wrap(
+    requested: &str,
+    command: &str,
+    ctx: &ToolCtx,
+) -> Result<(String, Vec<String>, Option<String>), String> {
+    let runtime = crate::backends::SandboxRuntime::parse(requested)
+        .map_err(|e| format!("bash: {e} — drop --runtime to use the platform default"))?;
+    match runtime {
+        crate::backends::SandboxRuntime::Native => Ok((
+            "sh".into(),
+            vec!["-c".into(), command.into()],
+            Some(
+                "runtime=native — running unsandboxed because --runtime native was requested"
+                    .into(),
+            ),
+        )),
+        crate::backends::SandboxRuntime::Seatbelt => {
+            #[cfg(target_os = "macos")]
+            {
+                seatbelt_invocation(command, ctx).ok_or_else(|| {
+                    "bash: --runtime seatbelt needs /usr/bin/sandbox-exec, which is not present \
+                     on this host — drop --runtime or pass --runtime native"
+                        .to_string()
+                })
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(
+                    "bash: --runtime seatbelt is macOS-only — use --runtime bubblewrap on \
+                     Linux, or --runtime native"
+                        .to_string(),
+                )
+            }
+        }
+        crate::backends::SandboxRuntime::Bubblewrap => {
+            #[cfg(target_os = "linux")]
+            {
+                bubblewrap_invocation(command, ctx).ok_or_else(|| {
+                    "bash: --runtime bubblewrap needs `bwrap` on PATH (and a user namespace \
+                     it can create) — drop --runtime or pass --runtime native"
+                        .to_string()
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(
+                    "bash: --runtime bubblewrap is Linux-only — use --runtime seatbelt on \
+                     macOS, or --runtime native"
+                        .to_string(),
+                )
+            }
+        }
+        crate::backends::SandboxRuntime::Gvisor => {
+            let bundle = ctx.cwd.join(crate::backends::GVISOR_BUNDLE_DIR).is_dir();
+            crate::backends::check_runtime(runtime, binary_available("runsc"), bundle)
+                .map_err(|e| format!("bash: --runtime gvisor — {e}"))?;
+            // Both requirements are met, but the runsc invocation itself is
+            // not wired: `runsc run` needs the prepared OCI bundle to be
+            // mounted with the workspace, and guessing that argv would be a
+            // fake sandbox. Refuse loudly instead.
+            Err(
+                "bash: --runtime gvisor — runsc and the OCI bundle are present, but the runsc \
+                 invocation is not wired yet (DEFERRED, see backends.rs) — pass --runtime native \
+                 to run unsandboxed or drop --runtime"
+                    .to_string(),
+            )
+        }
+    }
+}
+
+/// Whether `name` answers `--version` — the presence probe for a sandbox
+/// binary (`bwrap`, `runsc`). A binary that cannot be spawned, or that exits
+/// non-zero, counts as ABSENT: a runtime gate must not be satisfied by a name
+/// that resolves to nothing runnable.
+fn binary_available(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Whether bwrap exists on PATH — probed once per process.
 #[cfg(target_os = "linux")]
 fn bwrap_available() -> bool {
-    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FOUND.get_or_init(|| {
-        Command::new("bwrap")
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
+    static FOUND: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| binary_available("bwrap"));
+    *FOUND
 }
 
 #[cfg(test)]
@@ -332,6 +454,99 @@ mod tests {
             &mut c,
         );
         assert!(out.text.contains("ok"), "{}", out.text);
+    }
+
+    // ── P8-C `--runtime` (gVisor port) ───────────────────────────────────
+
+    /// A ctx whose agent config pins the sandbox runtime, as `--runtime`
+    /// does. The pin lives on the config (not on ToolCtx), so this is the
+    /// exact shape a real run carries.
+    fn ctx_with_runtime<'a>(dir: &'a std::path::Path, runtime: &str) -> ToolCtx<'a> {
+        let mut c = ctx(dir, true);
+        c.agent_config = Some(crate::agent::AgentConfig {
+            sandbox_runtime: Some(runtime.to_string()),
+            ..Default::default()
+        });
+        c
+    }
+
+    #[test]
+    fn pinned_native_runs_unsandboxed_only_because_it_was_asked_for() {
+        let dir = std::env::temp_dir();
+        let c = ctx_with_runtime(&dir, "native");
+        let (prog, args, note) = pinned_wrap("native", "echo hi", &c).unwrap();
+        assert_eq!(prog, "sh");
+        assert_eq!(args, vec!["-c", "echo hi"]);
+        let note = note.expect("an unsandboxed run must be visible, never quiet");
+        assert!(note.contains("native"), "{note}");
+    }
+
+    #[test]
+    fn pinned_unknown_runtime_errors_naming_the_valid_set() {
+        let dir = std::env::temp_dir();
+        let c = ctx(&dir, true);
+        let err = pinned_wrap("firecracker", "echo hi", &c).unwrap_err();
+        assert!(err.contains("firecracker"), "{err}");
+        assert!(err.contains("gvisor"), "names the valid set: {err}");
+        assert!(err.contains("--runtime"), "names the flag to fix: {err}");
+    }
+
+    #[test]
+    fn pinned_gvisor_without_runsc_fails_instead_of_running_unsandboxed() {
+        // Both requirements are probed for real: on a host with runsc and a
+        // bundle the call still refuses (the runsc argv is DEFERRED), and on
+        // a host without them it names what is missing. Either way it is an
+        // ERROR — never a silent downgrade to unsandboxed exec.
+        let dir = std::env::temp_dir().join("ovr-sbx-gvisor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = ctx_with_runtime(&dir, "gvisor");
+        let err = pinned_wrap("gvisor", "echo hi", &c).unwrap_err();
+        assert!(err.contains("gvisor"), "{err}");
+        assert!(
+            err.contains("runsc") || err.contains("bundle"),
+            "names the missing requirement: {err}"
+        );
+        let mut reg = ToolRegistry::core(Policy::allow_all());
+        let out = reg.call("bash", &serde_json::json!({"command": "echo hi"}), &mut c);
+        assert!(out.is_error, "a pinned-but-unavailable runtime is an error");
+        assert!(out.text.contains("gvisor"), "{}", out.text);
+    }
+
+    #[test]
+    fn pinned_runtime_is_platform_checked_and_the_native_path_agrees() {
+        let dir = std::env::temp_dir();
+        let c = ctx(&dir, true);
+        #[cfg(target_os = "macos")]
+        {
+            let err = pinned_wrap("bubblewrap", "echo hi", &c).unwrap_err();
+            assert!(err.contains("Linux-only"), "{err}");
+            assert!(err.contains("native"), "offers the repair: {err}");
+            // Pinning seatbelt is the default path, and both agree.
+            match pinned_wrap("seatbelt", "echo hi", &c) {
+                Ok((prog, _, _)) => assert!(prog.ends_with("sandbox-exec"), "{prog}"),
+                Err(e) => assert!(e.contains("sandbox-exec"), "only absence explains it: {e}"),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let err = pinned_wrap("seatbelt", "echo hi", &c).unwrap_err();
+            assert!(err.contains("macOS-only"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_pinned_native_run_still_executes_the_command() {
+        let dir = std::env::temp_dir().join("ovr-sbx-pinned-run");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = ctx_with_runtime(&dir, "native");
+        let mut reg = ToolRegistry::core(Policy::allow_all());
+        let out = reg.call(
+            "bash",
+            &serde_json::json!({"command": "echo pinned-ok"}),
+            &mut c,
+        );
+        assert!(out.text.contains("pinned-ok"), "{}", out.text);
+        assert!(!out.is_error, "{}", out.text);
     }
 
     #[test]

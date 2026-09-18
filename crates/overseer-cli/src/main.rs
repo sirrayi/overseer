@@ -197,6 +197,7 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
         verify_cmd: flags.verify.clone(),
         verify_block_cap: flags.verify_cap,
         sandbox_bash: flags.sandbox,
+        sandbox_runtime: flags.runtime.clone(),
         disabled_tools: flags.no_tools.clone(),
         autonomy: {
             let mut m = std::collections::HashMap::new();
@@ -787,6 +788,9 @@ fn usage() {
          \x20                     first attempt passing --verify wins\n\
          \x20 --no-sandbox        Run bash unsandboxed (default: sandbox-exec/\n\
          \x20                     bwrap wrapper when available)\n\
+         \x20 --runtime <name>    Pin the bash sandbox backend (P8-C): native |\n\
+         \x20                     seatbelt | bubblewrap | gvisor. An unavailable\n\
+         \x20                     runtime fails the call instead of downgrading\n\
          \x20 --memory            Enable file memory at <cwd>/memory\n\
          \x20 --autonomy <d=l>    Per-domain autonomy, repeatable (P5-B):
 \
@@ -842,6 +846,10 @@ struct ExecFlags {
     /// first attempt whose verify command exits 0 wins.
     best_of: u32,
     sandbox: bool,
+    /// `--runtime <name>` (P8-C gVisor port): pin the bash sandbox backend.
+    /// `None` = the platform default; a pinned runtime that is unavailable
+    /// fails the bash call instead of silently running unsandboxed.
+    runtime: Option<String>,
     memory: bool,
     /// `--no-tools a,b,c` — P4.3 ablation: named tools are removed from the
     /// spec list and refused at dispatch.
@@ -885,6 +893,7 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         reflect: overseer_core::agent::ReflectMode::Reflexion,
         best_of: 0,
         sandbox: true,
+        runtime: None,
         memory: false,
         no_tools: Vec::new(),
         autonomy: Vec::new(),
@@ -954,6 +963,13 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
                 }
             }
             "--no-sandbox" => f.sandbox = false,
+            "--runtime" => {
+                // Validate at parse time so a typo fails before a run, and
+                // store the canonical spelling the core parses back.
+                let rt = overseer_core::backends::SandboxRuntime::parse(take(&mut i)?)
+                    .map_err(|e| format!("bad --runtime ({e})"))?;
+                f.runtime = Some(rt.as_str().to_string());
+            }
             "--memory" => f.memory = true,
             "--autonomy" => {
                 let v = take(&mut i)?;
@@ -1460,6 +1476,30 @@ mod tests {
         let cfg = agent_config(&f);
         assert!(cfg.sandbox_bash, "--bare must not weaken the sandbox");
         assert!(cfg.rules_path.is_none(), "--bare loads no user rules");
+    }
+
+    #[test]
+    fn runtime_flag_is_validated_and_canonicalized_into_the_config() {
+        // P8-C accept (gVisor `--runtime` flag): the alias parses, the
+        // canonical spelling reaches the config, and a typo fails before a
+        // run instead of at the first bash call.
+        let f = parse_exec(&["--runtime".into(), "runsc".into(), "x".into()]).unwrap();
+        assert_eq!(f.runtime.as_deref(), Some("gvisor"));
+        let cfg = agent_config(&f);
+        assert_eq!(cfg.sandbox_runtime.as_deref(), Some("gvisor"));
+        assert!(
+            cfg.sandbox_bash,
+            "pinning a runtime never disables the sandbox"
+        );
+        // Unset stays unset: the platform default, byte-identical to before.
+        let bare = agent_config(&parse_exec(&["--bare".into(), "x".into()]).unwrap());
+        assert_eq!(bare.sandbox_runtime, None);
+        let err = match parse_exec(&["--runtime".into(), "firecracker".into(), "x".into()]) {
+            Ok(_) => panic!("a bogus --runtime must not parse"),
+            Err(e) => e,
+        };
+        assert!(err.contains("bad --runtime"), "{err}");
+        assert!(err.contains("gvisor"), "names the valid set: {err}");
     }
 }
 
