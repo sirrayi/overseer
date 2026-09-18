@@ -22,6 +22,7 @@ pub mod perm;
 pub mod profile;
 pub mod prompt;
 pub mod provider;
+pub mod rag;
 pub mod recipe;
 pub mod repomap;
 pub mod rewind;

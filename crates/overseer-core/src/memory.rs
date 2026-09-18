@@ -13,6 +13,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const INDEX_NAME: &str = "INDEX.md";
+/// Resident core file (Letta's `core_memory` pattern, arsenal B2): a small
+/// `CORE.md` always in the prompt, next to the index. Where INDEX.md is a
+/// pointer table that grows, CORE.md is the fixed handful of lines that
+/// must never be paged out — identity and standing instructions.
+pub const CORE_NAME: &str = "CORE.md";
+/// Hard cap on the resident core block (2KB ≈ 500 tokens). Over the cap the
+/// block is truncated *with a repair note*, never silently.
+pub const CORE_CAP: usize = 2_048;
+/// Routing hint (LightRAG pattern, arsenal B2): level-aware retrieval is a
+/// prompt contract, not code — tell the model which layer answers which
+/// kind of question, and the local/global split falls out of the files.
+pub const ROUTING_HINT: &str = "Retrieval: answer specific questions from \
+    topic files (`read` them); answer overview questions from this index.";
+
 /// Ceiling on a declared per-asset TTL (100 years — a bound, not a policy).
 pub const MAX_TTL_DAYS: u64 = 36_500;
 /// Playbook cap: the index is a pointer table, not a document store.
@@ -688,9 +702,40 @@ pub fn index_segment(dir: &Path) -> String {
         "## Memory index\n\
          `{}/` is your persistent memory — read and update it with ordinary \
          file tools. {INDEX_NAME} holds one-line pointers (≤25KB); details \
-         live in topic files you create there.\n\n{body}{note}\n\n{MEMORY_LEGEND}",
-        dir.display()
+         live in topic files you create there.\n\n{ROUTING_HINT}\n\n{body}{note}\n\n{MEMORY_LEGEND}{core}",
+        dir.display(),
+        core = core_block(dir)
     )
+}
+
+/// The resident core block (Letta `CORE.md`): the always-in-context handful
+/// of lines, capped with a repair note when over budget. Empty when the
+/// file is absent — the block is opt-in by existence, like everything else
+/// in the memory dir. Parent view only: `index_segment_filtered` (the
+/// quarantined subagent view) never carries it — core memory is not
+/// scoped per entry, so there is no sensitivity ceiling to apply to it.
+fn core_block(dir: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(dir.join(CORE_NAME)) else {
+        return String::new();
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    if text.len() > CORE_CAP {
+        let cut = text
+            .char_indices()
+            .map(|(i, c)| i + c.len_utf8())
+            .take_while(|end| *end <= CORE_CAP)
+            .last()
+            .unwrap_or(0);
+        return format!(
+            "\n\n## Memory core ({CORE_NAME})\n{}\n\n[overseer] {CORE_NAME} exceeds \
+             2KB — keep it to the lines that must survive every compaction.",
+            &text[..cut]
+        );
+    }
+    format!("\n\n## Memory core ({CORE_NAME})\n{text}")
 }
 
 /// Sensitivity-filtered index view (P6-2): the quarantined subagent
@@ -869,6 +914,97 @@ pub fn dirty_files(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// A reconciliation plan over the memory dir (mem0 pattern, arsenal B2):
+/// what the index claims versus what the directory actually holds, decided
+/// before any model call. Three verdicts, no model involved:
+///
+/// - `drop` — a pointer whose asset is missing, expired, or superseded;
+/// - `add`  — a topic file that no pointer names;
+/// - `keep` — a pointer and its asset agree (counted, not listed).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReconcilePlan {
+    pub drop: Vec<String>,
+    pub add: Vec<String>,
+    pub keep: usize,
+}
+
+impl ReconcilePlan {
+    /// Render the plan for the consolidation prompt — the model sees
+    /// exactly what the engine already decided.
+    pub fn render(&self) -> String {
+        let list = |v: &[String]| {
+            if v.is_empty() {
+                "(none)".to_string()
+            } else {
+                v.join(", ")
+            }
+        };
+        format!(
+            "- drop (stale pointers): {}\n- add (untracked topics): {}\n- keep: {} pointer(s)",
+            list(&self.drop),
+            list(&self.add),
+            self.keep
+        )
+    }
+}
+
+/// Classify the index against the directory. `index_text` is passed in so
+/// callers can reconcile a proposed index as well as the live one.
+pub fn reconcile(dir: &Path, index_text: &str) -> ReconcilePlan {
+    let mut named: Vec<String> = Vec::new();
+    for line in index_text.lines() {
+        // Proposals are never part of the trusted index (RT-3).
+        if is_proposal_pointer(line) {
+            continue;
+        }
+        if let Some(n) = topic_name(line) {
+            named.push(n.to_string());
+        }
+    }
+    named.sort();
+    named.dedup();
+
+    let mut plan = ReconcilePlan::default();
+    for n in &named {
+        let (topic, mtime) = topic_of(dir, n);
+        let live = match topic {
+            Topic::Missing => false,
+            Topic::Bare(t) => entry_valid(&t, mtime),
+            Topic::Headed(meta, t) => meta_current(&meta, &t, mtime),
+            Topic::Malformed => false,
+        };
+        if live {
+            plan.keep += 1;
+        } else {
+            plan.drop.push(n.clone());
+        }
+    }
+
+    // Untracked topics: a file on disk no pointer names. Root and the layer
+    // subdirs both count (pointers are always bare file names).
+    let mut dirs = vec![dir.to_path_buf()];
+    for layer in Layer::ALL {
+        dirs.push(dir.join(layer.name()));
+    }
+    for d in dirs {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") || name == INDEX_NAME || name == CORE_NAME {
+                continue;
+            }
+            if !named.iter().any(|n| n == &name) {
+                plan.add.push(name);
+            }
+        }
+    }
+    plan.add.sort();
+    plan.add.dedup();
+    plan
+}
+
 /// Sleep-time consolidation (P3.8): a small-tier call that dedupes and
 /// tightens `INDEX.md`, then a git commit. Topic files are read for
 /// context but only the index is rewritten — merging topic bodies is the
@@ -900,8 +1036,21 @@ pub fn consolidate(
         };
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().is_some_and(|x| x == "md") && e.file_name() != INDEX_NAME {
-                if let Ok(t) = std::fs::read_to_string(&p) {
+            let is_topic = p.extension().is_some_and(|x| x == "md")
+                && e.file_name() != INDEX_NAME
+                && e.file_name() != CORE_NAME;
+            if is_topic {
+                // P8-B (zep validity, entry half): an expired or superseded
+                // body must not be re-summarized into the index — consolidation
+                // reads only what the reader would serve.
+                let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+                let Ok(t) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
+                if !entry_valid(&t, mtime) {
+                    continue;
+                }
+                {
                     let head: String = t.chars().take(2_000).collect();
                     let rel = p
                         .strip_prefix(dir)
@@ -913,9 +1062,15 @@ pub fn consolidate(
         }
     }
 
+    // P8-B (mem0 reconcile): a deterministic plan over pointers vs backing
+    // files, computed BEFORE the model call. It rides the prompt (so the
+    // model sees exactly what changed) and is enforced afterwards (so a
+    // stale pointer cannot survive a lazy reply).
+    let plan = reconcile(dir, &old_index);
     let prompt = format!(
         "You are consolidating an agent's file-based memory. Below is \
          INDEX.md (one-line pointers) and the heads of the topic files.\n\
+         Reconcile plan (computed deterministically — honor it):\n{}\n\
          Rewrite INDEX.md only: dedupe pointers, drop stale entries whose \
          topic file is gone, keep one line per topic in the form \
          `name.md — what it's about`. Validity: if a topic's content says \
@@ -926,7 +1081,8 @@ pub fn consolidate(
          with a `superseded_by` trailer instead of deleting them; keep \
          entries whose validity window still covers now.\n\
          Reply with the full new index between ---INDEX--- markers.\n\n\
-         == CURRENT INDEX.md ==\n{old_index}\n== TOPIC HEADS =={topics}"
+         == CURRENT INDEX.md ==\n{old_index}\n== TOPIC HEADS =={topics}",
+        plan.render()
     );
     let msgs = [crate::ir::Message::user_text(prompt)];
     let req = crate::provider::Request {
@@ -957,7 +1113,27 @@ pub fn consolidate(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "consolidate: model reply had no ---INDEX--- section".to_string())?;
-    let capped: String = new_index.chars().take(INDEX_CAP).collect();
+    let mut capped: String = new_index.chars().take(INDEX_CAP).collect();
+    // mem0 reconcile enforcement: pointers the plan marked stale never
+    // come back, whatever the model replied (ADD-only: this can only drop
+    // a pointer whose backing file is gone or whose asset expired).
+    let mut dropped_stale = 0usize;
+    if !plan.drop.is_empty() {
+        let kept: Vec<&str> = capped
+            .lines()
+            .filter(|l| {
+                let stale = plan
+                    .drop
+                    .iter()
+                    .any(|d| topic_name(l).is_some_and(|n| n == d.as_str()));
+                if stale {
+                    dropped_stale += 1;
+                }
+                !stale
+            })
+            .collect();
+        capped = kept.join("\n");
+    }
     std::fs::write(&idx, format!("{capped}\n")).map_err(|e| e.to_string())?;
     commit(dir, "consolidate");
 
@@ -967,9 +1143,12 @@ pub fn consolidate(
         .filter(|l| !new_index.contains(l.trim()))
         .count();
     Ok(format!(
-        "consolidated: {} → {} index lines, {dropped} pointers dropped",
+        "consolidated: {} → {} index lines, {dropped} pointers dropped \
+         (reconcile: {} stale, {} untracked, {dropped_stale} stale reclaimed)",
         old_index.lines().count(),
-        capped.lines().count()
+        capped.lines().count(),
+        plan.drop.len(),
+        plan.add.len()
     ))
 }
 
@@ -1118,6 +1297,117 @@ mod tests {
         let p = FixedProvider::with_reply("no markers here");
         assert!(consolidate(&p, "tiny", &dir).is_err());
         assert_eq!(std::fs::read_to_string(&idx).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn reconcile_classifies_pointers_against_the_directory() {
+        // P8-B accept (mem0 reconcile): drop stale pointers, add untracked
+        // topics, count the ones that agree — all before any model call.
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        std::fs::write(dir.join("semantic").join("live.md"), "body\n").unwrap();
+        std::fs::write(
+            dir.join("semantic").join("gone.md"),
+            "---\nvalid_to: 2000-01-01T00:00:00Z\n---\nstale\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("untracked.md"), "not pointed at\n").unwrap();
+        std::fs::write(dir.join(CORE_NAME), "core lines\n").unwrap();
+        let index = "# Memory Index\n\nlive.md — fine\ngone.md — expired\nmissing.md — nowhere\n";
+
+        let plan = reconcile(&dir, index);
+        assert_eq!(plan.keep, 1, "live.md agrees");
+        assert_eq!(
+            plan.drop,
+            vec!["gone.md".to_string(), "missing.md".to_string()]
+        );
+        assert_eq!(plan.add, vec!["untracked.md".to_string()]);
+        // CORE.md is never a topic pointer target.
+        assert!(!plan.add.iter().any(|a| a == CORE_NAME));
+        // The rendered plan rides the consolidation prompt verbatim.
+        let rendered = plan.render();
+        assert!(rendered.contains("gone.md"), "{rendered}");
+        assert!(rendered.contains("untracked.md"), "{rendered}");
+        assert!(rendered.contains("keep: 1"), "{rendered}");
+
+        // An empty plan renders "(none)" rather than an empty line.
+        let empty = reconcile(&dir, "");
+        assert!(empty.render().contains("(none)"), "{}", empty.render());
+    }
+
+    #[test]
+    fn consolidate_enforces_the_reconcile_plan_and_skips_stale_bodies() {
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        std::fs::write(dir.join("facts.md"), "live facts\n").unwrap();
+        std::fs::write(
+            dir.join("dead.md"),
+            "---\nvalid_to: 2000-01-01T00:00:00Z\n---\nSTALE_BODY_MARKER\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(INDEX_NAME),
+            "# Memory Index\n\nfacts.md — facts\ndead.md — expired\n",
+        )
+        .unwrap();
+
+        // The model lazily keeps the stale pointer and drops the live one.
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\ndead.md — expired\nfacts.md — live facts\n---INDEX---",
+        );
+        let msg = consolidate(&p, "tiny", &dir).unwrap();
+        assert!(msg.contains("1 stale reclaimed"), "{msg}");
+        let new = std::fs::read_to_string(dir.join(INDEX_NAME)).unwrap();
+        assert!(
+            !new.contains("dead.md"),
+            "the engine reclaims a stale pointer the model kept: {new}"
+        );
+        assert!(new.contains("facts.md"), "{new}");
+
+        // The stale body never reached the prompt; the plan did.
+        let seen = p.seen.lock().map(|g| g.join("\n")).unwrap_or_default();
+        assert!(!seen.contains("STALE_BODY_MARKER"), "stale body was served");
+        assert!(seen.contains("Reconcile plan"), "{seen}");
+        assert!(seen.contains("dead.md"), "the plan names the stale pointer");
+    }
+
+    #[test]
+    fn core_block_is_resident_capped_and_parent_only() {
+        // P8-B accept (letta CORE.md): a small always-in-context block,
+        // capped with a repair note, and absent from the subagent view.
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        std::fs::write(dir.join(INDEX_NAME), "# Memory Index\n\nfacts.md — facts\n").unwrap();
+        std::fs::write(dir.join("facts.md"), "body\n").unwrap();
+
+        // Absent → no block at all (opt-in by existence).
+        let seg = index_segment(&dir);
+        assert!(!seg.contains("Memory core"), "{seg}");
+
+        std::fs::write(dir.join(CORE_NAME), "Never page me out.\n").unwrap();
+        let seg = index_segment(&dir);
+        assert!(seg.contains("## Memory core (CORE.md)"), "{seg}");
+        assert!(seg.contains("Never page me out."));
+        // Routing hint (lightrag): both halves of the local/global split.
+        assert!(seg.contains("answer specific questions from"), "{seg}");
+        assert!(seg.contains("overview questions from this index"), "{seg}");
+
+        // Over the cap → truncated with the repair note, and the bytes stay
+        // bounded (the block is resident, so it must not grow unbounded).
+        std::fs::write(dir.join(CORE_NAME), "y".repeat(CORE_CAP + 500)).unwrap();
+        let seg = index_segment(&dir);
+        assert!(seg.contains("exceeds"), "{seg}");
+        assert!(seg.len() < INDEX_CAP + CORE_CAP + 2_000, "{}", seg.len());
+
+        // CORE.md is not a topic: it never appears as a pointer, and the
+        // quarantined subagent view carries neither the block nor a pointer.
+        std::fs::write(dir.join(CORE_NAME), "core\n").unwrap();
+        let filtered = index_segment_filtered(&dir, Sensitivity::Personal);
+        assert!(!filtered.contains("Memory core"), "{filtered}");
+        assert!(!filtered.contains("CORE.md"), "{filtered}");
+        // CORE.md must never be reconciled as a topic file.
+        let plan = reconcile(&dir, "# Memory Index\n\nfacts.md — facts\n");
+        assert!(!plan.add.iter().any(|a| a == CORE_NAME));
     }
 
     #[test]
