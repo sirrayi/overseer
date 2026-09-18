@@ -5,6 +5,8 @@
 //! with engine-enforced budgets. Frontends attach via overseer-proto.
 
 pub mod agent;
+pub mod backends;
+pub mod browse;
 pub mod cache;
 pub mod cognee;
 pub mod compact;
@@ -21,6 +23,7 @@ pub mod hooks;
 pub mod ir;
 pub mod ledger;
 pub mod manifest;
+pub mod mcp;
 pub mod memory;
 pub mod microagent;
 pub mod modes;
@@ -34,6 +37,7 @@ pub mod prompt;
 pub mod provider;
 pub mod rag;
 pub mod recipe;
+pub mod refine;
 pub mod repomap;
 pub mod rewind;
 pub mod session;
@@ -49,3 +53,4 @@ pub mod toon;
 #[cfg(feature = "tree-sitter")]
 pub mod tsitter;
 pub mod web;
+pub mod webagent;
