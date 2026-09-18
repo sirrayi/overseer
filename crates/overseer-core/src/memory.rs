@@ -8,6 +8,20 @@
 //!
 //! The dir is git-versioned (Letta MemFS): free history, diffs, rollback.
 //! Commits are engine-made at turn boundaries, not model actions.
+//!
+//! Two P8-C ports (memory-graph wave), both pure over the same file
+//! convention and both reusing this module's liveness rules — a port never
+//! invents a second way to read the dir:
+//!
+//! - **mcp-mem-server `search_memory`** — deterministic lexical search over
+//!   the live topic files: a scored, capped, name-tie-broken result set
+//!   carrying the quotable line so a hit can be re-read instead of trusted.
+//! - **LanceDB frontmatter prefilter** — the `WHERE` half of a vector
+//!   search: header columns decide who is rankable, *before* scoring, so a
+//!   filtered-out asset can never occupy a result slot.
+// DEFERRED(owner): vector embeddings, an ANN/LanceDB index, and body-level
+// ranking — this port lands the prefilter plus lexical scoring only; the
+// delivery gate forbids new dependencies and a real index needs one.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1152,6 +1166,331 @@ pub fn consolidate(
     ))
 }
 
+/// Cap on `search_memory` hits. A search answers one question; it must not
+/// stream a whole memory dir into a prompt, so a larger `limit` is clamped
+/// (deliberately — this is a prompt budget, not a pagination knob).
+pub const MAX_SEARCH_HITS: usize = 50;
+
+/// Weight of a query term appearing in the topic file's name. A name hit
+/// says what the file is *about*; a body hit is one mention among many.
+const NAME_WEIGHT: u32 = 3;
+/// Ceiling on one term's body occurrences: a repeated word must not swamp
+/// a name hit (repetition is one fact stated many times).
+const BODY_CAP: usize = 5;
+/// Cap on a snippet's length in chars, the trailing `…` included.
+const SNIPPET_CHARS: usize = 200;
+
+/// LanceDB frontmatter prefilter (the `WHERE` half of a vector search): the
+/// header columns a caller may constrain, applied *before* ranking so a
+/// filtered-out asset can never occupy a result slot. Every clause is
+/// fail-closed — a column that cannot be proven excludes the asset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntryFilter {
+    /// Exact layer (directory) match; `None` = every layer.
+    pub layer: Option<Layer>,
+    /// Sensitivity ceiling, checked through `admits`; `None` = no ceiling.
+    pub sensitivity_max: Option<Sensitivity>,
+    /// The subagent-view rule: a `Regulated` asset never fans out, whatever
+    /// its sensitivity tier. Defaults to **true** (see `Default`).
+    pub exclude_regulated: bool,
+    /// Inclusive minimum header confidence. A non-finite entry confidence
+    /// never matches: `validate_meta` cannot produce one, a directly
+    /// constructed `EntryMeta` can, and an unreadable number must not pass
+    /// a numeric gate.
+    pub min_confidence: Option<f64>,
+    /// Exact provenance match, case-insensitive. Not a substring match:
+    /// `"seed"` does not admit `"seed-notes"`.
+    pub provenance: Option<String>,
+}
+
+impl Default for EntryFilter {
+    /// Deliberately hand-written, not derived: `bool`'s derived default is
+    /// `false`, which would fan *regulated* assets out to whoever forgot to
+    /// set the column. The subagent-view rule is the safe default, so the
+    /// column starts at `true`.
+    fn default() -> Self {
+        EntryFilter {
+            layer: None,
+            sensitivity_max: None,
+            exclude_regulated: true,
+            min_confidence: None,
+            provenance: None,
+        }
+    }
+}
+
+/// True when `meta` survives `f` for a file in `layer`: the column checks a
+/// vector store would have run as SQL, decided on the header alone (no body
+/// text, no ranking, no fs). Layer is equality; sensitivity goes through
+/// the one `admits` ordering; confidence is inclusive and must be finite;
+/// provenance is an exact case-insensitive compare.
+pub fn matches_filter(meta: &EntryMeta, layer: Layer, f: &EntryFilter) -> bool {
+    if let Some(want) = f.layer {
+        if layer != want {
+            return false;
+        }
+    }
+    if let Some(max) = f.sensitivity_max {
+        if !admits(max, meta.sensitivity) {
+            return false;
+        }
+    }
+    if f.exclude_regulated && meta.governance == Governance::Regulated {
+        return false;
+    }
+    if let Some(min) = f.min_confidence {
+        if !meta.confidence.is_finite() || meta.confidence < min {
+            return false;
+        }
+    }
+    if let Some(want) = &f.provenance {
+        if !meta.provenance.eq_ignore_ascii_case(want) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Resolve one topic name for filter/search: the layer dir that files it and
+/// the path to read, or `None` when no backing file exists. The layer-dir
+/// copy wins over a root-level duplicate — the filed asset is the one the
+/// layer column judges, and both callers must resolve it the same way.
+///
+/// A root-level topic (the pre-layer `facts.md` files) is filed as
+/// `Layer::Semantic`: it is world-fact-shaped, and an unscoped name must
+/// never be judged as identity (`Profile`) or personal history
+/// (`Episodic`), the two layers with a higher write bar.
+fn filed_topic(dir: &Path, name: &str) -> Option<(Layer, PathBuf)> {
+    for layer in Layer::ALL {
+        let p = dir.join(layer.name()).join(name);
+        if p.is_file() {
+            return Some((layer, p));
+        }
+    }
+    let root = dir.join(name);
+    root.is_file().then_some((Layer::Semantic, root))
+}
+
+/// Distinct topic-file names the filter admits, ascending: memory root plus
+/// the four layer dirs, minus the two non-topic `.md` files (`INDEX.md`,
+/// `CORE.md`). Still-current only (`entry_valid`'s rule: header parses and
+/// is neither expired nor superseded) and matching `f` — this is the
+/// prefilter `search_memory` ranks, so an asset dropped here can never be
+/// scored, let alone returned.
+pub fn filter_entries(dir: &Path, f: &EntryFilter) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut dirs: Vec<PathBuf> = vec![dir.to_path_buf()];
+    for layer in Layer::ALL {
+        dirs.push(dir.join(layer.name()));
+    }
+    for d in dirs {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") || name == INDEX_NAME || name == CORE_NAME {
+                continue;
+            }
+            if e.path().is_file() {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names.retain(|name| {
+        let Some((layer, path)) = filed_topic(dir, name) else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        // Unparsable header: fail closed (never served as current).
+        let Ok((meta, _)) = parse_meta(&text) else {
+            return false;
+        };
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        meta_current(&meta, &text, mtime) && matches_filter(&meta, layer, f)
+    });
+    names
+}
+
+/// One ranked hit from `search_memory` (mcp-mem-server `search_memory`):
+/// which topic file matched, its layer, the lexical score, and the quotable
+/// line — the caller can re-read `name` at `line` instead of trusting the
+/// snippet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryHit {
+    pub name: String,
+    pub layer: Layer,
+    pub score: u32,
+    /// 1-based line number of `snippet` in the file; 0 when the file has no
+    /// body line (never a fabricated line 1).
+    pub line: usize,
+    pub snippet: String,
+}
+
+/// Lexical search over the live topic files (mcp-mem-server `search_memory`):
+/// score the *filtered* assets, best first, and return at most `limit` of
+/// them. Deterministic by construction — the ordering is score descending,
+/// then name ascending, so the same dir and query always give the same list.
+///
+/// Contract:
+/// - the query is trimmed; no alphanumeric term after trimming is an error
+///   (a search with no terms matches nothing);
+/// - `limit` must be positive; anything above `MAX_SEARCH_HITS` is clamped
+///   to it (a search must not stream a whole memory dir);
+/// - a term in the file's name scores `NAME_WEIGHT`, each body occurrence 1
+///   up to `BODY_CAP` per term per file, and a file carrying no term at all
+///   is not a hit;
+/// - `filter` runs first (`filter_entries`), so superseded/expired files,
+///   unparsable headers, and everything the filter rejects are never
+///   ranked and never occupy a slot.
+pub fn search_memory(
+    dir: &Path,
+    query: &str,
+    filter: &EntryFilter,
+    limit: usize,
+) -> Result<Vec<MemoryHit>, String> {
+    let terms = query_tokens(query);
+    if terms.is_empty() {
+        return Err(
+            "memory: search_memory: a search with no terms matches nothing — pass at \
+             least one alphanumeric word"
+                .into(),
+        );
+    }
+    if limit == 0 {
+        return Err(
+            "memory: search_memory: limit 0 would return nothing — pass a positive limit".into(),
+        );
+    }
+    let limit = limit.min(MAX_SEARCH_HITS);
+
+    let mut hits: Vec<MemoryHit> = Vec::new();
+    for name in filter_entries(dir, filter) {
+        let Some((layer, path)) = filed_topic(dir, &name) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Fail closed: a header that stopped parsing between the prefilter
+        // and the read is not a hit.
+        let Ok((_, body)) = parse_meta(&text) else {
+            continue;
+        };
+        let stem = name.strip_suffix(".md").unwrap_or(&name);
+        let name_words = word_tokens(stem);
+        let body_words = word_tokens(&body);
+        let mut score = 0u32;
+        // Best term wins the snippet; equal scores keep the earlier term, so
+        // a repeated query is not a way to change the answer.
+        let mut best: Option<(usize, u32)> = None;
+        for (i, term) in terms.iter().enumerate() {
+            let weight = NAME_WEIGHT * u32::from(name_words.iter().any(|w| w == term))
+                + occurrences(&body_words, term) as u32;
+            score += weight;
+            if weight > 0 && best.is_none_or(|(_, w)| weight > w) {
+                best = Some((i, weight));
+            }
+        }
+        if score == 0 {
+            continue;
+        }
+        // Frontmatter lines sit above the body, so a body line's number is
+        // its index plus this head — `line` is a real file line.
+        let head = text.lines().count().saturating_sub(body.lines().count());
+        let (snippet, line) = match best {
+            Some((i, _)) => snippet_for(&body, &terms[i], head),
+            None => (String::new(), 0),
+        };
+        hits.push(MemoryHit {
+            name,
+            layer,
+            score,
+            line,
+            snippet,
+        });
+    }
+    hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+/// Lowercased alphanumeric words — the module's one tokenizer (`""` splits
+/// into nothing, so punctuation and separators fall out by construction).
+fn word_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
+/// Query terms: lowercased alphanumeric words, deduplicated, in the order
+/// the caller wrote them (scoring adds either way, but the snippet tie-break
+/// must be reproducible).
+fn query_tokens(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in word_tokens(query) {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Occurrences of `term` as a whole word in `words`, capped at `BODY_CAP` —
+/// `"cat"` matches the word `cat`, never `concatenate`.
+fn occurrences(words: &[String], term: &str) -> usize {
+    words
+        .iter()
+        .filter(|w| w.as_str() == term)
+        .count()
+        .min(BODY_CAP)
+}
+
+/// `s` cut to at most `max` chars (char counts, never byte offsets — a
+/// multibyte char is never split); the cut is marked with a trailing `…`
+/// that counts toward the budget.
+fn cut_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// The quotable line for one hit: the trimmed first body line carrying
+/// `term` (the highest-scoring query term), cut to `SNIPPET_CHARS`. A
+/// name-only hit has no such line, so it falls back to the first non-empty
+/// body line — still a line the caller can read. `head` is the number of
+/// frontmatter lines above the body, so the returned number is the line's
+/// real 1-based position in the file; `(String::new(), 0)` means the file
+/// has no body line at all.
+fn snippet_for(body: &str, term: &str, head: usize) -> (String, usize) {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut fallback: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if fallback.is_none() {
+            fallback = Some(i);
+        }
+        if word_tokens(trimmed).iter().any(|w| w == term) {
+            return (cut_chars(trimmed, SNIPPET_CHARS), head + i + 1);
+        }
+    }
+    match fallback {
+        Some(i) => (cut_chars(lines[i].trim(), SNIPPET_CHARS), head + i + 1),
+        None => (String::new(), 0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1768,5 +2107,346 @@ mod tests {
         assert!(seen[0].contains("ADD-only"), "{}", seen[0]);
         assert!(seen[0].contains("superseded_by"), "{}", seen[0]);
         assert!(seen[0].contains("quarantine"), "{}", seen[0]);
+    }
+
+    /// Write one topic file, creating the layer dir when needed.
+    fn put(dir: &Path, rel: &str, text: &str) {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, text).unwrap();
+    }
+
+    fn search(dir: &Path, q: &str, f: &EntryFilter) -> Vec<MemoryHit> {
+        search_memory(dir, q, f, 10).unwrap()
+    }
+
+    fn names(hits: &[MemoryHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.name.as_str()).collect()
+    }
+
+    #[test]
+    fn search_weights_name_hits_above_body_only_hits() {
+        let dir = tmpdir();
+        put(&dir, "semantic/other.md", "the kettle boils slowly\n");
+        put(&dir, "semantic/kettle.md", "no query word in this body\n");
+        let hits = search(&dir, "  Kettle  ", &EntryFilter::default());
+        assert_eq!(names(&hits), ["kettle.md", "other.md"]);
+        assert_eq!(hits[0].score, NAME_WEIGHT, "a name hit is worth 3");
+        assert_eq!(hits[1].score, 1, "one body occurrence is worth 1");
+    }
+
+    #[test]
+    fn search_excludes_expired_and_superseded_assets() {
+        let dir = tmpdir();
+        put(
+            &dir,
+            "semantic/expired.md",
+            "---\nvalid_to: 2000-01-01T00:00:00Z\n---\nkettle kettle kettle\n",
+        );
+        put(
+            &dir,
+            "semantic/superseded.md",
+            "kettle kettle\nsuperseded_by live.md\n",
+        );
+        put(&dir, "semantic/live.md", "kettle\n");
+        let hits = search(&dir, "kettle", &EntryFilter::default());
+        assert_eq!(
+            names(&hits),
+            ["live.md"],
+            "stale assets are not ranked, let alone returned"
+        );
+    }
+
+    #[test]
+    fn search_honours_a_personal_ceiling_over_secret_entries() {
+        let dir = tmpdir();
+        // The secret twin scores highest (name hit + body hit) — only the
+        // ceiling removes it.
+        put(
+            &dir,
+            "semantic/kettle-secret.md",
+            "---\nsensitivity: secret\n---\nkettle kettle\n",
+        );
+        put(&dir, "semantic/kettle-open.md", "one kettle mention\n");
+        let ceiling = EntryFilter {
+            sensitivity_max: Some(Sensitivity::Personal),
+            ..EntryFilter::default()
+        };
+        assert_eq!(
+            names(&search(&dir, "kettle", &ceiling)),
+            ["kettle-open.md"],
+            "a secret body is never served under a personal ceiling"
+        );
+        // Without a ceiling the secret twin is the top scorer, which is what
+        // proves the ceiling — not the ranking — removed it.
+        let open = search(&dir, "kettle", &EntryFilter::default());
+        assert_eq!(open[0].name, "kettle-secret.md", "{open:?}");
+    }
+
+    #[test]
+    fn search_never_returns_a_regulated_entry_even_when_it_scores_highest() {
+        let dir = tmpdir();
+        put(
+            &dir,
+            "semantic/kettle-regulated.md",
+            "---\ngovernance: regulated\n---\nkettle kettle kettle kettle kettle kettle\n",
+        );
+        put(&dir, "semantic/kettle-notes.md", "one kettle mention\n");
+        // With the governance column switched off the regulated asset is
+        // rank 0: its text really does score highest.
+        let ungoverned = EntryFilter {
+            exclude_regulated: false,
+            ..EntryFilter::default()
+        };
+        assert_eq!(
+            search(&dir, "kettle", &ungoverned)[0].name,
+            "kettle-regulated.md"
+        );
+        assert_eq!(
+            names(&search(&dir, "kettle", &EntryFilter::default())),
+            ["kettle-notes.md"],
+            "the prefilter runs before ranking, so nothing regulated takes a slot"
+        );
+    }
+
+    #[test]
+    fn search_skips_malformed_headers() {
+        let dir = tmpdir();
+        put(
+            &dir,
+            "semantic/broken.md",
+            "---\nconfidence: nonsense\n---\nkettle kettle kettle\n",
+        );
+        put(&dir, "semantic/fine.md", "kettle\n");
+        assert_eq!(
+            names(&search(&dir, "kettle", &EntryFilter::default())),
+            ["fine.md"]
+        );
+        // The prefilter and the search read the same gate.
+        assert_eq!(filter_entries(&dir, &EntryFilter::default()), ["fine.md"]);
+    }
+
+    #[test]
+    fn search_ties_break_on_name_ascending() {
+        let dir = tmpdir();
+        for n in ["c.md", "a.md", "b.md"] {
+            put(&dir, &format!("semantic/{n}"), "kettle\n");
+        }
+        let hits = search(&dir, "kettle", &EntryFilter::default());
+        assert!(hits.iter().all(|h| h.score == 1));
+        assert_eq!(names(&hits), ["a.md", "b.md", "c.md"], "{hits:?}");
+        // Same dir, same query, same order — every run.
+        assert_eq!(
+            names(&hits),
+            names(&search(&dir, "kettle", &EntryFilter::default()))
+        );
+    }
+
+    #[test]
+    fn search_rejects_a_query_with_no_terms() {
+        let dir = tmpdir();
+        put(&dir, "semantic/kettle.md", "kettle\n");
+        for q in ["", "   ", " — ... "] {
+            let e = search_memory(&dir, q, &EntryFilter::default(), 5).unwrap_err();
+            assert!(e.contains("no terms"), "{e}");
+            assert!(e.contains("matches nothing"), "{e}");
+        }
+    }
+
+    #[test]
+    fn search_clamps_limit_and_rejects_zero() {
+        let dir = tmpdir();
+        for i in 0..(MAX_SEARCH_HITS + 5) {
+            put(&dir, &format!("semantic/n{i:03}.md"), "kettle\n");
+        }
+        assert_eq!(
+            search_memory(&dir, "kettle", &EntryFilter::default(), 10_000)
+                .unwrap()
+                .len(),
+            MAX_SEARCH_HITS,
+            "a search must not stream the whole memory dir"
+        );
+        assert_eq!(
+            search_memory(&dir, "kettle", &EntryFilter::default(), 3)
+                .unwrap()
+                .len(),
+            3
+        );
+        let e = search_memory(&dir, "kettle", &EntryFilter::default(), 0).unwrap_err();
+        assert!(e.contains("limit 0"), "{e}");
+    }
+
+    #[test]
+    fn search_snippet_line_number_matches_the_file() {
+        let dir = tmpdir();
+        let text = "---\nconfidence: 0.9\n---\n# Notes\n\nfirst kettle line\nsecond line\n";
+        put(&dir, "semantic/lines.md", text);
+        let hits = search(&dir, "kettle", &EntryFilter::default());
+        assert_eq!(hits[0].snippet, "first kettle line");
+        assert_eq!(hits[0].line, 6);
+        assert_eq!(
+            text.lines().nth(hits[0].line - 1).unwrap().trim(),
+            hits[0].snippet,
+            "the line number must address the snippet in the file"
+        );
+
+        // A name-only hit has no matching body line: the first non-empty
+        // body line is quoted, and its number is still the file's.
+        put(
+            &dir,
+            "semantic/only-name.md",
+            "---\nx: 1\n---\n\nfirst real line\nsecond\n",
+        );
+        let hits = search(&dir, "only", &EntryFilter::default());
+        assert_eq!(names(&hits), ["only-name.md"]);
+        assert_eq!(hits[0].snippet, "first real line");
+        assert_eq!(hits[0].line, 5);
+
+        // A long line is cut to the cap, and the cut is marked.
+        put(
+            &dir,
+            "semantic/long.md",
+            &format!("kettle {}\n", "w".repeat(500)),
+        );
+        let hits = search(&dir, "kettle", &EntryFilter::default());
+        let long = hits
+            .iter()
+            .find(|h| h.name == "long.md")
+            .unwrap_or_else(|| panic!("long.md must be a hit: {hits:?}"));
+        assert_eq!(long.snippet.chars().count(), SNIPPET_CHARS);
+        assert!(long.snippet.ends_with('…'), "{}", long.snippet);
+    }
+
+    #[test]
+    fn filter_entries_is_sorted_distinct_and_current() {
+        let dir = tmpdir();
+        put(&dir, "semantic/zeta.md", "z\n");
+        put(&dir, "profile/alpha.md", "a\n");
+        put(&dir, "beta.md", "b\n");
+        put(
+            &dir,
+            "expired.md",
+            "---\nvalid_to: 2000-01-01T00:00:00Z\n---\nx\n",
+        );
+        put(&dir, INDEX_NAME, "index\n");
+        put(&dir, CORE_NAME, "core\n");
+        put(&dir, "semantic/notes.txt", "not a topic\n");
+        assert_eq!(
+            filter_entries(&dir, &EntryFilter::default()),
+            ["alpha.md", "beta.md", "zeta.md"],
+            "layer dirs and the root, minus INDEX/CORE, current only, sorted"
+        );
+        let profile = EntryFilter {
+            layer: Some(Layer::Profile),
+            ..EntryFilter::default()
+        };
+        assert_eq!(filter_entries(&dir, &profile), ["alpha.md"]);
+        // A root-level topic is filed as Semantic (never as a higher-bar
+        // layer), so a semantic column still reaches it.
+        let semantic = EntryFilter {
+            layer: Some(Layer::Semantic),
+            ..EntryFilter::default()
+        };
+        assert_eq!(filter_entries(&dir, &semantic), ["beta.md", "zeta.md"]);
+    }
+
+    #[test]
+    fn filter_default_is_default_deny_on_regulated() {
+        let f = EntryFilter::default();
+        assert!(
+            f.exclude_regulated,
+            "a derived default would fan regulated assets out"
+        );
+        let regulated = EntryMeta {
+            governance: Governance::Regulated,
+            ..EntryMeta::default()
+        };
+        assert!(!matches_filter(&regulated, Layer::Semantic, &f));
+        assert!(matches_filter(&EntryMeta::default(), Layer::Semantic, &f));
+
+        // Layer is equality; the sensitivity ceiling goes through `admits`.
+        let profile = EntryFilter {
+            layer: Some(Layer::Profile),
+            ..EntryFilter::default()
+        };
+        assert!(matches_filter(
+            &EntryMeta::default(),
+            Layer::Profile,
+            &profile
+        ));
+        assert!(!matches_filter(
+            &EntryMeta::default(),
+            Layer::Semantic,
+            &profile
+        ));
+        let personal = EntryFilter {
+            sensitivity_max: Some(Sensitivity::Personal),
+            ..EntryFilter::default()
+        };
+        let public = EntryMeta {
+            sensitivity: Sensitivity::Public,
+            ..EntryMeta::default()
+        };
+        let secret = EntryMeta {
+            sensitivity: Sensitivity::Secret,
+            ..EntryMeta::default()
+        };
+        assert!(matches_filter(&public, Layer::Semantic, &personal));
+        assert!(!matches_filter(&secret, Layer::Semantic, &personal));
+    }
+
+    #[test]
+    fn filter_min_confidence_is_inclusive_and_rejects_non_finite() {
+        let meta = EntryMeta {
+            confidence: 0.5,
+            ..EntryMeta::default()
+        };
+        let at = EntryFilter {
+            min_confidence: Some(0.5),
+            ..EntryFilter::default()
+        };
+        assert!(matches_filter(&meta, Layer::Semantic, &at), "inclusive");
+        let above = EntryFilter {
+            min_confidence: Some(0.51),
+            ..EntryFilter::default()
+        };
+        assert!(!matches_filter(&meta, Layer::Semantic, &above));
+        let nan = EntryMeta {
+            confidence: f64::NAN,
+            ..EntryMeta::default()
+        };
+        let any = EntryFilter {
+            min_confidence: Some(0.0),
+            ..EntryFilter::default()
+        };
+        assert!(
+            !matches_filter(&nan, Layer::Semantic, &any),
+            "an unreadable confidence never passes a numeric gate"
+        );
+    }
+
+    #[test]
+    fn filter_provenance_is_case_insensitive_but_exact() {
+        let meta = EntryMeta {
+            provenance: "Seed-Notes".into(),
+            ..EntryMeta::default()
+        };
+        let same = EntryFilter {
+            provenance: Some("seed-notes".into()),
+            ..EntryFilter::default()
+        };
+        assert!(matches_filter(&meta, Layer::Semantic, &same));
+        let prefix = EntryFilter {
+            provenance: Some("seed".into()),
+            ..EntryFilter::default()
+        };
+        assert!(
+            !matches_filter(&meta, Layer::Semantic, &prefix),
+            "no substring match"
+        );
+        let absent = EntryMeta::default();
+        assert!(!matches_filter(&absent, Layer::Semantic, &same));
     }
 }

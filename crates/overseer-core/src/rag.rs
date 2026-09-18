@@ -13,6 +13,9 @@
 //! - **sentence-transformers traits + colbert maxsim** — the interfaces
 //!   (`Embedder`, `Reranker`) and the late-interaction scoring function, so
 //!   a real backend can be dropped in later without moving call sites.
+//! - **ragflow `chunk_text`** — the delimiter hierarchy (headings →
+//!   paragraphs → sentences → char window) with section-local overlap and
+//!   exact byte spans, so a chunk can be quoted and re-read.
 //!
 //! `HashingEmbedder` is the deterministic stand-in used by tests and by
 //! any offline path: a hashed bag of tokens, L2-normalized. It is a
@@ -21,6 +24,10 @@
 //! `// DEFERRED(owner): real embedding/reranking backends, a persistent
 //! vector index, and hierarchical (parent/child) chunk linking — this batch
 //! lands the interfaces, the chunker, and the scoring math only.`
+// DEFERRED(owner): ragflow's PDF/DOCX layout parsers, table extraction, and
+// tokenizer-based budgets (this port takes a plain text and a char budget) —
+// the delivery gate forbids new dependencies, and every layout parser needs
+// one.
 
 /// One chunk of a document: the text plus its byte span in the source, so
 /// every chunk is quotable and re-readable.
@@ -48,7 +55,21 @@ pub fn to_chunks(text: &str, max_chars: usize, overlap: usize) -> Vec<Chunk> {
     }
     let max_chars = max_chars.max(1);
     let overlap = overlap.min(max_chars / 2);
-    let pieces = hard_split(paragraph_spans(text), text, max_chars);
+    pack(
+        &hard_split(paragraph_spans(text), text, max_chars),
+        text,
+        max_chars,
+        overlap,
+    )
+}
+
+/// Pack pre-cut pieces into chunks: greedy up to `max_chars`, with the tail
+/// of the previous chunk repeated as `overlap` chars of context. The pieces
+/// arrive in order and gapless, and every piece is already at most
+/// `max_chars`, so the cap holds for every produced chunk and progress is
+/// guaranteed (`widened > prev.start`). One call packs one section — a
+/// caller that wants overlap to stop at a boundary calls `pack` per section.
+fn pack(pieces: &[(usize, usize)], text: &str, max_chars: usize, overlap: usize) -> Vec<Chunk> {
     if pieces.is_empty() {
         return Vec::new();
     }
@@ -65,7 +86,7 @@ pub fn to_chunks(text: &str, max_chars: usize, overlap: usize) -> Vec<Chunk> {
         let first = pieces[i].0;
         let mut end = pieces[i].1;
         let mut j = i + 1;
-        while j < pieces.len() && pieces[j].1 - first <= budget {
+        while j < pieces.len() && char_span_len(text, first, pieces[j].1) <= budget {
             end = pieces[j].1;
             j += 1;
         }
@@ -75,10 +96,10 @@ pub fn to_chunks(text: &str, max_chars: usize, overlap: usize) -> Vec<Chunk> {
             // that is already at the limit takes no overlap (the cap wins
             // over context — a chunk longer than `max_chars` breaks both
             // the promise and the downstream embedding budget).
-            let room = max_chars.saturating_sub(end - first);
+            let room = max_chars.saturating_sub(char_span_len(text, first, end));
             let back = overlap.min(room);
             if back > 0 {
-                let widened = floor_boundary(text, first.saturating_sub(back));
+                let widened = back_char_boundary(text, first, back);
                 // Never step backwards past the previous chunk's own start:
                 // progress first, context second.
                 if widened > prev.start {
@@ -135,33 +156,57 @@ fn paragraph_spans(text: &str) -> Vec<(usize, usize)> {
     out
 }
 
-/// Cut spans longer than `max` into `max`-char windows at char boundaries.
+/// Cut spans into at most `max`-char windows at char boundaries. Char
+/// counts, never bytes: a multibyte char is never split and a CJK run still
+/// spends its whole budget instead of being cut at a byte count.
 fn hard_split(spans: Vec<(usize, usize)>, text: &str, max: usize) -> Vec<(usize, usize)> {
+    // A zero window would never advance; both callers guarantee `max >= 1`.
+    debug_assert!(max >= 1, "hard_split: zero window");
     let mut out = Vec::new();
     for (s, e) in spans {
         let mut cur = s;
-        while e.saturating_sub(cur) > max {
-            let cut = floor_boundary(text, cur + max);
-            if cut <= cur {
-                break; // no progress possible (shouldn't happen: max ≥ 1)
+        loop {
+            let cut = char_window_end(text, cur, max);
+            if cut >= e {
+                if e > cur {
+                    out.push((cur, e));
+                }
+                break;
             }
             out.push((cur, cut));
             cur = cut;
-        }
-        if e > cur {
-            out.push((cur, e));
         }
     }
     out
 }
 
-/// Largest char boundary at or below `idx`.
-fn floor_boundary(text: &str, idx: usize) -> usize {
-    let mut i = idx.min(text.len());
-    while i > 0 && !text.is_char_boundary(i) {
-        i -= 1;
+/// Byte offset of the first char *after* the `max`-char window starting at
+/// `start` (`text.len()` when fewer than `max` chars remain).
+fn char_window_end(text: &str, start: usize, max: usize) -> usize {
+    text[start..]
+        .char_indices()
+        .nth(max)
+        .map_or(text.len(), |(off, _)| start + off)
+}
+
+/// Byte offset of the char `back` chars before `idx` (0 when `idx` is fewer
+/// than `back` chars in) — the overlap window is counted in chars, like
+/// every other budget here.
+fn back_char_boundary(text: &str, idx: usize, back: usize) -> usize {
+    if back == 0 {
+        return idx;
     }
-    i
+    text[..idx]
+        .char_indices()
+        .rev()
+        .nth(back - 1)
+        .map_or(0, |(off, _)| off)
+}
+
+/// Char length of `text[a..b]`: the packer measures in the unit it promises
+/// (`max_chars` is chars, so a byte length would under-fill every CJK chunk).
+fn char_span_len(text: &str, a: usize, b: usize) -> usize {
+    text[a..b].chars().count()
 }
 
 /// pgvector-style recency decay: `0.5^(age / half_life)`. A non-positive
@@ -388,6 +433,175 @@ pub fn maxsim(query: &[Vec<f32>], doc: &[Vec<f32>]) -> f32 {
     total
 }
 
+/// Budget knobs for `chunk_text` (ragflow's per-chunk character budget and
+/// repeated context), as one value so a caller cannot pass them swapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkOpts {
+    /// Hard ceiling on one chunk, in chars (never bytes).
+    pub max_chars: usize,
+    /// Chars of the previous chunk repeated at the head of the next one,
+    /// inside the same section only.
+    pub overlap: usize,
+}
+
+/// Split `text` down ragflow's delimiter hierarchy: markdown headings open
+/// sections, blank lines open paragraphs inside a section, sentence marks
+/// split an over-long paragraph, and only a run with no delimiter at all is
+/// cut at a char window. Chunk spans are absolute byte offsets into `text`,
+/// so every chunk is quotable with `read path:lo-hi`.
+///
+/// Invariants (asserted by the tests):
+/// - a chunk never spans two headings — a heading line starts a new chunk
+///   even when the previous one is short;
+/// - every `chunk.text == &text[chunk.start..chunk.end]`;
+/// - every chunk is at most `ChunkOpts::max_chars` chars (char counts, never
+///   byte offsets — a multibyte char is never split);
+/// - spans increase monotonically and cover the section's text in order
+///   (overlap repeats text, it never skips);
+/// - `overlap` is applied only inside a section, so context never leaks
+///   across a heading boundary.
+///
+/// A zero budget and an overlap that cannot make progress are errors rather
+/// than silent repair: either one hands back an empty or non-advancing
+/// result, and only the caller knows the downstream embedding budget.
+pub fn chunk_text(text: &str, opts: &ChunkOpts) -> Result<Vec<Chunk>, String> {
+    if opts.max_chars == 0 {
+        return Err(
+            "rag: chunk_text: max_chars 0 would cut every chunk to nothing — pass \
+             max_chars >= 1"
+                .into(),
+        );
+    }
+    if opts.overlap >= opts.max_chars {
+        return Err(format!(
+            "rag: chunk_text: overlap {} must be smaller than max_chars {} — an overlap \
+             that large cannot make progress",
+            opts.overlap, opts.max_chars
+        ));
+    }
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut chunks: Vec<Chunk> = Vec::new();
+    for (start, end) in section_spans(text) {
+        let section = &text[start..end];
+        let pieces: Vec<(usize, usize)> = sentence_pieces(section, opts.max_chars)
+            .into_iter()
+            .map(|(s, e)| (s + start, e + start))
+            .collect();
+        // One `pack` per section: its first chunk gets no overlap, which is
+        // exactly "overlap never crosses a heading boundary".
+        chunks.extend(pack(&pieces, text, opts.max_chars, opts.overlap));
+    }
+    Ok(chunks)
+}
+
+/// Section spans, cut at ATX heading lines. Gapless and covering the whole
+/// text: the head before the first heading is a section of its own, so no
+/// byte is left outside a chunk.
+fn section_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut starts: Vec<usize> = vec![0];
+    let mut off = 0usize;
+    for line in text.split_inclusive('\n') {
+        // `off > 0`: a heading on the first line opens the section that
+        // already starts at 0.
+        if off > 0 && is_heading(line) {
+            starts.push(off);
+        }
+        off += line.len();
+    }
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(starts.len());
+    for (i, s) in starts.iter().enumerate() {
+        let e = starts.get(i + 1).copied().unwrap_or(text.len());
+        if e > *s {
+            out.push((*s, e));
+        }
+    }
+    out
+}
+
+/// True when a line is an ATX heading: one to six `#` at the line start,
+/// followed by a space/tab or the line end. An indented `#` is body text —
+/// the port reads "at line start" literally, so a quoted `  # title` never
+/// becomes a chunk boundary.
+fn is_heading(line: &str) -> bool {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let hashes = line.bytes().take_while(|b| *b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return false;
+    }
+    match line[hashes..].chars().next() {
+        None => true, // a bare `#` line is still a heading
+        Some(c) => c == ' ' || c == '\t',
+    }
+}
+
+/// The hierarchy below a section: paragraphs, then sentences inside an
+/// over-long paragraph, then a hard char window for a run with no delimiter.
+/// Spans are section-relative, gapless, and each is at most `max` chars.
+fn sentence_pieces(section: &str, max: usize) -> Vec<(usize, usize)> {
+    let paragraphs = paragraph_spans(section);
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    // `paragraph_spans` starts at the first non-blank line, so a leading
+    // blank run (only the pre-heading section can have one) is covered
+    // explicitly: the pieces must stay gapless.
+    let head = paragraphs.first().map_or(section.len(), |(s, _)| *s);
+    if head > 0 {
+        // The head is whitespace and can still be longer than the budget.
+        pieces.extend(hard_split(vec![(0, head)], section, max));
+    }
+    for (ps, pe) in paragraphs {
+        let paragraph = &section[ps..pe];
+        for (s, e) in hard_split(sentence_spans(paragraph), paragraph, max) {
+            pieces.push((s + ps, e + ps));
+        }
+    }
+    pieces
+}
+
+/// Sentence spans inside one paragraph: cut after `。`, after `. `/`! `/`? `
+/// (the space run after the mark belongs to the sentence that ends, so the
+/// next piece starts on a word), and after every line end. Gapless and
+/// covering the paragraph — a boundary moves, it never drops text.
+fn sentence_spans(paragraph: &str) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < paragraph.len() {
+        // One char at a time: every offset stays on a char boundary.
+        let Some(c) = paragraph[i..].chars().next() else {
+            break;
+        };
+        let after = i + c.len_utf8();
+        let (cut, swallow) = match c {
+            '。' => (true, false),
+            '.' | '!' | '?' => (paragraph[after..].starts_with(' '), true),
+            '\n' => (true, false),
+            _ => (false, false),
+        };
+        if cut {
+            let mut end = after;
+            if swallow {
+                while let Some(c) = paragraph[end..].chars().next() {
+                    if c == ' ' || c == '\t' {
+                        end += c.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            out.push((start, end));
+            start = end;
+        }
+        i = after;
+    }
+    if start < paragraph.len() {
+        out.push((start, paragraph.len()));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +765,259 @@ mod tests {
         // covers each query token somewhere outscores a denser partial.
         let spread = token_vectors(&e, "braces and the parser");
         assert!(maxsim(&q, &spread) > maxsim(&q, &disjoint));
+    }
+
+    #[test]
+    fn chunk_text_starts_a_new_chunk_at_every_heading() {
+        let text = "# One\n\nshort\n## Two\n\nbody two\n### Three\n";
+        let chunks = chunk_text(
+            text,
+            &ChunkOpts {
+                max_chars: 10,
+                overlap: 4,
+            },
+        )
+        .unwrap();
+        // A chunk carries at most one heading line, and only as its first
+        // line: no chunk straddles two sections.
+        for c in &chunks {
+            let heads = c.text.lines().filter(|l| is_heading(l)).count();
+            assert!(heads <= 1, "chunk straddles a heading: {c:?}");
+            if heads == 1 {
+                assert!(
+                    is_heading(c.text.lines().next().unwrap_or("")),
+                    "a heading opens its chunk: {c:?}"
+                );
+            }
+        }
+        // Every heading line — even one following a short section — starts a
+        // chunk of its own.
+        for heading in ["# One", "## Two", "### Three"] {
+            let at = text.find(heading).unwrap();
+            assert!(
+                chunks.iter().any(|c| c.start == at),
+                "`{heading}` must start its own chunk: {chunks:?}"
+            );
+        }
+        // Coverage across section boundaries: no hole at a heading, and the
+        // document is covered end to end.
+        assert_eq!(chunks[0].start, 0);
+        assert_eq!(chunks.last().unwrap().end, text.len());
+        for w in chunks.windows(2) {
+            assert!(w[1].start <= w[0].end, "gap between chunks: {w:?}");
+        }
+    }
+
+    #[test]
+    fn chunk_text_offsets_are_exact_bounded_and_monotonic() {
+        let text = doc();
+        for opts in [
+            ChunkOpts {
+                max_chars: 40,
+                overlap: 0,
+            },
+            ChunkOpts {
+                max_chars: 120,
+                overlap: 20,
+            },
+            ChunkOpts {
+                max_chars: 1,
+                overlap: 0,
+            },
+            ChunkOpts {
+                max_chars: 10_000,
+                overlap: 7,
+            },
+        ] {
+            let chunks = chunk_text(&text, &opts).unwrap();
+            assert!(!chunks.is_empty(), "{opts:?} produced nothing");
+            for c in &chunks {
+                assert_eq!(c.text, text[c.start..c.end], "span/text mismatch");
+                assert!(
+                    c.text.chars().count() <= opts.max_chars,
+                    "chunk of {} chars exceeds {}",
+                    c.text.chars().count(),
+                    opts.max_chars
+                );
+                assert!(c.end > c.start, "empty chunk span");
+            }
+            for w in chunks.windows(2) {
+                assert!(w[0].start < w[1].start, "must progress: {w:?}");
+                assert!(w[0].end <= w[1].end);
+            }
+            assert_eq!(chunks[0].start, 0, "the first chunk starts at the head");
+            assert_eq!(
+                chunks.last().unwrap().end,
+                text.len(),
+                "the last chunk reaches the end"
+            );
+        }
+        assert!(
+            chunk_text(
+                "",
+                &ChunkOpts {
+                    max_chars: 10,
+                    overlap: 2
+                }
+            )
+            .unwrap()
+            .is_empty(),
+            "empty text → no chunks"
+        );
+    }
+
+    #[test]
+    fn chunk_text_hard_splits_a_punctuationless_paragraph_at_char_boundaries() {
+        // Two-byte chars and no delimiter anywhere: only the char window can
+        // cut this, and it must cut between chars, never through one.
+        let text = "å".repeat(25);
+        let chunks = chunk_text(
+            &text,
+            &ChunkOpts {
+                max_chars: 10,
+                overlap: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(chunks.len(), 3);
+        for c in &chunks {
+            assert!(text.is_char_boundary(c.start) && text.is_char_boundary(c.end));
+            assert_eq!(c.text.chars().count(), c.text.len() / 2);
+        }
+        // No overlap → the windows tile the paragraph exactly.
+        for w in chunks.windows(2) {
+            assert_eq!(w[0].end, w[1].start, "gapless");
+        }
+        let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(joined, text);
+    }
+
+    #[test]
+    fn chunk_text_keeps_cjk_content_valid() {
+        let text = "最初の文。次の文です。三つ目の文。";
+        let chunks = chunk_text(
+            text,
+            &ChunkOpts {
+                max_chars: 6,
+                overlap: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(chunks.len(), 3, "one chunk per sentence: {chunks:?}");
+        for c in &chunks {
+            // Slicing a &str at a non-boundary would panic; the slices below
+            // are the proof, the char count is the budget check.
+            assert_eq!(c.text, text[c.start..c.end]);
+            assert!(c.text.chars().count() <= 6);
+        }
+        // The CJK full stop survives: it is a boundary, not a separator that
+        // gets dropped.
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|c| c.text.matches('。').count())
+                .sum::<usize>(),
+            3
+        );
+        let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(joined, text, "no multibyte char was lost or doubled");
+        assert_eq!(chunks[0].text, "最初の文。");
+    }
+
+    #[test]
+    fn chunk_text_rejects_a_budget_or_overlap_that_cannot_progress() {
+        let e = chunk_text(
+            "x",
+            &ChunkOpts {
+                max_chars: 0,
+                overlap: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("max_chars 0"), "{e}");
+        assert!(e.contains("pass max_chars >= 1"), "{e}");
+        for overlap in [8usize, 9] {
+            let e = chunk_text(
+                "x",
+                &ChunkOpts {
+                    max_chars: 8,
+                    overlap,
+                },
+            )
+            .unwrap_err();
+            assert!(e.contains("smaller than max_chars"), "{e}");
+            assert!(e.contains("cannot make progress"), "{e}");
+        }
+        // One below the cap is still legal.
+        assert!(chunk_text(
+            "x",
+            &ChunkOpts {
+                max_chars: 8,
+                overlap: 7
+            }
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn chunk_text_applies_overlap_only_within_a_section() {
+        let text = "# One\n\nAAAA BBBB CCCC DDDD\n\n## Two\n\nEEEE FFFF GGGG HHHH\n";
+        let chunks = chunk_text(
+            text,
+            &ChunkOpts {
+                max_chars: 12,
+                overlap: 6,
+            },
+        )
+        .unwrap();
+        let two = text.find("## Two").unwrap();
+        let second = chunks
+            .iter()
+            .find(|c| c.start == two)
+            .unwrap_or_else(|| panic!("the second heading must open a chunk: {chunks:?}"));
+        assert!(
+            !second.text.contains("AAAA"),
+            "the second section re-read the first: {second:?}"
+        );
+        for c in &chunks {
+            assert!(
+                c.start <= two || !c.text.contains("# One"),
+                "a chunk re-read past the heading boundary: {c:?}"
+            );
+        }
+        // Overlap is still applied where it belongs — inside a section.
+        assert!(
+            chunks.windows(2).any(|w| w[1].start < w[0].end),
+            "no chunk repeated context inside its section: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn chunk_text_prefers_sentence_boundaries_over_a_char_window() {
+        let text = "Alpha one. Beta two. Gamma three.";
+        let chunks = chunk_text(
+            text,
+            &ChunkOpts {
+                max_chars: 12,
+                overlap: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            ["Alpha one. ", "Beta two. ", "Gamma three."],
+            "a char window would have cut mid-sentence"
+        );
+        // The same paragraph with the budget wide enough stays whole.
+        let whole = chunk_text(
+            text,
+            &ChunkOpts {
+                max_chars: 100,
+                overlap: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].text, text);
     }
 }
