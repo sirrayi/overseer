@@ -767,7 +767,10 @@ impl Policy {
                             .get(Self::domain(class))
                             .copied()
                             .unwrap_or(lane_default);
-                        let need_level = need.max(level);
+                        // Most restrictive wins: the enum orders Observe <
+                        // ... < ActSilently, so min() is the tighter bar
+                        // (max() would pick the loosest — inverted).
+                        let need_level = need.min(level);
                         if need_level == Autonomy::Observe {
                             return Verdict::Deny {
                                 reason: format!(
