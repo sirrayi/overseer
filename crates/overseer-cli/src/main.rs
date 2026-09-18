@@ -222,6 +222,8 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
             let d = cwd_canonical.join("persona");
             d.is_dir().then_some(d)
         },
+        // P7-1 computer-use containment: engine defaults (takeover_pause on).
+        computer: Default::default(),
         ask_handler: None,
         // --bare: no persisted rules — a CI run must not inherit or
         // mutate the operator's allow-list. Ask verdicts still
