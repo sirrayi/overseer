@@ -332,6 +332,17 @@ impl Broker {
         self.map.get(id).map(|c| c.real_secret())
     }
 
+    /// True when `cmd` mentions any registered selector (`$TOKEN`,
+    /// `${TOKEN}`, or bare) — the command could exfil the secret (RT-4).
+    /// Selectors are operator-declared env names; substring match is the
+    /// documented conservative rule (same rigor as EXTERNAL_MARKERS).
+    pub fn mentions_selector(&self, cmd: &str) -> bool {
+        self.map.values().any(|c| {
+            let s = c.selector.as_str();
+            !s.is_empty() && (cmd.contains(s) || cmd.contains(&format!("${s}")))
+        })
+    }
+
     pub fn sentinel_for_id(&self, id: &str) -> Option<&str> {
         self.map.get(id).map(|c| c.sentinel.as_str())
     }

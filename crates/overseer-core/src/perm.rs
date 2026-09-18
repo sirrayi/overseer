@@ -498,6 +498,23 @@ impl Policy {
         None
     }
 
+    /// Mark the sensitive latch directly (RT-4): broker injection IS a
+    /// sensitive touch — declared secrets entering a child env must arm the
+    /// triangle so follow-up side effects Ask. Returns a notice on flip.
+    pub fn mark_sensitive(&self, via: &str) -> Option<String> {
+        let mut t = self.taint.lock().ok()?;
+        if t.sensitive {
+            return None;
+        }
+        t.sensitive = true;
+        Some(format!("sensitive data touched (via {via})"))
+    }
+
+    /// The sensitive latch alone (RT-4 regression surface).
+    pub fn taint_sensitive(&self) -> bool {
+        self.taint.lock().map(|t| t.sensitive).unwrap_or(false)
+    }
+
     /// Both Rule-of-Two latches are set — the exfil triangle is armed.
     pub fn taint_armed(&self) -> bool {
         self.taint
