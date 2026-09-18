@@ -1,0 +1,16 @@
+{
+  "id": "topo-sort",
+  "version": 1,
+  "tags": ["script", "graph"],
+  "difficulty": "hard",
+  "instruction": "deps.txt holds dependency edges 'A B' (A depends on B, one per line). Write order.py printing a valid build order (dependencies before dependents), one node per line; if a cycle exists print 'CYCLE' instead. Any valid order is accepted. Run it.",
+  "setup": "printf 'web api\\napi db\\nworker db\\nweb worker\\n' > deps.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 order.py > got.txt && python3 -c \"\nlines = open('got.txt').read().split()\nassert lines != ['CYCLE']\nedges = [('web','api'),('api','db'),('worker','db'),('web','worker')]\npos = {n: i for i, n in enumerate(lines)}\nassert set(lines) == {'web','api','worker','db'}, 'node set wrong'\nassert all(pos[b] < pos[a] for a, b in edges), 'dependency after dependent'\n\" && printf 'a b\\nb a\\n' > deps.txt && python3 order.py | grep -qx 'CYCLE'"
+  },
+  "oracle": {
+    "script": "cat > order.py <<'EOF'\nedges = [ln.split() for ln in open('deps.txt') if ln.split()]\nnodes = set()\nfor a, b in edges:\n    nodes.add(a)\n    nodes.add(b)\ndeps = {n: set() for n in nodes}\nfor a, b in edges:\n    deps[a].add(b)\nout, temp, perm, cyc = [], set(), set(), []\ndef visit(n):\n    if cyc or n in perm:\n        return\n    if n in temp:\n        cyc.append(True)\n        return\n    temp.add(n)\n    for d in sorted(deps[n]):\n        visit(d)\n    temp.discard(n)\n    perm.add(n)\n    out.append(n)\nfor n in sorted(nodes):\n    visit(n)\nprint('CYCLE' if cyc else '\\n'.join(out))\nEOF\npython3 order.py"
+  },
+  "limits": {"max_steps": 15, "max_cost_usd": 0.6, "wall_s": 900}
+}

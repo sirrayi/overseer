@@ -1,0 +1,16 @@
+{
+  "id": "cidr-match",
+  "version": 1,
+  "tags": ["script", "net"],
+  "difficulty": "med",
+  "instruction": "Write match.py: reads CIDR blocks (one per line) from cidrs.txt (IPv4 and IPv6 mixed) and IP addresses from ips.txt (one per line); prints, for each IP in order, the first CIDR in cidrs.txt containing it, or 'NONE'. Run it.",
+  "setup": "printf '10.0.0.0/8\\n192.168.1.0/24\\n2001:db8::/32\\n' > cidrs.txt && printf '10.1.2.3\\n192.168.1.7\\n192.168.2.1\\n2001:db8::1\\n8.8.8.8\\n' > ips.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 match.py > got.txt && printf '10.0.0.0/8\\n192.168.1.0/24\\nNONE\\n2001:db8::/32\\nNONE\\n' | diff - got.txt"
+  },
+  "oracle": {
+    "script": "cat > match.py <<'EOF'\nimport ipaddress\nnets = [(ln.strip(), ipaddress.ip_network(ln.strip())) for ln in open('cidrs.txt') if ln.strip()]\nfor ln in open('ips.txt'):\n    ip = ln.strip()\n    if not ip:\n        continue\n    addr = ipaddress.ip_address(ip)\n    hit = next((c for c, n in nets if addr in n), 'NONE')\n    print(hit)\nEOF\npython3 match.py"
+  },
+  "limits": {"max_steps": 12, "max_cost_usd": 0.4, "wall_s": 600}
+}
