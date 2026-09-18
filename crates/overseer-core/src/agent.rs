@@ -463,6 +463,57 @@ impl Agent {
         self.tools = Self::registry(&self.config);
     }
 
+    /// P8-B (crush `set_model`): switch the run's model mid-session. The
+    /// audit event carries the from/to ids plus the new model's list
+    /// prices (`profile::lookup`), so a session's cost steps are
+    /// attributable without re-deriving them from the table later.
+    /// Switching to the current model is a no-op (no event).
+    pub fn set_model(
+        &mut self,
+        model: &str,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<()> {
+        if model == self.config.model {
+            return Ok(());
+        }
+        let p = profile::lookup(model);
+        let from = std::mem::replace(&mut self.config.model, model.to_string());
+        self.emit(
+            EventKind::ModelSwitch {
+                from,
+                to: model.to_string(),
+                price_in: p.price.input,
+                price_out: p.price.output,
+            },
+            on_event,
+        )
+    }
+
+    /// P8-B (roo modes): switch the session's posture — toolset by
+    /// capability removal, optional model, `edit_globs`, and the mode's
+    /// framing line as a logged Nudge. The frozen prompt ORDER is never
+    /// touched (that is why the framing is a Nudge, not a segment), and a
+    /// switch rebuilds the toolset from the resident set so `--no-tools`
+    /// ablations survive it.
+    pub fn set_mode(
+        &mut self,
+        mode: &'static crate::modes::Mode,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<()> {
+        self.tools.set_mode(mode, &self.config.disabled_tools);
+        if let Some(m) = mode.model {
+            self.set_model(m, on_event)?;
+        }
+        let text = format!("[mode {}] {}", mode.name, mode.prompt_frag);
+        self.messages.push(Message::user_text(text.clone()));
+        self.emit(EventKind::Nudge { text }, on_event)
+    }
+
+    /// The active session mode (None = default posture).
+    pub fn mode(&self) -> Option<&'static crate::modes::Mode> {
+        self.tools.mode
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -517,8 +568,18 @@ impl Agent {
             });
         }
 
+        // P8-B microagents (OpenHands microagent pattern): repo-authored
+        // instructions whose triggers match this prompt ride in as a
+        // harness Nudge — logged, provenance-wrapped, and replayed
+        // identically on resume. Only the turns they were written for.
+        let micros = crate::microagent::matching(&self.config.cwd, input);
+        if !micros.is_empty() {
+            let text = crate::microagent::render(&micros);
+            self.messages.push(Message::user_text(text.clone()));
+            self.emit(EventKind::Nudge { text }, on_event)?;
+        }
+
         let mut steps = 0u32;
-        let profile = profile::lookup(&self.config.model);
 
         loop {
             // Steering boundary (P2.4): interrupt ends the run; queued
@@ -605,6 +666,10 @@ impl Agent {
             // it increments `steps` and records ledger usage on success.
             // Malformed responses are prompt-adjacent, so the retry request
             // stays in the dynamic segment — the static prefix is untouched.
+            // Re-read the profile every iteration: `set_model` can switch
+            // the model mid-session (P8-B), which changes both the cost
+            // math and the compaction trigger.
+            let profile = profile::lookup(&self.config.model);
             let mut malformed_retried = false;
             let resp = loop {
                 match self.provider.complete(&req) {
@@ -894,6 +959,10 @@ impl Agent {
             }
 
             self.emit(EventKind::TurnEnd { step: steps }, on_event)?;
+            // P8-B: one turn elapsed — the clock a TTL'd session grant
+            // (`AllowEntry::expires_turn`) reads. Bumped at the same
+            // durable boundary as the log flush.
+            self.tools.policy.tick_turn();
             self.log.flush()?;
             // Git-version memory at the durable-tail point (playbook: free
             // history/diff/rollback). Engine-made commit, best-effort.
@@ -1536,6 +1605,158 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e.kind, EventKind::Compaction { .. })));
+    }
+
+    /// P8-B accept (crush `set_model`): a mid-session model switch is
+    /// audited with the new model's list prices, and the very next request
+    /// carries the new model (the loop re-reads the profile each step, so
+    /// cost math and the compaction trigger follow it).
+    #[test]
+    fn set_model_switches_and_audits_prices() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        let provider = Mock::new(vec![done()]);
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+
+        // Same model → no event (nothing changed).
+        agent.set_model("claude-sonnet-5", &mut sink).unwrap();
+        agent.set_model("fleet-k3", &mut sink).unwrap();
+        agent.run_turn("work", &mut sink).unwrap();
+
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        let switches: Vec<(&str, &str, f64, f64)> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ModelSwitch {
+                    from,
+                    to,
+                    price_in,
+                    price_out,
+                } => Some((from.as_str(), to.as_str(), *price_in, *price_out)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            switches.len(),
+            1,
+            "one switch, no no-op event: {switches:?}"
+        );
+        assert_eq!(switches[0].0, "claude-sonnet-5");
+        assert_eq!(switches[0].1, "fleet-k3");
+        // Prices come from the profile table (Fleet fleet is $0).
+        let p = profile::lookup("fleet-k3");
+        assert_eq!(switches[0].2, p.price.input);
+        assert_eq!(switches[0].3, p.price.output);
+        // The audit event never rehydrates into the model's context.
+        let view = rehydrate_messages(&events);
+        assert!(
+            view.iter().all(|m| !m.text().contains("fleet-k3")),
+            "a model switch is provenance, not conversation"
+        );
+    }
+
+    /// P8-B accept (roo modes): a mode switch removes tools from the spec
+    /// list, moves the model when the mode names one, and states its
+    /// posture as a logged Nudge — the static prompt ORDER is untouched.
+    #[test]
+    fn set_mode_removes_tools_moves_model_and_nudges() {
+        static VERIFY_MODE: crate::modes::Mode = crate::modes::Mode {
+            name: "verify-only",
+            prompt_frag: "Only read and run checks; change nothing.",
+            allowed_tools: &["read", "grep", "glob", "bash"],
+            model: Some("fleet-k3"),
+            edit_globs: &[],
+        };
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        let provider = Mock::new(vec![done()]);
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        agent.set_mode(&VERIFY_MODE, &mut sink).unwrap();
+
+        assert_eq!(agent.mode().map(|m| m.name), Some("verify-only"));
+        let names: Vec<String> = agent.tools.specs.iter().map(|s| s.name.clone()).collect();
+        for t in ["write", "edit", "task", "computer"] {
+            assert!(!names.contains(&t.to_string()), "{t} must be removed");
+        }
+        assert!(names.contains(&"read".to_string()));
+        assert_eq!(agent.config.model, "fleet-k3", "mode model override applies");
+        assert!(agent
+            .messages()
+            .iter()
+            .any(|m| m.text().contains("[mode verify-only]")));
+
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Nudge { text } if text.contains("[mode verify-only]")
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ModelSwitch { to, .. } if to == "fleet-k3")),
+            "the mode's model rides the audited switch"
+        );
+    }
+
+    /// P8-B accept (openhands microagent): a repo microagent whose trigger
+    /// matches the prompt is injected as a provenance-wrapped Nudge — and
+    /// only for matching prompts.
+    #[test]
+    fn microagent_trigger_injects_repo_guidance() {
+        let dir = tmpdir();
+        let md = dir.join(".overseer/microagents/style");
+        std::fs::create_dir_all(&md).unwrap();
+        std::fs::write(
+            md.join("MICROAGENT.md"),
+            "---\nname: style\ntriggers: flaky\n---\nAlways keep the flaky-test repro.\n",
+        )
+        .unwrap();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        let provider = Mock::new(vec![done()]);
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+
+        agent
+            .run_turn("the flaky test needs fixing", &mut sink)
+            .unwrap();
+        let nudges: Vec<String> = EventLog::replay(dir.join("events.jsonl"))
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Nudge { text } if text.contains("microagent") => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nudges.len(), 1, "{nudges:?}");
+        assert!(nudges[0].contains("Always keep the flaky-test repro."));
+        assert!(
+            nudges[0].contains("<microagent name=\"style\""),
+            "{}",
+            nudges[0]
+        );
+
+        // A prompt that does not match the trigger injects nothing.
+        agent.run_turn("unrelated work", &mut sink).unwrap();
+        let after = EventLog::replay(dir.join("events.jsonl"))
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::Nudge { text } if text.contains("microagent")))
+            .count();
+        assert_eq!(after, 1, "only the matching turn carries the microagent");
     }
 
     /// With memory enabled, the provider sees a second system segment

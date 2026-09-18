@@ -225,10 +225,22 @@ fn rg_json(
     Some(lines)
 }
 
+thread_local! {
+    /// Thread-scoped PATH override (test seam). The B1-4 fallback test needs
+    /// a PATH without `rg`; replacing `PATH` *process-wide* also hides `git`,
+    /// `sh`, and `rustfmt` from every other test running concurrently, which
+    /// surfaces as intermittent spawn failures elsewhere in the suite. A
+    /// thread-local override keeps the scrub on the calling thread, so the
+    /// fallback path is still covered without breaking test isolation.
+    static PATH_OVERRIDE: std::cell::RefCell<Option<std::ffi::OsString>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Resolve `rg` on PATH (respects the caller's PATH, so tests can scrub it
 /// to force the fallback). No caching — PATH can change per call.
 fn which_rg() -> Option<std::path::PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
+    let override_var = PATH_OVERRIDE.with(|p| p.borrow().clone());
+    let path_var = override_var.or_else(|| std::env::var_os("PATH"))?;
     for dir in std::env::split_paths(&path_var) {
         if dir.as_os_str().is_empty() {
             continue;
@@ -262,6 +274,23 @@ mod tests {
         let d = std::env::temp_dir().join(format!("overseer-grep-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A PATH with no `rg` on it, scoped to this thread and restored on
+    /// drop (panic-safe: a failing test cannot leak the scrub to the next
+    /// test scheduled on the same worker thread).
+    fn scrub_path() -> PathScrub {
+        PATH_OVERRIDE
+            .with(|p| *p.borrow_mut() = Some(std::ffi::OsString::from("/nonexistent-no-rg-here")));
+        PathScrub
+    }
+
+    struct PathScrub;
+
+    impl Drop for PathScrub {
+        fn drop(&mut self) {
+            PATH_OVERRIDE.with(|p| *p.borrow_mut() = None);
+        }
     }
 
     fn ctx(dir: &std::path::Path) -> ToolCtx<'static> {
@@ -301,12 +330,9 @@ mod tests {
         let dir = tmpdir();
         seed(&dir);
         let mut c = ctx(&dir);
-        let old = std::env::var_os("PATH");
-        std::env::set_var("PATH", "/nonexistent-no-rg-here");
+        let guard = scrub_path();
         let out = run(&serde_json::json!({"pattern": "needle"}), &mut c);
-        if let Some(p) = old {
-            std::env::set_var("PATH", p);
-        }
+        drop(guard);
         assert!(!out.is_error);
         assert!(out.text.contains("needle"), "got: {}", out.text);
     }
@@ -333,12 +359,9 @@ mod tests {
         let dir = tmpdir();
         std::fs::write(dir.join("uni.txt"), format!("needle {}\n", "é".repeat(600))).unwrap();
         let mut c = ctx(&dir);
-        let old = std::env::var_os("PATH");
-        std::env::set_var("PATH", "/nonexistent-no-rg-here");
+        let guard = scrub_path();
         let out = run(&serde_json::json!({"pattern": "needle"}), &mut c);
-        if let Some(p) = old {
-            std::env::set_var("PATH", p);
-        }
+        drop(guard);
         assert!(!out.is_error, "must not panic/error: {}", out.text);
         assert!(out.text.contains("needle"));
     }

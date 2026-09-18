@@ -5,20 +5,30 @@
 //! with engine-enforced budgets. Frontends attach via overseer-proto.
 
 pub mod agent;
+pub mod cache;
 pub mod compact;
 pub mod computer_obs;
 pub mod control;
 pub mod cred;
+pub mod evalcfg;
 pub mod event;
+pub mod fuzzy;
+pub mod hooks;
 pub mod ir;
 pub mod ledger;
 pub mod manifest;
 pub mod memory;
+pub mod microagent;
+pub mod modes;
+pub mod observability;
 pub mod onboard;
+pub mod orchestration;
 pub mod perm;
 pub mod profile;
 pub mod prompt;
 pub mod provider;
+pub mod rag;
+pub mod recipe;
 pub mod repomap;
 pub mod rewind;
 pub mod session;

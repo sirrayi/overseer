@@ -378,6 +378,120 @@ pub fn classify_batch(tool: &str, input: &Value) -> Irreversibility {
     }
     classify(tool, input)
 }
+/// Risk class of an MCP server/tool (awesome-mcp-servers taxonomy, arsenal
+/// B2). Used when deciding how much trust a server listing earns before any
+/// of its tools are exposed: a filesystem or shell server is not the same
+/// proposition as a read-only docs server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Risk {
+    /// Reads data, changes nothing.
+    Low,
+    /// Network or filesystem reach with bounded blast radius.
+    Medium,
+    /// Writes outside a sandbox, or mutates a datastore.
+    High,
+    /// Arbitrary execution or credential access.
+    Critical,
+}
+
+impl Risk {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Risk::Low => "low",
+            Risk::Medium => "medium",
+            Risk::High => "high",
+            Risk::Critical => "critical",
+        }
+    }
+
+    /// Whether exposing this server's tools requires a human decision up
+    /// front (rather than only at the call site).
+    pub const fn needs_approval(self) -> bool {
+        matches!(self, Risk::High | Risk::Critical)
+    }
+}
+
+/// Classify a server/tool by its declared capabilities. Unknown capability
+/// strings fail **up** (High): an unrecognized claim is not evidence of
+/// safety, the same rule `classify` uses for unknown tools.
+pub fn mcp_risk(tool: &str, capabilities: &[&str]) -> Risk {
+    let mut risk = Risk::Low;
+    let mut unknown = false;
+    for cap in capabilities {
+        let c = cap.trim().to_ascii_lowercase();
+        let r = match c.as_str() {
+            "read" | "read-only" | "search" | "list" | "docs" => Risk::Low,
+            "network" | "fetch" | "http" | "browser" | "file-write" | "write" => Risk::Medium,
+            "database-write" | "sql-write" | "delete" | "admin" | "filesystem-write" => Risk::High,
+            "shell" | "exec" | "execute" | "credentials" | "secrets" | "cloud-admin" => {
+                Risk::Critical
+            }
+            _ => {
+                unknown = true;
+                Risk::High
+            }
+        };
+        risk = risk.max(r);
+    }
+    if unknown {
+        risk = risk.max(Risk::High);
+    }
+    // The tool name is evidence too: a server that calls itself a shell is
+    // one, whatever its capability list claims.
+    let name_risk = match tool.to_ascii_lowercase().as_str() {
+        n if n.contains("shell") || n.contains("exec") || n.contains("terminal") => Risk::Critical,
+        n if n.contains("filesystem") || n.contains("postgres") || n.contains("sql") => Risk::High,
+        n if n.contains("fetch") || n.contains("browser") || n.contains("http") => Risk::Medium,
+        _ => Risk::Low,
+    };
+    risk.max(name_risk)
+}
+
+/// One session-scoped allow (P8-B cline `expires_turns` port): the key a
+/// `check` matches, plus the turn it stops mattering on. `None` = never
+/// expires (rules-file entries and `AllowAlways`); `Some(n)` = the grant is
+/// honored while `current_turn < n`. A turn counter rather than a wall
+/// clock: sessions are measured in turns, and a grant that outlives its
+/// context (a different command, a different day) is exactly the stale
+/// approval a TTL exists to retire.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AllowEntry {
+    pub key: String,
+    pub expires_turn: Option<u64>,
+}
+
+impl AllowEntry {
+    /// Parse a rules-file line: `tool:resource` or `tool:resource @turns=N`.
+    /// `base_turn` is the current turn, so a persisted TTL counts from load.
+    pub fn parse_line(line: &str, base_turn: u64) -> Option<Self> {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        match line.split_once("@turns=") {
+            Some((key, n)) => {
+                let key = key.trim();
+                if key.is_empty() {
+                    return None;
+                }
+                let n: u64 = n.trim().parse().ok()?;
+                Some(AllowEntry {
+                    key: key.to_string(),
+                    expires_turn: Some(base_turn.saturating_add(n)),
+                })
+            }
+            None => Some(AllowEntry {
+                key: line.to_string(),
+                expires_turn: None,
+            }),
+        }
+    }
+
+    fn live(&self, turn: u64) -> bool {
+        self.expires_turn.is_none_or(|t| turn < t)
+    }
+}
+
 pub struct Policy {
     /// Working directory root; write/edit must stay inside it.
     pub root: PathBuf,
@@ -396,8 +510,16 @@ pub struct Policy {
     /// Tool+resource keys the human allowed for the session
     /// (`AllowSession`) plus every key loaded from `rules_path`
     /// (`AllowAlways` in a past session). Interior-mutable: `check`
-    /// takes `&self`.
-    session_allow: Arc<Mutex<HashSet<String>>>,
+    /// takes `&self`. Entries carry an optional `expires_turn` (P8-B).
+    session_allow: Arc<Mutex<HashSet<AllowEntry>>>,
+    /// Turns this session has completed — the clock `expires_turn` reads.
+    /// Bumped by the agent at each turn boundary (`tick_turn`).
+    turns: Mutex<u64>,
+    /// Default TTL applied to a *new* `AllowSession` grant: the grant
+    /// stops matching after this many further turns. `None` (default) =
+    /// session-long, the pre-P8-B behavior. Rules-file entries override
+    /// it per line with `@turns=N`.
+    pub session_ttl_turns: Option<u64>,
     /// Persisted-allow file — one `tool:resource` key per line. The
     /// frontend supplies the path (`~/.overseer/rules` by convention);
     /// None disables persistence while `AllowAlways` still works for
@@ -427,6 +549,8 @@ impl Policy {
             allow_all: false,
             ask_handler: None,
             session_allow: Arc::new(Mutex::new(HashSet::new())),
+            turns: Mutex::new(0),
+            session_ttl_turns: None,
             rules_path: None,
             autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
@@ -444,6 +568,8 @@ impl Policy {
             allow_all: false,
             ask_handler: None,
             session_allow: Arc::new(Mutex::new(HashSet::new())),
+            turns: Mutex::new(0),
+            session_ttl_turns: None,
             rules_path: None,
             autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
@@ -462,6 +588,8 @@ impl Policy {
             allow_all: true,
             ask_handler: None,
             session_allow: Arc::new(Mutex::new(HashSet::new())),
+            turns: Mutex::new(0),
+            session_ttl_turns: None,
             rules_path: None,
             autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
@@ -475,17 +603,37 @@ impl Policy {
     /// `#` comments and blanks ignored. Keys land in the same set as
     /// `AllowSession` — deny rules still trump them in `check`.
     pub fn load_rules(&mut self, path: PathBuf) {
+        let base = self.current_turn();
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(mut s) = self.session_allow.lock() {
                 for line in text.lines() {
-                    let k = line.trim();
-                    if !k.is_empty() && !k.starts_with('#') {
-                        s.insert(k.to_string());
+                    // One entry per line: `key` or `key @turns=N`. A line
+                    // whose TTL does not parse is dropped, never loaded as
+                    // a permanent key (a bad TTL must not widen a grant).
+                    if let Some(e) = AllowEntry::parse_line(line, base) {
+                        s.insert(e);
                     }
                 }
             }
         }
         self.rules_path = Some(path);
+    }
+
+    /// The current turn index (the clock `expires_turn` reads).
+    pub fn current_turn(&self) -> u64 {
+        self.turns.lock().map(|t| *t).unwrap_or(0)
+    }
+
+    /// Advance the session clock by one turn. The agent calls this at each
+    /// turn boundary; a TTL grant that reaches its turn stops matching.
+    pub fn tick_turn(&self) -> u64 {
+        match self.turns.lock() {
+            Ok(mut t) => {
+                *t += 1;
+                *t
+            }
+            Err(_) => 0,
+        }
     }
 
     /// Append a key to the rules file. Best-effort: a write failure
@@ -524,10 +672,15 @@ impl Policy {
         let Some(key) = self.session_key(tool, input) else {
             return false;
         };
-        self.session_allow
-            .lock()
-            .map(|s| s.contains(&key))
-            .unwrap_or(false)
+        let turn = self.current_turn();
+        // P8-B TTL: an entry past its `expires_turn` is a stale approval —
+        // it is pruned here (lazily) and no longer matches, so the call
+        // falls back to the ladder/Ask path it would have taken.
+        let Ok(mut set) = self.session_allow.lock() else {
+            return false;
+        };
+        set.retain(|e| e.live(turn));
+        set.iter().any(|e| e.key == key)
     }
 
     /// Record a completed tool call's result/input against the taint
@@ -637,8 +790,18 @@ impl Policy {
                             if d == AskDecision::AllowAlways {
                                 self.persist_rule(&key);
                             }
+                            // P8-B: `AllowSession` grants honor the
+                            // policy's session TTL (None = session-long).
+                            // `AllowAlways` is permanent by definition —
+                            // it was just written to the rules file.
+                            let expires_turn = if d == AskDecision::AllowAlways {
+                                None
+                            } else {
+                                self.session_ttl_turns
+                                    .map(|n| self.current_turn().saturating_add(n))
+                            };
                             if let Ok(mut s) = self.session_allow.lock() {
-                                s.insert(key);
+                                s.insert(AllowEntry { key, expires_turn });
                             }
                         }
                         Gate::Allow
@@ -2041,5 +2204,118 @@ mod tests {
             classify_batch("computer", &json!({"actions": [{"type": "send"}]})),
             Irreversibility::ExternalComms
         );
+    }
+
+    #[test]
+    fn mcp_risk_takes_the_max_and_fails_up_on_unknowns() {
+        assert_eq!(mcp_risk("docs", &["read-only", "search"]), Risk::Low);
+        assert_eq!(mcp_risk("web", &["network"]), Risk::Medium);
+        assert_eq!(mcp_risk("db", &["read", "database-write"]), Risk::High);
+        assert_eq!(mcp_risk("ops", &["read", "shell"]), Risk::Critical);
+        assert_eq!(mcp_risk("vault", &["credentials"]), Risk::Critical);
+        // Unknown capability → High, never Low.
+        assert_eq!(mcp_risk("mystery", &["teleport"]), Risk::High);
+        // The name is evidence even with a benign capability list.
+        assert_eq!(mcp_risk("my-shell-server", &["read"]), Risk::Critical);
+        assert_eq!(mcp_risk("postgres-tools", &[]), Risk::High);
+        assert_eq!(mcp_risk("weather", &[]), Risk::Low);
+        // Approval is required exactly for the top two classes.
+        assert!(!Risk::Low.needs_approval() && !Risk::Medium.needs_approval());
+        assert!(Risk::High.needs_approval() && Risk::Critical.needs_approval());
+        assert_eq!(Risk::Critical.as_str(), "critical");
+        // Ordering is the class ladder (used by the max above).
+        assert!(Risk::Critical > Risk::High && Risk::High > Risk::Medium);
+    }
+
+    /// Count a shared Ask counter without unwrapping the lock (house
+    /// style: a poisoned lock is a zero, never a panic).
+    fn tally(c: &std::sync::Arc<std::sync::Mutex<usize>>) -> usize {
+        c.lock().map(|g| *g).unwrap_or(0)
+    }
+
+    #[test]
+    fn session_ttl_retires_a_grant_after_n_turns() {
+        // P8-B accept (cline expires_turns): an AllowSession grant stops
+        // matching once the session clock passes its expiry, so the ladder
+        // Ask returns — the stale approval is retired, not remembered.
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+        let asks = Arc::new(Mutex::new(0usize));
+        let calls = asks.clone();
+        let handler = AskHandler(Arc::new(move |_| {
+            if let Ok(mut g) = calls.lock() {
+                *g += 1;
+            }
+            AskDecision::AllowSession
+        }));
+        let mut pol = Policy::preset(Preset::WorkspaceWrite, PathBuf::from("/tmp/ws"));
+        pol.ask_handler = Some(handler);
+        pol.session_ttl_turns = Some(2);
+        let cmd = json!({"command": "curl https://example.com/x"});
+
+        // Turn 0: the Ask is answered and remembered (expires at turn 2).
+        assert_eq!(pol.gate("bash", &cmd), Gate::Allow);
+        assert_eq!(tally(&asks), 1);
+        // Same turn: no second Ask.
+        assert_eq!(pol.check("bash", &cmd), Verdict::Allow);
+        assert_eq!(tally(&asks), 1);
+        // Turn 1: still inside the window.
+        pol.tick_turn();
+        assert_eq!(pol.check("bash", &cmd), Verdict::Allow);
+        assert_eq!(tally(&asks), 1);
+        // Turn 2: expired → the ladder Ask is back.
+        pol.tick_turn();
+        assert!(
+            matches!(pol.check("bash", &cmd), Verdict::Ask { .. }),
+            "an expired grant must fall back to Ask"
+        );
+        assert_eq!(
+            pol.gate("bash", &cmd),
+            Gate::Allow,
+            "the human can re-grant"
+        );
+        assert_eq!(tally(&asks), 2);
+
+        // No TTL (default) → session-long, exactly as before.
+        let mut forever = Policy::preset(Preset::WorkspaceWrite, PathBuf::from("/tmp/ws"));
+        forever.ask_handler = Some(AskHandler(Arc::new(|_| AskDecision::AllowSession)));
+        assert_eq!(forever.gate("bash", &cmd), Gate::Allow);
+        for _ in 0..10 {
+            forever.tick_turn();
+        }
+        assert_eq!(forever.check("bash", &cmd), Verdict::Allow);
+    }
+
+    #[test]
+    fn rules_file_ttl_suffix_is_honored_and_malformed_ttls_drop_the_entry() {
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!("overseer-rules-ttl-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rules = dir.join("rules");
+        let cmd = json!({"command": "curl https://example.com/y"});
+        std::fs::write(
+            &rules,
+            "# comment\nbash:curl https://example.com/y @turns=1\n\
+             bash:curl https://other.example @turns=soon\n",
+        )
+        .unwrap();
+        let mut p = Policy::preset(Preset::WorkspaceWrite, dir.clone());
+        p.load_rules(rules);
+        assert_eq!(
+            p.check("bash", &cmd),
+            Verdict::Allow,
+            "loaded grant matches"
+        );
+        p.tick_turn();
+        assert!(
+            matches!(p.check("bash", &cmd), Verdict::Ask { .. }),
+            "the @turns=1 grant expired after one turn"
+        );
+        // The malformed TTL line never became a permanent allow.
+        assert!(matches!(
+            p.check("bash", &json!({"command": "curl https://other.example"})),
+            Verdict::Ask { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -25,26 +25,42 @@ pub struct SkillMeta {
     pub path: PathBuf,
     /// Where it came from: `workspace` or `user` (provenance label).
     pub source: &'static str,
+    /// `trigger:`/`triggers:` phrases (awesomeclaude convention, B2): a
+    /// resident routing hint. Trigger *lines* are rendered in the index
+    /// (routing precision for the model); `matching()` gives the engine the
+    /// same signal for lookup-miss hints.
+    pub triggers: Vec<String>,
 }
 
-/// `---`-delimited frontmatter → (name, description). Deliberately
-/// minimal — `key: value` lines only, no YAML dep for two fields.
-fn parse_frontmatter(text: &str) -> Option<(String, String)> {
+/// `---`-delimited frontmatter → (name, description, triggers).
+/// Deliberately minimal — `key: value` lines only, no YAML dep.
+fn parse_frontmatter(text: &str) -> Option<(String, String, Vec<String>)> {
     let t = text.strip_prefix("---")?;
     let fm = t.split("\n---").next()?;
     let mut name = None;
     let mut desc = None;
+    let mut triggers: Vec<String> = Vec::new();
     for line in fm.lines() {
         if let Some((k, v)) = line.split_once(':') {
             let v = v.trim().trim_matches('"').trim_matches('\'');
             match k.trim() {
                 "name" => name = Some(v.to_string()),
                 "description" => desc = Some(v.to_string()),
+                "trigger" | "triggers" => {
+                    for part in v.split(',') {
+                        let p = part.trim();
+                        if !p.is_empty() {
+                            triggers.push(p.to_string());
+                        }
+                    }
+                }
                 _ => {}
             }
         }
     }
-    Some((name?, desc.unwrap_or_default()))
+    triggers.sort();
+    triggers.dedup();
+    Some((name?, desc.unwrap_or_default(), triggers))
 }
 
 /// The body after the frontmatter block (what `skill` loads on demand).
@@ -66,12 +82,13 @@ fn scan_root(root: &Path, source: &'static str) -> Vec<SkillMeta> {
             let Ok(text) = std::fs::read_to_string(&md) else {
                 continue;
             };
-            if let Some((name, description)) = parse_frontmatter(&text) {
+            if let Some((name, description, triggers)) = parse_frontmatter(&text) {
                 out.push(SkillMeta {
                     name,
                     description,
                     path: md,
                     source,
+                    triggers,
                 });
             }
         }
@@ -106,9 +123,46 @@ pub fn index_segment(cwd: &Path) -> Option<String> {
          its description matches the task. One line per skill:\n",
     );
     for s in &skills {
-        lines.push_str(&format!("- {} — {}\n", s.name, s.description));
+        // Trigger phrases ride the resident line (awesomeclaude `trigger:`
+        // convention): one extra clause per skill, and the model routes on
+        // it without loading the body — the same earn-your-tokens trade
+        // the description already makes.
+        if s.triggers.is_empty() {
+            lines.push_str(&format!("- {} — {}\n", s.name, s.description));
+        } else {
+            lines.push_str(&format!(
+                "- {} — {} [triggers: {}]\n",
+                s.name,
+                s.description,
+                s.triggers.join(", ")
+            ));
+        }
     }
     Some(lines)
+}
+
+/// Skills whose triggers match `prompt` (case-insensitive substring), most
+/// specific first: more matched triggers, then name order. Empty when no
+/// skill declares a trigger that hits — a skill without triggers is never
+/// a "match", it is only reachable by description.
+pub fn matching(cwd: &Path, prompt: &str) -> Vec<SkillMeta> {
+    let lower = prompt.to_lowercase();
+    let mut hits: Vec<(usize, SkillMeta)> = scan(cwd)
+        .into_iter()
+        .filter_map(|s| {
+            let n = s
+                .triggers
+                .iter()
+                .filter(|t| {
+                    let t = t.to_lowercase();
+                    !t.is_empty() && lower.contains(&t)
+                })
+                .count();
+            (n > 0).then_some((n, s))
+        })
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    hits.into_iter().map(|(_, s)| s).collect()
 }
 
 /// Load a skill body by name, provenance-wrapped. `Err` names the
@@ -116,13 +170,16 @@ pub fn index_segment(cwd: &Path) -> Option<String> {
 pub fn load(cwd: &Path, name: &str) -> Result<String, String> {
     let skills = scan(cwd);
     let Some(s) = skills.iter().find(|s| s.name == name) else {
-        let avail: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        let names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
+        let hint = crate::fuzzy::miss_hint(name, &names, 3)
+            .map(|h| format!(" {h}"))
+            .unwrap_or_default();
         return Err(format!(
-            "no skill '{name}'. Available: {}",
-            if avail.is_empty() {
+            "no skill '{name}'. Available: {}{hint}",
+            if names.is_empty() {
                 "(none)".into()
             } else {
-                avail.join(", ")
+                names.join(", ")
             }
         ));
     };
@@ -196,5 +253,75 @@ mod tests {
         assert!(seg.contains("fat — heavy skill"));
         assert!(seg.len() < 1_000, "body must not be resident");
         assert!(index_segment(&tmpdir()).is_none(), "empty → no segment");
+    }
+
+    #[test]
+    fn miss_hints_rank_near_names_and_stay_quiet_otherwise() {
+        // P8-B accept (fzf lookup-miss hints): a name that is a subsequence
+        // of a real skill gets a ranked suggestion; an unrelated one gets
+        // only the available list (no noise).
+        let dir = tmpdir();
+        let root = dir.join(".overseer/skills");
+        mk_skill(&root, "deploy", "name: deploy\ndescription: ship it\n", "B");
+        mk_skill(&root, "deps", "name: deps\ndescription: list deps\n", "B");
+        let near = load(&dir, "dpl").unwrap_err();
+        assert!(near.contains("did you mean:"), "{near}");
+        assert!(near.contains("deploy"), "{near}");
+        let far = load(&dir, "qqqq").unwrap_err();
+        assert!(!far.contains("did you mean:"), "no noise hints: {far}");
+        assert!(far.contains("Available:"), "{far}");
+        assert!(far.contains("deploy"), "{far}");
+        assert!(far.contains("deps"), "{far}");
+    }
+
+    #[test]
+    fn trigger_lines_route_without_loading_bodies() {
+        // P8-B accept (awesomeclaude `trigger:` frontmatter): trigger
+        // phrases are resident routing hints — indexed, and matchable
+        // engine-side for the same prompt.
+        let dir = tmpdir();
+        let root = dir.join(".overseer/skills");
+        mk_skill(
+            &root,
+            "pdf",
+            "name: pdf\ndescription: fill forms\ntrigger: pdf, acroform\n",
+            "SECRET-BODY",
+        );
+        mk_skill(
+            &root,
+            "plain",
+            "name: plain\ndescription: no triggers\n",
+            "B",
+        );
+        let seg = index_segment(&dir).unwrap();
+        assert!(
+            seg.contains("pdf — fill forms [triggers: acroform, pdf]"),
+            "{seg}"
+        );
+        // The plain skill's line is unchanged — no empty bracket.
+        assert!(seg.contains("- plain — no triggers\n"), "{seg}");
+        assert!(!seg.contains("SECRET-BODY"), "bodies stay out of the index");
+
+        let hits = matching(&dir, "please fill this ACROFORM for me");
+        assert_eq!(
+            hits.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["pdf"],
+            "a trigger hit routes the skill"
+        );
+        assert!(matching(&dir, "unrelated request").is_empty());
+        // Most-specific first: a skill matching two triggers outranks one.
+        mk_skill(
+            &root,
+            "both",
+            "name: both\ndescription: two hits\ntriggers: acroform, pdf\n",
+            "B",
+        );
+        let hits = matching(&dir, "acroform pdf work");
+        assert_eq!(
+            hits[0].name,
+            "both",
+            "{:?}",
+            hits.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
     }
 }

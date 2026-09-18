@@ -121,33 +121,26 @@ pub fn filtered_memory_dir(
             kept_lines.push(line.to_string());
             continue;
         };
-        let src = crate::memory::layer_path(parent_mem, &name);
-        let Some(src) = src else {
-            // Pointer with no backing file: keep the line (stale-pointer
-            // hygiene is consolidate's job), copy nothing.
-            kept_lines.push(line.to_string());
-            continue;
-        };
-        let body = std::fs::read_to_string(&src).unwrap_or_default();
-        // F3: fail CLOSED to Secret on unparsable headers (a file whose
-        // header says secret — or cannot be parsed — is never admitted
-        // below the Secret ceiling). Mirrors index_segment_filtered.
-        let tier = if body.lines().next().map(|l| l.trim()) == Some("---") {
-            match crate::memory::parse_meta(&body) {
-                Ok((m, _)) => m.sensitivity,
-                // Unparsable header: fail closed to Secret (F3).
-                Err(_) => crate::memory::Sensitivity::Secret,
+        // P8-B: one rule for what a quarantined view may see — current
+        // (validity window + TTL), within the sensitivity ceiling, and not
+        // `regulated`. Orphan pointers keep their line (stale-pointer
+        // hygiene is consolidate's job) but copy nothing.
+        match crate::memory::subagent_view(parent_mem, &name, filter) {
+            crate::memory::View::PointerOnly => {
+                kept_lines.push(line.to_string());
+                continue;
             }
-        } else {
-            crate::memory::Sensitivity::Personal
-        };
-        if crate::memory::admits(filter, tier) {
-            kept_lines.push(line.to_string());
-            if let Some(rel) = src.strip_prefix(parent_mem).ok().and_then(|r| r.parent()) {
-                std::fs::create_dir_all(dest.join(rel)).ok()?;
-            }
-            if let Ok(rel) = src.strip_prefix(parent_mem) {
-                std::fs::write(dest.join(rel), body).ok()?;
+            crate::memory::View::Hidden => continue,
+            crate::memory::View::Admitted(body) => {
+                if let Some(src) = crate::memory::layer_path(parent_mem, &name) {
+                    if let Ok(rel) = src.strip_prefix(parent_mem) {
+                        if let Some(parent) = rel.parent() {
+                            std::fs::create_dir_all(dest.join(parent)).ok()?;
+                        }
+                        std::fs::write(dest.join(rel), body).ok()?;
+                    }
+                }
+                kept_lines.push(line.to_string());
             }
         }
     }
@@ -522,6 +515,57 @@ mod tests {
         let out = run(&json!({"prompt": "x", "mode": "write"}), &mut c);
         assert!(out.is_error);
         assert!(out.text.contains("git worktree"));
+    }
+
+    #[test]
+    fn filtered_view_drops_stale_and_regulated_topics() {
+        // P8-B accept: the quarantined subagent view applies the validity
+        // window, the TTL column, the sensitivity ceiling, and the
+        // governance column — pointers AND bodies agree.
+        let dir = std::env::temp_dir().join(format!("overseer-submem-{}", uuid::Uuid::now_v7()));
+        let mem = dir.join("memory");
+        for layer in ["profile", "episodic", "semantic", "procedural"] {
+            std::fs::create_dir_all(mem.join(layer)).unwrap();
+        }
+        std::fs::write(mem.join("semantic/ok.md"), "fine body\n").unwrap();
+        std::fs::write(
+            mem.join("semantic/expired.md"),
+            "---\nvalid_to: 2000-01-01T00:00:00Z\n---\nstale\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem.join("semantic/reg.md"),
+            "---\ngovernance: regulated\n---\ncompliance\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem.join("semantic/secret.md"),
+            "---\nsensitivity: secret\n---\nhush\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem.join("INDEX.md"),
+            "# Memory Index\n\nok.md — fine\nexpired.md — stale\nreg.md — compliance\nsecret.md — hush\n",
+        )
+        .unwrap();
+
+        let dest = dir.join("filtered");
+        let out = filtered_memory_dir(&mem, crate::memory::Sensitivity::Personal, &dest)
+            .expect("filtered dir");
+        let index = std::fs::read_to_string(out.join("INDEX.md")).unwrap();
+        assert!(index.contains("ok.md"), "{index}");
+        assert!(!index.contains("expired.md"), "{index}");
+        assert!(!index.contains("reg.md"), "{index}");
+        assert!(!index.contains("secret.md"), "{index}");
+        assert!(out.join("semantic/ok.md").exists(), "admitted body copied");
+        for dropped in [
+            "semantic/expired.md",
+            "semantic/reg.md",
+            "semantic/secret.md",
+        ] {
+            assert!(!out.join(dropped).exists(), "{dropped} must not be copied");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
