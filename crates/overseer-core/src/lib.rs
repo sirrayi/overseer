@@ -20,6 +20,7 @@ pub mod memory;
 pub mod microagent;
 pub mod modes;
 pub mod onboard;
+pub mod orchestration;
 pub mod perm;
 pub mod profile;
 pub mod prompt;
