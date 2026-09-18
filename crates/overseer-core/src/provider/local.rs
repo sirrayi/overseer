@@ -1,18 +1,27 @@
-//! Local inference backends (llama.cpp / mlx-lm, arsenal B2).
+//! Local inference backends (llama.cpp / mlx-lm / outlines, arsenal B2+B3).
 //!
-//! Both `llama-server` (llama.cpp) and `mlx_lm.server` (mlx-lm) expose an
-//! OpenAI-compatible `/v1/chat/completions` endpoint on localhost, so the
-//! *provider* is the existing OpenAI adapter pointed at the loopback URL —
-//! no new transport, no new dependency, no CUDA build. What this module adds
-//! is the naming, the default ports, and the lifecycle probe.
+//! `llama-server` (llama.cpp), `mlx_lm.server` (mlx-lm) and `outlines serve`
+//! (P8-C) expose an OpenAI-compatible `/v1/chat/completions` endpoint on
+//! localhost, so the *provider* is the existing OpenAI adapter pointed at
+//! the loopback URL — no new transport, no new dependency, no CUDA build.
+//! What this module adds is the naming, the default ports, and the
+//! lifecycle probe.
+//!
+//! The outlines arm is the constrained-decoding one: `outlines serve`
+//! enforces a JSON schema on generation, so `enforces_json_schema` is the
+//! routing fact a structured call reads before choosing a backend (a
+//! backend that only *accepts* `response_format` would return free text).
 //!
 //! The ollama probe is the lifecycle half: before routing to a local model,
 //! ask whether the daemon is up and which models it holds. It fails open
 //! (`Unavailable`) — a probe must never be the reason a turn dies — and its
 //! parser is pure, so the "is it up?" decision is testable without a server.
 //! `// DEFERRED(owner): managed server lifecycle (start/stop/health-watch for
-//! llama-server and mlx_lm.server) — this batch points at an already-running
-//! server; process supervision belongs with the ops surface, not the engine.
+//! llama-server, mlx_lm.server and outlines serve) — this batch points at an
+//! already-running server; process supervision belongs with the ops surface,
+//! not the engine. CLI/provider-selection wiring for the local backends
+//! (`--backend outlines`, port flags) is likewise still open — the naming,
+//! ports, routing facts and probe land here; the flag rides the CLI work.
 //! CUDA-only stacks (TabbyAPI/EXL2, TensorRT-LLM) stay PARKed: no weights,
 //! no servers, docs-only discipline.`
 
@@ -30,30 +39,75 @@ pub enum LocalBackend {
     LlamaServer,
     /// `mlx_lm.server` — the mlx-lm OpenAI-compatible server.
     MlxLmServer,
+    /// `outlines serve` (P8-C port): the structured-generation server.
+    ///
+    /// Outlines' `serve --model <repo> --port <port>` exposes the same
+    /// OpenAI-compatible chat route, but enforces a JSON *schema* on
+    /// generation via constrained decoding — so a call that needs a
+    /// guaranteed-shape reply can be routed here instead of being asked
+    /// for and hoped about.
+    Outlines,
 }
 
 impl LocalBackend {
+    pub const ALL: [LocalBackend; 3] = [
+        LocalBackend::LlamaServer,
+        LocalBackend::MlxLmServer,
+        LocalBackend::Outlines,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             LocalBackend::LlamaServer => "llama-server",
             LocalBackend::MlxLmServer => "mlx_lm.server",
+            LocalBackend::Outlines => "outlines",
         }
     }
 
-    /// Command an operator runs to serve this backend.
+    /// Command an operator runs to serve this backend. The flags are the
+    /// port: `--port` is where the backend's endpoint is pinned, and
+    /// `outlines serve` additionally takes the model repo.
     pub const fn serve_command(self) -> &'static str {
         match self {
             LocalBackend::LlamaServer => "llama-server -m <model.gguf> --port <port>",
             LocalBackend::MlxLmServer => "mlx_lm.server --model <repo> --port <port>",
+            LocalBackend::Outlines => "outlines serve --model <repo> --port <port>",
         }
     }
 
-    /// Default port both servers ship with.
+    /// Default port each server ships with (outlines serves on 8000).
     pub const fn default_port(self) -> u16 {
         match self {
             LocalBackend::LlamaServer => 8080,
             LocalBackend::MlxLmServer => 8080,
+            LocalBackend::Outlines => 8000,
         }
+    }
+
+    /// Parse a backend name as the CLI/`--backend` spelling.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let want = s.trim().to_ascii_lowercase().replace('_', "-");
+        LocalBackend::ALL
+            .into_iter()
+            .find(|b| {
+                let name = b.as_str().to_ascii_lowercase().replace('_', "-");
+                name == want || (b == &LocalBackend::Outlines && want == "outlines-serve")
+            })
+            .ok_or_else(|| {
+                let names: Vec<&str> = LocalBackend::ALL.iter().map(|b| b.as_str()).collect();
+                format!("local backend: unknown `{s}` — want {}", names.join("|"))
+            })
+    }
+
+    /// Whether the server enforces a JSON *schema* on generation.
+    ///
+    /// This is the routing fact that matters: `outlines serve` exists for
+    /// constrained decoding, `llama-server` enforces schemas through GBNF
+    /// grammars, and `mlx_lm.server` has no schema path — so a structured
+    /// request must never be routed to a backend that only *accepts*
+    /// `response_format` and would return free text anyway.
+    pub const fn enforces_json_schema(self) -> bool {
+        matches!(self, LocalBackend::LlamaServer | LocalBackend::Outlines)
     }
 }
 
@@ -92,6 +146,17 @@ impl LocalProvider {
     /// mlx_lm.server on the given port.
     pub fn mlx_lm_server(port: u16) -> Self {
         Self::new(LocalBackend::MlxLmServer, port, None)
+    }
+
+    /// `outlines serve` on the given port — the constrained-decoding arm.
+    pub fn outlines(port: u16) -> Self {
+        Self::new(LocalBackend::Outlines, port, None)
+    }
+
+    /// Whether this provider's server enforces a JSON schema on
+    /// generation (see `LocalBackend::enforces_json_schema`).
+    pub fn enforces_json_schema(&self) -> bool {
+        self.backend.enforces_json_schema()
     }
 
     pub fn backend(&self) -> LocalBackend {
@@ -232,6 +297,48 @@ mod tests {
             .serve_command()
             .contains("mlx_lm.server"));
         assert_eq!(LocalBackend::default_port(LocalBackend::LlamaServer), 8080);
+    }
+
+    #[test]
+    fn outlines_is_the_constrained_decoding_arm() {
+        // P8-C accept: the outlines backend is named, ported, and carries
+        // the routing fact a structured call reads.
+        let o = LocalProvider::outlines(8000);
+        assert_eq!(o.backend().as_str(), "outlines");
+        assert_eq!(o.port(), 8000);
+        assert_eq!(o.endpoint(), "http://127.0.0.1:8000/v1");
+        assert_eq!(LocalBackend::Outlines.default_port(), 8000);
+        assert!(LocalBackend::Outlines
+            .serve_command()
+            .starts_with("outlines serve --model"));
+        assert!(LocalBackend::Outlines.serve_command().contains("--port"));
+        assert!(o.enforces_json_schema(), "outlines constrains the decode");
+        assert!(LocalProvider::llama_server(8080).enforces_json_schema());
+        assert!(
+            !LocalProvider::mlx_lm_server(8080).enforces_json_schema(),
+            "mlx_lm.server has no schema path: a structured call must not \
+             be routed there on the assumption that it does"
+        );
+        // Parsing accepts the CLI spellings and refuses an unknown name.
+        assert_eq!(
+            LocalBackend::parse("outlines").unwrap(),
+            LocalBackend::Outlines
+        );
+        assert_eq!(
+            LocalBackend::parse("Llama-Server").unwrap(),
+            LocalBackend::LlamaServer
+        );
+        assert_eq!(
+            LocalBackend::parse("mlx_lm.server").unwrap(),
+            LocalBackend::MlxLmServer
+        );
+        let err = LocalBackend::parse("vllm").unwrap_err();
+        assert!(err.contains("vllm"), "{err}");
+        assert!(
+            err.contains("outlines"),
+            "the error names the valid set: {err}"
+        );
+        assert_eq!(LocalBackend::ALL.len(), 3);
     }
 
     #[test]
