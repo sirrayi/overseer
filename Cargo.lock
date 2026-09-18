@@ -1138,6 +1138,7 @@ name = "overseer-cli"
 version = "0.1.0"
 dependencies = [
  "overseer-core",
+ "overseer-gateway",
  "overseer-tui",
  "serde_json",
 ]
@@ -1154,6 +1155,17 @@ dependencies = [
  "sha2",
  "thiserror 2.0.20",
  "ureq",
+ "uuid",
+]
+
+[[package]]
+name = "overseer-gateway"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
  "uuid",
 ]
 

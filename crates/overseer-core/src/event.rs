@@ -124,6 +124,94 @@ pub struct Event {
 /// Writer for a session's `events.jsonl`. IDs are monotonic per session;
 /// `parent_id` chains to the previous event head (forks come later: a child
 /// event can name any earlier id as parent).
+/// OTel GenAI projection (B1-8, openllmetry attribute schema).
+///
+/// Pure naming map over `&[Event]` — no package, no exporter, zero tokens.
+/// events.jsonl stays the source of truth; this projection mutates nothing
+/// and is safe to point at any OTLP backend (Jaeger/Grafana/Phoenix/Langfuse)
+/// with zero parsers. Attribute table documented in `eval/LEDGER.md`.
+///
+/// Mapping:
+/// - session_id → `gen_ai.trace.id` (from SessionStart.session_id)
+/// - ModelResponse → span `gen_ai.span.kind="llm"`, model → `gen_ai.request.model`
+/// - Usage fresh/cache/output/reasoning → `gen_ai.usage.*`
+/// - latency_ms → `gen_ai.latency_ms`, cost_usd → `gen_ai.cost_usd`
+/// - ToolCallStart/ToolResult → span `gen_ai.span.kind="tool"`
+pub fn otel_spans(events: &[Event]) -> Vec<serde_json::Value> {
+    let trace_id = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::SessionStart { session_id, .. } => Some(session_id.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut spans = Vec::new();
+    for e in events {
+        match &e.kind {
+            EventKind::ModelResponse {
+                blocks,
+                usage,
+                stop_reason,
+                latency_ms,
+                cost_usd,
+            } => {
+                let model = events
+                    .iter()
+                    .find_map(|s| match &s.kind {
+                        EventKind::SessionStart { model, .. } => Some(model.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                spans.push(serde_json::json!({
+                    "gen_ai.trace.id": trace_id,
+                    "gen_ai.span.id": e.id,
+                    "gen_ai.span.kind": "llm",
+                    "gen_ai.request.model": model,
+                    "gen_ai.response.stop_reason": stop_reason,
+                    "gen_ai.usage.input_tokens": usage.fresh_input,
+                    "gen_ai.usage.cache_write_tokens": usage.cache_write,
+                    "gen_ai.usage.cache_read_tokens": usage.cache_read,
+                    "gen_ai.usage.output_tokens": usage.output,
+                    "gen_ai.usage.reasoning_tokens": usage.reasoning,
+                    "gen_ai.latency_ms": latency_ms,
+                    "gen_ai.cost_usd": cost_usd,
+                    "gen_ai.tool_calls": blocks.iter().filter(|b| matches!(b, Block::ToolCall { .. })).count(),
+                }));
+            }
+            EventKind::ToolCallStart { call_id, name, .. } => {
+                spans.push(serde_json::json!({
+                    "gen_ai.trace.id": trace_id,
+                    "gen_ai.span.id": e.id,
+                    "gen_ai.span.kind": "tool",
+                    "gen_ai.tool.call_id": call_id,
+                    "gen_ai.tool.name": name,
+                }));
+            }
+            EventKind::ToolResult {
+                call_id,
+                name,
+                is_error,
+                denied,
+                raw_bytes,
+                ..
+            } => {
+                spans.push(serde_json::json!({
+                    "gen_ai.trace.id": trace_id,
+                    "gen_ai.span.id": e.id,
+                    "gen_ai.span.kind": "tool",
+                    "gen_ai.tool.call_id": call_id,
+                    "gen_ai.tool.name": name,
+                    "gen_ai.tool.is_error": is_error,
+                    "gen_ai.tool.denied": denied,
+                    "gen_ai.tool.raw_bytes": raw_bytes,
+                }));
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
 pub struct EventLog {
     file: File,
     path: PathBuf,
@@ -248,12 +336,34 @@ pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
         }
     };
 
+    // B1-7: collect tagged reflection Nudges first so only the last 1
+    // replays verbatim (view rule; the log is untouched). Untagged Nudges
+    // (verify-tail, empty, stuck) always replay.
+    let last_reflection = events
+        .iter()
+        .filter(|e| e.id >= tail_from)
+        .filter_map(|e| match &e.kind {
+            EventKind::Nudge { text } if text.starts_with(crate::agent::Agent::REFLECTION_TAG) => {
+                Some(e.id)
+            }
+            _ => None,
+        })
+        .max();
     for ev in events {
         if ev.id < tail_from {
             continue;
         }
         match &ev.kind {
-            EventKind::UserInput { text } | EventKind::Nudge { text } => {
+            EventKind::UserInput { text } => {
+                flush_results(&mut pending_results, &mut messages);
+                messages.push(Message::user_text(text.clone()));
+            }
+            EventKind::Nudge { text } => {
+                if text.starts_with(crate::agent::Agent::REFLECTION_TAG)
+                    && Some(ev.id) != last_reflection
+                {
+                    continue; // superseded critique: view-only eviction
+                }
                 flush_results(&mut pending_results, &mut messages);
                 messages.push(Message::user_text(text.clone()));
             }
@@ -485,5 +595,105 @@ mod tests {
         drop(f);
         let events = EventLog::replay(&path).unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn otel_projection_maps_gen_ai_aliases() {
+        // B1-8: every alias present; trace id flows from SessionStart.
+        // Projection mutates nothing — events.jsonl stays source of truth
+        // (asserted by the no-mutation test below).
+        let events = vec![
+            Event {
+                id: 0,
+                parent_id: None,
+                ts_ms: 1,
+                kind: EventKind::SessionStart {
+                    session_id: "s1".into(),
+                    cwd: "/tmp".into(),
+                    model: "m".into(),
+                    harness_version: "0.1.0".into(),
+                    parent: None,
+                },
+            },
+            Event {
+                id: 1,
+                parent_id: Some(0),
+                ts_ms: 2,
+                kind: EventKind::ModelResponse {
+                    blocks: vec![],
+                    usage: Usage {
+                        fresh_input: 10,
+                        cache_read: 90,
+                        ..Usage::default()
+                    },
+                    stop_reason: "end_turn".into(),
+                    latency_ms: 5,
+                    cost_usd: 0.1,
+                },
+            },
+            Event {
+                id: 2,
+                parent_id: Some(1),
+                ts_ms: 3,
+                kind: EventKind::ToolCallStart {
+                    call_id: "c1".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                },
+            },
+            Event {
+                id: 3,
+                parent_id: Some(2),
+                ts_ms: 4,
+                kind: EventKind::ToolResult {
+                    call_id: "c1".into(),
+                    name: "read".into(),
+                    content: "x".into(),
+                    is_error: false,
+                    raw_bytes: 1,
+                    spilled_to: None,
+                    denied: false,
+                },
+            },
+        ];
+        let before = serde_json::to_string(&events).unwrap();
+        let spans = otel_spans(&events);
+        let after = serde_json::to_string(&events).unwrap();
+        assert_eq!(before, after, "projection must not mutate events");
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0]["gen_ai.trace.id"], "s1");
+        assert_eq!(spans[0]["gen_ai.span.kind"], "llm");
+        assert_eq!(spans[0]["gen_ai.request.model"], "m");
+        assert_eq!(spans[0]["gen_ai.usage.cache_read_tokens"], 90);
+        assert_eq!(spans[0]["gen_ai.latency_ms"], 5);
+        assert_eq!(spans[0]["gen_ai.cost_usd"], 0.1);
+        assert_eq!(spans[1]["gen_ai.tool.name"], "read");
+        assert_eq!(spans[2]["gen_ai.tool.is_error"], false);
+        // Snapshot: the exported key set is the contract OTLP backends read.
+        let mut keys: Vec<&str> = spans[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "gen_ai.cost_usd",
+                "gen_ai.latency_ms",
+                "gen_ai.request.model",
+                "gen_ai.response.stop_reason",
+                "gen_ai.span.id",
+                "gen_ai.span.kind",
+                "gen_ai.tool_calls",
+                "gen_ai.trace.id",
+                "gen_ai.usage.cache_read_tokens",
+                "gen_ai.usage.cache_write_tokens",
+                "gen_ai.usage.input_tokens",
+                "gen_ai.usage.output_tokens",
+                "gen_ai.usage.reasoning_tokens",
+            ]
+        );
     }
 }

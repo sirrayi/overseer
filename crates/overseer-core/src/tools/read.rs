@@ -78,7 +78,9 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
     for (i, line) in lines[start..end].iter().enumerate() {
         let n = start + i + 1;
         if line.len() > MAX_LINE {
-            out.push_str(&format!("{n:>6}\t{} [line truncated]\n", &line[..MAX_LINE]));
+            // FAIL-2: same char-boundary class as FAIL-1 — truncate safely.
+            let head: String = line.chars().take(MAX_LINE).collect();
+            out.push_str(&format!("{n:>6}\t{head} [line truncated]\n"));
         } else {
             out.push_str(&format!("{n:>6}\t{line}\n"));
         }
@@ -97,4 +99,41 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
     }
     reg.record_read(&path, mtime, start, end);
     ToolOutput::ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("overseer-read-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn ctx(dir: &std::path::Path) -> ToolCtx<'static> {
+        ToolCtx {
+            cwd: dir.to_path_buf(),
+            session_dir: dir.join("session"),
+            spill_seq: 0,
+            provider: None,
+            agent_config: None,
+            subagent_seq: 0,
+            checkpoint: None,
+            sandbox: false,
+        }
+    }
+
+    #[test]
+    fn multibyte_long_line_truncates_without_panic() {
+        // FAIL-2: byte 2000 inside a multibyte char must not panic.
+        let dir = tmpdir();
+        let line = format!("{}{}tail", "x".repeat(1999), "é");
+        std::fs::write(dir.join("uni.txt"), &line).unwrap();
+        let mut reg = crate::tools::ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut c = ctx(&dir);
+        let out = run(&serde_json::json!({"path": "uni.txt"}), &mut c, &mut reg);
+        assert!(!out.is_error, "must not panic: {}", out.text);
+        assert!(out.text.contains("[line truncated]"));
+    }
 }

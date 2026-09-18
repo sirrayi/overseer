@@ -82,6 +82,25 @@ pub struct AgentConfig {
     /// P4.3 ablation: tool names removed from the spec list and refused at
     /// dispatch (`--no-tools`). Validated against tools::TOOL_NAMES.
     pub disabled_tools: Vec<String>,
+    /// P5-B per-domain autonomy overrides (domain → level). Empty = lane
+    /// defaults (internal: existing rules decide; external/money/identity:
+    /// approval). Merged into the Policy at agent start.
+    pub autonomy: std::collections::HashMap<String, crate::perm::Autonomy>,
+    /// B1-7 Reflexion hook (Reflexion post-episode pattern): on a verify
+    /// block, ask the aux tier for a ≤300-token self-critique appended as a
+    /// `[reflection]`-tagged Nudge. `Off` disables; `Reflexion` reflects on
+    /// verify blocks only (never on success). Default: Reflexion.
+    pub reflect: ReflectMode,
+}
+
+/// B1-7: when the Reflexion hook fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReflectMode {
+    /// No reflection critiques.
+    Off,
+    /// Reflect on verify-gate blocks only (default).
+    #[default]
+    Reflexion,
 }
 
 impl Default for AgentConfig {
@@ -107,6 +126,8 @@ impl Default for AgentConfig {
             ask_handler: None,
             rules_path: None,
             disabled_tools: Vec::new(),
+            autonomy: Default::default(),
+            reflect: ReflectMode::Reflexion,
         }
     }
 }
@@ -422,18 +443,32 @@ impl Agent {
                 cache_breakpoints: true,
             };
 
-            let resp = match self.provider.complete(&req) {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = e.to_string();
-                    self.emit(
-                        EventKind::Error {
-                            message: msg.clone(),
-                        },
-                        on_event,
-                    )?;
-                    self.end_run("provider_error", steps, on_event)?;
-                    return Ok(RunOutcome::Provider(msg));
+            // B1-2 (Instructor retry): on a Malformed response only, re-issue
+            // the same request once per provider call (flag scoped to this
+            // invocation, reset before every call — multi-Malformed sequences
+            // retry each call once, never loop). The retry is a normal step:
+            // it increments `steps` and records ledger usage on success.
+            // Malformed responses are prompt-adjacent, so the retry request
+            // stays in the dynamic segment — the static prefix is untouched.
+            let mut malformed_retried = false;
+            let resp = loop {
+                match self.provider.complete(&req) {
+                    Ok(r) => break r,
+                    Err(crate::provider::ProviderError::Malformed(_msg)) if !malformed_retried => {
+                        malformed_retried = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        self.emit(
+                            EventKind::Error {
+                                message: msg.clone(),
+                            },
+                            on_event,
+                        )?;
+                        self.end_run("provider_error", steps, on_event)?;
+                        return Ok(RunOutcome::Provider(msg));
+                    }
                 }
             };
             steps += 1;
@@ -455,7 +490,17 @@ impl Agent {
             if self.config.auto_compact {
                 let frac = self.config.compact_at.unwrap_or(profile.compact_at);
                 let budget = frac as f64 * f64::from(profile.context_in);
-                if self.ctx_wall_stop || resp.usage.total_input() as f64 > budget {
+                // B1-9a: estimator pre-trigger — when measured usage is not
+                // yet over budget but the token estimate is, compact early
+                // rather than risk a context-wall stop mid-turn.
+                let est_tokens = crate::tokens::count_tokens(
+                    &prompt_text_for_estimate(&self.messages),
+                    &self.config.model,
+                ) as f64;
+                if self.ctx_wall_stop
+                    || resp.usage.total_input() as f64 > budget
+                    || est_tokens > budget
+                {
                     self.pending_compact = true;
                 }
             }
@@ -547,6 +592,12 @@ impl Agent {
                         );
                         self.messages.push(Message::user_text(text.clone()));
                         self.emit(EventKind::Nudge { text }, on_event)?;
+                        // B1-7: post-episode verbal-RL hook — a bounded
+                        // aux-tier critique of this failed attempt, tagged
+                        // so the keep-last-1 eviction never touches
+                        // verify-tail/empty/stuck Nudges. small_model None
+                        // → skip (zero spend change by default).
+                        self.reflect(&tail, on_event)?;
                         continue;
                     }
                 }
@@ -696,6 +747,107 @@ impl Agent {
             e = e.bumped();
         }
         e
+    }
+
+    /// Nudge tag for B1-7 reflection critiques. Stable prefix — the
+    /// keep-last-1 eviction matches only this tag, so verify-tail, empty-
+    /// response, and stuck Nudges are never evicted.
+    pub const REFLECTION_TAG: &str = "[reflection]";
+
+    /// B1-7 Reflexion hook: one bounded aux-tier critique of a failed
+    /// verify block, appended as a tagged Nudge. Live view AND resume view
+    /// stay identical: pushes to `messages` + appends the event, then prunes
+    /// older tagged critiques from BOTH (keep last 1). Log bytes are never
+    /// rewritten — eviction is view-only (messages drain + rehydrate rule).
+    /// small_model None → Ok (skip). Respects `reflect: Off`.
+    /// ≤1 aux call per verify block, ≤300-token critique, 1024-token request.
+    fn reflect(
+        &mut self,
+        verify_tail: &str,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<()> {
+        if self.config.reflect == ReflectMode::Off {
+            return Ok(());
+        }
+        if self.config.small_model.is_none() {
+            return Ok(()); // aux-tier-only: no small model → no critique
+        }
+        let prompt = format!(
+            "The last attempt failed verification. Output tail:\n{verify_tail}\n\
+             List the 2 most likely defects and the single most useful next fix. \
+             Keep it under 300 tokens, actionable and specific."
+        );
+        // D2: small tier DIRECTLY — never aux_call (which escalates to the
+        // main model on small-tier failure/empty, bypassing ledger). A
+        // failed/empty small critique fail-softs to no-critique; the verify
+        // Nudge remains. Zero main-model spend, by construction.
+        let small = self.config.small_model.clone().expect("checked above");
+        let msgs = [Message::user_text(prompt)];
+        let req = Request {
+            model: &small,
+            system: &[],
+            tools: &[],
+            messages: &msgs,
+            max_tokens: 1_024,
+            thinking_budget: None,
+            effort: Some(crate::provider::Effort::Min),
+            cache_breakpoints: false,
+        };
+        let critique = match self.provider.complete(&req) {
+            Ok(r) => {
+                let t: String = r
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+                    .chars()
+                    .take(1200)
+                    .collect();
+                if t.trim().is_empty() {
+                    return Ok(());
+                }
+                t
+            }
+            Err(_) => return Ok(()), // fail-soft: the verify Nudge remains
+        };
+        let text = format!("{} {critique}", Self::REFLECTION_TAG);
+        self.messages.push(Message::user_text(text.clone()));
+        self.emit(EventKind::Nudge { text }, on_event)?;
+        // Dual eviction (keep last 1 tagged): live messages drain + the
+        // rehydrate rule mirrors it. Untagged Nudges untouched.
+        Self::prune_reflections(&mut self.messages);
+        Ok(())
+    }
+
+    /// Prune older `[reflection]`-tagged user messages, keeping the last 1.
+    /// Live-view half of the B1-7 dual eviction (rehydrate mirrors it).
+    /// Superseded critiques are DRAINED (removed), not blanked — after two
+    /// verify blocks the live message list holds exactly 1 tagged critique,
+    /// byte-identical to what rehydrate replays. Nudges carry no
+    /// tool_use/tool_result blocks, so provider pairing is unaffected.
+    fn prune_reflections(messages: &mut Vec<Message>) {
+        use crate::ir::Block;
+        let last = messages.iter().rposition(|m| {
+            m.content.iter().any(|b| match b {
+                Block::Text { text } => text.starts_with(Self::REFLECTION_TAG),
+                _ => false,
+            })
+        });
+        if let Some(keep) = last {
+            let mut idx = 0;
+            messages.retain(|m| {
+                let is_ref = m.content.iter().any(|b| match b {
+                    Block::Text { text } => text.starts_with(Self::REFLECTION_TAG),
+                    _ => false,
+                });
+                let cur = idx;
+                idx += 1;
+                !is_ref || cur == keep
+            });
+        }
     }
 
     /// Small-tier call (P3.2): one stateless request on `small_model`
@@ -874,6 +1026,7 @@ impl Agent {
         } else {
             let mut p = crate::perm::Policy::preset(config.policy_preset, config.cwd.clone());
             p.ask_handler = config.ask_handler.clone();
+            p.autonomy = config.autonomy.clone();
             if let Some(path) = &config.rules_path {
                 p.load_rules(path.clone());
             }
@@ -906,6 +1059,23 @@ impl Agent {
         )?;
         self.log.flush()
     }
+}
+
+/// Serialize the current message view for the B1-9 token estimate.
+/// Runs once per turn at the budget checkpoint — never in hot loops.
+fn prompt_text_for_estimate(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        for b in &m.content {
+            match b {
+                Block::Text { text } => out.push_str(text),
+                Block::ToolResult { content, .. } => out.push_str(content),
+                Block::ToolCall { name, .. } => out.push_str(name),
+                Block::Reasoning { .. } => {}
+            }
+        }
+    }
+    out
 }
 
 fn count_tool_calls(blocks: &[Block]) -> usize {
@@ -1011,6 +1181,9 @@ mod tests {
         seen_models: Mutex<Vec<String>>,
         /// Models that always error — drives the aux-call escalation path.
         fail_models: Vec<String>,
+        /// Fail the next N calls with Malformed, then serve responses.
+        /// Drives the B1-2 structured-retry path.
+        malformed_first: Mutex<usize>,
     }
 
     impl Mock {
@@ -1020,7 +1193,14 @@ mod tests {
                 seen_systems: Mutex::new(Vec::new()),
                 seen_models: Mutex::new(Vec::new()),
                 fail_models: Vec::new(),
+                malformed_first: Mutex::new(0),
             }
+        }
+
+        fn malformed_first(n: usize, responses: Vec<Response>) -> Self {
+            let m = Self::new(responses);
+            *m.malformed_first.lock().unwrap() = n;
+            m
         }
 
         fn failing_on(models: &[&str], responses: Vec<Response>) -> Self {
@@ -1039,6 +1219,13 @@ mod tests {
             self.seen_models.lock().unwrap().push(req.model.to_string());
             if self.fail_models.iter().any(|m| m == req.model) {
                 return Err(ProviderError::Transport("mock fail".into()));
+            }
+            {
+                let mut n = self.malformed_first.lock().unwrap();
+                if *n > 0 {
+                    *n -= 1;
+                    return Err(ProviderError::Malformed("mock malformed".into()));
+                }
             }
             let mut q = self.responses.lock().unwrap();
             if q.len() > 1 {
@@ -1311,6 +1498,143 @@ mod tests {
             .iter()
             .any(|m| m.text().contains("Verification failed")));
 
+        // B1-7: small_model None → no critiques (verify Nudges only).
+        let reflections = events
+            .iter()
+            .filter(|e| {
+                matches!(&e.kind, EventKind::Nudge { text } if text.starts_with(Agent::REFLECTION_TAG))
+            })
+            .count();
+        assert_eq!(reflections, 0, "no small model → no reflection Nudges");
+
+        // B1-7: small_model Some → exactly 1 tagged critique in BOTH views,
+        // verify-tail Nudges survive eviction, live == rehydrate.
+        let dir3 = tmpdir();
+        let cfg3 = AgentConfig {
+            cwd: dir3.clone(),
+            full_access: true,
+            verify_cmd: Some("false".into()),
+            verify_block_cap: 3,
+            small_model: Some("tiny-1".into()),
+            ..AgentConfig::default()
+        };
+        // done() for the 3 main turns + "critique" aux texts for 2 blocks.
+        let critique = Response {
+            blocks: vec![Block::Text {
+                text: "defect A; defect B; fix C".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        };
+        let provider3 = Mock::new(vec![done(), critique.clone(), done(), critique, done()]);
+        // NOTE: aux_call uses the main model when small_model fails; here
+        // tiny-1 is not in fail_models so aux serves from the queue.
+        let mut agent3 = Agent::start(Arc::new(provider3), cfg3, dir3.clone(), "s".into()).unwrap();
+        let mut sink3 = |_: &Event| {};
+        let out3 = agent3.run_turn("finish fast", &mut sink3).unwrap();
+        assert!(matches!(out3, RunOutcome::VerifyFailed { steps: 3, .. }));
+        let events3 = EventLog::replay(dir3.join("events.jsonl")).unwrap();
+        let tails3 = events3
+            .iter()
+            .filter(|e| {
+                matches!(&e.kind, EventKind::Nudge { text } if text.contains("Verification failed"))
+            })
+            .count();
+        assert_eq!(tails3, 2, "both verify tails must survive");
+        let refs3: Vec<&str> = events3
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Nudge { text } if text.starts_with(Agent::REFLECTION_TAG) => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refs3.len(), 2, "two critiques logged (log keeps both)");
+        // Rehydrate keeps only the last tagged critique; live view matches
+        // after the dual prune (last message holds the live critique).
+        let re = crate::event::rehydrate_messages(&events3);
+        let re_refs = re
+            .iter()
+            .filter(|m| m.text().starts_with(Agent::REFLECTION_TAG))
+            .count();
+        assert_eq!(re_refs, 1, "rehydrate keeps last-1 reflection");
+        let live_refs = agent3
+            .messages()
+            .iter()
+            .filter(|m| m.text().starts_with(Agent::REFLECTION_TAG))
+            .count();
+        assert_eq!(live_refs, 1, "live view keeps last-1 reflection");
+        // D3: live == rehydrate byte-for-byte on the tagged stream — no
+        // superseded stubs linger in either view.
+        let live_texts: Vec<String> = agent3.messages().iter().map(|m| m.text()).collect();
+        let re_texts: Vec<String> = re.iter().map(|m| m.text()).collect();
+        let live_tagged: Vec<&str> = live_texts
+            .iter()
+            .filter(|t| t.starts_with(Agent::REFLECTION_TAG))
+            .map(|s| s.as_str())
+            .collect();
+        let re_tagged: Vec<&str> = re_texts
+            .iter()
+            .filter(|t| t.starts_with(Agent::REFLECTION_TAG))
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            live_tagged, re_tagged,
+            "live and rehydrate tagged streams must match exactly"
+        );
+
+        // D2: small-tier failure → no critique AND no main-model call.
+        // (aux_call would escalate; reflect() must not.)
+        let dir5 = tmpdir();
+        let cfg5 = AgentConfig {
+            cwd: dir5.clone(),
+            full_access: true,
+            verify_cmd: Some("false".into()),
+            verify_block_cap: 2,
+            small_model: Some("tiny-1".into()),
+            ..AgentConfig::default()
+        };
+        // tiny-1 always fails; main model would serve done() if called.
+        let provider5 = Arc::new(Mock::failing_on(&["tiny-1"], vec![done()]));
+        let mut agent5 = Agent::start(provider5.clone(), cfg5, dir5.clone(), "s".into()).unwrap();
+        let mut sink5 = |_: &Event| {};
+        let _ = agent5.run_turn("finish fast", &mut sink5).unwrap();
+        let models5 = provider5.seen_models.lock().unwrap();
+        let main_calls = models5.iter().filter(|m| *m == "claude-sonnet-5").count();
+        assert_eq!(
+            main_calls, 2,
+            "loop turns only (2 blocks); reflect must add zero main-model calls, saw: {models5:?}"
+        );
+        let events5 = EventLog::replay(dir5.join("events.jsonl")).unwrap();
+        assert!(
+            !events5.iter().any(|e| matches!(&e.kind, EventKind::Nudge { text } if text.starts_with(Agent::REFLECTION_TAG))),
+            "failed small critique → no reflection Nudge"
+        );
+
+        // B1-7: --reflect=off disables critiques entirely.
+        let dir4 = tmpdir();
+        let cfg4 = AgentConfig {
+            cwd: dir4.clone(),
+            full_access: true,
+            verify_cmd: Some("false".into()),
+            verify_block_cap: 2,
+            small_model: Some("tiny-1".into()),
+            reflect: ReflectMode::Off,
+            ..AgentConfig::default()
+        };
+        let provider4 = Mock::new(vec![done()]);
+        let mut agent4 = Agent::start(Arc::new(provider4), cfg4, dir4.clone(), "s".into()).unwrap();
+        let mut sink4 = |_: &Event| {};
+        let _ = agent4.run_turn("finish fast", &mut sink4).unwrap();
+        let events4 = EventLog::replay(dir4.join("events.jsonl")).unwrap();
+        assert!(
+            !events4.iter().any(|e| matches!(&e.kind, EventKind::Nudge { text } if text.starts_with(Agent::REFLECTION_TAG))),
+            "reflect=off → no critiques"
+        );
+
         // A passing check completes on the first attempt.
         let dir2 = tmpdir();
         let cfg2 = AgentConfig {
@@ -1512,6 +1836,29 @@ mod tests {
         assert_eq!(out.trim(), "all done");
         let models = provider.seen_models.lock().unwrap();
         assert_eq!(models.as_slice(), &["tiny-1", "claude-sonnet-5"]);
+    }
+
+    /// B1-2: a single Malformed response is retried once per provider call.
+    /// The retry consumes exactly 1 step and records exactly 1 ledger call.
+    #[test]
+    fn malformed_response_retried_once_with_budget() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        // First provider call fails Malformed, retry succeeds with done().
+        let provider = Arc::new(Mock::malformed_first(1, vec![done()]));
+        let mut agent = Agent::start(provider.clone(), cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        let out = agent.run_turn("finish fast", &mut sink).unwrap();
+        assert!(matches!(out, RunOutcome::Completed { steps: 1, .. }));
+        // Two provider calls (initial + 1 retry), one recorded ledger call
+        // (ledger records successes; the Malformed attempt never completes).
+        assert_eq!(provider.seen_models.lock().unwrap().len(), 2);
+        let ledger = Ledger::read_all(dir.join("ledger.jsonl"));
+        assert_eq!(ledger.len(), 1, "retry success records exactly 1 call");
     }
 
     /// P3.10: tool results enter the model view provenance-wrapped, and

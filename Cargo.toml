@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/overseer-core",
     "crates/overseer-cli",
+    "crates/overseer-gateway",
     "crates/overseer-proto",
     "crates/overseer-tui",
 ]

@@ -138,3 +138,11 @@ review ← default branch; all PRs target here first
   protection available on a private repo — enforced socially).
 - CI runs on PRs and on pushes to `main`; keep main pushes rare to
   conserve Actions minutes.
+
+## Standing rule: deferred-item comments (confirmed 2026-09-18)
+
+Everything we do ships with comments on anything left out for later:
+- Every PR body ends with a "Deferred" section naming each leftover with status + owner.
+- Every merge commit message carries the same deferred list.
+- Every code site that defers work carries an adjacent comment (`// DEFERRED(<owner>): <what> — <gate>`).
+- Format follows the 42-PR follow-up sweep of 2026-09-18 (FIXED SINCE / STILL OPEN / INTENTIONAL / SUPERSEDED).

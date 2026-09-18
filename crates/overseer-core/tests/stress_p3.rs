@@ -743,6 +743,7 @@ fn gemini_1k_messages_full_path() {
     }
     let g = overseer_core::provider::gemini::Gemini::new("k", format!("http://127.0.0.1:{port}"));
     let system = vec![SystemSegment {
+        name: "test",
         text: "sys".into(),
         cacheable: true,
     }];
