@@ -426,7 +426,11 @@ fn pointer_live(dir: &Path, line: &str) -> bool {
     let Some(name) = topic_name(line) else {
         return true;
     };
-    let path = dir.join(name);
+    // Layer-aware lookup (F9): topics live in profile/episodic/semantic/
+    // procedural — a root-only join misses every layered file (always-live).
+    let Some(path) = layer_path(dir, name) else {
+        return true;
+    };
     let Ok(text) = std::fs::read_to_string(&path) else {
         return true;
     };
@@ -506,10 +510,9 @@ pub fn index_segment_filtered(dir: &Path, filter: Sensitivity) -> String {
                 return true;
             };
             match entry_sensitivity(dir, name) {
-                // F3: unparsable headers fail CLOSED to Secret — a file
-                // whose header says secret (or cannot be parsed) is never
-                // admitted below the Secret ceiling.
-                None => admits(filter, Sensitivity::Secret),
+                // Missing file (orphan pointer): pass through (F8 —
+                // fail-open for pointers, fail-closed for bodies).
+                None => true,
                 Some(s) => admits(filter, s),
             }
         })
@@ -565,24 +568,46 @@ fn topic_name(line: &str) -> Option<&str> {
 /// the layer subdirs as well as the memory root. None when the file
 /// is missing or its header is unreadable (caller defaults).
 fn entry_sensitivity(dir: &Path, name: &str) -> Option<Sensitivity> {
+    // Three cases, three answers (F3/F8): explicit header → its tier;
+    // bare file (no header) → Personal default; malformed header →
+    // Secret (fail closed); missing file → None (orphan pointer, the
+    // caller passes through per F8).
+    match entry_tier(dir, name) {
+        EntryTier::Tier(s) | EntryTier::BareDefault(s) => Some(s),
+        EntryTier::Missing => None,
+    }
+}
+
+/// Presence + parse state of a topic file backing an INDEX pointer.
+enum EntryTier {
+    /// Explicit valid header — trust its tier.
+    Tier(Sensitivity),
+    /// Bare file, no header — the documented Personal default.
+    BareDefault(Sensitivity),
+    /// No backing file — orphan pointer (F8: pass through).
+    Missing,
+}
+
+fn entry_tier(dir: &Path, name: &str) -> EntryTier {
     let mut cands = vec![dir.join(name)];
     for layer in Layer::ALL {
         cands.push(dir.join(layer.name()).join(name));
     }
     for cand in cands {
         if let Ok(text) = std::fs::read_to_string(&cand) {
-            if let Ok((meta, _)) = parse_meta(&text) {
-                // A bare file (no frontmatter) parses to the default —
-                // only trust an explicit header.
-                if text.lines().next().map(|l| l.trim()) == Some("---") {
-                    return Some(meta.sensitivity);
-                }
-                return None;
+            if text.lines().next().map(|l| l.trim()) != Some("---") {
+                return EntryTier::BareDefault(Sensitivity::Personal);
             }
-            return None;
+            match parse_meta(&text) {
+                Ok((meta, _)) => return EntryTier::Tier(meta.sensitivity),
+                // Malformed header: fail closed to Secret (F3) — a file
+                // whose header says secret (or cannot be parsed) is never
+                // admitted below the Secret ceiling.
+                Err(_) => return EntryTier::Tier(Sensitivity::Secret),
+            }
         }
     }
-    None
+    EntryTier::Missing
 }
 
 /// Quarantine a memory entry without overwriting it (P6-2 ADD-only):
