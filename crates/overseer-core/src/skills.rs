@@ -170,13 +170,16 @@ pub fn matching(cwd: &Path, prompt: &str) -> Vec<SkillMeta> {
 pub fn load(cwd: &Path, name: &str) -> Result<String, String> {
     let skills = scan(cwd);
     let Some(s) = skills.iter().find(|s| s.name == name) else {
-        let avail: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        let names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
+        let hint = crate::fuzzy::miss_hint(name, &names, 3)
+            .map(|h| format!(" {h}"))
+            .unwrap_or_default();
         return Err(format!(
-            "no skill '{name}'. Available: {}",
-            if avail.is_empty() {
+            "no skill '{name}'. Available: {}{hint}",
+            if names.is_empty() {
                 "(none)".into()
             } else {
-                avail.join(", ")
+                names.join(", ")
             }
         ));
     };
@@ -250,6 +253,25 @@ mod tests {
         assert!(seg.contains("fat — heavy skill"));
         assert!(seg.len() < 1_000, "body must not be resident");
         assert!(index_segment(&tmpdir()).is_none(), "empty → no segment");
+    }
+
+    #[test]
+    fn miss_hints_rank_near_names_and_stay_quiet_otherwise() {
+        // P8-B accept (fzf lookup-miss hints): a name that is a subsequence
+        // of a real skill gets a ranked suggestion; an unrelated one gets
+        // only the available list (no noise).
+        let dir = tmpdir();
+        let root = dir.join(".overseer/skills");
+        mk_skill(&root, "deploy", "name: deploy\ndescription: ship it\n", "B");
+        mk_skill(&root, "deps", "name: deps\ndescription: list deps\n", "B");
+        let near = load(&dir, "dpl").unwrap_err();
+        assert!(near.contains("did you mean:"), "{near}");
+        assert!(near.contains("deploy"), "{near}");
+        let far = load(&dir, "qqqq").unwrap_err();
+        assert!(!far.contains("did you mean:"), "no noise hints: {far}");
+        assert!(far.contains("Available:"), "{far}");
+        assert!(far.contains("deploy"), "{far}");
+        assert!(far.contains("deps"), "{far}");
     }
 
     #[test]

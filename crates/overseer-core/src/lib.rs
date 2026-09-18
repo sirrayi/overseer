@@ -11,6 +11,7 @@ pub mod computer_obs;
 pub mod control;
 pub mod cred;
 pub mod event;
+pub mod fuzzy;
 pub mod hooks;
 pub mod ir;
 pub mod ledger;
