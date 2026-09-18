@@ -328,6 +328,22 @@ impl ToolRegistry {
                 "Tool '{name}' is disabled for this run (--no-tools)."
             ));
         }
+        // RT-4: a bash command mentioning a brokered selector can exfil
+        // the secret (echo $TOKEN > /tmp/x) — latch sensitive BEFORE the
+        // gate so the triangle arms for this and follow-up side effects.
+        // (The child still gets the real; the gate now Asks on the exfil.)
+        if name == "bash" {
+            if let (Some(cmd), Some(br)) = (
+                input.get("command").and_then(|v| v.as_str()),
+                ctx.broker.as_ref(),
+            ) {
+                if br.mentions_selector(cmd) {
+                    if let Some(notice) = self.policy.mark_sensitive("broker") {
+                        self.taint_notices.push(notice);
+                    }
+                }
+            }
+        }
         match self.policy.gate(name, input) {
             crate::perm::Gate::Allow => {}
             crate::perm::Gate::Deny(reason) => {
@@ -679,6 +695,27 @@ mod tests {
         assert!(
             body.contains("UNTRUSTED-NOTE-42"),
             "payload preserved, got: {body}"
+        );
+    }
+
+    #[test]
+    fn bash_mentioning_brokered_selector_latches_sensitive() {
+        // RT-4: `echo $TOKEN > /tmp/x` must arm the triangle's sensitive half.
+        let dir = tmpdir();
+        let mut br = crate::cred::Broker::new();
+        br.issue_capability("a", "API_TOKEN", "real-secret-1", vec![], vec![], None);
+        let pol = crate::perm::Policy::headless(dir.clone());
+        let mut reg = ToolRegistry::core(pol);
+        let mut c = ctx(&dir);
+        c.broker = Some(br);
+        let _ = reg.call(
+            "bash",
+            &serde_json::json!({"command": "echo $API_TOKEN > /tmp/rt4-x"}),
+            &mut c,
+        );
+        assert!(
+            reg.policy().taint_sensitive(),
+            "brokered selector in bash must latch sensitive"
         );
     }
 
