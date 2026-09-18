@@ -430,9 +430,11 @@ pub fn enforce_budget(out: ToolOutput, ctx: &mut ToolCtx) -> ToolOutput {
     let _ = std::fs::create_dir_all(&dir);
     #[cfg(unix)]
     {
-        // Spill dirs 0700 (R1-F4): tool output may carry secrets.
-        use std::os::unix::fs::DirBuilderExt;
-        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+        // Spill dirs 0700 (R1-F4/F7): tool output may carry secrets.
+        // DirBuilder.mode is a no-op when the dir already exists, so set
+        // permissions explicitly after creation.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
     ctx.spill_seq += 1;
     let path = dir.join(format!("output-{}.txt", ctx.spill_seq));
@@ -678,6 +680,42 @@ mod tests {
             body.contains("UNTRUSTED-NOTE-42"),
             "payload preserved, got: {body}"
         );
+    }
+
+    #[test]
+    fn memory_gate_burst_preserves_every_payload() {
+        // F2 (extreme): 100 same-ms gated writes → 100 files, zero loss.
+        let dir = tmpdir();
+        let mem = dir.join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let mut pol = crate::perm::Policy::headless(dir.clone());
+        pol.memory_dir = Some(mem.clone());
+        pol.note_result("task", &serde_json::json!({}), "some task digest");
+        pol.note_result("read", &serde_json::json!({"path": ".env"}), "export KEY=1");
+        assert!(pol.taint_armed());
+        let mut reg = ToolRegistry::core(pol);
+        let mut c = ctx(&dir);
+        for i in 0..100 {
+            let out = reg.call(
+                "write",
+                &serde_json::json!({"path": format!("memory/note-{i}.md"), "content": format!("PAYLOAD-{i}")}),
+                &mut c,
+            );
+            assert!(out.denied, "write {i} must deny headless");
+        }
+        let props = mem.join("proposals");
+        let files: Vec<_> = std::fs::read_dir(&props).unwrap().flatten().collect();
+        assert_eq!(files.len(), 100, "every payload gets its own file");
+        let bodies: Vec<String> = files
+            .iter()
+            .map(|f| std::fs::read_to_string(f.path()).unwrap())
+            .collect();
+        for i in 0..100 {
+            assert!(
+                bodies.iter().any(|b| b.contains(&format!("PAYLOAD-{i}"))),
+                "payload {i} kept"
+            );
+        }
     }
 
     #[test]
@@ -980,9 +1018,9 @@ mod tests {
                 .unwrap()
                 .permissions()
                 .mode();
-            // DirBuilder 0700 may not tighten a pre-existing dir; the
-            // file mode is the hard bar.
-            assert!(dmode & 0o077 == 0 || true, "dir mode {dmode:o}");
+            // F7: the dir itself must be owner-only (set_permissions
+            // after creation tightens pre-existing dirs too).
+            assert_eq!(dmode & 0o777, 0o700, "spill dir mode {dmode:o}");
         }
     }
 }

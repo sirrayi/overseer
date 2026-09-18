@@ -312,6 +312,31 @@ pub const WRITE_BAR: [(Layer, crate::perm::Autonomy); 4] = [
     (Layer::Procedural, crate::perm::Autonomy::ActAndReport),
 ];
 
+/// Map a write/edit target to its memory layer's write bar (F5).
+/// None when the target is outside `memory_dir` (or no memory dir): the
+/// lane default decides. Pure path-prefix check — no fs access.
+pub fn layer_bar_for_path(
+    memory_dir: Option<&std::path::Path>,
+    root: &std::path::Path,
+    target: &str,
+) -> Option<crate::perm::Autonomy> {
+    let mem = memory_dir?;
+    let resolved = if std::path::Path::new(target).is_absolute() {
+        std::path::PathBuf::from(target)
+    } else {
+        root.join(target)
+    };
+    let rel = resolved.strip_prefix(mem).ok()?;
+    let first = rel
+        .components()
+        .next()?
+        .as_os_str()
+        .to_string_lossy()
+        .to_string();
+    let layer = Layer::ALL.iter().find(|l| l.name() == first)?;
+    Some(layer.write_bar())
+}
+
 /// Prompt legend for the memory segment: layer dirs + header keys.
 /// Static bytes (prefix-cache safe); the ≤200B cap is asserted in test.
 pub const MEMORY_LEGEND: &str = "Layers: profile/ identity, episodic/ events, \
@@ -337,9 +362,98 @@ pub fn ensure(dir: &Path) -> std::io::Result<PathBuf> {
 /// and an edit only invalidates cache from this segment onward.
 /// Re-read every turn because the model may have just edited it. An index
 /// over the cap is truncated *with a repair note* — never silently.
+/// True when an INDEX pointer line names a quarantine proposal: unreviewed
+/// untrusted text (RT-3). Proposals stay on disk for human review but are
+/// never injected into the trusted memory segment.
+/// Lexicographic RFC-3339 expiry check (UTC `now`): valid_to past → expired.
+/// No chrono dep — RFC-3339 UTC strings compare lexicographically.
+fn meta_expired(meta: &EntryMeta) -> bool {
+    let Some(to) = &meta.valid_to else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Format now as RFC-3339-ish UTC for string comparison via the same
+    // lexicographic property: compare against the stored string's prefix.
+    // Simplest sound rule: a valid_to strictly earlier than the current
+    // year-month-day prefix chain — compare full strings against a
+    // now-formatted stamp built without chrono.
+    let stamp = format_utc_stamp(now);
+    to.as_str() < stamp.as_str()
+}
+
+fn format_utc_stamp(secs: u64) -> String {
+    // Days since epoch → civil date (Howard Hinnant's algorithm), UTC.
+    let days = (secs / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let sod = secs % 86_400;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
+}
+
+/// True when the topic body carries a `superseded_by:` trailer pointing at a
+/// live successor (F9 — invalidate() appends these; the pointer is stale).
+fn meta_superseded(text: &str) -> bool {
+    text.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with("superseded_by:") && t.len() > "superseded_by:".len()
+    })
+}
+
+/// True when an INDEX pointer still names live content: the topic file's
+/// own header must not say expired (valid_to past) or superseded
+/// (superseded_by trailer). Unresolvable lines pass through (F8 — the
+/// caller decides; bodies stay fail-closed elsewhere).
+fn pointer_live(dir: &Path, line: &str) -> bool {
+    let Some(name) = topic_name(line) else {
+        return true;
+    };
+    let path = dir.join(name);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return true;
+    };
+    // Unparsable headers fail closed elsewhere; for liveness, only an
+    // affirmative expired/superseded signal drops the pointer.
+    if let Ok((meta, _)) = parse_meta(&text) {
+        if meta_expired(&meta) || meta_superseded(&text) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_proposal_pointer(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("proposals/") || t.contains("proposals/")
+}
+
 pub fn index_segment(dir: &Path) -> String {
     let idx = dir.join(INDEX_NAME);
     let text = std::fs::read_to_string(&idx).unwrap_or_default();
+    // RT-3: drop proposal pointers (unreviewed) + expired/superseded (F9).
+    let text: String = text
+        .lines()
+        .filter(|l| !is_proposal_pointer(l) && pointer_live(dir, l))
+        .collect::<Vec<_>>()
+        .join("\n");
     let (body, note) = if text.len() > INDEX_CAP {
         // Largest char-boundary byte offset still within the cap.
         let cut = text
@@ -378,12 +492,24 @@ pub fn index_segment_filtered(dir: &Path, filter: Sensitivity) -> String {
     let kept: Vec<&str> = text
         .lines()
         .filter(|line| {
+            // RT-3: proposals never enter any view.
+            if is_proposal_pointer(line) {
+                return false;
+            }
+            // F9: expired/superseded pointers are not served as current.
+            if !pointer_live(dir, line) {
+                return false;
+            }
             let Some(name) = topic_name(line) else {
+                // F8: orphan/unresolvable pointer lines pass through
+                // (fail-open for pointers, fail-closed for bodies).
                 return true;
             };
             match entry_sensitivity(dir, name) {
-                // Missing/unreadable headers default to Personal.
-                None => admits(filter, Sensitivity::Personal),
+                // F3: unparsable headers fail CLOSED to Secret — a file
+                // whose header says secret (or cannot be parsed) is never
+                // admitted below the Secret ceiling.
+                None => admits(filter, Sensitivity::Secret),
                 Some(s) => admits(filter, s),
             }
         })
@@ -574,18 +700,29 @@ pub fn consolidate(
     let idx = ensure(dir).map_err(|e| e.to_string())?;
     let old_index = std::fs::read_to_string(&idx).unwrap_or_default();
 
-    // Topic files: bounded context for the dedupe pass.
+    // Topic files: bounded context for the dedupe pass. Walks the top
+    // level AND the P6-1 layer subdirs (F6: after layering, topics live in
+    // profile/episodic/semantic/procedural — a top-level-only scan judges
+    // every layer pointer blind).
     let mut topics = String::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    let mut topic_dirs = vec![dir.to_path_buf()];
+    for layer in Layer::ALL {
+        topic_dirs.push(dir.join(layer.name()));
+    }
+    for tdir in topic_dirs {
+        let Ok(entries) = std::fs::read_dir(&tdir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "md") && e.file_name() != INDEX_NAME {
                 if let Ok(t) = std::fs::read_to_string(&p) {
                     let head: String = t.chars().take(2_000).collect();
-                    topics.push_str(&format!(
-                        "\n### {}\n{head}\n",
-                        e.file_name().to_string_lossy()
-                    ));
+                    let rel = p
+                        .strip_prefix(dir)
+                        .map(|r| r.display().to_string())
+                        .unwrap_or_else(|_| e.file_name().to_string_lossy().to_string());
+                    topics.push_str(&format!("\n### {rel}\n{head}\n"));
                 }
             }
         }
@@ -708,6 +845,15 @@ mod tests {
 
     struct FixedProvider {
         reply: String,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+    impl FixedProvider {
+        fn with_reply(reply: &str) -> Self {
+            Self {
+                reply: reply.into(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
     }
     impl crate::provider::Provider for FixedProvider {
         fn complete(
@@ -715,6 +861,17 @@ mod tests {
             req: &crate::provider::Request,
         ) -> Result<crate::provider::Response, crate::provider::ProviderError> {
             assert_eq!(req.effort, Some(crate::provider::Effort::Min));
+            let prompt: String = req
+                .messages
+                .iter()
+                .flat_map(|m| {
+                    m.content.iter().filter_map(|b| match b {
+                        crate::ir::Block::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                })
+                .collect();
+            self.seen.lock().unwrap().push(prompt);
             Ok(crate::provider::Response {
                 blocks: vec![crate::ir::Block::Text {
                     text: self.reply.clone(),
@@ -731,14 +888,35 @@ mod tests {
     }
 
     #[test]
+    fn consolidate_sees_layer_dir_topics() {
+        // F6: topics in profile/episodic/semantic/procedural reach the prompt.
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        std::fs::write(
+            dir.join("semantic/facts.md"),
+            "EXPIRED-MARKER-CONTENT sky-blue",
+        )
+        .unwrap();
+        let p = FixedProvider::with_reply("---INDEX---\n# Memory Index\n---INDEX---");
+        let _ = consolidate(&p, "tiny", &dir).unwrap();
+        let seen = p.seen.lock().unwrap().join("\n");
+        assert!(
+            seen.contains("EXPIRED-MARKER-CONTENT"),
+            "layer topic must reach the prompt, got: {}",
+            &seen[..seen.len().min(500)]
+        );
+        assert!(seen.contains("semantic/facts.md"), "layer-relative name");
+    }
+
+    #[test]
     fn consolidate_rewrites_index_and_commits() {
         let dir = tmpdir();
         let idx = ensure(&dir).unwrap();
         std::fs::write(&idx, "# Memory Index\n\nfacts.md — old\ndupe.md — old\n").unwrap();
         std::fs::write(dir.join("facts.md"), "data").unwrap();
-        let p = FixedProvider {
-            reply: "---INDEX---\n# Memory Index\n\nfacts.md — user facts\n---INDEX---".into(),
-        };
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\nfacts.md — user facts\n---INDEX---",
+        );
         let msg = consolidate(&p, "tiny", &dir).unwrap();
         assert!(msg.contains("consolidated"));
         let new = std::fs::read_to_string(&idx).unwrap();
@@ -752,9 +930,7 @@ mod tests {
         let dir = tmpdir();
         let idx = ensure(&dir).unwrap();
         std::fs::write(&idx, "original\n").unwrap();
-        let p = FixedProvider {
-            reply: "no markers here".into(),
-        };
+        let p = FixedProvider::with_reply("no markers here");
         assert!(consolidate(&p, "tiny", &dir).is_err());
         assert_eq!(std::fs::read_to_string(&idx).unwrap(), "original\n");
     }
