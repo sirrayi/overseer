@@ -133,7 +133,18 @@ const BASH_ASK: &[(&str, &str)] = &[
 
 /// Tools with no side effects — allowed under every preset.
 const READ_TOOLS: &[&str] = &[
-    "read", "grep", "glob", "task", "plan", "skill", "repo_map", "symbol",
+    "read",
+    "grep",
+    "glob",
+    "task",
+    "plan",
+    "skill",
+    "repo_map",
+    "symbol",
+    // P8-C: structural search reads the workspace (ast-grep/semgrep are
+    // read-only probes — same lane as `grep`, whose shell equivalent is
+    // denied while the tool is allowed).
+    "struct_search",
 ];
 
 /// Rule-of-Two state (P3.10): an agent holding (a) untrusted input,

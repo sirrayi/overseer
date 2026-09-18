@@ -23,6 +23,7 @@ pub mod plan;
 pub mod read;
 pub mod repomap;
 pub mod skill;
+pub mod struct_search;
 pub mod task;
 pub mod write;
 
@@ -170,7 +171,7 @@ struct ReadRecord {
 /// `--no-tools` ablations (typo'd names fail fast, not silently no-op).
 /// Sorted; `all_core_specs_deny_additional_properties` pins the count to
 /// the registry's spec list.
-pub const TOOL_NAMES: [&str; 13] = [
+pub const TOOL_NAMES: [&str; 14] = [
     "bash",
     "computer",
     "diagnostics",
@@ -181,6 +182,7 @@ pub const TOOL_NAMES: [&str; 13] = [
     "read",
     "repo_map",
     "skill",
+    "struct_search",
     "symbol",
     "task",
     "write",
@@ -230,6 +232,7 @@ impl ToolRegistry {
             repomap::spec_symbol(),
             computer::spec(),
             diagnostics::spec(),
+            struct_search::spec(),
         ];
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         let hooks = crate::hooks::load(&policy.root);
@@ -477,6 +480,7 @@ impl ToolRegistry {
             "symbol" => repomap::run_symbol(input, ctx),
             "computer" => computer::run(input, ctx),
             "diagnostics" => diagnostics::run(input, ctx),
+            "struct_search" => struct_search::run(input, ctx),
             other => ToolOutput::err(format!(
                 "Unknown tool '{other}'. Available tools: {}.",
                 TOOL_NAMES.join(", ")
