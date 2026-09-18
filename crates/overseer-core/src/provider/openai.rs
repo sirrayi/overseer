@@ -408,10 +408,12 @@ mod tests {
     fn system_joins_segments() {
         let system = [
             SystemSegment {
+                name: "test",
                 text: "a".into(),
                 cacheable: true,
             },
             SystemSegment {
+                name: "test",
                 text: "b".into(),
                 cacheable: false,
             },

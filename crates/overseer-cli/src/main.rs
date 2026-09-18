@@ -55,6 +55,9 @@ fn real_main() -> i32 {
         "consolidate" => cmd_consolidate(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
         "rewind" => cmd_rewind(&args[1..]),
+        "daemon" => cmd_daemon(&args[1..]),
+        "inbox" => cmd_inbox(&args[1..]),
+        "trigger" => cmd_trigger(&args[1..]),
         other => {
             eprintln!("overseer: unknown command '{other}'");
             usage();
@@ -188,6 +191,21 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
         verify_block_cap: flags.verify_cap,
         sandbox_bash: flags.sandbox,
         disabled_tools: flags.no_tools.clone(),
+        autonomy: {
+            let mut m = std::collections::HashMap::new();
+            for (d, l) in &flags.autonomy {
+                let level = match l.as_str() {
+                    "observe" => overseer_core::perm::Autonomy::Observe,
+                    "suggest" => overseer_core::perm::Autonomy::Suggest,
+                    "approve" => overseer_core::perm::Autonomy::ActWithApproval,
+                    "report" => overseer_core::perm::Autonomy::ActAndReport,
+                    _ => overseer_core::perm::Autonomy::ActSilently,
+                };
+                m.insert(d.clone(), level);
+            }
+            m
+        },
+        reflect: flags.reflect,
         ask_handler: None,
         // --bare: no persisted rules — a CI run must not inherit or
         // mutate the operator's allow-list. Ask verdicts still
@@ -520,11 +538,19 @@ fn usage() {
          \x20 --verify <cmd>      Definition-of-done check; blocks finish on\n\
          \x20                     failure (stop-hook gate)\n\
          \x20 --verify-cap <n>    Max consecutive verify blocks (default: 8)\n\
+         \x20 --reflect <mode>    off | reflexion (default: reflexion)\n\
+         \x20                     aux-tier self-critique on verify blocks\n\
          \x20 --best-of <n>       N parallel attempts in git worktrees (2-4);\n\
          \x20                     first attempt passing --verify wins\n\
          \x20 --no-sandbox        Run bash unsandboxed (default: sandbox-exec/\n\
          \x20                     bwrap wrapper when available)\n\
          \x20 --memory            Enable file memory at <cwd>/memory\n\
+         \x20 --autonomy <d=l>    Per-domain autonomy, repeatable (P5-B):
+\
+         \x20                     domains internal|external|money|identity;
+\
+         \x20                     levels observe|suggest|approve|report|silent
+\
          \x20 --no-tools <list>   Ablation: comma-separated tool names removed\n\
          \x20                     from the spec list and refused at dispatch\n\
          \n\
@@ -564,6 +590,7 @@ struct ExecFlags {
     keep_results: usize,
     verify: Option<String>,
     verify_cap: u32,
+    reflect: overseer_core::agent::ReflectMode,
     /// `--best-of N`: N parallel attempts in isolated git worktrees;
     /// first attempt whose verify command exits 0 wins.
     best_of: u32,
@@ -572,6 +599,11 @@ struct ExecFlags {
     /// `--no-tools a,b,c` — P4.3 ablation: named tools are removed from the
     /// spec list and refused at dispatch.
     no_tools: Vec<String>,
+    /// `--autonomy external=suggest` — P5-B per-domain autonomy overrides
+    /// (repeatable). Domains: internal, external, money, identity. Levels:
+    /// observe, suggest, approve (act-with-approval), report (act+report),
+    /// silent (act-silently).
+    autonomy: Vec<(String, String)>,
     prompt: Option<String>,
 }
 
@@ -599,10 +631,12 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
         keep_results: 5,
         verify: None,
         verify_cap: 8,
+        reflect: overseer_core::agent::ReflectMode::Reflexion,
         best_of: 0,
         sandbox: true,
         memory: false,
         no_tools: Vec::new(),
+        autonomy: Vec::new(),
         prompt: None,
     };
     let mut i = 0;
@@ -660,8 +694,35 @@ fn parse_exec(args: &[String]) -> Result<ExecFlags, String> {
             "--verify-cap" => {
                 f.verify_cap = take(&mut i)?.parse().map_err(|_| "bad --verify-cap")?
             }
+            "--reflect" => {
+                f.reflect = match take(&mut i)?.as_str() {
+                    "off" => overseer_core::agent::ReflectMode::Off,
+                    "reflexion" => overseer_core::agent::ReflectMode::Reflexion,
+                    other => return Err(format!("bad --reflect '{other}' (off|reflexion)")),
+                }
+            }
             "--no-sandbox" => f.sandbox = false,
             "--memory" => f.memory = true,
+            "--autonomy" => {
+                let v = take(&mut i)?;
+                let (domain, level) = v
+                    .split_once('=')
+                    .ok_or("bad --autonomy (want domain=level, e.g. external=suggest)")?;
+                if !["internal", "external", "money", "identity"].contains(&domain) {
+                    return Err(format!(
+                        "bad --autonomy domain '{domain}' (internal|external|money|identity)"
+                    ));
+                }
+                match level {
+                    "observe" | "suggest" | "approve" | "report" | "silent" => {}
+                    _ => {
+                        return Err(format!(
+                            "bad --autonomy level '{level}' (observe|suggest|approve|report|silent)"
+                        ))
+                    }
+                }
+                f.autonomy.push((domain.to_string(), level.to_string()));
+            }
             "--no-tools" => {
                 let v = take(&mut i)?;
                 for name in v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -898,6 +959,225 @@ fn dirs_home() -> PathBuf {
         .join(".overseer")
 }
 
+// ---------- gateway daemon (playbook 12.7 §5.1–5.3) ----------
+
+fn daemon_dirs(args: &[String]) -> overseer_gateway::config::DaemonDirs {
+    let dir = args
+        .windows(2)
+        .find(|w| w[0] == "--dir")
+        .map(|w| PathBuf::from(&w[1]))
+        .unwrap_or_else(|| dirs_home().join("daemon"));
+    overseer_gateway::config::DaemonDirs::new(dir)
+}
+
+/// Positional args with `--dir <value>` pairs removed — so
+/// `daemon --dir $DD status` detects `status`, not `$DD`. Only `--dir`
+/// takes a value on the daemon/inbox/trigger surface; every other flag
+/// is boolean.
+fn positionals(args: &[String]) -> Vec<&String> {
+    let mut out = Vec::new();
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a == "--dir" {
+            skip_next = true;
+            continue;
+        }
+        if a.starts_with('-') {
+            continue;
+        }
+        out.push(a);
+    }
+    out
+}
+
+fn ctl_call(
+    dirs: &overseer_gateway::config::DaemonDirs,
+    req: overseer_gateway::ctl::CtlRequest,
+) -> Result<overseer_gateway::ctl::CtlResponse, String> {
+    overseer_gateway::ctl::call(&dirs.socket(), &req)
+}
+
+/// `overseer daemon` — run the always-on gateway in the foreground
+/// (launchd/systemd supervision comes with the release packaging).
+/// Subcommands status/kill/reload go through the unix socket.
+fn cmd_daemon(args: &[String]) -> i32 {
+    let dirs = daemon_dirs(args);
+    use overseer_gateway::ctl::CtlRequest;
+    let pos = positionals(args);
+    match pos.first().map(|s| s.as_str()) {
+        Some("status") => match ctl_call(&dirs, CtlRequest::Status) {
+            Ok(r) => {
+                println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+                if r.ok {
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(e) => {
+                eprintln!("overseer daemon: {e}");
+                1
+            }
+        },
+        Some("kill") => match ctl_call(&dirs, CtlRequest::Kill) {
+            Ok(r) if r.ok => {
+                println!("daemon stopping");
+                0
+            }
+            Ok(r) => {
+                eprintln!("overseer daemon: {}", r.error.unwrap_or_default());
+                1
+            }
+            Err(e) => {
+                eprintln!("overseer daemon: {e}");
+                1
+            }
+        },
+        Some("reload") => match ctl_call(&dirs, CtlRequest::Reload) {
+            Ok(r) if r.ok => {
+                println!("config reloaded");
+                0
+            }
+            Ok(r) => {
+                eprintln!("overseer daemon: {}", r.error.unwrap_or_default());
+                1
+            }
+            Err(e) => {
+                eprintln!("overseer daemon: {e}");
+                1
+            }
+        },
+        Some(other) => {
+            eprintln!("overseer daemon: unknown subcommand '{other}' (run|status|kill|reload)");
+            2
+        }
+        // Bare `overseer daemon` = run in foreground.
+        None => {
+            let bin = overseer_gateway::daemon::overseer_binary();
+            match overseer_gateway::daemon::Daemon::new(dirs, bin) {
+                Ok(mut d) => {
+                    eprintln!(
+                        "overseer daemon: running (kill: `overseer daemon kill` or touch STOP)"
+                    );
+                    d.run()
+                }
+                Err(e) => {
+                    eprintln!("overseer daemon: {e}");
+                    1
+                }
+            }
+        }
+    }
+}
+
+/// `overseer inbox` — the Agent Inbox surface: list/decide/act.
+fn cmd_inbox(args: &[String]) -> i32 {
+    let dirs = daemon_dirs(args);
+    use overseer_gateway::ctl::CtlRequest;
+    let rest: Vec<&String> = positionals(args);
+    let sub = rest.first().map(|s| s.as_str());
+    let req = match sub {
+        Some("list") | None => CtlRequest::InboxList,
+        Some("approve") | Some("reject") => {
+            let Some(id) = rest.get(1) else {
+                eprintln!("overseer inbox {sub:?}: needs an item id");
+                return 2;
+            };
+            CtlRequest::InboxDecide {
+                id: id.to_string(),
+                decision: sub.unwrap().to_string(),
+                snooze_ms: None,
+            }
+        }
+        Some("snooze") => {
+            let Some(id) = rest.get(1) else {
+                eprintln!("overseer inbox snooze: needs an item id");
+                return 2;
+            };
+            let ms = rest.get(2).and_then(|s| s.parse::<u64>().ok()).map(|v| {
+                if v < 10_000 {
+                    v * 1000
+                } else {
+                    v
+                }
+            });
+            CtlRequest::InboxDecide {
+                id: id.to_string(),
+                decision: "snooze".into(),
+                snooze_ms: ms,
+            }
+        }
+        Some("act") => {
+            let Some(id) = rest.get(1) else {
+                eprintln!("overseer inbox act: needs an item id");
+                return 2;
+            };
+            CtlRequest::InboxAct { id: id.to_string() }
+        }
+        Some(other) => {
+            eprintln!(
+                "overseer inbox: unknown subcommand '{other}' (list|approve|reject|snooze|act)"
+            );
+            return 2;
+        }
+    };
+    match ctl_call(&dirs, req) {
+        Ok(r) if r.ok => {
+            if let Some(d) = r.data {
+                println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default());
+            }
+            0
+        }
+        Ok(r) => {
+            eprintln!("overseer inbox: {}", r.error.unwrap_or_default());
+            1
+        }
+        Err(e) => {
+            eprintln!("overseer inbox: {e}");
+            1
+        }
+    }
+}
+
+/// `overseer trigger fire` — inject an event (testing + webhook shim).
+fn cmd_trigger(args: &[String]) -> i32 {
+    let dirs = daemon_dirs(args);
+    if args.first().map(String::as_str) != Some("fire") {
+        eprintln!("overseer trigger: only 'fire' is supported");
+        return 2;
+    }
+    let val = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+    let (Some(source), Some(class), Some(payload)) =
+        (val("--source"), val("--class"), val("--payload"))
+    else {
+        eprintln!("overseer trigger fire: needs --source --class --payload");
+        return 2;
+    };
+    let req = overseer_gateway::ctl::CtlRequest::TriggerFire {
+        source,
+        class,
+        payload,
+    };
+    match ctl_call(&dirs, req) {
+        Ok(r) if r.ok => {
+            println!("fired");
+            0
+        }
+        Ok(r) => {
+            eprintln!("overseer trigger: {}", r.error.unwrap_or_default());
+            1
+        }
+        Err(e) => {
+            eprintln!("overseer trigger: {e}");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,5 +1203,74 @@ mod tests {
         let cfg = agent_config(&f);
         assert!(cfg.sandbox_bash, "--bare must not weaken the sandbox");
         assert!(cfg.rules_path.is_none(), "--bare loads no user rules");
+    }
+}
+
+#[cfg(test)]
+mod daemon_arg_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_dir_flag_order_independent() {
+        // The live-smoke bug: `daemon --dir $DD status` read `$DD` as the
+        // subcommand. --dir pairs strip before subcommand detection.
+        assert_eq!(
+            positionals(&["--dir".into(), "/tmp/x".into(), "status".into()]),
+            vec!["status"]
+        );
+        assert_eq!(
+            positionals(&["status".into(), "--dir".into(), "/tmp/x".into()]),
+            vec!["status"]
+        );
+        assert!(positionals(&["--dir".into(), "/tmp/x".into()]).is_empty());
+        assert_eq!(
+            positionals(&[
+                "approve".into(),
+                "--dir".into(),
+                "/tmp/x".into(),
+                "abc".into()
+            ]),
+            vec!["approve", "abc"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod autonomy_flag_tests {
+    use super::*;
+
+    #[test]
+    fn autonomy_flag_parses_domains_and_levels() {
+        let f = parse_exec(&["--autonomy".into(), "external=suggest".into(), "x".into()]).unwrap();
+        assert_eq!(
+            f.autonomy,
+            vec![("external".to_string(), "suggest".to_string())]
+        );
+        let f = parse_exec(&[
+            "--autonomy".into(),
+            "money=observe".into(),
+            "--autonomy".into(),
+            "identity=silent".into(),
+            "x".into(),
+        ])
+        .unwrap();
+        assert_eq!(f.autonomy.len(), 2);
+    }
+
+    #[test]
+    fn autonomy_flag_rejects_bad_domain_and_level() {
+        assert!(parse_exec(&["--autonomy".into(), "bogus=approve".into(), "x".into()]).is_err());
+        assert!(parse_exec(&["--autonomy".into(), "external=bogus".into(), "x".into()]).is_err());
+        assert!(parse_exec(&["--autonomy".into(), "external".into(), "x".into()]).is_err());
+    }
+
+    #[test]
+    fn autonomy_flag_flows_into_agent_config() {
+        let f = parse_exec(&["--autonomy".into(), "external=suggest".into(), "x".into()]).unwrap();
+        let cfg = agent_config(&f);
+        assert_eq!(
+            cfg.autonomy.get("external"),
+            Some(&overseer_core::perm::Autonomy::Suggest)
+        );
     }
 }

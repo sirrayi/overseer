@@ -329,6 +329,15 @@ impl ToolRegistry {
             crate::perm::Gate::Allow => {}
             crate::perm::Gate::Deny(reason) => return ToolOutput::denied(reason),
         }
+        // B1-2 (Instructor/FastMCP): hand-rolled required/type check against
+        // the advertised `input_schema` before dispatch. Zero-dep (serde_json
+        // is already in the tree); failures return a field-level error that
+        // names the violated field — no dispatch, no side effects.
+        if let Some(spec) = self.specs.iter().find(|s| s.name == name) {
+            if let Err(e) = check_args(&spec.input_schema, input) {
+                return e;
+            }
+        }
         let out = match name {
             "bash" => bash::run(input, ctx),
             "read" => read::run(input, ctx, self),
@@ -357,6 +366,16 @@ impl ToolRegistry {
 /// Enforce the tool-result byte budget (playbook Ch.6 §2.2):
 /// ≤30K chars inline; larger results spill to a file and return a pointer.
 pub fn enforce_budget(out: ToolOutput, ctx: &mut ToolCtx) -> ToolOutput {
+    if out.text.len() <= INLINE_CAP {
+        return out;
+    }
+    // B1-3: TOON tabular pass — uniform JSON arrays shrink ~30-60% before
+    // the spill decision. JSON stays at API boundaries; only the inline
+    // text the model reads changes.
+    let out = ToolOutput {
+        text: crate::toon::maybe_encode_json_array(&out.text),
+        ..out
+    };
     if out.text.len() <= INLINE_CAP {
         return out;
     }
@@ -420,6 +439,77 @@ pub fn middle_truncate(s: &str, cap: usize) -> String {
     format!("{head}\n[...{} chars truncated...]\n{tail}", n - cap)
 }
 
+/// Validate `input` against a tool's advertised JSON schema (B1-2).
+/// Hand-rolled over the subset `schema()` emits: object `properties` with
+/// `type` in {string, integer, boolean, array, object}, `required`, and
+/// `additionalProperties: false`. Unknown/complex subschemas pass through —
+/// this is a typo-catcher, not a validator; per-tool `run()` stays
+/// authoritative. Zero new deps.
+pub fn check_args(schema: &Value, input: &Value) -> Result<(), ToolOutput> {
+    let obj = match input.as_object() {
+        Some(o) => o,
+        None => {
+            return Err(ToolOutput::err(
+                "Tool input must be a JSON object matching the tool's input_schema.",
+            ))
+        }
+    };
+    let props = schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let required: Vec<String> = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    for key in &required {
+        if !obj.contains_key(key) {
+            return Err(ToolOutput::err(format!(
+                "Missing required parameter '{key}' — check the tool's input_schema."
+            )));
+        }
+    }
+    let no_extra = schema
+        .get("additionalProperties")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !no_extra {
+        for key in obj.keys() {
+            if !props.contains_key(key) {
+                return Err(ToolOutput::err(format!(
+                    "Unknown parameter '{key}' — check the tool's input_schema."
+                )));
+            }
+        }
+    }
+    for (key, val) in obj {
+        let Some(decl) = props.get(key) else { continue };
+        let Some(want) = decl.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let ok = match want {
+            "string" => val.is_string(),
+            "integer" => val.is_i64() || val.is_u64(),
+            "boolean" => val.is_boolean(),
+            "array" => val.is_array(),
+            "object" => val.is_object(),
+            _ => true, // unknown type word: pass through
+        };
+        if !ok {
+            return Err(ToolOutput::err(format!(
+                "Parameter '{key}' must be {want} — check the tool's input_schema."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Helper for arg extraction with an error that teaches the schema.
 pub fn need_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolOutput> {
     input
@@ -473,6 +563,68 @@ mod tests {
             checkpoint: None,
             sandbox: false,
         }
+    }
+
+    #[test]
+    fn check_args_rejects_missing_required_without_dispatch() {
+        // B1-2: malformed args fail at the schema check — the tool never runs.
+        let dir = tmpdir();
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut c = ctx(&dir);
+        let out = reg.call("read", &serde_json::json!({}), &mut c);
+        assert!(out.is_error, "missing required path must error");
+        assert!(
+            out.text.contains("Missing required parameter 'path'"),
+            "field-level error, got: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn check_args_rejects_wrong_type_without_dispatch() {
+        let dir = tmpdir();
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut c = ctx(&dir);
+        let out = reg.call("read", &serde_json::json!({"path": 42}), &mut c);
+        assert!(out.is_error);
+        assert!(
+            out.text.contains("must be string"),
+            "type error names the kind, got: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn check_args_rejects_unknown_param() {
+        let dir = tmpdir();
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut c = ctx(&dir);
+        let out = reg.call(
+            "read",
+            &serde_json::json!({"path": "a.txt", "bogus": true}),
+            &mut c,
+        );
+        assert!(out.is_error);
+        assert!(
+            out.text.contains("Unknown parameter 'bogus'"),
+            "got: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn all_core_specs_deny_additional_properties() {
+        // B1-2 FastMCP audit: every advertised spec must be strict.
+        let reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        for spec in &reg.specs {
+            assert_eq!(
+                spec.input_schema.get("additionalProperties"),
+                Some(&serde_json::Value::Bool(false)),
+                "spec {} must set additionalProperties:false",
+                spec.name
+            );
+        }
+        assert_eq!(reg.specs.len(), TOOL_NAMES.len());
     }
 
     #[test]
@@ -576,7 +728,7 @@ mod tests {
             &mut c,
         );
         assert!(bad.is_error);
-        assert!(bad.text.contains("invalid JSON"));
+        assert!(bad.text.contains("invalid json"), "got: {}", bad.text);
         assert_eq!(
             std::fs::read_to_string(dir.join("c.json")).unwrap(),
             "{\"a\": 1}"
