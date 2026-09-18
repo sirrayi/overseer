@@ -187,6 +187,10 @@ impl Outbox {
         if text.trim().is_empty() {
             return Err("outbox: refusing to draft an empty message".into());
         }
+        // F4: empty recipients enter the approval queue otherwise.
+        if to.trim().is_empty() {
+            return Err("outbox: refusing to draft without a recipient".into());
+        }
         let draft = Draft {
             id: uuid::Uuid::now_v7().to_string(),
             created_ms: now_ms(),
@@ -376,6 +380,17 @@ mod tests {
                 .push((draft.idempotency_key.clone(), draft.text.clone()));
             Ok(())
         }
+    }
+
+    #[test]
+    fn empty_recipient_is_refused() {
+        // F4: empty `to` must refuse like empty text (no approval-queue spam).
+        let dir = tmpdir("empty-to");
+        let j = journal(&dir);
+        let outbox = Outbox::new(dir.join("outbox")).unwrap();
+        let err = outbox.draft(&j, "local", "   ", None, "hello").unwrap_err();
+        assert!(err.contains("recipient"), "got: {err}");
+        let _ = j;
     }
 
     #[test]
