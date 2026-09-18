@@ -1,0 +1,16 @@
+{
+  "id": "anagram-groups",
+  "version": 1,
+  "tags": ["script", "text"],
+  "difficulty": "easy",
+  "instruction": "words.txt holds one lowercase word per line. Write groups.py printing each anagram group with 2+ members as the members joined by '.' (members sorted alphabetically), one group per line, groups sorted by first member. Run it.",
+  "setup": "printf 'listen\\nsilent\\nenlist\\nhello\\nevil\\nvile\\nnight\\nthing\\nveil\\npython\\nworld\\n' > words.txt",
+  "grader": {
+    "type": "bash_assert",
+    "script": "python3 groups.py > got.txt && printf 'enlist.listen.silent\\nevil.veil.vile\\nnight.thing\\n' | diff - got.txt"
+  },
+  "oracle": {
+    "script": "cat > groups.py <<'EOF'\nfrom collections import defaultdict\ngroups = defaultdict(list)\nfor w in open('words.txt').read().split():\n    groups[''.join(sorted(w))].append(w)\nout = ['.'.join(sorted(g)) for g in groups.values() if len(g) > 1]\nout.sort(key=lambda s: s.split('.')[0])\nprint('\\n'.join(out))\nEOF\npython3 groups.py"
+  },
+  "limits": {"max_steps": 10, "max_cost_usd": 0.3, "wall_s": 300}
+}
