@@ -65,7 +65,10 @@ impl OpenAiCompatible {
         for m in req.messages {
             ir_message_to_wire(m, &mut messages);
         }
-
+        // P7-2 CU: the Responses-API linkage (`previous_response_id` /
+        // `pending_safety_checks`) rides inside computer tool inputs at the
+        // message layer (see ir_message_to_wire); build_body section order
+        // system/messages/tools stays frozen — no new top-level section.
         let tools: Vec<Value> = req
             .tools
             .iter()
@@ -132,6 +135,29 @@ impl OpenAiCompatible {
         }
         if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
             for c in calls {
+                // P7-2 CU: `computer_call` items (Responses API) decode to a
+                // `computer` ToolCall; `pending_safety_checks` ride in the
+                // input so the ack gate can hold the turn.
+                if c.get("type").and_then(Value::as_str) == Some("computer_call") {
+                    let inner = c.get("computer_call").cloned().unwrap_or(json!({}));
+                    let mut input = inner.get("input").cloned().unwrap_or(json!({}));
+                    if let Some(prev) = inner.get("previous_response_id") {
+                        input["previous_response_id"] = prev.clone();
+                    }
+                    if let Some(checks) = inner.get("pending_safety_checks") {
+                        input["pending_safety_checks"] = checks.clone();
+                    }
+                    blocks.push(Block::ToolCall {
+                        id: c
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        name: "computer".into(),
+                        input,
+                    });
+                    continue;
+                }
                 let args = c
                     .pointer("/function/arguments")
                     .and_then(Value::as_str)
@@ -207,8 +233,30 @@ impl OpenAiCompatible {
     }
 }
 
+/// P7-2 CU ack gate: a computer input with non-empty
+/// `pending_safety_checks` and no `safety_ack: true` must NOT dispatch —
+/// the engine holds the turn until the checks are acknowledged.
+pub fn safety_ack_complete(input: &Value) -> bool {
+    let pending = input
+        .get("pending_safety_checks")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if !pending {
+        return true;
+    }
+    input
+        .get("safety_ack")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// One IR message → one or more wire messages (tool results fan out into
 /// individual `tool` role messages — OpenAI's pairing rule).
+/// P7-2 CU (Responses API): `computer_call` items arrive as ToolCalls whose
+/// input may carry `previous_response_id`; results go back as
+/// `computer_call_output` tool messages; `pending_safety_checks` without a
+/// matching ack blocks at the gate (see `safety_ack_complete`).
 fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
     match m.role {
         Role::User => {
@@ -218,13 +266,37 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
                         tool_use_id,
                         content,
                         ..
-                    } => out.push(json!({
-                        "role": "tool",
-                        "tool_call_id": tool_use_id,
-                        "content": content,
-                    })),
+                    } => {
+                        // P7-2 CU output: computer results carry the
+                        // `computer_call_output` type marker so the
+                        // Responses-API pairing survives the chat wire.
+                        let is_cu = tool_use_id.starts_with("computer")
+                            || content.starts_with("[computer]");
+                        let mut v = json!({
+                            "role": "tool",
+                            "tool_call_id": tool_use_id,
+                            "content": content,
+                        });
+                        if is_cu {
+                            v["type"] = json!("computer_call_output");
+                        }
+                        out.push(v);
+                    }
+                    // P7-1: screenshots ride as image_url blocks; other
+                    // variants (Reasoning/ToolCall) never appear user-side.
                     Block::Text { text } => out.push(json!({
                         "role": "user", "content": text
+                    })),
+                    Block::Image {
+                        media_type,
+                        data_b64,
+                        ..
+                    } => out.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "image_url",
+                            "image_url": {"url": format!("data:{media_type};base64,{data_b64}")}
+                        }]
                     })),
                     _ => {}
                 }
@@ -241,17 +313,36 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
                         }
                         text.push_str(t);
                     }
-                    Block::ToolCall { id, name, input } => calls.push(json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": serde_json::to_string(input).unwrap_or_default(),
+                    // P7-2 CU: a `computer` ToolCall serializes as a
+                    // `computer_call` item (Responses-API type marker) with
+                    // the input passthrough (incl. previous_response_id).
+                    Block::ToolCall { id, name, input } => {
+                        if name == "computer" {
+                            calls.push(json!({
+                                "id": id,
+                                "type": "computer_call",
+                                "computer_call": {
+                                    "action": input.get("action").cloned().unwrap_or(json!(null)),
+                                    "input": input,
+                                    "previous_response_id": input.get("previous_response_id").cloned().unwrap_or(json!(null)),
+                                }
+                            }));
+                        } else {
+                            calls.push(json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": serde_json::to_string(input).unwrap_or_default(),
+                                }
+                            }));
                         }
-                    })),
+                    }
                     // Reasoning is never echoed back on this API family.
                     Block::Reasoning { .. } => {}
                     Block::ToolResult { .. } => {}
+                    // Screenshots never appear assistant-side; skip.
+                    Block::Image { .. } => {}
                 }
             }
             if text.is_empty() && calls.is_empty() {
@@ -270,6 +361,13 @@ impl Provider for OpenAiCompatible {
     fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
         let body = Self::build_body(req);
         let request_bytes = body.to_string().len() as u64;
+        // P7-2 fail-closed: a CU request without credentials never reaches
+        // the wire — honest error, never a silent skip.
+        if req.tools.iter().any(|t| t.name == "computer") && self.api_key.trim().is_empty() {
+            return Err(ProviderError::Transport(
+                "openai computer-use: no API key — refusing to send CU request".into(),
+            ));
+        }
 
         let started = Instant::now();
         let mut resp = self
@@ -433,5 +531,122 @@ mod tests {
         let body = OpenAiCompatible::build_body(&req);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "a\n\nb");
+    }
+
+    #[test]
+    fn computer_call_serializes_with_previous_response_id() {
+        // P7-2: computer ToolCall → computer_call item + previous_response_id.
+        let m = Message {
+            role: Role::Assistant,
+            content: vec![Block::ToolCall {
+                id: "cu_1".into(),
+                name: "computer".into(),
+                input: json!({"action": "click", "previous_response_id": "resp-9"}),
+            }],
+        };
+        let mut out = Vec::new();
+        ir_message_to_wire(&m, &mut out);
+        let tc = &out[0]["tool_calls"][0];
+        assert_eq!(tc["type"], "computer_call");
+        assert_eq!(tc["computer_call"]["previous_response_id"], "resp-9");
+        // Non-computer calls keep the function shape.
+        let m2 = Message {
+            role: Role::Assistant,
+            content: vec![Block::ToolCall {
+                id: "tc1".into(),
+                name: "bash".into(),
+                input: json!({"command": "ls"}),
+            }],
+        };
+        let mut out2 = Vec::new();
+        ir_message_to_wire(&m2, &mut out2);
+        assert_eq!(out2[0]["tool_calls"][0]["type"], "function");
+    }
+
+    #[test]
+    fn computer_call_output_marker_on_results() {
+        // P7-2: computer results carry the computer_call_output marker.
+        let m = Message::tool_results(vec![Block::ToolResult {
+            tool_use_id: "computer-1".into(),
+            content: "[computer] clicked".into(),
+            is_error: false,
+        }]);
+        let mut out = Vec::new();
+        ir_message_to_wire(&m, &mut out);
+        assert_eq!(out[0]["type"], "computer_call_output");
+        let plain = Message::tool_results(vec![Block::ToolResult {
+            tool_use_id: "a".into(),
+            content: "r1".into(),
+            is_error: false,
+        }]);
+        let mut out2 = Vec::new();
+        ir_message_to_wire(&plain, &mut out2);
+        assert!(out2[0].get("type").is_none());
+    }
+
+    #[test]
+    fn unacked_safety_check_blocks_ack_gate() {
+        // P7-2 ack gate: pending checks without safety_ack → blocked.
+        assert!(!safety_ack_complete(
+            &json!({"action": "click", "pending_safety_checks": [{"id": "s1"}]})
+        ));
+        assert!(safety_ack_complete(
+            &json!({"action": "click", "pending_safety_checks": [{"id": "s1"}], "safety_ack": true})
+        ));
+        assert!(safety_ack_complete(&json!({"action": "click"})));
+        assert!(safety_ack_complete(
+            &json!({"action": "click", "pending_safety_checks": []})
+        ));
+    }
+
+    #[test]
+    fn computer_call_parses_with_safety_checks() {
+        // P7-2: wire computer_call → computer ToolCall with checks in input.
+        let body = json!({
+            "choices": [{"message": {
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": "cu_2", "type": "computer_call",
+                    "computer_call": {
+                        "action": "type",
+                        "input": {"action": "type", "text": "hi"},
+                        "previous_response_id": "resp-3",
+                        "pending_safety_checks": [{"id": "s9"}]
+                    }}]
+            }, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5}
+        });
+        let r = OpenAiCompatible::parse_response(&body, 10, 5).unwrap();
+        assert!(matches!(
+            &r.blocks[0],
+            Block::ToolCall { name, input, .. }
+            if name == "computer"
+                && input["previous_response_id"] == "resp-3"
+                && !safety_ack_complete(input)
+        ));
+    }
+
+    #[test]
+    fn unconfigured_cu_request_errors_honestly() {
+        // P7-2 fail-closed: empty key + computer tool → Transport, no wire.
+        let p = OpenAiCompatible::new("", "http://127.0.0.1:9/v1");
+        let tools = vec![ToolSpec {
+            name: "computer".into(),
+            description: "cu".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let msgs = vec![Message::user_text("hi")];
+        let system: Vec<SystemSegment> = vec![];
+        let req = Request {
+            model: "m",
+            system: &system,
+            tools: &tools,
+            messages: &msgs,
+            max_tokens: 10,
+            thinking_budget: None,
+            effort: None,
+            cache_breakpoints: false,
+        };
+        let err = p.complete(&req).unwrap_err();
+        assert!(matches!(err, ProviderError::Transport(_)));
     }
 }

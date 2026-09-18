@@ -16,7 +16,13 @@
 //! daemon itself never executes agent work. Every open line between user
 //! and agent is a durable inbox item: approve / reject / snooze writes a
 //! receipt to the append-only journal.
+//!
+//! Messaging channels (P7-4) feed the same pipeline: verified inbound
+//! messages arrive as `untrusted_source` events, which the daemon refuses
+//! to act on (Notify-or-Draft only) and whose spawns carry the
+//! `external=approve` autonomy floor.
 
+pub mod channels;
 pub mod config;
 pub mod ctl;
 pub mod daemon;
@@ -25,6 +31,7 @@ pub mod gate;
 pub mod inbox;
 pub mod journal;
 pub mod notify;
+pub mod outbox;
 pub mod spawn;
 pub mod triage;
 pub mod trigger;

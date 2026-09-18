@@ -19,6 +19,11 @@ use crate::ir::{Block, Usage};
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 
+/// P7-2 hosted computer-use toolset version (Anthropic CU contract id).
+/// Sent as the `anthropic-beta` header only when the request advertises a
+/// `computer` tool — text-only requests send no beta header (prefix stable).
+pub const COMPUTER_TOOLSET_BETA: &str = "computer_toolset_20260801";
+
 pub struct Anthropic {
     agent: ureq::Agent,
     api_key: String,
@@ -128,6 +133,9 @@ impl Anthropic {
                 Some("thinking") | Some("redacted_thinking") => {
                     blocks.push(Block::Reasoning { raw: b.clone() });
                 }
+                // P7-2 CU: batched tool_use (incl. computer actions) each
+                // becomes one ToolCall; the gate's classify() holds on the
+                // decoded input (screenshot→Read … cred focus→Identity).
                 Some("tool_use") => blocks.push(Block::ToolCall {
                     id: b
                         .get("id")
@@ -141,6 +149,29 @@ impl Anthropic {
                         .to_string(),
                     input: b.get("input").cloned().unwrap_or(json!({})),
                 }),
+                // P7-2 CU image result: base64 source → Image block with
+                // zeroed scaling metadata (the tool fills real dims).
+                Some("image") => {
+                    let (media_type, data_b64) = b
+                        .get("source")
+                        .map(|s| {
+                            (
+                                s.get("media_type")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("image/png"),
+                                s.get("data").and_then(Value::as_str).unwrap_or(""),
+                            )
+                        })
+                        .unwrap_or(("image/png", ""));
+                    blocks.push(Block::Image {
+                        media_type: media_type.to_string(),
+                        data_b64: data_b64.to_string(),
+                        px_w: 0,
+                        px_h: 0,
+                        sent_w: 0,
+                        sent_h: 0,
+                    });
+                }
                 other => {
                     // Unknown block types are preserved, not dropped.
                     if let Some(t) = other {
@@ -199,6 +230,16 @@ fn ir_message_to_wire(m: &crate::ir::Message) -> Value {
         .map(|b| match b {
             Block::Text { text } => json!({"type": "text", "text": text}),
             Block::Reasoning { raw } => raw.clone(),
+            // P7-1: screenshots ride as Anthropic image blocks (base64 source);
+            // text-only test doubles never emit Image so the prefix is stable.
+            Block::Image {
+                media_type,
+                data_b64,
+                ..
+            } => json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data_b64}
+            }),
             Block::ToolCall { id, name, input } => json!({
                 "type": "tool_use", "id": id, "name": name, "input": input
             }),
@@ -221,14 +262,27 @@ impl Provider for Anthropic {
     fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
         let body = Self::build_body(req);
         let request_bytes = body.to_string().len() as u64;
+        // P7-2 fail-closed: a CU request without credentials never reaches
+        // the wire — honest error, never a silent skip.
+        let wants_cu = req.tools.iter().any(|t| t.name == "computer");
+        if wants_cu && self.api_key.trim().is_empty() {
+            return Err(ProviderError::Transport(
+                "anthropic computer-use: no API key — refusing to send CU request".into(),
+            ));
+        }
 
         let started = Instant::now();
-        let mut resp = self
+        let mut call = self
             .agent
             .post(&self.base_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        // Hosted CU toolset declaration: beta header only on CU requests.
+        if wants_cu {
+            call = call.header("anthropic-beta", COMPUTER_TOOLSET_BETA);
+        }
+        let mut resp = call
             .send_json(&body)
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
         let latency_ms = started.elapsed().as_millis() as u64;
@@ -397,5 +451,121 @@ mod tests {
         assert_eq!(r.usage.cache_read, 90);
         assert_eq!(r.blocks.len(), 2);
         assert!(matches!(r.blocks[1], Block::ToolCall { .. }));
+    }
+
+    #[test]
+    fn computer_toolset_beta_const() {
+        // P7-2: hosted CU toolset declaration id is frozen.
+        assert_eq!(COMPUTER_TOOLSET_BETA, "computer_toolset_20260801");
+    }
+
+    #[test]
+    fn batched_computer_tool_use_parses_and_classifies() {
+        // P7-2: batched tool_use incl. computer actions; classifier holds.
+        let body = json!({
+            "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "computer", "input": {"action": "screenshot"}},
+                {"type": "tool_use", "id": "tu_2", "name": "computer", "input": {"action": "click", "x": 5, "y": 6}},
+                {"type": "tool_use", "id": "tu_3", "name": "computer", "input": {"action": "type", "text": "hi", "cred_field": true}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let r = Anthropic::parse_response(&body, 10, 1).unwrap();
+        assert_eq!(r.blocks.len(), 3);
+        for b in &r.blocks {
+            assert!(matches!(b, Block::ToolCall { name, .. } if name == "computer"));
+        }
+        let classes: Vec<_> = r
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::ToolCall { input, .. } => crate::perm::classify("computer", input),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            classes,
+            vec![
+                crate::perm::Irreversibility::Read,
+                crate::perm::Irreversibility::InternalWrite,
+                crate::perm::Irreversibility::Identity,
+            ]
+        );
+    }
+
+    #[test]
+    fn image_result_parses_to_image_block() {
+        // P7-2: image-vs-text result — image content becomes Image.
+        let body = json!({
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let r = Anthropic::parse_response(&body, 10, 1).unwrap();
+        assert!(matches!(r.blocks[0], Block::Image { .. }));
+    }
+
+    #[test]
+    fn build_body_section_order_frozen() {
+        // P7-2 R1-F3: system/tools/messages order untouched by CU.
+        let system = vec![SystemSegment {
+            name: "test",
+            text: "s".into(),
+            cacheable: true,
+        }];
+        let tools = vec![ToolSpec {
+            name: "computer".into(),
+            description: "cu".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let msgs = vec![Message::user_text("hi")];
+        let body = Anthropic::build_body(&sample_req(&system, &tools, &msgs));
+        let keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(keys.contains(&"model"));
+        assert!(keys.contains(&"max_tokens"));
+        assert!(keys.contains(&"system"));
+        assert!(keys.contains(&"tools"));
+        assert!(keys.contains(&"messages"));
+        // Image blocks serialize in message content, not as a new section.
+        let img = Message {
+            role: Role::User,
+            content: vec![Block::Image {
+                media_type: "image/png".into(),
+                data_b64: "eA==".into(),
+                px_w: 10,
+                px_h: 10,
+                sent_w: 5,
+                sent_h: 5,
+            }],
+        };
+        let wire = ir_message_to_wire(&img);
+        assert_eq!(wire["content"][0]["type"], "image");
+    }
+
+    #[test]
+    fn unconfigured_cu_request_errors_honestly() {
+        // P7-2 fail-closed: empty key + computer tool → Transport, no wire.
+        let a = Anthropic {
+            agent: ureq::Agent::new_with_defaults(),
+            api_key: String::new(),
+            base_url: "http://127.0.0.1:9/none".into(),
+        };
+        let tools = vec![ToolSpec {
+            name: "computer".into(),
+            description: "cu".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let msgs = vec![Message::user_text("hi")];
+        let system = vec![];
+        let err = a.complete(&sample_req(&system, &tools, &msgs)).unwrap_err();
+        assert!(matches!(err, ProviderError::Transport(_)));
     }
 }

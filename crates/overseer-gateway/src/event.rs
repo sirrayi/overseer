@@ -21,6 +21,29 @@ pub struct TriggerEvent {
     /// Free-form payload (diff summary, webhook body, heartbeat note).
     pub payload: String,
     pub fired_at_ms: u64,
+    /// P7-4: the content came from an untrusted source (a channel user, not
+    /// the operator). Serde-defaulted so pre-existing events and configs
+    /// round-trip unchanged; the daemon refuses to act on such an event.
+    #[serde(default)]
+    pub untrusted_source: bool,
+    /// P7-4: channel envelope for thread routing. `None` for every local
+    /// trigger — additive, so old records still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ChannelOrigin>,
+}
+
+/// Who sent an inbound channel message, and where it belongs. A channel
+/// identity is a claim, not a verification — it is audit metadata and a
+/// routing key, never an authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelOrigin {
+    pub channel: String,
+    pub sender: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    /// Keyword intent (`chat`/`steer`/`queue`/`approve_only`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
 }
 
 impl TriggerEvent {
@@ -29,13 +52,29 @@ impl TriggerEvent {
         class: impl Into<String>,
         payload: impl Into<String>,
     ) -> Self {
-        Self {
+        TriggerEvent {
             id: uuid::Uuid::now_v7().to_string(),
             source: source.into(),
             class: class.into(),
             payload: payload.into(),
             fired_at_ms: now_ms(),
+            untrusted_source: false,
+            origin: None,
         }
+    }
+
+    /// An inbound channel message: `source = <channel>:<sender>`,
+    /// `class = msg.inbound`, always untrusted (P7-4).
+    pub fn from_channel(channel: &str, sender: &str, thread: Option<&str>, text: &str) -> Self {
+        let mut ev = TriggerEvent::new(format!("{channel}:{sender}"), "msg.inbound", text);
+        ev.untrusted_source = true;
+        ev.origin = Some(ChannelOrigin {
+            channel: channel.to_string(),
+            sender: sender.to_string(),
+            thread: thread.map(str::to_string),
+            intent: None,
+        });
+        ev
     }
 
     /// Dedup identity: same source+class+payload within the window is a

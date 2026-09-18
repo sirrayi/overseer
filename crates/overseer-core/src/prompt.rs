@@ -34,6 +34,14 @@ const SAFETY: &str = "\
 Never claim a file was edited, created, or verified unless a tool call \
 actually did it. If a tool errors, read the error before retrying differently.";
 
+/// Computer use (P7-3). Static — backend state is deliberately absent
+/// (it would be a cache killer); the tool reports an unconfigured backend
+/// itself when it is called.
+const COMPUTER: &str = "\
+Computer use is tiered: a structured API first, then element lookups by name/role, then pixel acts.\n\
+Captures report the sent and native frame sizes — give coordinates in the frame you were shown; they are scaled for you.\n\
+A suppressed capture returns metadata only, and credential fields are never typed into.";
+
 /// Assemble the ordered system segments for a request. Section order is the
 /// wire order — reordering a cacheable section is a cache-breaking change
 /// and must be deliberate.
@@ -82,6 +90,12 @@ pub fn assemble(config: &AgentConfig) -> Vec<SystemSegment> {
             cacheable: true,
         });
     }
+    // Computer use (P7-3): advertised only while the `computer` tool is
+    // resident — an ablated arm must not describe a tool the model cannot
+    // call (P4.3 confound). Last static slot, after `skills`.
+    if !config.disabled_tools.iter().any(|t| t == "computer") {
+        segments.push(seg("computer", COMPUTER));
+    }
     // --- DYNAMIC boundary: non-cacheable per-turn sections go below. ---
     segments
 }
@@ -94,14 +108,15 @@ fn seg(name: &'static str, text: &str) -> SystemSegment {
     }
 }
 
-/// Frozen section order (B1-10, vLLM/SGLang prefix discipline): the
-/// static sections assemble identity→contract→safety→memory→skills→
-/// persona→computer. Absent optionals (memory/skills/persona/computer)
-/// are skipped; order among the present must be preserved. Reordering a
-/// cacheable section breaks prefix-cache hits and must be deliberate.
-/// P6 adds only the persona segment; P7 adds only computer — the ORDER
-/// line is the union value on both branches (merge-safe).
-///
+/// Frozen static section order — the P6/P7 union (R1-F2): the static
+/// sections assemble identity→contract→safety→memory→skills with each
+/// branch adding only its own segment (`persona` on P6, `computer` on
+/// P7). Absent optionals are skipped; order among the present must be
+/// preserved. Reordering a cacheable section breaks prefix-cache hits and
+/// must be deliberate.
+pub const ORDER: &[&str] = &[
+    "identity", "contract", "safety", "memory", "skills", "persona", "computer",
+];
 /// Boundary lint used by tests and future assemblers: every cacheable
 /// segment must precede every non-cacheable one.
 pub fn boundary_ok(segments: &[SystemSegment]) -> bool {
@@ -114,10 +129,7 @@ pub fn boundary_ok(segments: &[SystemSegment]) -> bool {
             return false;
         }
     }
-    // Frozen static order (union value — identical on P6/P7).
-    const ORDER: &[&str] = &[
-        "identity", "contract", "safety", "memory", "skills", "persona", "computer",
-    ];
+    // Frozen static order.
     let mut last_rank: Option<usize> = None;
     for s in segments {
         if !s.cacheable {
@@ -210,19 +222,23 @@ mod tests {
         cfg.memory_dir = Some(dir);
         let segs = assemble(&cfg);
         assert!(boundary_ok(&segs));
-        // Names ⊆ ORDER (union value, identical on P6/P7) + boundary holds.
-        const ORDER: &[&str] = &[
-            "identity", "contract", "safety", "memory", "skills", "persona", "computer",
-        ];
-        for s in segs.iter().filter(|s| s.cacheable) {
-            assert!(
-                ORDER.contains(&s.name),
-                "segment `{}` not in frozen ORDER",
-                s.name
-            );
+        // Union-safe shape check (replaces the branch-local `segs.len()==4`
+        // pin): the memory index is present, every static section is named
+        // in the frozen union ORDER, and the boundary holds. P6 adds
+        // `persona`, P7 adds `computer` — neither branch may pin a count.
+        assert!(segs.iter().any(|s| s.name == "memory"));
+        assert!(segs.iter().any(|s| s.name == "computer"));
+        for s in &segs {
+            if s.cacheable {
+                assert!(
+                    ORDER.contains(&s.name),
+                    "static section '{}' not in ORDER",
+                    s.name
+                );
+            }
         }
         // Nothing volatile may live above the boundary.
-        for s in &segs[..3] {
+        for s in segs.iter().filter(|s| s.cacheable) {
             for needle in ["ts_ms", "timestamp", "session_id", "uuid"] {
                 assert!(
                     !s.text.contains(needle),
@@ -266,10 +282,21 @@ mod tests {
         assert!(p.cacheable, "persona is a static section");
         assert!(!p.text.contains("DRAFT_ONLY_INSIGHT"), "{}", p.text);
         assert_eq!(p.text.lines().count(), 1);
-        // Slot: after skills, before the dynamic boundary.
+        // Slot in ORDER-rank form (P8-A): persona ranks below computer and
+        // every present cacheable section is an ORDER member — no positional
+        // pin, so the computer arm can coexist in the union.
         let names: Vec<&str> = segs.iter().map(|s| s.name).collect();
-        let pos = names.iter().position(|n| *n == "persona").unwrap();
-        assert!(pos + 1 == names.len(), "{names:?}");
+        for s in segs.iter().filter(|s| s.cacheable) {
+            assert!(
+                ORDER.contains(&s.name),
+                "segment `{}` not in frozen ORDER",
+                s.name
+            );
+        }
+        let persona_rank = ORDER.iter().position(|n| *n == "persona").unwrap();
+        let computer_rank = ORDER.iter().position(|n| *n == "computer").unwrap();
+        assert!(persona_rank < computer_rank, "{names:?}");
+        assert!(boundary_ok(&segs), "{names:?}");
 
         // Approved → the real content renders, still boundary-clean.
         crate::onboard::approve(&persona).unwrap();
