@@ -258,7 +258,7 @@ fn is_bare_host(s: &str) -> bool {
         && host
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        && port.map_or(true, is_port)
+        && port.is_none_or(is_port)
 }
 
 /// A port: digits only, at least one.

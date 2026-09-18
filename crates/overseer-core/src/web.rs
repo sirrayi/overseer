@@ -122,10 +122,10 @@ pub fn searxng_url(base: &str, req: &SearchRequest) -> Result<String, String> {
     let base = base.trim();
     let is_https = base
         .get(..8)
-        .map_or(false, |s| s.eq_ignore_ascii_case("https://"));
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
     let is_http = base
         .get(..7)
-        .map_or(false, |s| s.eq_ignore_ascii_case("http://"));
+        .is_some_and(|s| s.eq_ignore_ascii_case("http://"));
     if !is_https && !is_http {
         return Err(format!(
             "base `{base}` is not an http(s) URL — pass the instance root, e.g. https://searx.example"
@@ -142,7 +142,7 @@ pub fn searxng_url(base: &str, req: &SearchRequest) -> Result<String, String> {
         ));
     }
     let rest = if is_https { &base[8..] } else { &base[7..] };
-    let host = rest.split(|c| c == '/' || c == '?').next().unwrap_or("");
+    let host = rest.split(['/', '?']).next().unwrap_or("");
     if host.is_empty() {
         return Err(format!(
             "base `{base}` has no host — pass the instance root, e.g. https://searx.example"
@@ -558,7 +558,7 @@ fn accept(kind: FieldKind, raw: &str) -> Option<String> {
         }
         FieldKind::List => {
             let items: Vec<&str> = v
-                .split(|c| c == ',' || c == ';')
+                .split([',', ';'])
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
@@ -601,7 +601,7 @@ fn strip_markers(line: &str) -> &str {
     let mut s = line.trim_start();
     loop {
         let before = s.len();
-        s = s.trim_start_matches(|c| c == '#' || c == '>' || c == '•');
+        s = s.trim_start_matches(['#', '>', '•']);
         s = s.trim_start();
         if let Some(rest) = s
             .strip_prefix('-')
@@ -648,12 +648,11 @@ fn split_dash(line: &str) -> Option<(&str, &str)> {
     for (i, c) in line.char_indices() {
         match c {
             '—' | '–' => return Some((&line[..i], &line[i + c.len_utf8()..])),
-            '-' if i > 0 => {
-                if line[..i].ends_with(char::is_whitespace)
-                    && line[i + 1..].starts_with(char::is_whitespace)
-                {
-                    return Some((&line[..i], &line[i + 1..]));
-                }
+            '-' if i > 0
+                && line[..i].ends_with(char::is_whitespace)
+                && line[i + 1..].starts_with(char::is_whitespace) =>
+            {
+                return Some((&line[..i], &line[i + 1..]));
             }
             _ => {}
         }
@@ -687,7 +686,7 @@ fn clean_value(raw: &str) -> String {
 
 /// Strip emphasis wrapping from a label before comparing it to a field name.
 fn clean_label(raw: &str) -> String {
-    raw.trim().trim_matches(|c| is_wrap(c)).trim().to_string()
+    raw.trim().trim_matches(is_wrap).trim().to_string()
 }
 
 /// Case-insensitive equality without allocating, trimming both sides first.
