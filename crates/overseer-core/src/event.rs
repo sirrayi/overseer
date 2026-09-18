@@ -142,6 +142,17 @@ pub enum EventKind {
     Error {
         message: String,
     },
+    /// The engine switched the run's model mid-session (P8-B crush
+    /// `set_model` port): `from`/`to` model ids plus the to-model's list
+    /// prices, so the audit trail shows what a switch costs without a
+    /// profile lookup at read time. Audit-only — never rehydrates into
+    /// messages (the request itself carries the new model).
+    ModelSwitch {
+        from: String,
+        to: String,
+        price_in: f64,
+        price_out: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -29,6 +29,15 @@ const CONTRACT_TASK: &str = "\
 \nDelegate read-heavy subtasks to the `task` subagent — it investigates in an \
 isolated context and returns a compact digest.";
 
+/// Appended to CONTRACT for models whose profile edit dialect is
+/// whole-file (P8-B aider edit-format port): such a model should rewrite
+/// files with `write` rather than emit an anchor `edit` it will miss.
+/// Session-stable (the model is fixed for a session) and absent for every
+/// other dialect, so the static prefix is unchanged for those models.
+const CONTRACT_WHOLE_FILE: &str = "\
+\nFor file changes, rewrite the whole file with `write` — this model's edit \
+dialect is whole-file.";
+
 /// Non-negotiable behavior constraints. Fixed across all sessions.
 const SAFETY: &str = "\
 Never claim a file was edited, created, or verified unless a tool call \
@@ -51,6 +60,15 @@ pub fn assemble(config: &AgentConfig) -> Vec<SystemSegment> {
     } else {
         format!("{CONTRACT}{CONTRACT_TASK}")
     };
+    // P8-B: a whole-file edit dialect is advertised as such — the model is
+    // told which tool to reach for instead of being left to emit an anchor
+    // that will miss. Absent for every other dialect (byte-stable prefix).
+    let contract =
+        if crate::profile::edit_format(&config.model) == crate::profile::EditFormat::WholeFile {
+            format!("{contract}{CONTRACT_WHOLE_FILE}")
+        } else {
+            contract
+        };
     let mut segments = vec![
         seg("identity", IDENTITY),
         seg("contract", &contract),
@@ -177,6 +195,33 @@ mod tests {
         let ta: Vec<&str> = a.iter().map(|s| s.text.as_str()).collect();
         let tb: Vec<&str> = b.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(ta, tb);
+    }
+
+    #[test]
+    fn whole_file_edit_dialect_is_advertised_in_contract() {
+        // P8-B: the contract names the file-writing tool for a whole-file
+        // model; every other dialect's contract is byte-identical to the
+        // pre-B2 text (the static prefix stays cache-stable).
+        let default = assemble(&AgentConfig::default());
+        assert!(
+            !default[1].text.contains("whole-file"),
+            "anchored models keep the plain contract"
+        );
+        let wf = assemble(&AgentConfig {
+            model: "fleet-q27".into(),
+            ..Default::default()
+        });
+        assert!(wf[1].text.contains("whole-file"), "{}", wf[1].text);
+        assert!(wf[1].text.contains("`write`"));
+        assert!(boundary_ok(&wf), "the extra line stays inside one segment");
+        // Ablating `task` still takes the task line out, dialect or not.
+        let wf_ablated = assemble(&AgentConfig {
+            model: "fleet-q27".into(),
+            disabled_tools: vec!["task".into()],
+            ..Default::default()
+        });
+        assert!(!wf_ablated[1].text.contains("task` subagent"));
+        assert!(wf_ablated[1].text.contains("whole-file"));
     }
 
     #[test]
