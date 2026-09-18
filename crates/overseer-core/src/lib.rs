@@ -5,6 +5,7 @@
 //! with engine-enforced budgets. Frontends attach via overseer-proto.
 
 pub mod agent;
+pub mod cache;
 pub mod compact;
 pub mod computer_obs;
 pub mod control;
