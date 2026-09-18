@@ -325,11 +325,55 @@ fn digest_short(text: &str) -> String {
     format!("sha256:{}", &hex[..16])
 }
 
+/// Owner-only file write (0600 unix, best-effort elsewhere) for capture
+/// artifacts — screen pixels routinely contain secrets.
+fn write_owner_only(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(content.as_bytes())
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content)
+    }
+}
+
 /// One JSON request in, one JSON response out.
 fn call_helper(helper: &Path, request: &Value) -> Result<Value, String> {
     use std::io::Write;
 
+    // F1 (extreme): no-creds invariant — helpers inherit the allowlisted
+    // env only (mirrors bash.rs). The full process env carries brokered
+    // secrets and webhook tokens; ComputerConfig::env_allowed was dead code.
     let mut child = Command::new(helper)
+        .env_clear()
+        .envs(std::env::vars().filter(|(k, _)| {
+            matches!(
+                k.as_str(),
+                "PATH"
+                    | "HOME"
+                    | "USER"
+                    | "SHELL"
+                    | "TERM"
+                    | "LANG"
+                    | "LC_ALL"
+                    | "TMPDIR"
+                    | "OVERSEER_COMPUTER_PIXEL"
+                    | "OVERSEER_COMPUTER_A11Y"
+                    | "OVERSEER_COMPUTER_API"
+                    | "CI"
+            ) || k.starts_with("LC_")
+        }))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -476,6 +520,13 @@ fn run_capture(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Valu
     let dir = ctx.session_dir.join(CAPTURE_DIR);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("computer: cannot create {}: {e}", dir.display()))?;
+    // Red-team capture fix: screen pixels routinely contain secrets — the
+    // dir is owner-only (0700) like spill dirs (unix; best-effort elsewhere).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     let seq = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
     let file = dir.join(format!("capture-{seq}.json"));
     let capture = json!({
@@ -486,7 +537,7 @@ fn run_capture(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Valu
         "sent_w": sent_w,
         "sent_h": sent_h,
     });
-    std::fs::write(&file, capture.to_string())
+    write_owner_only(&file, &capture.to_string())
         .map_err(|e| format!("computer: cannot write {}: {e}", file.display()))?;
     Ok(json!({
         "ok": true,
@@ -670,6 +721,18 @@ fn validate(input: &Value) -> Result<String, String> {
             return Err("'scroll' needs 'dy'".into());
         }
         _ => {}
+    }
+    // F3: coordinate type check — presence is not enough. A string/bool/null
+    // x/y/dy would otherwise scale to Null and dispatch a coordinate-less act.
+    for key in ["x", "y", "dy"] {
+        if let Some(v) = input.get(key) {
+            let ok = v.as_f64().is_some_and(|f| f.is_finite());
+            if !ok {
+                return Err(format!(
+                    "'{action}' coordinate '{key}' must be a finite number"
+                ));
+            }
+        }
     }
     Ok(action)
 }
@@ -1172,5 +1235,45 @@ mod tests {
         assert!(crate::prompt::assemble(&cfg)
             .iter()
             .all(|s| s.name != "computer"));
+    }
+
+    #[test]
+    fn string_coordinates_are_refused() {
+        // F3: presence-only validation dispatched coordinate-less acts.
+        let dir = std::env::temp_dir().join(format!("overseer-cu-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = ctx(&dir);
+        let backends = Backends::default();
+        let err = run_with(
+            &serde_json::json!({"action": "click", "x": "abc", "y": "def"}),
+            &mut ctx,
+            &backends,
+        )
+        .expect_err("string coords must refuse");
+        assert!(err.contains("finite number"), "got: {err}");
+    }
+
+    #[test]
+    fn helper_env_carries_no_secrets() {
+        // F1: helpers inherit the allowlisted env only (mirrors bash.rs).
+        // Spawns a real dump-env helper and asserts the secret is absent.
+        // NOTE: call_helper speaks JSON-RPC (writes request, parses JSON
+        // reply) so the helper must print a JSON object, not raw env.
+        std::env::set_var("OVERSEER_STRESS_SECRET_KEY", "leak-value-123");
+        let helper = std::env::temp_dir().join(format!("dump-env-{}", uuid::Uuid::now_v7()));
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nread _line\nif env | grep -q OVERSEER_STRESS_SECRET_KEY; then echo '{\"ok\":false}'; else echo '{\"ok\":true}'; fi\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755));
+        }
+        let out = call_helper(&helper, &serde_json::json!({"probe": 1})).expect("helper runs");
+        std::env::remove_var("OVERSEER_STRESS_SECRET_KEY");
+        assert_eq!(out["ok"], true, "child env must not carry secrets: {out}");
+        let _ = std::fs::remove_file(&helper);
     }
 }
