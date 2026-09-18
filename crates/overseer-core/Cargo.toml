@@ -15,3 +15,8 @@ ignore = "0.4"
 globset = "0.4"
 regex-lite = "0.1"
 sha2 = "0.10"
+
+[features]
+default = []
+# Zero-dependency opt-in: compiles the tree-sitter grammar/query registry.
+tree-sitter = []
