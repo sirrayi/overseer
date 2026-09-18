@@ -195,7 +195,7 @@ fn digits(b: &[u8], at: usize, n: usize) -> Option<u32> {
 }
 
 fn is_leap(year: u32) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }
 
 /// Days in a calendar month; `0` for a month outside `1..=12`, which makes

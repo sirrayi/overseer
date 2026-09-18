@@ -619,9 +619,7 @@ fn normalize_abs(path: &str) -> Option<Vec<&str>> {
         match part {
             "" | "." => {}
             ".." => {
-                if out.pop().is_none() {
-                    return None;
-                }
+                out.pop()?;
             }
             p => out.push(p),
         }
