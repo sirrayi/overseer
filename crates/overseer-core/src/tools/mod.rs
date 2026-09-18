@@ -49,6 +49,9 @@ pub struct ToolCtx<'a> {
     pub checkpoint: Option<&'a mut Checkpoint>,
     /// P1.5: wrap bash calls in the platform sandbox when one exists.
     pub sandbox: bool,
+    /// P6-3 credential broker: bash injects declared secrets from it;
+    /// `call()` sanitizes every ToolResult through it. None = no creds.
+    pub broker: Option<crate::cred::Broker>,
 }
 
 /// A per-user-prompt checkpoint (P1.9): `dir` holds file snapshots +
@@ -325,9 +328,46 @@ impl ToolRegistry {
                 "Tool '{name}' is disabled for this run (--no-tools)."
             ));
         }
+        // RT-4: a bash command mentioning a brokered selector can exfil
+        // the secret (echo $TOKEN > /tmp/x) — latch sensitive BEFORE the
+        // gate so the triangle arms for this and follow-up side effects.
+        // (The child still gets the real; the gate now Asks on the exfil.)
+        if name == "bash" {
+            if let (Some(cmd), Some(br)) = (
+                input.get("command").and_then(|v| v.as_str()),
+                ctx.broker.as_ref(),
+            ) {
+                if br.mentions_selector(cmd) {
+                    if let Some(notice) = self.policy.mark_sensitive("broker") {
+                        self.taint_notices.push(notice);
+                    }
+                }
+            }
+        }
         match self.policy.gate(name, input) {
             crate::perm::Gate::Allow => {}
-            crate::perm::Gate::Deny(reason) => return ToolOutput::denied(reason),
+            crate::perm::Gate::Deny(reason) => {
+                // F2: memory-gate quarantine — a denied memory write still
+                // preserves its payload under memory/proposals/ for human
+                // review (Ask headless-denies; the content must not drop).
+                // Only fires when the reason names a quarantine redirect.
+                if (name == "write" || name == "edit") && reason.contains("quarantined to ") {
+                    if let Some(dest) = self.policy.proposal_path() {
+                        let payload = input
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| input.get("new_string").and_then(|v| v.as_str()))
+                            .unwrap_or("");
+                        if !payload.is_empty() {
+                            if let Some(parent) = dest.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = std::fs::write(&dest, payload);
+                        }
+                    }
+                }
+                return ToolOutput::denied(reason);
+            }
         }
         // B1-2 (Instructor/FastMCP): hand-rolled required/type check against
         // the advertised `input_schema` before dispatch. Zero-dep (serde_json
@@ -355,10 +395,22 @@ impl ToolRegistry {
             )),
         };
         // Rule-of-Two bookkeeping (P3.10): this result may carry untrusted
-        // content or secret material — latch before the next call is gated.
+        // content or secret material — latch on the RAW text before any
+        // redaction (latch-order fix: sanitize must not blind the gate).
         if let Some(notice) = self.policy.note_result(name, input, &out.text) {
             self.taint_notices.push(notice);
         }
+        // P6-3 broker sanitize: verbatim real→sentinel over the result
+        // text AFTER note_result and BEFORE enforce_budget. This single
+        // string flows into BOTH the model context and the ToolResult
+        // event append, so events.jsonl is covered by construction.
+        let out = match &ctx.broker {
+            Some(br) if !br.is_empty() => ToolOutput {
+                text: crate::cred::sanitize(br, &out.text),
+                ..out
+            },
+            _ => out,
+        };
         enforce_budget(out, ctx)
     }
 }
@@ -379,14 +431,33 @@ pub fn enforce_budget(out: ToolOutput, ctx: &mut ToolCtx) -> ToolOutput {
     if out.text.len() <= INLINE_CAP {
         return out;
     }
+    // P6-3 scan: curated secret families redact BEFORE the spill write —
+    // the spilled file, the preview, and the metadata log never hold
+    // plaintext. Span-only redact + notice (no secret content copied).
+    let (scan_text, scan_notice) = crate::cred::redact(&out.text);
+    let out = ToolOutput {
+        text: scan_text,
+        ..out
+    };
+    if !scan_notice.is_empty() {
+        crate::cred::note_redaction(&scan_notice);
+    }
     let dir = ctx.session_dir.join("tool-outputs");
     let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        // Spill dirs 0700 (R1-F4/F7): tool output may carry secrets.
+        // DirBuilder.mode is a no-op when the dir already exists, so set
+        // permissions explicitly after creation.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     ctx.spill_seq += 1;
     let path = dir.join(format!("output-{}.txt", ctx.spill_seq));
     let raw = out.text.clone();
     let preview: String = raw.chars().take(4_000).collect();
     let size = raw.len();
-    match std::fs::write(&path, &raw) {
+    match spill_write(&path, &raw) {
         Ok(()) => ToolOutput {
             text: format!(
                 "Output too large ({size} bytes) — written to {}.\n\
@@ -414,6 +485,29 @@ pub fn enforce_budget(out: ToolOutput, ctx: &mut ToolCtx) -> ToolOutput {
                 denied: out.denied,
             }
         }
+    }
+}
+
+/// Spill write with 0600 file perms on unix (R1-F4): tool output may
+/// carry secrets; non-unix is best-effort (no mode API).
+fn spill_write(path: &std::path::Path, raw: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(raw.as_bytes())
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, raw)
     }
 }
 
@@ -562,6 +656,102 @@ mod tests {
             subagent_seq: 0,
             checkpoint: None,
             sandbox: false,
+            broker: None,
+        }
+    }
+
+    #[test]
+    fn memory_gate_quarantine_preserves_payload() {
+        // F2: headless Ask→Deny on a memory write still lands the payload
+        // under memory/proposals/ for human review (nothing dropped).
+        use serde_json::json;
+        let dir = tmpdir();
+        let mem = dir.join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let mut pol = crate::perm::Policy::headless(dir.clone());
+        pol.memory_dir = Some(mem.clone());
+        pol.note_result("task", &json!({}), "some task digest");
+        pol.note_result("read", &json!({"path": ".env"}), "export KEY=1");
+        assert!(pol.taint_armed());
+        let mut reg = ToolRegistry::core(pol);
+        let mut c = ctx(&dir);
+        let out = reg.call(
+            "write",
+            &json!({"path": "memory/episodic/diary.md", "content": "UNTRUSTED-NOTE-42"}),
+            &mut c,
+        );
+        assert!(
+            out.denied,
+            "memory write must deny headless, got: {}",
+            out.text
+        );
+        let props = mem.join("proposals");
+        let found: Vec<_> = std::fs::read_dir(&props)
+            .expect("proposals dir must exist")
+            .flatten()
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one quarantined payload");
+        let body = std::fs::read_to_string(found[0].path()).unwrap();
+        assert!(
+            body.contains("UNTRUSTED-NOTE-42"),
+            "payload preserved, got: {body}"
+        );
+    }
+
+    #[test]
+    fn bash_mentioning_brokered_selector_latches_sensitive() {
+        // RT-4: `echo $TOKEN > /tmp/x` must arm the triangle's sensitive half.
+        let dir = tmpdir();
+        let mut br = crate::cred::Broker::new();
+        br.issue_capability("a", "API_TOKEN", "real-secret-1", vec![], vec![], None);
+        let pol = crate::perm::Policy::headless(dir.clone());
+        let mut reg = ToolRegistry::core(pol);
+        let mut c = ctx(&dir);
+        c.broker = Some(br);
+        let _ = reg.call(
+            "bash",
+            &serde_json::json!({"command": "echo $API_TOKEN > /tmp/rt4-x"}),
+            &mut c,
+        );
+        assert!(
+            reg.policy().taint_sensitive(),
+            "brokered selector in bash must latch sensitive"
+        );
+    }
+
+    #[test]
+    fn memory_gate_burst_preserves_every_payload() {
+        // F2 (extreme): 100 same-ms gated writes → 100 files, zero loss.
+        let dir = tmpdir();
+        let mem = dir.join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let mut pol = crate::perm::Policy::headless(dir.clone());
+        pol.memory_dir = Some(mem.clone());
+        pol.note_result("task", &serde_json::json!({}), "some task digest");
+        pol.note_result("read", &serde_json::json!({"path": ".env"}), "export KEY=1");
+        assert!(pol.taint_armed());
+        let mut reg = ToolRegistry::core(pol);
+        let mut c = ctx(&dir);
+        for i in 0..100 {
+            let out = reg.call(
+                "write",
+                &serde_json::json!({"path": format!("memory/note-{i}.md"), "content": format!("PAYLOAD-{i}")}),
+                &mut c,
+            );
+            assert!(out.denied, "write {i} must deny headless");
+        }
+        let props = mem.join("proposals");
+        let files: Vec<_> = std::fs::read_dir(&props).unwrap().flatten().collect();
+        assert_eq!(files.len(), 100, "every payload gets its own file");
+        let bodies: Vec<String> = files
+            .iter()
+            .map(|f| std::fs::read_to_string(f.path()).unwrap())
+            .collect();
+        for i in 0..100 {
+            assert!(
+                bodies.iter().any(|b| b.contains(&format!("PAYLOAD-{i}"))),
+                "payload {i} kept"
+            );
         }
     }
 
@@ -770,6 +960,7 @@ mod tests {
             subagent_seq: 0,
             checkpoint: Some(&mut cp),
             sandbox: false,
+            broker: None,
         };
 
         reg.call(
@@ -816,5 +1007,57 @@ mod tests {
             rec.canonicalize().unwrap(),
             dir.join("new.txt").canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn broker_sanitize_runs_after_latch_before_budget() {
+        // P6-3 accept: a tool result carrying a mapped real comes back
+        // with the sentinel, not the real — and the taint latch still
+        // saw the raw text (latch-order: note_result runs first).
+        // Uses the read tool (no child spawn — hermetic under load).
+        let dir = tmpdir();
+        std::fs::write(dir.join("secret.txt"), "password is pw-real-9 ok\n").unwrap();
+        let mut br = crate::cred::Broker::new();
+        let sentinel = br.issue_capability(
+            "db",
+            "DB_PASS",
+            "pw-real-9",
+            vec![],
+            vec!["read".into()],
+            None,
+        );
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut c = ctx(&dir);
+        c.broker = Some(br);
+        let out = reg.call("read", &serde_json::json!({"path": "secret.txt"}), &mut c);
+        assert!(!out.is_error, "got: {}", out.text);
+        assert!(!out.text.contains("pw-real-9"), "got: {}", out.text);
+        assert!(out.text.contains(&sentinel), "got: {}", out.text);
+    }
+
+    #[test]
+    fn spill_files_are_owner_only() {
+        // P6-3 accept (spill-perms): over-cap output spills to a 0600
+        // file under a 0700 dir (unix; best-effort elsewhere).
+        let dir = tmpdir();
+        std::fs::create_dir_all(dir.join("session")).unwrap();
+        let mut c = ctx(&dir);
+        c.session_dir = dir.join("session");
+        let big = "y".repeat(crate::cred::scan("plain").len() + INLINE_CAP + 100);
+        let out = enforce_budget(ToolOutput::ok(big), &mut c);
+        let spilled = out.spilled_to.expect("over-cap must spill");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&spilled).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "spill file mode {mode:o}");
+            let dmode = std::fs::metadata(dir.join("session").join("tool-outputs"))
+                .unwrap()
+                .permissions()
+                .mode();
+            // F7: the dir itself must be owner-only (set_permissions
+            // after creation tightens pre-existing dirs too).
+            assert_eq!(dmode & 0o777, 0o700, "spill dir mode {dmode:o}");
+        }
     }
 }
