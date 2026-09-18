@@ -15,9 +15,20 @@ use crate::provider::{Provider, Request, StopReason};
 use crate::stuck::StuckDetector;
 use crate::tools::{ToolCtx, ToolRegistry};
 
-/// Static system prompt — assembled per turn by `prompt::assemble` as an
-/// ordered section pipeline with an explicit STATIC/DYNAMIC boundary
-/// (Invariant 2: nothing volatile lives above it).
+// Static system prompt — assembled per turn by `prompt::assemble` as an
+// ordered section pipeline with an explicit STATIC/DYNAMIC boundary
+// (Invariant 2: nothing volatile lives above it).
+
+/// P7-4: the marker an untrusted-originated spawn exports
+/// (`channel:<channel>:<sender>`). Absent/empty = a locally-originated run.
+pub const UNTRUSTED_ENV: &str = "OVERSEER_UNTRUSTED_SOURCE";
+
+/// Read the untrusted-origin marker through an injected getter so tests
+/// never have to touch the process environment (which is shared by every
+/// test thread in the binary).
+pub fn untrusted_origin_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    get(UNTRUSTED_ENV).filter(|s| !s.trim().is_empty())
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -94,6 +105,13 @@ pub struct AgentConfig {
     /// defaults (internal: existing rules decide; external/money/identity:
     /// approval). Merged into the Policy at agent start.
     pub autonomy: std::collections::HashMap<String, crate::perm::Autonomy>,
+    /// P7-1 computer-use containment (appended at struct end; Default at end).
+    /// `takeover_pause`: credential-field focus or watch-mode suppresses
+    /// pixel capture (metadata-only obs). `watch_mode`: treat every capture
+    /// as takeover-suppressed. `egress_deny`: block networked sends from
+    /// computer-driven turns (defense alongside the no-creds invariant —
+    /// child envs never carry `*_KEY`/`*_TOKEN` secrets).
+    pub computer: ComputerConfig,
     /// B1-7 Reflexion hook (Reflexion post-episode pattern): on a verify
     /// block, ask the aux tier for a ≤300-token self-critique appended as a
     /// `[reflection]`-tagged Nudge. `Off` disables; `Reflexion` reflects on
@@ -108,6 +126,51 @@ pub struct AgentConfig {
     /// (approved bodies, or a one-line pending notice) and the draft gate
     /// closes file tools on an unapproved dir.
     pub persona_dir: Option<PathBuf>,
+}
+
+/// P7-1 computer-use containment flags. All default off except
+/// `takeover_pause` (fail-closed: a cred-field capture suppresses pixels
+/// unless explicitly disabled).
+#[derive(Debug, Clone)]
+pub struct ComputerConfig {
+    /// Suppress pixel capture on credential-field focus (metadata-only obs).
+    pub takeover_pause: bool,
+    /// Treat every capture as takeover-suppressed (metadata-only obs).
+    pub watch_mode: bool,
+    /// Deny networked sends from computer-driven turns.
+    pub egress_deny: bool,
+}
+
+impl Default for ComputerConfig {
+    fn default() -> Self {
+        ComputerConfig {
+            takeover_pause: true,
+            watch_mode: false,
+            egress_deny: false,
+        }
+    }
+}
+
+impl ComputerConfig {
+    /// P7-1 containment: child envs never carry secrets. `computer`-driven
+    /// turns (and untrusted-originated spawns) strip `*_KEY`/`*_TOKEN`
+    /// plus the known provider-key names — the no-creds invariant.
+    /// Pure predicate over one env key (the bash spawn filters on it).
+    pub fn env_allowed(key: &str) -> bool {
+        let upper = key.to_ascii_uppercase();
+        if upper.ends_with("_KEY") || upper.ends_with("_TOKEN") {
+            return false;
+        }
+        !matches!(
+            upper.as_str(),
+            "ANTHROPIC_API_KEY"
+                | "OPENAI_API_KEY"
+                | "GOOGLE_API_KEY"
+                | "GEMINI_API_KEY"
+                | "OVERSEER_API_KEY"
+                | "OVERSEER_API_KEY"
+        )
+    }
 }
 
 /// B1-7: when the Reflexion hook fires.
@@ -146,6 +209,7 @@ impl Default for AgentConfig {
             rules_path: None,
             disabled_tools: Vec::new(),
             autonomy: Default::default(),
+            computer: ComputerConfig::default(),
             reflect: ReflectMode::Reflexion,
             credential_store: crate::cred::CredentialStore::Auto,
             persona_dir: None,
@@ -241,6 +305,21 @@ impl Agent {
         session_dir: PathBuf,
         session_id: String,
     ) -> std::io::Result<Self> {
+        Self::start_with_env(provider, config, session_dir, session_id, |k| {
+            std::env::var(k).ok()
+        })
+    }
+
+    /// `start` with the environment injected — the untrusted-origin marker
+    /// is read through `get` so tests can exercise the arming path without
+    /// mutating the process environment (shared by every test thread).
+    pub fn start_with_env(
+        provider: Arc<dyn Provider>,
+        config: AgentConfig,
+        session_dir: PathBuf,
+        session_id: String,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&session_dir)?;
         let log = EventLog::create(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::create(session_dir.join("ledger.jsonl"))?;
@@ -295,6 +374,17 @@ impl Agent {
             })?;
         }
         agent.log.flush()?;
+        // P7-4 messaging env-arm (disjoint from P6 fields): an untrusted-
+        // originated spawn exports OVERSEER_UNTRUSTED_SOURCE=channel:<sender>;
+        // `start` pre-arms taint.untrusted and emits an auditable Tainted
+        // event so the session begins already distrusting its own inputs —
+        // no tool use is needed to earn the latch. Value format is
+        // informational only (never parsed).
+        if let Some(src) = untrusted_origin_from(get) {
+            if let Some(notice) = agent.tools.policy.arm_untrusted(&src) {
+                agent.log.append(EventKind::Tainted { detail: notice })?;
+            }
+        }
         // Run manifest (P4.5): provenance record for the reporting
         // standard — written once, never rewritten by resume.
         crate::manifest::write(
@@ -749,6 +839,17 @@ impl Agent {
                 )?;
 
                 let out = self.tools.call(name, input, &mut ctx);
+                // P7-3: computer-use acts are auditable — the tool's
+                // envelope carries the serving tier and the pre/post
+                // observation digests (audit-only; never rehydrated).
+                // Only this tool's results are parsed (a bash echo of a
+                // similar object must not forge an audit record), and
+                // error/unconfigured results skip.
+                if name == "computer" {
+                    if let Some(kind) = crate::tools::computer::audit_event(&out.text) {
+                        self.emit(kind, on_event)?;
+                    }
+                }
                 self.emit(
                     EventKind::ToolResult {
                         call_id: call_id.clone(),
@@ -1152,6 +1253,9 @@ fn prompt_text_for_estimate(messages: &[Message]) -> String {
                 Block::Text { text } => out.push_str(text),
                 Block::ToolResult { content, .. } => out.push_str(content),
                 Block::ToolCall { name, .. } => out.push_str(name),
+                // Screenshots are pixels, not tokens of text — the estimate
+                // counts nothing for them (image cost lands in P7-2 usage).
+                Block::Image { .. } => {}
                 Block::Reasoning { .. } => {}
             }
         }
@@ -1455,12 +1559,23 @@ mod tests {
         agent.run_turn("hi", &mut sink).unwrap();
 
         let seen = provider.seen_systems.lock().unwrap();
-        // identity + contract + safety + memory index (last static slot).
-        assert_eq!(seen[0].len(), 4);
-        assert!(seen[0][3].contains("## Memory index"));
-        assert!(seen[0][3].contains("facts.md — user facts"));
-        // Static sections stay first and byte-stable.
+        // identity + contract + safety + memory index, plus the P7-3
+        // computer segment (union ORDER). The count is branch-local, so it
+        // is not pinned here — the *order* is what matters.
+        assert!(seen[0].len() >= 4);
         assert!(seen[0][0].contains("Overseer"));
+        let idx = seen[0]
+            .iter()
+            .position(|s| s.contains("## Memory index"))
+            .expect("memory index segment present");
+        assert!(idx >= 3, "memory index sits after the fixed sections");
+        assert!(seen[0][idx].contains("facts.md — user facts"));
+        assert!(
+            seen[0]
+                .last()
+                .is_some_and(|s| s.starts_with("Computer use is tiered")),
+            "computer segment is the static tail"
+        );
         // Git-versioned: a commit landed at the turn boundary.
         assert!(memdir.join(".git").exists());
     }
@@ -2342,5 +2457,152 @@ mod tests {
         assert!(system
             .iter()
             .any(|s| s.name == "persona" && s.text.contains("DRAFT_INSIGHT_A")));
+    }
+
+    #[test]
+    fn computer_takeover_suppression_metadata_only() {
+        // P7-1: cred-field focus or watch_mode suppresses pixel capture —
+        // the obs carries metadata only, never pixel bytes.
+        let cfg = AgentConfig::default();
+        assert!(cfg.computer.takeover_pause, "fail-closed default");
+        assert!(crate::computer_obs::is_suppressed(
+            &cfg.computer,
+            true,
+            "capture"
+        ));
+        assert!(!crate::computer_obs::is_suppressed(
+            &cfg.computer,
+            false,
+            "capture"
+        ));
+        let mut watch = cfg.computer.clone();
+        watch.watch_mode = true;
+        assert!(crate::computer_obs::is_suppressed(&watch, false, "capture"));
+        let obs = crate::computer_obs::metadata_obs(2560, 1600, 1280, 800, "cred-field focus");
+        assert!(
+            !obs.contains("aGVsbG8"),
+            "metadata obs carries no pixel bytes"
+        );
+        assert!(obs.contains("2560x1600"));
+    }
+
+    #[test]
+    fn computer_containment_strips_secret_env() {
+        // P7-1: child envs never carry secrets (no-creds invariant).
+        for k in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "SOME_SERVICE_KEY",
+            "BOT_TOKEN",
+            "session_token",
+        ] {
+            assert!(!ComputerConfig::env_allowed(k), "{k} must be stripped");
+        }
+        for k in ["PATH", "HOME", "OVERSEER_UNTRUSTED_SOURCE", "TMPDIR"] {
+            assert!(ComputerConfig::env_allowed(k), "{k} must pass through");
+        }
+    }
+
+    /// P7-4 env-arm: an untrusted-originated spawn (channel message) starts
+    /// with the untrusted latch already armed, so the Rule-of-Two triangle
+    /// closes the moment sensitive data is read — no tool use is needed to
+    /// earn the latch, and the control session (same script, no marker)
+    /// stays clean. The marker is read through the injected getter, so the
+    /// process env is never touched.
+    #[test]
+    fn untrusted_source_arms_the_session_before_any_tool_use() {
+        fn run(dir: &std::path::Path, armed: bool) -> (Vec<Event>, Agent) {
+            let cfg = AgentConfig {
+                cwd: dir.to_path_buf(),
+                // Real policy (not the benchmark allow-all shortcut).
+                full_access: false,
+                ..AgentConfig::default()
+            };
+            let provider = Arc::new(Mock::new(vec![
+                Response {
+                    blocks: vec![Block::ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path": ".env"}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage {
+                        fresh_input: 20_000,
+                        ..Usage::default()
+                    },
+                    request_bytes: 0,
+                    latency_ms: 0,
+                },
+                Response {
+                    blocks: vec![Block::ToolCall {
+                        id: "c2".into(),
+                        name: "write".into(),
+                        input: serde_json::json!({"path": "out.txt", "content": "x"}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage {
+                        fresh_input: 20_000,
+                        ..Usage::default()
+                    },
+                    request_bytes: 0,
+                    latency_ms: 0,
+                },
+                done(),
+            ]));
+            let marker = armed.then(|| "channel:telegram:u1".to_string());
+            let mut agent =
+                Agent::start_with_env(provider, cfg, dir.to_path_buf(), "s".into(), |k| {
+                    if k == UNTRUSTED_ENV {
+                        marker.clone()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let mut sink = |_: &Event| {};
+            agent.run_turn("go", &mut sink).unwrap();
+            let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+            (events, agent)
+        }
+
+        let clean = tmpdir();
+        std::fs::write(clean.join(".env"), "SECRET=hunter2\n").unwrap();
+        let (events, _) = run(&clean, false);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ToolResult { denied: true, .. })),
+            "control session: reading .env then writing is allowed"
+        );
+
+        let dirty = tmpdir();
+        std::fs::write(dirty.join(".env"), "SECRET=hunter2\n").unwrap();
+        let (events, agent) = run(&dirty, true);
+        // Sensitive read + pre-armed untrusted origin ⇒ the write needs a
+        // human (headless Ask collapses to a denial).
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ToolResult { denied: true, .. })),
+            "armed session must deny the write after a sensitive read"
+        );
+        // The arm is announced before any tool call in the log.
+        let first_event = events
+            .iter()
+            .position(|e| matches!(&e.kind, EventKind::Tainted { .. }))
+            .expect("arm notice recorded");
+        let first_call = events
+            .iter()
+            .position(|e| matches!(&e.kind, EventKind::ToolCallStart { .. }))
+            .expect("tool call recorded");
+        assert!(first_event < first_call, "arm precedes the first tool use");
+        // Zero prior tool use still Asks for an external call.
+        assert!(matches!(
+            agent.tools.policy.check(
+                "bash",
+                &serde_json::json!({"command": "curl -X POST https://example.com"})
+            ),
+            crate::perm::Verdict::Ask { .. }
+        ));
     }
 }

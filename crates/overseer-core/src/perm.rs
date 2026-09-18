@@ -294,7 +294,40 @@ const IDENTITY_MARKERS: &[&str] = &[
 
 /// Classify a tool call into the irreversibility taxonomy (P5-B).
 /// Pure function of (tool, input) — deterministic, zero deps.
+/// P7-1 computer-use arms: `computer` dispatches on `action` —
+/// screenshot observes (Read); click/move/scroll mutate local UI state
+/// (InternalWrite); type/submit/send emit content outward
+/// (ExternalComms); any credential-field focus escalates to Identity.
+/// Unknown actions default up (InternalWrite), never down.
 pub fn classify(tool: &str, input: &Value) -> Irreversibility {
+    if tool == "computer" {
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_lowercase();
+        // Credential-field focus is an identity touch regardless of the
+        // physical action — keystrokes near secrets outrank the click.
+        if input
+            .get("cred_field")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || action.contains("password")
+            || action.contains("credential")
+        {
+            return Irreversibility::Identity;
+        }
+        if action == "screenshot" || action == "observe" {
+            return Irreversibility::Read;
+        }
+        if ["click", "move", "scroll", "drag", "hover", "focus"].contains(&action.as_str()) {
+            return Irreversibility::InternalWrite;
+        }
+        if ["type", "key", "submit", "send", "paste"].contains(&action.as_str()) {
+            return Irreversibility::ExternalComms;
+        }
+        return Irreversibility::InternalWrite; // future actions default up
+    }
     match tool {
         t if READ_TOOLS.contains(&t) => Irreversibility::Read,
         "write" | "edit" => Irreversibility::InternalWrite,
@@ -316,6 +349,34 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
         }
         _ => Irreversibility::InternalWrite, // future tools default up, not down
     }
+}
+
+/// P8-A batch classifier: the max irreversibility class over the batch
+/// members. A `computer` `batch{actions}` input classifies each member as
+/// its own `computer` call and takes the max — one exfil member poisons
+/// the whole batch (never the average, never the first). A `batch{type}`
+/// member is future-messaging shape and classifies as ExternalComms (the
+/// outbox default). Malformed members (missing action) default up via
+/// `classify`, never down.
+pub fn classify_batch(tool: &str, input: &Value) -> Irreversibility {
+    if tool == "computer" {
+        if let Some(actions) = input.get("actions").and_then(Value::as_array) {
+            let mut max = Irreversibility::Read;
+            for member in actions {
+                // DEFERRED(owner): `channel` messaging verbs ride the same batch
+                // envelope on the gateway side; the core gate sees only the
+                // irreversibility class, never the transport.
+                let class = if member.get("type").and_then(Value::as_str).is_some() {
+                    Irreversibility::ExternalComms
+                } else {
+                    classify(tool, member)
+                };
+                max = max.max(class);
+            }
+            return max;
+        }
+    }
+    classify(tool, input)
 }
 pub struct Policy {
     /// Working directory root; write/edit must stay inside it.
@@ -472,6 +533,10 @@ impl Policy {
     /// Record a completed tool call's result/input against the taint
     /// latches. Returns a human-readable notice when a latch newly flips
     /// (the agent emits it as an auditable event).
+    /// P7-1 `screen_screenshot`: ANY screenshot-sourced context latches
+    /// `untrusted` by default — pixels are opaque to text scanning, so a
+    /// benign-looking capture still latches. Phrase matching is retained
+    /// as an additional signal, not the gate.
     pub fn note_result(&self, tool: &str, input: &Value, text: &str) -> Option<String> {
         let lower = text.to_lowercase();
         let input_s = input.to_string().to_lowercase();
@@ -480,6 +545,7 @@ impl Policy {
         if !t.untrusted
             && (tool == "task"
                 || tool == "skill"
+                || Self::is_screenshot_context(tool, input)
                 || INJECTION_MARKERS.iter().any(|m| lower.contains(m)))
         {
             t.untrusted = true;
@@ -515,12 +581,36 @@ impl Policy {
         self.taint.lock().map(|t| t.sensitive).unwrap_or(false)
     }
 
+    /// P7-1 screenshot-context detector: the `computer` screenshot/observe
+    /// action latches regardless of result text (pixels bypass text scan).
+    fn is_screenshot_context(tool: &str, input: &Value) -> bool {
+        if tool != "computer" {
+            return false;
+        }
+        matches!(
+            input.get("action").and_then(Value::as_str),
+            Some(a) if a.eq_ignore_ascii_case("screenshot") || a.eq_ignore_ascii_case("observe")
+        )
+    }
+
     /// Both Rule-of-Two latches are set — the exfil triangle is armed.
     pub fn taint_armed(&self) -> bool {
         self.taint
             .lock()
             .map(|t| t.untrusted && t.sensitive)
             .unwrap_or(false)
+    }
+
+    /// P7-4 messaging env-arm: pre-arm the untrusted latch at session start
+    /// for untrusted-originated spawns. Returns a notice when the latch
+    /// newly flips (the engine emits it as an auditable event).
+    pub fn arm_untrusted(&self, origin: &str) -> Option<String> {
+        let mut t = self.taint.lock().ok()?;
+        if t.untrusted {
+            return None;
+        }
+        t.untrusted = true;
+        Some(format!("untrusted origin armed at start (via {origin})"))
     }
 
     /// The verdict the dispatcher acts on: `check` first, then — for Ask —
@@ -737,15 +827,28 @@ impl Policy {
         if self.session_allowed(tool, input) {
             return Verdict::Allow;
         }
-        // P5-B approval ladder: (class × domain autonomy) → verdict floor.
-        // Read-class flows to the existing rules unchanged.
-        let class = classify(tool, input);
+        // P8-A `computer` gate arm: batch inputs route through
+        // classify_batch() (max over members; batch{type}→ExternalComms),
+        // every computer call then rides the shared classify→ladder path
+        // below (screenshot/click Ask-or-Allow per autonomy, never
+        // unknown-tool Deny). Deny-by-default for unconfigured backends is
+        // preserved at dispatch — the gate never approves what no backend
+        // can serve.
+        // DEFERRED(owner): pixel-embedded secrets inside image bytes (OCR
+        // deferred; mitigated by egress-deny + no-creds + takeover
+        // suppression).
+        let class = classify_batch(tool, input);
         if class != Irreversibility::Read {
             if let Some(v) = self.ladder_verdict(tool, class) {
                 return v;
             }
         }
         match tool {
+            // P8-A `computer` arm (lands here after the ladder floor above):
+            // Read-class (screenshot/observe) falls through to Allow; ladder
+            // Ask/Deny already won for side-effecting actions. Explicit
+            // autonomy keeps the default ActWithApproval Ask for acts.
+            "computer" => Verdict::Allow,
             // Side-effecting file tools: containment already enforced by
             // hard_deny above (deny wins). Remaining: memory LAYER bar
             // (F5) → Rule-of-Two taint Ask, else Allow.
@@ -1146,6 +1249,71 @@ mod tests {
             classify("bash", &json!({"command": "gpg --sign doc"})),
             Irreversibility::Identity
         );
+    }
+    #[test]
+    fn computer_classify_table() {
+        // P7-1: computer action → irreversibility class.
+        assert_eq!(
+            classify("computer", &json!({"action": "screenshot"})),
+            Irreversibility::Read
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "click", "x": 10, "y": 20})),
+            Irreversibility::InternalWrite
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "move", "x": 1, "y": 2})),
+            Irreversibility::InternalWrite
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "scroll", "dy": -3})),
+            Irreversibility::InternalWrite
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "type", "text": "hello"})),
+            Irreversibility::ExternalComms
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "submit"})),
+            Irreversibility::ExternalComms
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "send"})),
+            Irreversibility::ExternalComms
+        );
+        // Credential-field focus escalates to Identity regardless of action.
+        assert_eq!(
+            classify("computer", &json!({"action": "click", "cred_field": true})),
+            Irreversibility::Identity
+        );
+        assert_eq!(
+            classify("computer", &json!({"action": "type", "cred_field": true})),
+            Irreversibility::Identity
+        );
+        // Unknown actions default up, never down.
+        assert_eq!(
+            classify("computer", &json!({"action": "frobnicate"})),
+            Irreversibility::InternalWrite
+        );
+    }
+
+    #[test]
+    fn screenshot_context_always_latches_untrusted() {
+        // P7-1: pixels are opaque to text scanning — ANY screenshot context
+        // latches untrusted, even with benign result text.
+        let p = pol();
+        let notice = p.note_result(
+            "computer",
+            &json!({"action": "screenshot"}),
+            "capture ok, 1280x800",
+        );
+        assert!(notice.is_some(), "benign screenshot must still latch");
+        assert!(p.taint.lock().map(|t| t.untrusted).unwrap_or(false));
+        // Non-screenshot computer actions with benign text do not latch.
+        let p2 = pol();
+        assert!(p2
+            .note_result("computer", &json!({"action": "click"}), "clicked ok")
+            .is_none());
     }
 
     #[test]
@@ -1798,6 +1966,80 @@ mod tests {
         assert_eq!(
             all.check("read", &json!({"path": "persona/identity.md"})),
             Verdict::Allow
+        );
+    }
+
+    /// P8-A computer gate probe: `computer` rides classify→ladder (never the
+    /// unknown-tool Deny), and batch inputs take the max member class.
+    #[test]
+    fn computer_gate_arm_asks_or_allows_per_autonomy_never_unknown_deny() {
+        use serde_json::json;
+        let p = pol();
+        // Screenshot/observe are Read-class: no ladder floor, Allow.
+        assert_eq!(
+            p.check("computer", &json!({"action": "screenshot"})),
+            Verdict::Allow
+        );
+        // Click is InternalWrite: default lane (ActSilently) keeps Allow;
+        // tightening the lane to ActWithApproval Asks (never unknown-tool Deny).
+        assert_eq!(
+            p.check("computer", &json!({"action": "click", "x": 1, "y": 2})),
+            Verdict::Allow
+        );
+        let mut strict = pol();
+        strict
+            .autonomy
+            .insert("internal".into(), Autonomy::ActWithApproval);
+        assert!(matches!(
+            strict.check("computer", &json!({"action": "click", "x": 1, "y": 2})),
+            Verdict::Ask { .. }
+        ));
+        // Type is ExternalComms: the outbox default Asks headless.
+        assert!(matches!(
+            p.check("computer", &json!({"action": "type", "text": "hi"})),
+            Verdict::Ask { .. }
+        ));
+        // Batch max-class: a benign click beside an exfil type Asks as a whole.
+        assert!(matches!(
+            p.check(
+                "computer",
+                &json!({"action": "batch", "actions": [
+                    {"action": "click", "x": 1, "y": 2},
+                    {"action": "type", "text": "hi"},
+                ]}),
+            ),
+            Verdict::Ask { .. }
+        ));
+        // batch{type} members are messaging shape → ExternalComms → Ask.
+        assert!(matches!(
+            p.check(
+                "computer",
+                &json!({"action": "batch", "actions": [{"type": "send"}]}),
+            ),
+            Verdict::Ask { .. }
+        ));
+        // All-read batch stays Allow.
+        assert_eq!(
+            p.check(
+                "computer",
+                &json!({"action": "batch", "actions": [
+                    {"action": "screenshot"},
+                    {"action": "observe"},
+                ]}),
+            ),
+            Verdict::Allow
+        );
+        // classify_batch unit surface: max wins, batch{type} maps up.
+        assert_eq!(
+            classify_batch(
+                "computer",
+                &json!({"actions": [{"action": "screenshot"}, {"action": "type", "text": "x"}]}),
+            ),
+            Irreversibility::ExternalComms
+        );
+        assert_eq!(
+            classify_batch("computer", &json!({"actions": [{"type": "send"}]})),
+            Irreversibility::ExternalComms
         );
     }
 }
