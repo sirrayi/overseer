@@ -129,10 +129,15 @@ pub fn filtered_memory_dir(
             continue;
         };
         let body = std::fs::read_to_string(&src).unwrap_or_default();
+        // F3: fail CLOSED to Secret on unparsable headers (a file whose
+        // header says secret — or cannot be parsed — is never admitted
+        // below the Secret ceiling). Mirrors index_segment_filtered.
         let tier = if body.lines().next().map(|l| l.trim()) == Some("---") {
-            crate::memory::parse_meta(&body)
-                .map(|(m, _)| m.sensitivity)
-                .unwrap_or(crate::memory::Sensitivity::Personal)
+            match crate::memory::parse_meta(&body) {
+                Ok((m, _)) => m.sensitivity,
+                // Unparsable header: fail closed to Secret (F3).
+                Err(_) => crate::memory::Sensitivity::Secret,
+            }
         } else {
             crate::memory::Sensitivity::Personal
         };
