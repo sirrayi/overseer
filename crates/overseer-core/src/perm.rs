@@ -183,7 +183,19 @@ const SENSITIVE_PATHS: &[&str] = &[
 ];
 
 /// Content markers that mark a result as carrying secret material.
-const SENSITIVE_CONTENT: &[&str] = &["-----BEGIN", "PRIVATE KEY-----"];
+/// Content markers that mark a result as carrying secret material.
+/// Lowercase: compared against lowercased text (RT-1: uppercase markers
+/// were dead code — lowercased text can never contain them).
+const SENSITIVE_CONTENT: &[&str] = &["-----begin", "private key-----"];
+
+/// P6-5: persona file names — a `grep`/`glob` pattern naming one of these is
+/// a targeted read of the (possibly unapproved) persona dir.
+const PERSONA_MARKERS: &[&str] = &[
+    "identity.md",
+    "relationships.md",
+    "preferences.md",
+    "SOUL.md",
+];
 
 // Rules are evaluated in order — deny, then ask, then allow — over
 // (tool × resource). First match inside each class wins; unmatched
@@ -332,6 +344,16 @@ pub struct Policy {
     rules_path: Option<PathBuf>,
     /// Rule-of-Two latches (P3.10) — interior-mutable like session_allow.
     taint: Mutex<Taint>,
+    /// Memory root for the P6-2 untrusted write-gate: untrusted-sourced
+    /// writes (taint armed) landing under this dir are Ask-gated and
+    /// redirected to `memory/proposals/<ts>.md`. None = gate off.
+    pub memory_dir: Option<PathBuf>,
+    /// P6-5 persona dir (onboarding). None = no onboarding in this session.
+    pub persona_dir: Option<PathBuf>,
+    /// P6-5: whether every persona file is approved. False closes the whole
+    /// persona dir to the file tools — a draft is unreadable, not merely
+    /// absent from the prompt (`draft_deny`, R2-F8).
+    pub persona_approved: bool,
 }
 
 impl Policy {
@@ -347,6 +369,9 @@ impl Policy {
             rules_path: None,
             autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
+            memory_dir: None,
+            persona_dir: None,
+            persona_approved: false,
         }
     }
 
@@ -361,6 +386,9 @@ impl Policy {
             rules_path: None,
             autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
+            memory_dir: None,
+            persona_dir: None,
+            persona_approved: false,
         }
     }
 
@@ -376,6 +404,9 @@ impl Policy {
             rules_path: None,
             autonomy: Default::default(),
             taint: Mutex::new(Taint::default()),
+            memory_dir: None,
+            persona_dir: None,
+            persona_approved: false,
         }
     }
 
@@ -467,6 +498,23 @@ impl Policy {
         None
     }
 
+    /// Mark the sensitive latch directly (RT-4): broker injection IS a
+    /// sensitive touch — declared secrets entering a child env must arm the
+    /// triangle so follow-up side effects Ask. Returns a notice on flip.
+    pub fn mark_sensitive(&self, via: &str) -> Option<String> {
+        let mut t = self.taint.lock().ok()?;
+        if t.sensitive {
+            return None;
+        }
+        t.sensitive = true;
+        Some(format!("sensitive data touched (via {via})"))
+    }
+
+    /// The sensitive latch alone (RT-4 regression surface).
+    pub fn taint_sensitive(&self) -> bool {
+        self.taint.lock().map(|t| t.sensitive).unwrap_or(false)
+    }
+
     /// Both Rule-of-Two latches are set — the exfil triangle is armed.
     pub fn taint_armed(&self) -> bool {
         self.taint
@@ -516,6 +564,14 @@ impl Policy {
     pub fn check(&self, tool: &str, input: &Value) -> Verdict {
         if self.allow_all {
             return Verdict::Allow;
+        }
+        // P6-5 (R2-F8) persona draft gate — runs BEFORE the read-tool
+        // early-allow: hiding a draft from the prompt is worthless if
+        // `read`/`grep` can pull it into context, so the dir is closed on
+        // disk too. The engine's interview writer uses the filesystem
+        // directly and never passes through here.
+        if let Some(v) = self.draft_deny(tool, input) {
+            return v;
         }
         // Read-only tools are allowed under every preset — `task` is safe
         // at the gate (its own read-only registry + step ceiling enforce
@@ -606,15 +662,33 @@ impl Policy {
                 } else {
                     self.root.join(p)
                 };
-                let canon = resolved
-                    .parent()
-                    .and_then(|d| d.canonicalize().ok())
-                    .map(|d| d.join(resolved.file_name().unwrap_or_default()))
-                    .unwrap_or_else(|| resolved.clone());
-                let root = self
-                    .root
-                    .canonicalize()
-                    .unwrap_or_else(|_| self.root.clone());
+                // Canonicalize the longest existing ancestor + re-append
+                // the remainder (same helper as the memory gate): parent
+                // dirs that don't exist yet can't canonicalize, and the
+                // raw TMPDIR path vs the /private symlink would compare
+                // unequal without it.
+                fn canon_deep(p: &Path) -> PathBuf {
+                    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+                    let mut cur = p.to_path_buf();
+                    loop {
+                        if let Ok(c) = cur.canonicalize() {
+                            let mut out = c;
+                            for comp in missing.iter().rev() {
+                                out.push(comp);
+                            }
+                            return out;
+                        }
+                        match cur.file_name() {
+                            Some(name) => {
+                                missing.push(name.to_os_string());
+                                cur.pop();
+                            }
+                            None => return p.to_path_buf(),
+                        }
+                    }
+                }
+                let canon = canon_deep(&resolved);
+                let root = canon_deep(&self.root);
                 if canon.starts_with(&root) {
                     None
                 } else {
@@ -673,9 +747,64 @@ impl Policy {
         }
         match tool {
             // Side-effecting file tools: containment already enforced by
-            // hard_deny above (deny wins). Remaining: the Rule-of-Two
-            // taint Ask, else Allow.
+            // hard_deny above (deny wins). Remaining: memory LAYER bar
+            // (F5) → Rule-of-Two taint Ask, else Allow.
             "write" | "edit" => {
+                // F5: WRITE_BAR enforcement — identity-layer facts need
+                // approval even in a clean session. Maps the target path to
+                // its memory Layer (None outside memory_dir) and takes the
+                // max of the layer bar and the lane default already computed.
+                if let Some(p) = input.get("path").and_then(Value::as_str) {
+                    if let Some(need) =
+                        crate::memory::layer_bar_for_path(self.memory_dir.as_deref(), &self.root, p)
+                    {
+                        let lane_default = match class {
+                            Irreversibility::InternalWrite => Autonomy::ActSilently,
+                            _ => Autonomy::default(),
+                        };
+                        let level = self
+                            .autonomy
+                            .get(Self::domain(class))
+                            .copied()
+                            .unwrap_or(lane_default);
+                        // Most restrictive wins: the enum orders Observe <
+                        // ... < ActSilently, so min() is the tighter bar
+                        // (max() would pick the loosest — inverted).
+                        let need_level = need.min(level);
+                        if need_level == Autonomy::Observe {
+                            return Verdict::Deny {
+                                reason: format!(
+                                    "{tool}: memory layer needs approval (class {class:?})"
+                                ),
+                            };
+                        }
+                        if matches!(need_level, Autonomy::Suggest | Autonomy::ActWithApproval) {
+                            return Verdict::Ask {
+                                reason: format!(
+                                    "{tool}: memory layer needs approval (class {class:?})"
+                                ),
+                            };
+                        }
+                    }
+                }
+                // P6-2 memory gate: untrusted-sourced writes into the
+                // memory dir quarantine to proposals/ for human review
+                // (Ask; headless denies). Runs before the generic
+                // Rule-of-Two Ask so the redirect path is named.
+                if let Some(p) = input.get("path").and_then(Value::as_str) {
+                    if self.memory_gate_hit(p) {
+                        let dest = self
+                            .proposal_path()
+                            .map(|d| d.display().to_string())
+                            .unwrap_or_else(|| "memory/proposals/".into());
+                        return Verdict::Ask {
+                            reason: format!(
+                                "{tool}: untrusted content in context — memory write \
+                                 quarantined to {dest}; needs human confirmation"
+                            ),
+                        };
+                    }
+                }
                 // Rule-of-Two latch (P3.10): contained writes are
                 // still an exfil/exfil-prep channel when both
                 // untrusted content and secrets are in context.
@@ -731,6 +860,211 @@ impl Policy {
             },
         }
     }
+}
+
+impl Policy {
+    /// P6-5 (R2-F8) persona draft gate — the file half of the onboarding
+    /// gate. While the persona dir is unapproved, every file tool that can
+    /// touch it is denied: `read`/`grep`/`glob` (which the read early-allow
+    /// would otherwise permit) and `write`/`edit` (the model must not author
+    /// its own persona). The engine writes drafts itself, bypassing the gate
+    /// by construction, and `--approve` flips the verdict.
+    fn draft_deny(&self, tool: &str, input: &Value) -> Option<Verdict> {
+        if self.persona_approved {
+            return None;
+        }
+        let dir = self.persona_dir.as_ref()?;
+        if !matches!(tool, "read" | "write" | "edit" | "glob" | "grep" | "bash") {
+            return None;
+        }
+        let deny = |how: &str| {
+            Some(Verdict::Deny {
+                reason: format!(
+                    "{tool}: the persona directory {} is an unapproved draft ({how}) — \
+                     review it and run `overseer onboard --approve`; file access stays \
+                     closed until then",
+                    dir.display()
+                ),
+            })
+        };
+        // An explicit path/pattern that names the dir (or a file inside it).
+        // Marker matching is case-insensitive (IDENTITY.MD == identity.md).
+        if let Some(p) = input.get("path").and_then(Value::as_str) {
+            if under_dir(&self.root, dir, p) {
+                return deny("path is inside it");
+            }
+        }
+        if let Some(p) = input.get("pattern").and_then(Value::as_str) {
+            // A literal traversal of the dir, or a pattern that names a
+            // persona file, is a targeted read even with the root elsewhere.
+            let literal = dir.to_string_lossy().to_string();
+            let pl = p.to_lowercase();
+            let named = PERSONA_MARKERS
+                .iter()
+                .any(|m| pl.contains(&m.to_lowercase()));
+            if p.contains(&literal) || named {
+                return deny("pattern targets it");
+            }
+        }
+        // `glob`/`grep` without an explicit root search the working
+        // directory, which contains the dir — fail closed.
+        if matches!(tool, "glob" | "grep") && input.get("path").is_none() {
+            return deny("a working-directory search traverses it");
+        }
+        // `bash` has no path field — match the command string against the
+        // dir path and persona file markers (same targeted-read rule). Plus
+        // wildcard containment (F4): glob metacharacters that could expand
+        // into the dir are denied while unapproved — `cat persona/*` must
+        // not bypass the gate via shell expansion. The engine interview
+        // writer uses fs directly and never needs shell globs here.
+        if tool == "bash" {
+            if let Some(cmd) = input.get("command").and_then(Value::as_str) {
+                let literal = dir.to_string_lossy().to_string();
+                let cl = cmd.to_lowercase();
+                let named = PERSONA_MARKERS
+                    .iter()
+                    .any(|m| cl.contains(&m.to_lowercase()));
+                if cmd.contains(&literal) || named {
+                    return deny("command targets it");
+                }
+                // Token containment (F4 hardened): split the command on
+                // shell metacharacters and resolve every path-looking token
+                // against the root — `tee persona/a.md`, `cp /tmp/evil
+                // persona/`, `ls persona/` all name the dir without globs.
+                // Plus a glob guard: any wildcard token alongside a persona
+                // stem may expand into the dir (`cat persona/*`).
+                for tok in cmd.split([
+                    ' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>', '`', '$', '\'', '"',
+                ]) {
+                    let tok = tok.trim().trim_matches(|c| c == '\'' || c == '"');
+                    if tok.is_empty() || tok.starts_with('-') {
+                        continue;
+                    }
+                    // Redirections attach to the next token (`> persona/x`);
+                    // the token itself is still path-checked below.
+                    if under_dir(&self.root, dir, tok) {
+                        return deny("command targets it");
+                    }
+                }
+                let lower = cmd.to_lowercase();
+                let dir_stem = dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let has_glob = cmd.contains(['*', '?', '[']);
+                if has_glob
+                    && !dir_stem.is_empty()
+                    && lower.contains(&dir_stem[..dir_stem.len().min(4)])
+                {
+                    return deny("command may expand into it");
+                }
+            }
+            return None;
+        }
+        None
+    }
+
+    /// P6-2 untrusted memory write-gate: true when the taint triangle is
+    /// armed AND `path` resolves under `memory_dir`. Read-class tools are
+    /// never gated (reads under memory stay Ask-free).
+    pub fn memory_gate_hit(&self, path: &str) -> bool {
+        // RT-2: untrusted content alone arms the memory gate. Requiring the
+        // full triangle (untrusted AND sensitive) left prompt-injection ->
+        // durable-memory writes ungated: one injection-marker read sets
+        // untrusted but not sensitive, and the poisoned write Allowed.
+        // Sensitive-only (no untrusted source) still flows to the generic
+        // Rule-of-Two Ask below — this gate is about untrusted provenance.
+        let untrusted = self.taint.lock().map(|t| t.untrusted).unwrap_or(false);
+        if !untrusted {
+            return false;
+        }
+        let Some(mem) = &self.memory_dir else {
+            return false;
+        };
+        under_dir(&self.root, mem, path)
+    }
+
+    /// Quarantine redirect for a gated memory write: `proposals/<ts>.md`
+    /// under the memory dir. The proposal preserves the content for human
+    /// review instead of dropping it.
+    pub fn proposal_path(&self) -> Option<PathBuf> {
+        // F2 (extreme): ms timestamps collide within a batch — append a
+        // process-wide monotonic counter so same-ms writes never overwrite.
+        static PROPOSAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mem = self.memory_dir.as_ref()?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let n = PROPOSAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(mem.join("proposals").join(format!("{ts}-{n}.md")))
+    }
+}
+
+/// True when `path` (absolute or root-relative) resolves under `mem`
+/// (itself root-relative-or-absolute). Pure path-prefix check on
+/// normalized components — `..` escapes fail closed (return false).
+/// Both roots canonicalize when they exist; missing dirs compare lexically.
+fn under_dir(root: &Path, mem: &Path, path: &str) -> bool {
+    fn norm(base: &Path, p: &str) -> Option<PathBuf> {
+        let mut out = if Path::new(p).is_absolute() {
+            PathBuf::new()
+        } else {
+            base.to_path_buf()
+        };
+        for c in Path::new(p).components() {
+            use std::path::Component;
+            match c {
+                // Keep the anchor: dropping it makes an absolute target
+                // compare as a relative path (and never match its dir).
+                Component::Prefix(pfx) => out.push(pfx.as_os_str()),
+                Component::RootDir => out.push(std::path::MAIN_SEPARATOR_STR),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !out.pop() {
+                        return None;
+                    }
+                }
+                Component::Normal(s) => out.push(s),
+            }
+        }
+        Some(out)
+    }
+    fn canon(p: &Path) -> PathBuf {
+        // Canonicalize the longest existing ancestor, then re-append the
+        // remainder lexically: existing and not-yet-created paths under
+        // the same tree compare equal even across symlinked tmp dirs.
+        let mut missing: Vec<std::ffi::OsString> = Vec::new();
+        let mut cur = p.to_path_buf();
+        loop {
+            if let Ok(c) = cur.canonicalize() {
+                let mut out = c;
+                for comp in missing.iter().rev() {
+                    out.push(comp);
+                }
+                return out;
+            }
+            match cur.file_name() {
+                Some(name) => {
+                    missing.push(name.to_os_string());
+                    cur.pop();
+                }
+                None => return p.to_path_buf(),
+            }
+        }
+    }
+    let (norm_target, norm_mem) = match (norm(root, path), {
+        let m = if mem.is_absolute() {
+            mem.to_path_buf()
+        } else {
+            root.join(mem)
+        };
+        Some(m)
+    }) {
+        (Some(t), Some(m)) => (canon(&t), canon(&m)),
+        _ => return false,
+    };
+    norm_target.starts_with(&norm_mem)
 }
 
 /// Glob match over a command string: `*` = any run of characters,
@@ -1228,5 +1562,242 @@ mod tests {
         assert!(p.note_result("task", &json!({}), "digest").is_some());
         // Second task result: latch already set, no new notice.
         assert!(p.note_result("task", &json!({}), "more").is_none());
+    }
+
+    #[test]
+    fn memory_gate_armed_asks_with_proposal() {
+        // P6-2 accept (armed→Ask+proposal file): taint armed + write
+        // under memory_dir → Ask naming the quarantine redirect.
+        let root = std::env::temp_dir().join(format!("overseer-memgate-{}", uuid::Uuid::now_v7()));
+        let mem = root.join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let mut p = Policy::headless(root.clone());
+        p.memory_dir = Some(mem.clone());
+        // Arm both latches.
+        p.note_result("task", &json!({}), "some task digest");
+        p.note_result("read", &json!({"path": ".env"}), "export KEY=1");
+        assert!(p.taint_armed());
+        assert!(p.memory_gate_hit("memory/episodic/diary.md"));
+        // Absolute paths hit the same gate (the containment helper keeps
+        // the path anchor; a stripped root silently never matched).
+        assert!(p.memory_gate_hit(mem.join("episodic/diary.md").to_string_lossy().as_ref()));
+        let v = p.check(
+            "write",
+            &json!({"path": "memory/episodic/diary.md", "content": "x"}),
+        );
+        match v {
+            Verdict::Ask { reason } => assert!(
+                reason.contains("quarantined"),
+                "Ask must name the redirect: {reason}"
+            ),
+            other => panic!("expected Ask, got {other:?}"),
+        }
+        let dest = p.proposal_path().expect("proposal path");
+        assert_eq!(dest.parent().unwrap().file_name().unwrap(), "proposals");
+        assert!(dest.starts_with(&mem));
+    }
+
+    #[test]
+    fn draft_deny_covers_bash_commands() {
+        // F1: `bash cat persona/identity.md` is a targeted draft read.
+        let root = std::env::temp_dir().join(format!("overseer-draft-{}", uuid::Uuid::now_v7()));
+        let persona = root.join("persona");
+        std::fs::create_dir_all(&persona).unwrap();
+        let mut p = Policy::headless(root.clone());
+        p.persona_dir = Some(persona.clone());
+        p.persona_approved = false;
+        let v = p.check(
+            "bash",
+            &json!({"command": format!("cat {}/identity.md", persona.display())}),
+        );
+        assert!(
+            matches!(v, Verdict::Deny { .. }),
+            "bash draft read must deny, got {v:?}"
+        );
+        // Benign commands still pass.
+        assert_eq!(
+            p.check("bash", &json!({"command": "cargo test"})),
+            Verdict::Allow
+        );
+        // Approved dir re-opens.
+        p.persona_approved = true;
+        assert_eq!(
+            p.check(
+                "bash",
+                &json!({"command": format!("cat {}/identity.md", persona.display())}),
+            ),
+            Verdict::Allow
+        );
+        // F4 hardened matrix (unapproved): wildcards, copies, listings.
+        p.persona_approved = false;
+        for cmd in [
+            "cat persona/*".to_string(),
+            "cat persona/*.md".to_string(),
+            "tee persona/a.md".to_string(),
+            "cp /tmp/evil persona/".to_string(),
+            "mv /tmp/evil persona/new.md".to_string(),
+            "ls persona/".to_string(),
+            format!("head -c 40 {}/IDENTITY.MD", persona.display()),
+        ] {
+            let dir = std::env::current_dir().unwrap();
+            let _ = dir;
+            let v = p.check("bash", &json!({"command": cmd}));
+            assert!(
+                matches!(v, Verdict::Deny { .. }),
+                "{cmd} must deny while unapproved, got {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_gate_clean_allows_and_reads_free() {
+        // P6-2 accept (clean→Allow): same write with no taint passes,
+        // and reads under memory never trip the gate.
+        let root = std::env::temp_dir().join(format!("overseer-memgate-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        let mut p = Policy::headless(root.clone());
+        p.memory_dir = Some(root.join("memory"));
+        assert!(!p.taint_armed());
+        assert!(!p.memory_gate_hit("memory/episodic/diary.md"));
+        assert_eq!(
+            p.check(
+                "write",
+                &json!({"path": "memory/episodic/diary.md", "content": "x"}),
+            ),
+            Verdict::Allow
+        );
+        // Armed but outside memory → generic taint Ask, not the gate.
+        p.note_result("task", &json!({}), "digest");
+        p.note_result("read", &json!({"path": ".env"}), "KEY=1");
+        assert!(!p.memory_gate_hit("src/main.rs"));
+        // Reads under memory stay free even when armed (read-class).
+        assert_eq!(
+            p.check("read", &json!({"path": "memory/INDEX.md"})),
+            Verdict::Allow
+        );
+        // `..` escape out of memory is not a gate hit (fails closed).
+        assert!(!p.memory_gate_hit("memory/../outside.md"));
+    }
+
+    // ---------- P6-5: persona draft gate ----------
+
+    fn persona_pol(approved: bool) -> (Policy, PathBuf) {
+        let root = std::env::temp_dir().join(format!("overseer-persona-{}", uuid::Uuid::now_v7()));
+        let persona = root.join("persona");
+        std::fs::create_dir_all(&persona).unwrap();
+        let mut p = Policy::headless(root.clone());
+        p.persona_dir = Some(persona.clone());
+        p.persona_approved = approved;
+        (p, persona)
+    }
+
+    /// P6-5 accept (draft-unreadable): an unapproved persona dir is closed
+    /// to the file tools — including `read`, which the early-allow would
+    /// otherwise wave through.
+    #[test]
+    fn unapproved_persona_dir_is_closed_to_file_tools() {
+        let (p, persona) = persona_pol(false);
+        let inside = persona.join("identity.md");
+        let inside_s = inside.to_string_lossy().to_string();
+        for tool in ["read", "write", "edit"] {
+            let input = if tool == "read" {
+                json!({"path": inside_s})
+            } else {
+                json!({"path": inside_s, "content": "x"})
+            };
+            match p.check(tool, &input) {
+                Verdict::Deny { reason } => {
+                    assert!(reason.contains("unapproved draft"), "{tool}: {reason}");
+                    assert!(reason.contains("onboard --approve"), "{tool}: {reason}");
+                }
+                other => panic!("{tool} on a draft must be denied, got {other:?}"),
+            }
+        }
+        // Relative paths resolve against the workspace root too.
+        assert!(matches!(
+            p.check("read", &json!({"path": "persona/identity.md"})),
+            Verdict::Deny { .. }
+        ));
+        // A search rooted at the dir, or a pattern naming a persona file.
+        assert!(matches!(
+            p.check("grep", &json!({"pattern": "x", "path": inside_s})),
+            Verdict::Deny { .. }
+        ));
+        assert!(matches!(
+            p.check("glob", &json!({"pattern": "SOUL.md"})),
+            Verdict::Deny { .. }
+        ));
+        // A working-directory-wide search traverses the dir: fail closed.
+        assert!(matches!(
+            p.check("grep", &json!({"pattern": "anything"})),
+            Verdict::Deny { .. }
+        ));
+        // Everything else is untouched by this gate.
+        assert_eq!(
+            p.check("read", &json!({"path": "src/main.rs"})),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check("write", &json!({"path": "src/main.rs", "content": "x"})),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check("grep", &json!({"pattern": "x", "path": "src"})),
+            Verdict::Allow
+        );
+        assert_eq!(p.check("bash", &json!({"command": "ls"})), Verdict::Allow);
+    }
+
+    /// P6-5 accept: approval flips the same calls to Allow, and no gate is
+    /// armed when the session has no persona dir at all.
+    #[test]
+    fn approved_persona_dir_is_readable_and_writable() {
+        let (p, persona) = persona_pol(true);
+        let inside = persona.join("identity.md").to_string_lossy().to_string();
+        assert_eq!(p.check("read", &json!({"path": inside})), Verdict::Allow);
+        assert_eq!(
+            p.check("write", &json!({"path": inside, "content": "x"})),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check("glob", &json!({"pattern": "SOUL.md"})),
+            Verdict::Allow
+        );
+        // No persona dir → the gate never fires.
+        let mut none = Policy::headless(PathBuf::from("/tmp/ws"));
+        none.persona_approved = false;
+        assert!(none.persona_dir.is_none());
+        assert_eq!(
+            none.check("read", &json!({"path": "persona/identity.md"})),
+            Verdict::Allow
+        );
+    }
+
+    /// The gate composes with the presets: a read-only policy still denies
+    /// writes to an approved persona dir (deny order is unchanged).
+    #[test]
+    fn persona_gate_does_not_loosen_other_denies() {
+        let root = std::env::temp_dir().join(format!("overseer-persona-{}", uuid::Uuid::now_v7()));
+        let mut p = Policy::preset(Preset::ReadOnly, root.clone());
+        p.persona_dir = Some(root.join("persona"));
+        p.persona_approved = true;
+        assert_eq!(
+            p.check("read", &json!({"path": "persona/identity.md"})),
+            Verdict::Allow
+        );
+        assert!(matches!(
+            p.check(
+                "write",
+                &json!({"path": "persona/identity.md", "content": "x"})
+            ),
+            Verdict::Deny { .. }
+        ));
+        // Full access bypasses the gate (the environment is the sandbox).
+        let mut all = Policy::allow_all();
+        all.persona_dir = Some(root.join("persona"));
+        assert_eq!(
+            all.check("read", &json!({"path": "persona/identity.md"})),
+            Verdict::Allow
+        );
     }
 }

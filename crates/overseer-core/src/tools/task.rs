@@ -20,7 +20,7 @@
 //! no model arg is accepted. The subagent is just `Agent` with a swapped
 //! registry — same loop, same budgets, same event sourcing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -76,17 +76,85 @@ pub fn spec() -> ToolSpec {
     }
 }
 
-/// Shared subtask config: tight step ceiling, no shared memory view,
-/// same model + effort as the parent (one model per subagent).
+/// Shared subtask config: tight step ceiling, same model + effort as the
+/// parent (one model per subagent). P6-2: the subagent keeps a memory
+/// view but sensitivity-filtered — Secret entries stay out of the
+/// quarantined context (the parent's `memory_filter` is the ceiling).
 fn sub_cfg(ctx: &ToolCtx, input: &Value, cwd: &Path) -> crate::agent::AgentConfig {
-    let mut cfg = ctx.agent_config.clone().unwrap_or_default();
+    let parent = ctx.agent_config.clone().unwrap_or_default();
+    let filter = parent.memory_filter;
+    let mut cfg = parent;
     cfg.max_steps = opt_u64(input, "max_steps")
         .unwrap_or(DEFAULT_STEPS)
         .clamp(1, MAX_STEPS) as u32;
-    cfg.memory_dir = None;
+    cfg.memory_filter = filter;
     cfg.cwd = cwd.to_path_buf();
     cfg.auto_compact = false; // 20-step ceiling can't fill a window
     cfg
+}
+
+/// Filtered memory dir for a subagent spawn (P6-2): materializes a
+/// sibling `<name>.filtered/` dir holding the parent's INDEX reduced to
+/// the filter ceiling plus the admitted topic files. Returns None when
+/// the parent has no memory dir. Best-effort — a materialization
+/// failure falls back to no memory view rather than failing the spawn.
+pub fn filtered_memory_dir(
+    parent_mem: &std::path::Path,
+    filter: crate::memory::Sensitivity,
+    dest: &Path,
+) -> Option<PathBuf> {
+    let idx = parent_mem.join(crate::memory::INDEX_NAME);
+    let text = std::fs::read_to_string(&idx).ok()?;
+    std::fs::create_dir_all(dest).ok()?;
+    let mut kept_lines = Vec::new();
+    for line in text.lines() {
+        // Preserve non-pointer lines (headers, blanks) verbatim.
+        let mut named: Option<String> = None;
+        for tok in line.split_whitespace() {
+            let t = tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';');
+            if t.ends_with(".md") && !t.contains('/') && !t.contains('\\') {
+                named = Some(t.to_string());
+                break;
+            }
+        }
+        let Some(name) = named else {
+            kept_lines.push(line.to_string());
+            continue;
+        };
+        let src = crate::memory::layer_path(parent_mem, &name);
+        let Some(src) = src else {
+            // Pointer with no backing file: keep the line (stale-pointer
+            // hygiene is consolidate's job), copy nothing.
+            kept_lines.push(line.to_string());
+            continue;
+        };
+        let body = std::fs::read_to_string(&src).unwrap_or_default();
+        // F3: fail CLOSED to Secret on unparsable headers (a file whose
+        // header says secret — or cannot be parsed — is never admitted
+        // below the Secret ceiling). Mirrors index_segment_filtered.
+        let tier = if body.lines().next().map(|l| l.trim()) == Some("---") {
+            match crate::memory::parse_meta(&body) {
+                Ok((m, _)) => m.sensitivity,
+                // Unparsable header: fail closed to Secret (F3).
+                Err(_) => crate::memory::Sensitivity::Secret,
+            }
+        } else {
+            crate::memory::Sensitivity::Personal
+        };
+        if crate::memory::admits(filter, tier) {
+            kept_lines.push(line.to_string());
+            if let Some(rel) = src.strip_prefix(parent_mem).ok().and_then(|r| r.parent()) {
+                std::fs::create_dir_all(dest.join(rel)).ok()?;
+            }
+            if let Ok(rel) = src.strip_prefix(parent_mem) {
+                std::fs::write(dest.join(rel), body).ok()?;
+            }
+        }
+    }
+    let mut out = kept_lines.join("\n");
+    out.push('\n');
+    std::fs::write(dest.join(crate::memory::INDEX_NAME), out).ok()?;
+    Some(dest.to_path_buf())
 }
 
 /// Run one subagent to completion; returns (digest, outcome_debug).
@@ -223,11 +291,33 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     } else {
         subagents_dir.join(&id)
     };
-    let cfg = sub_cfg(ctx, input, &sub_cwd);
+    let mut cfg = sub_cfg(ctx, input, &sub_cwd);
+    // P6-2 filtered view: the subagent's memory dir is a reduced copy —
+    // Secret entries never reach the quarantined context. A copy failure
+    // falls back to no memory view (never the full parent dir).
+    if let Some(parent_mem) = ctx.agent_config.as_ref().and_then(|c| c.memory_dir.clone()) {
+        let dest = subagents_dir.join(format!("{id}.filtered"));
+        match filtered_memory_dir(&parent_mem, cfg.memory_filter, &dest) {
+            Some(d) => cfg.memory_dir = Some(d),
+            None => cfg.memory_dir = None,
+        }
+    } else {
+        cfg.memory_dir = None;
+    }
     let policy = if cfg.full_access {
         crate::perm::Policy::allow_all()
     } else {
-        crate::perm::Policy::preset(cfg.policy_preset, sub_cwd.clone())
+        let mut pol = crate::perm::Policy::preset(cfg.policy_preset, sub_cwd.clone());
+        // F1: draft gate propagates — a read-mode subagent inherits the
+        // parent's persona verdict so unapproved drafts stay closed there too.
+        if let Some(parent_cfg) = ctx.agent_config.as_ref() {
+            pol.persona_dir = parent_cfg.persona_dir.clone();
+            pol.persona_approved = parent_cfg
+                .persona_dir
+                .as_deref()
+                .is_some_and(crate::onboard::all_approved);
+        }
+        pol
     };
     let mut registry = if write_mode {
         ToolRegistry::core(policy)
@@ -337,6 +427,7 @@ mod tests {
             subagent_seq: 0,
             checkpoint: None,
             sandbox: false,
+            broker: None,
         }
     }
 
@@ -431,5 +522,47 @@ mod tests {
         let out = run(&json!({"prompt": "x", "mode": "write"}), &mut c);
         assert!(out.is_error);
         assert!(out.text.contains("git worktree"));
+    }
+
+    #[test]
+    fn subagent_inherits_persona_draft_gate() {
+        // F1: a read-mode subagent of a persona-gated parent denies draft reads.
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!("overseer-subdraft-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join("persona")).unwrap();
+        let persona = dir.join("persona");
+        let parent_cfg = crate::agent::AgentConfig {
+            cwd: dir.clone(),
+            persona_dir: Some(persona.clone()),
+            ..Default::default()
+        };
+        let ctx = ToolCtx {
+            cwd: dir.clone(),
+            session_dir: dir.join("session"),
+            spill_seq: 0,
+            provider: None,
+            agent_config: Some(parent_cfg),
+            subagent_seq: 0,
+            checkpoint: None,
+            sandbox: false,
+            broker: None,
+        };
+        let sub = sub_cfg(&ctx, &json!({}), &dir);
+        let pol = if sub.full_access {
+            crate::perm::Policy::allow_all()
+        } else {
+            let mut pol = crate::perm::Policy::preset(sub.policy_preset, dir.clone());
+            pol.persona_dir = sub.persona_dir.clone();
+            pol.persona_approved = sub
+                .persona_dir
+                .as_deref()
+                .is_some_and(crate::onboard::all_approved);
+            pol
+        };
+        let v = pol.check("read", &json!({"path": "persona/identity.md"}));
+        assert!(
+            matches!(v, crate::perm::Verdict::Deny { .. }),
+            "subagent draft read must deny, got {v:?}"
+        );
     }
 }

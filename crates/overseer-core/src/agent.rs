@@ -53,6 +53,14 @@ pub struct AgentConfig {
     /// the end of the static prompt region each turn. None = memory off.
     /// Must sit under `cwd` for the permission gate to allow writes.
     pub memory_dir: Option<PathBuf>,
+    /// P6-2 sensitivity ceiling for the quarantined subagent memory view:
+    /// `task` subagents see only entries at or below this tier (Secret
+    /// hidden by default). The parent always sees the full index.
+    pub memory_filter: crate::memory::Sensitivity,
+    /// P6-3 credential broker: process-side secret store. The agent
+    /// hands it to each turn's ToolCtx for bash injection + result
+    /// sanitization. Default-empty (no creds); P6-4 adds persistence.
+    pub broker: crate::cred::Broker,
     /// P1.2 stale tool-result clearing: this many most-recent ToolResult
     /// blocks stay verbatim; older ones render as a placeholder in the view
     /// (events untouched). 0 disables clearing.
@@ -91,6 +99,15 @@ pub struct AgentConfig {
     /// `[reflection]`-tagged Nudge. `Off` disables; `Reflexion` reflects on
     /// verify blocks only (never on success). Default: Reflexion.
     pub reflect: ReflectMode,
+    /// P6-4 credential store: where secrets are read from at session start.
+    /// The CLI resolves the configured value against the machine (keychain
+    /// backend present? entry usable?) and stores the *effective* store
+    /// here, so the manifest records what actually held the secret.
+    pub credential_store: crate::cred::CredentialStore,
+    /// P6-5 persona dir (onboarding). Some = the persona segment renders
+    /// (approved bodies, or a one-line pending notice) and the draft gate
+    /// closes file tools on an unapproved dir.
+    pub persona_dir: Option<PathBuf>,
 }
 
 /// B1-7: when the Reflexion hook fires.
@@ -119,6 +136,8 @@ impl Default for AgentConfig {
             auto_compact: true,
             compact_at: None,
             memory_dir: None,
+            memory_filter: crate::memory::Sensitivity::Personal,
+            broker: crate::cred::Broker::new(),
             keep_tool_results: 5,
             verify_cmd: None,
             verify_block_cap: 8,
@@ -128,6 +147,8 @@ impl Default for AgentConfig {
             disabled_tools: Vec::new(),
             autonomy: Default::default(),
             reflect: ReflectMode::Reflexion,
+            credential_store: crate::cred::CredentialStore::Auto,
+            persona_dir: None,
         }
     }
 }
@@ -247,6 +268,11 @@ impl Agent {
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
         }
+        // P6-5: the persona dir is seeded as drafts (never overwritten) so
+        // the interview has files to write and the gate has a target.
+        if let Some(dir) = agent.config.persona_dir.clone() {
+            crate::onboard::ensure_persona_dir(&dir)?;
+        }
         let cwd = agent.config.cwd.display().to_string();
         agent.log.append(EventKind::SessionStart {
             session_id: session_id.clone(),
@@ -255,6 +281,19 @@ impl Agent {
             harness_version: env!("CARGO_PKG_VERSION").to_string(),
             parent: None,
         })?;
+        agent.log.flush()?;
+        // P6-4: consent grants loaded into the broker are audited at
+        // session start — audit-only events carrying client/scope metadata,
+        // never secret material (Invariant 1: the log is the paper trail).
+        for g in agent.config.broker.grants() {
+            agent.log.append(EventKind::ConsentGranted {
+                client: g.client.clone(),
+                scopes: g.scopes.clone(),
+                expires_ms: g.expires_ms,
+                actor: g.actor.clone(),
+                approved_by: g.approved_by.clone(),
+            })?;
+        }
         agent.log.flush()?;
         // Run manifest (P4.5): provenance record for the reporting
         // standard — written once, never rewritten by resume.
@@ -336,6 +375,32 @@ impl Agent {
 
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Record a user-role message without running a turn (P6-5): interview
+    /// answers land in the log — written, flushed, fsynced — before any
+    /// persona file is drafted, so a crash mid-interview loses nothing.
+    pub fn record_user_input(
+        &mut self,
+        text: &str,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<()> {
+        self.messages.push(Message::user_text(text));
+        self.emit(EventKind::UserInput { text: text.into() }, on_event)?;
+        self.log.flush()
+    }
+
+    /// Record harness-authored user-role text without running a turn
+    /// (P6-5): the onboarding questions. `Nudge` is provably not user-typed
+    /// (same durability contract as `record_user_input`).
+    pub fn record_nudge(
+        &mut self,
+        text: &str,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<()> {
+        self.messages.push(Message::user_text(text));
+        self.emit(EventKind::Nudge { text: text.into() }, on_event)?;
+        self.log.flush()
     }
 
     /// Run one user turn through the ReAct loop until the model stops calling
@@ -629,6 +694,7 @@ impl Agent {
                 subagent_seq: 0,
                 checkpoint: checkpoint.as_mut(),
                 sandbox: self.config.sandbox_bash,
+                broker: Some(self.config.broker.clone()),
             };
             let mut results = Vec::new();
             for (idx, (call_id, name, input)) in calls.iter().enumerate() {
@@ -730,8 +796,14 @@ impl Agent {
             self.log.flush()?;
             // Git-version memory at the durable-tail point (playbook: free
             // history/diff/rollback). Engine-made commit, best-effort.
-            if let Some(dir) = &self.config.memory_dir {
+            // P6-2 audit: a dirty worktree at the boundary emits a
+            // log-only MemoryUpdated event (never injected into context).
+            if let Some(dir) = &self.config.memory_dir.clone() {
                 crate::memory::commit(dir, &format!("turn {steps}"));
+                let files = crate::memory::dirty_files(dir);
+                if !files.is_empty() {
+                    self.emit(EventKind::MemoryUpdated { files }, on_event)?;
+                }
             }
         }
     }
@@ -1027,6 +1099,15 @@ impl Agent {
             let mut p = crate::perm::Policy::preset(config.policy_preset, config.cwd.clone());
             p.ask_handler = config.ask_handler.clone();
             p.autonomy = config.autonomy.clone();
+            p.memory_dir = config.memory_dir.clone();
+            // P6-5: the draft gate needs the dir and the approval verdict —
+            // computed once here so a mid-session `--approve` is a restart
+            // (approval is a trust-boundary change, like a preset swap).
+            p.persona_dir = config.persona_dir.clone();
+            p.persona_approved = config
+                .persona_dir
+                .as_deref()
+                .is_some_and(crate::onboard::all_approved);
             if let Some(path) = &config.rules_path {
                 p.load_rules(path.clone());
             }
@@ -1465,6 +1546,130 @@ mod tests {
         let ro = crate::tools::ToolRegistry::readonly(crate::perm::Policy::allow_all());
         let names: Vec<&str> = ro.specs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["read", "grep", "glob"]);
+    }
+
+    /// P6-2 accept (Secret hidden from subagent view): parent memory with
+    /// a Secret topic → the spawned subagent's filtered dir keeps the
+    /// Personal pointer and drops the Secret one (body and bytes).
+    #[test]
+    fn subagent_memory_view_hides_secret() {
+        let dir = tmpdir();
+        let mem = dir.join("memory");
+        crate::memory::ensure(&mem).unwrap();
+        std::fs::write(
+            mem.join("episodic").join("diary.md"),
+            "---\nsensitivity: personal\n---\nhad lunch\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem.join("semantic").join("token.md"),
+            "---\nsensitivity: secret\n---\nsk-live-abc\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem.join("INDEX.md"),
+            "# Memory Index\n\ndiary.md — lunch notes\ntoken.md — api token\n",
+        )
+        .unwrap();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            memory_dir: Some(mem.clone()),
+            ..AgentConfig::default()
+        };
+        let dest = dir.join("sub-view");
+        let got = crate::tools::task::filtered_memory_dir(&mem, cfg.memory_filter, &dest)
+            .expect("filtered view materializes");
+        assert_eq!(got, dest);
+        let idx = std::fs::read_to_string(dest.join("INDEX.md")).unwrap();
+        assert!(idx.contains("diary.md"), "{idx}");
+        assert!(!idx.contains("token.md"), "{idx}");
+        assert!(dest.join("episodic").join("diary.md").exists());
+        assert!(!dest.join("semantic").join("token.md").exists());
+        // Default ceiling is Personal.
+        assert_eq!(cfg.memory_filter, crate::memory::Sensitivity::Personal);
+    }
+
+    /// P6-2 accept (consolidate no rewrite-smaller): a consolidation that
+    /// drops a stale pointer leaves topic bodies byte-identical — only
+    /// INDEX.md is rewritten.
+    #[test]
+    fn consolidate_never_rewrites_topic_bodies() {
+        let dir = tmpdir();
+        let mem = dir.join("memory");
+        crate::memory::ensure(&mem).unwrap();
+        let topic = mem.join("episodic").join("diary.md");
+        std::fs::write(&topic, "---\nsensitivity: personal\n---\nhad lunch\n").unwrap();
+        std::fs::write(
+            mem.join("INDEX.md"),
+            "# Memory Index\n\ndiary.md — lunch\ndupe.md — stale\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&topic).unwrap();
+        struct Fixed {
+            reply: String,
+        }
+        impl crate::provider::Provider for Fixed {
+            fn complete(
+                &self,
+                _: &crate::provider::Request,
+            ) -> Result<crate::provider::Response, crate::provider::ProviderError> {
+                Ok(crate::provider::Response {
+                    blocks: vec![Block::Text {
+                        text: self.reply.clone(),
+                    }],
+                    stop_reason: crate::provider::StopReason::EndTurn,
+                    usage: crate::ir::Usage::default(),
+                    request_bytes: 0,
+                    latency_ms: 0,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "fixed"
+            }
+        }
+        let p = Fixed {
+            reply: "---INDEX---\n# Memory Index\n\ndiary.md — lunch\n---INDEX---".into(),
+        };
+        crate::memory::consolidate(&p, "tiny", &mem).unwrap();
+        assert_eq!(std::fs::read(&topic).unwrap(), before);
+        let new_idx = std::fs::read_to_string(mem.join("INDEX.md")).unwrap();
+        assert!(!new_idx.contains("dupe.md"));
+    }
+
+    /// P6-2 accept (dirty→event, clean→none): `dirty_files` reports the
+    /// post-commit residue and is empty on a clean tree.
+    #[test]
+    fn memory_audit_dirty_and_clean() {
+        let dir = tmpdir();
+        let mem = dir.join("memory");
+        crate::memory::ensure(&mem).unwrap();
+        crate::memory::commit(&mem, "seed");
+        // Clean tree → no files.
+        assert!(crate::memory::dirty_files(&mem).is_empty());
+        // New file → porcelain names it. (Committed at the boundary in
+        // run_turn; here we observe the pre-commit residue directly.)
+        std::fs::write(mem.join("episodic").join("note.md"), "hi\n").unwrap();
+        let dirty = crate::memory::dirty_files(&mem);
+        assert!(
+            dirty.iter().any(|f| f.contains("note.md")),
+            "dirty files: {dirty:?}"
+        );
+        // The event round-trips through the log (audit-only shape).
+        let log_path = dir.join("audit.jsonl");
+        let mut log = EventLog::create(&log_path).unwrap();
+        log.append(EventKind::MemoryUpdated {
+            files: dirty.clone(),
+        })
+        .unwrap();
+        log.flush().unwrap();
+        let events = EventLog::replay(&log_path).unwrap();
+        assert!(matches!(
+            &events[0].kind,
+            EventKind::MemoryUpdated { files } if files == &dirty
+        ));
+        // Audit-only: never rehydrates into messages.
+        assert!(crate::event::rehydrate_messages(&events).is_empty());
     }
 
     /// P1.10 verification gate: a failing DoD check blocks the finish and
@@ -1948,5 +2153,194 @@ mod tests {
         assert_eq!(e, Effort::Max, "bounded at Max");
         assert_eq!(Effort::parse("med"), Some(Effort::Medium));
         assert_eq!(Effort::parse("bogus"), None);
+    }
+
+    /// P6-3 accept (no-plaintext-in-events): a tool that returns a mapped
+    /// real lands in events.jsonl with the sentinel, never the real.
+    #[test]
+    fn broker_secret_never_reaches_events_jsonl() {
+        let dir = tmpdir();
+        let mut broker = crate::cred::Broker::new();
+        let sentinel = broker.issue_capability(
+            "db",
+            "DB_PASS",
+            "pw-real-9",
+            vec![],
+            vec!["read".into()],
+            None,
+        );
+        let mut cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            sandbox_bash: false,
+            ..AgentConfig::default()
+        };
+        cfg.broker = broker;
+        // The real enters via file bytes (not the call input — inputs log
+        // raw in ToolCallStart, so a real in argv would leak by design).
+        std::fs::write(dir.join("secret.txt"), "password is pw-real-9 ok\n").unwrap();
+        let bash_call = crate::provider::Response {
+            blocks: vec![Block::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "secret.txt"}),
+            }],
+            stop_reason: crate::provider::StopReason::ToolUse,
+            usage: crate::ir::Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        };
+        let provider = Mock::new(vec![
+            bash_call,
+            crate::provider::Response {
+                blocks: vec![Block::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: crate::provider::StopReason::EndTurn,
+                usage: crate::ir::Usage::default(),
+                request_bytes: 0,
+                latency_ms: 0,
+            },
+        ]);
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        agent.run_turn("go", &mut sink).unwrap();
+        let raw = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert!(!raw.contains("pw-real-9"), "events.jsonl leaked the real");
+        assert!(
+            raw.contains(&sentinel),
+            "events.jsonl must carry the sentinel"
+        );
+    }
+
+    /// P6-4 accept: consent grants are audited at session start and stay
+    /// audit-only — rehydration must not turn them into model context, and
+    /// the audit copy carries metadata only (no real, no sentinel).
+    #[test]
+    fn consent_grant_is_audited_and_never_rehydrates() {
+        let dir = tmpdir();
+        let mut cfg = AgentConfig {
+            cwd: dir.clone(),
+            ..AgentConfig::default()
+        };
+        cfg.broker.grant_book_mut().add(crate::cred::Grant {
+            client: "gh".into(),
+            scopes: vec!["repo".into(), "read".into()],
+            expires_ms: 0,
+            actor: "user".into(),
+            approved_by: "alice".into(),
+        });
+        let sentinel = cfg.broker.issue_capability(
+            "gh",
+            "GH_TOKEN",
+            "ghp_real_grant_1",
+            vec![],
+            vec!["repo".into()],
+            None,
+        );
+        let agent =
+            Agent::start(Arc::new(Mock::new(vec![])), cfg, dir.clone(), "s".into()).unwrap();
+        drop(agent);
+
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        let granted: Vec<(&str, &[String], &str)> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ConsentGranted {
+                    client,
+                    scopes,
+                    approved_by,
+                    ..
+                } => Some((client.as_str(), scopes.as_slice(), approved_by.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(granted.len(), 1, "the grant must be on the record");
+        assert_eq!(granted[0].0, "gh");
+        assert_eq!(granted[0].1, ["repo".to_string(), "read".to_string()]);
+        assert_eq!(granted[0].2, "alice");
+        let raw = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert!(
+            !raw.contains("ghp_real_grant_1"),
+            "audit event leaked a real"
+        );
+        assert!(
+            !raw.contains(&sentinel),
+            "audit event must not carry sentinels"
+        );
+
+        // Audit-only: no message view entry, no context injection.
+        let msgs = crate::event::rehydrate_messages(&events);
+        let view = format!("{msgs:?}");
+        assert!(
+            !view.contains("alice"),
+            "grant leaked into the view: {view}"
+        );
+        assert!(
+            !view.contains("consent"),
+            "grant leaked into the view: {view}"
+        );
+    }
+
+    /// P6-5 accept, at the engine boundary: an unapproved persona dir is
+    /// closed to the file tools AND invisible in the prompt; approving it
+    /// flips both halves for the next session.
+    #[test]
+    fn persona_draft_gate_is_wired_through_registry_and_prompt() {
+        let dir = tmpdir();
+        let persona = dir.join("persona");
+        crate::onboard::ensure_persona_dir(&persona).unwrap();
+        crate::onboard::write_drafts(
+            &persona,
+            &[(
+                "identity.md".to_string(),
+                vec![crate::onboard::Insight {
+                    text: "DRAFT_INSIGHT_A".to_string(),
+                    source: 1,
+                }],
+            )],
+            1,
+        )
+        .unwrap();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            persona_dir: Some(persona.clone()),
+            ..AgentConfig::default()
+        };
+        let rel = serde_json::json!({"path": "persona/identity.md"});
+
+        let agent = Agent::start(
+            Arc::new(Mock::new(vec![])),
+            cfg.clone(),
+            dir.join("s1"),
+            "s1".into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            agent.tools.policy().check("read", &rel),
+            crate::perm::Verdict::Deny { .. }
+        ));
+        let system = crate::prompt::assemble(&agent.config);
+        let seg = system.iter().find(|s| s.name == "persona").unwrap();
+        assert!(!seg.text.contains("DRAFT_INSIGHT_A"), "{}", seg.text);
+        drop(agent);
+
+        // Approve → the next session can read it and the prompt carries it.
+        crate::onboard::approve(&persona).unwrap();
+        let agent = Agent::start(
+            Arc::new(Mock::new(vec![])),
+            cfg,
+            dir.join("s2"),
+            "s2".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            agent.tools.policy().check("read", &rel),
+            crate::perm::Verdict::Allow
+        );
+        let system = crate::prompt::assemble(&agent.config);
+        assert!(system
+            .iter()
+            .any(|s| s.name == "persona" && s.text.contains("DRAFT_INSIGHT_A")));
     }
 }
