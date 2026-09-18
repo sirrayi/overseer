@@ -126,7 +126,93 @@ fn seg(name: &'static str, text: &str) -> SystemSegment {
     }
 }
 
-/// Frozen static section order — the P6/P7 union (R1-F2): the static
+/// Prompt-hygiene lint (leaked-prompt lessons, arsenal B2).
+///
+/// Reading only — no port. The leaked production system prompts (the
+/// "leaked-prompts" collection) are worth reading for one reason: the same
+/// handful of failures recur, and they are all visible in the assembled
+/// text. Namely: a date or a "current" anything above the cache boundary
+/// (kills the prefix cache *and* goes stale), an absolute user path that
+/// leaks the operator's machine into every request, a duplicated section
+/// (the model gets two contradictory instructions and follows the later
+/// one), a section that names tools the run cannot call, and instructions
+/// written as prose the model must interpret instead of rules it can check.
+///
+/// The first four are mechanically detectable, so they are checked here;
+/// the fifth is a review habit, not a lint. Findings are advisory strings
+/// (one per problem, naming the segment) — `assemble` never mutates on the
+/// strength of one, because a lint that silently rewrites the prompt is a
+/// worse failure mode than the leak it prevents.
+pub fn hygiene_lint(segments: &[SystemSegment]) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    // Duplicate static sections: two instructions, one wins silently.
+    for s in segments.iter().filter(|s| s.cacheable) {
+        if !seen.insert(s.name) {
+            findings.push(format!(
+                "static section `{}` appears twice — the model sees two instructions",
+                s.name
+            ));
+        }
+    }
+    for s in segments {
+        if !s.cacheable {
+            continue;
+        }
+        // A date in a static section: volatile *and* stale.
+        if has_date(&s.text) {
+            findings.push(format!(
+                "static section `{}` contains a date — volatile content above the cache boundary",
+                s.name
+            ));
+        }
+        // Absolute home/workspace paths leak the operator's machine.
+        if has_user_path(&s.text) {
+            findings.push(format!(
+                "static section `{}` names an absolute user path — leaks the operator's machine",
+                s.name
+            ));
+        }
+    }
+    findings
+}
+
+/// `YYYY-MM-DD` anywhere (the shape every "today is …" leak takes).
+fn has_date(text: &str) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    while i + 10 <= b.len() {
+        let win = &b[i..i + 10];
+        let ok = win[0..4].iter().all(u8::is_ascii_digit)
+            && win[4] == b'-'
+            && win[5..7].iter().all(u8::is_ascii_digit)
+            && win[7] == b'-'
+            && win[8..10].iter().all(u8::is_ascii_digit);
+        if ok {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `/Users/<name>`, `/home/<name>`, or `C:\Users\<name>` — a machine-specific
+/// path, as opposed to the deliberate `<cwd>/memory` style placeholder.
+fn has_user_path(text: &str) -> bool {
+    for (marker, sep) in [("/Users/", '/'), ("/home/", '/'), (r"C:\Users\", '\\')] {
+        if let Some(idx) = text.find(marker) {
+            let after = &text[idx + marker.len()..];
+            let name_len = after.find(sep).unwrap_or(after.len());
+            if name_len > 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Frozen static section order — the P6/P7 union (R1-F2): the static/// Frozen static section order — the P6/P7 union (R1-F2): the static
 /// sections assemble identity→contract→safety→memory→skills with each
 /// branch adding only its own segment (`persona` on P6, `computer` on
 /// P7). Absent optionals are skipped; order among the present must be
@@ -222,6 +308,66 @@ mod tests {
         });
         assert!(!wf_ablated[1].text.contains("task` subagent"));
         assert!(wf_ablated[1].text.contains("whole-file"));
+    }
+
+    #[test]
+    fn hygiene_lint_flags_leaks_and_passes_a_clean_assembly() {
+        // P8-B accept (leaked-prompts reading → lint): the default prompt is
+        // clean; each detected failure class names its segment.
+        let clean = assemble(&AgentConfig::default());
+        assert!(
+            hygiene_lint(&clean).is_empty(),
+            "default assembly must be clean: {:?}",
+            hygiene_lint(&clean)
+        );
+
+        let leaky = vec![
+            SystemSegment {
+                name: "identity",
+                text: "Today is 2026-09-18 and you work in /Users/alice/src.".into(),
+                cacheable: true,
+            },
+            SystemSegment {
+                name: "contract",
+                text: "first".into(),
+                cacheable: true,
+            },
+            SystemSegment {
+                name: "contract",
+                text: "second".into(),
+                cacheable: true,
+            },
+        ];
+        let findings = hygiene_lint(&leaky);
+        assert_eq!(findings.len(), 3, "{findings:?}");
+        assert!(findings.iter().any(|f| f.contains("date")), "{findings:?}");
+        assert!(
+            findings.iter().any(|f| f.contains("user path")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.contains("appears twice")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.contains("`identity`") || f.contains("`contract`")),
+            "every finding names its segment: {findings:?}"
+        );
+        // A non-cacheable (dynamic) section may carry volatile content — it
+        // sits below the boundary by construction.
+        let dynamic = vec![SystemSegment {
+            name: "scratch",
+            text: "today is 2026-09-18".into(),
+            cacheable: false,
+        }];
+        assert!(hygiene_lint(&dynamic).is_empty());
+        // The detectors are pure; a bare `home` word is not a path.
+        assert!(!has_date("no date here") && has_date("x 2026-01-02 y"));
+        assert!(!has_user_path("the home directory"));
+        assert!(has_user_path("/home/bob/code"));
+        assert!(has_user_path("C:\\Users\\bob\\code"));
     }
 
     #[test]

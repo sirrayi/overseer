@@ -378,6 +378,75 @@ pub fn classify_batch(tool: &str, input: &Value) -> Irreversibility {
     }
     classify(tool, input)
 }
+/// Risk class of an MCP server/tool (awesome-mcp-servers taxonomy, arsenal
+/// B2). Used when deciding how much trust a server listing earns before any
+/// of its tools are exposed: a filesystem or shell server is not the same
+/// proposition as a read-only docs server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Risk {
+    /// Reads data, changes nothing.
+    Low,
+    /// Network or filesystem reach with bounded blast radius.
+    Medium,
+    /// Writes outside a sandbox, or mutates a datastore.
+    High,
+    /// Arbitrary execution or credential access.
+    Critical,
+}
+
+impl Risk {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Risk::Low => "low",
+            Risk::Medium => "medium",
+            Risk::High => "high",
+            Risk::Critical => "critical",
+        }
+    }
+
+    /// Whether exposing this server's tools requires a human decision up
+    /// front (rather than only at the call site).
+    pub const fn needs_approval(self) -> bool {
+        matches!(self, Risk::High | Risk::Critical)
+    }
+}
+
+/// Classify a server/tool by its declared capabilities. Unknown capability
+/// strings fail **up** (High): an unrecognized claim is not evidence of
+/// safety, the same rule `classify` uses for unknown tools.
+pub fn mcp_risk(tool: &str, capabilities: &[&str]) -> Risk {
+    let mut risk = Risk::Low;
+    let mut unknown = false;
+    for cap in capabilities {
+        let c = cap.trim().to_ascii_lowercase();
+        let r = match c.as_str() {
+            "read" | "read-only" | "search" | "list" | "docs" => Risk::Low,
+            "network" | "fetch" | "http" | "browser" | "file-write" | "write" => Risk::Medium,
+            "database-write" | "sql-write" | "delete" | "admin" | "filesystem-write" => Risk::High,
+            "shell" | "exec" | "execute" | "credentials" | "secrets" | "cloud-admin" => {
+                Risk::Critical
+            }
+            _ => {
+                unknown = true;
+                Risk::High
+            }
+        };
+        risk = risk.max(r);
+    }
+    if unknown {
+        risk = risk.max(Risk::High);
+    }
+    // The tool name is evidence too: a server that calls itself a shell is
+    // one, whatever its capability list claims.
+    let name_risk = match tool.to_ascii_lowercase().as_str() {
+        n if n.contains("shell") || n.contains("exec") || n.contains("terminal") => Risk::Critical,
+        n if n.contains("filesystem") || n.contains("postgres") || n.contains("sql") => Risk::High,
+        n if n.contains("fetch") || n.contains("browser") || n.contains("http") => Risk::Medium,
+        _ => Risk::Low,
+    };
+    risk.max(name_risk)
+}
+
 /// One session-scoped allow (P8-B cline `expires_turns` port): the key a
 /// `check` matches, plus the turn it stops mattering on. `None` = never
 /// expires (rules-file entries and `AllowAlways`); `Some(n)` = the grant is
@@ -2135,6 +2204,27 @@ mod tests {
             classify_batch("computer", &json!({"actions": [{"type": "send"}]})),
             Irreversibility::ExternalComms
         );
+    }
+
+    #[test]
+    fn mcp_risk_takes_the_max_and_fails_up_on_unknowns() {
+        assert_eq!(mcp_risk("docs", &["read-only", "search"]), Risk::Low);
+        assert_eq!(mcp_risk("web", &["network"]), Risk::Medium);
+        assert_eq!(mcp_risk("db", &["read", "database-write"]), Risk::High);
+        assert_eq!(mcp_risk("ops", &["read", "shell"]), Risk::Critical);
+        assert_eq!(mcp_risk("vault", &["credentials"]), Risk::Critical);
+        // Unknown capability → High, never Low.
+        assert_eq!(mcp_risk("mystery", &["teleport"]), Risk::High);
+        // The name is evidence even with a benign capability list.
+        assert_eq!(mcp_risk("my-shell-server", &["read"]), Risk::Critical);
+        assert_eq!(mcp_risk("postgres-tools", &[]), Risk::High);
+        assert_eq!(mcp_risk("weather", &[]), Risk::Low);
+        // Approval is required exactly for the top two classes.
+        assert!(!Risk::Low.needs_approval() && !Risk::Medium.needs_approval());
+        assert!(Risk::High.needs_approval() && Risk::Critical.needs_approval());
+        assert_eq!(Risk::Critical.as_str(), "critical");
+        // Ordering is the class ladder (used by the max above).
+        assert!(Risk::Critical > Risk::High && Risk::High > Risk::Medium);
     }
 
     /// Count a shared Ask counter without unwrapping the lock (house
