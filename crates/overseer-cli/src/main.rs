@@ -63,6 +63,7 @@ fn real_main() -> i32 {
         "daemon" => cmd_daemon(&args[1..]),
         "inbox" => cmd_inbox(&args[1..]),
         "trigger" => cmd_trigger(&args[1..]),
+        "channel" => cmd_channel(&args[1..]),
         other => {
             eprintln!("overseer: unknown command '{other}'");
             usage();
@@ -94,7 +95,9 @@ fn cmd_tui(args: &[String]) -> i32 {
         eprintln!("overseer: stdout is not a terminal — use `overseer exec` for pipes/CI");
         return 2;
     }
-    let provider: std::sync::Arc<dyn Provider> = match build_provider(&flags) {
+    let mut config = agent_config(&flags);
+    apply_credentials(&mut config);
+    let provider: std::sync::Arc<dyn Provider> = match build_provider(&flags, &config.broker) {
         Ok(p) => p.into(),
         Err(msg) => {
             eprintln!("overseer: {msg}");
@@ -102,8 +105,6 @@ fn cmd_tui(args: &[String]) -> i32 {
         }
     };
     let (session_dir, resume) = resolve_session(&flags);
-    let mut config = agent_config(&flags);
-    apply_credentials(&mut config);
     let cfg = overseer_tui::TuiConfig {
         provider,
         agent: config,
@@ -218,7 +219,17 @@ fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConfig {
             m
         },
         reflect: flags.reflect,
-        credential_store: flags.credential_store,
+        // --bare: hermetic also covers the OS keychain — a CI run reads
+        // credentials from env only, unless the operator explicitly names
+        // a store (Env is the explicit-safe default; Auto would touch the
+        // keychain, which is operator state, not CI state).
+        credential_store: if flags.bare
+            && flags.credential_store == overseer_core::cred::CredentialStore::Auto
+        {
+            overseer_core::cred::CredentialStore::Env
+        } else {
+            flags.credential_store
+        },
         // P6-5: an existing <cwd>/persona dir joins the session — the
         // persona segment renders (approved bodies or the pending notice)
         // and the draft gate closes the dir to file tools until approved.
@@ -324,7 +335,10 @@ fn cmd_onboard(args: &[String]) -> i32 {
     let model =
         std::env::var("OVERSEER_ONBOARD_MODEL").unwrap_or_else(|_| "claude-sonnet-5".into());
     base_flags.model = model.clone();
-    let provider: std::sync::Arc<dyn Provider> = match build_provider(&base_flags) {
+    let mut cred_cfg = agent_config(&base_flags);
+    apply_credentials(&mut cred_cfg);
+    let provider: std::sync::Arc<dyn Provider> = match build_provider(&base_flags, &cred_cfg.broker)
+    {
         Ok(p) => p.into(),
         Err(msg) => {
             eprintln!("overseer onboard: {msg}");
@@ -479,7 +493,9 @@ fn cmd_consolidate(args: &[String]) -> i32 {
         }
     };
     flags.memory = true; // the command exists to touch memory
-    let provider: std::sync::Arc<dyn Provider> = match build_provider(&flags) {
+    let mut cred_cfg = agent_config(&flags);
+    apply_credentials(&mut cred_cfg);
+    let provider: std::sync::Arc<dyn Provider> = match build_provider(&flags, &cred_cfg.broker) {
         Ok(p) => p.into(),
         Err(msg) => {
             eprintln!("overseer: {msg}");
@@ -1049,15 +1065,15 @@ fn cmd_exec(args: &[String]) -> i32 {
 
     let (session_dir, resume) = resolve_session(&flags);
 
-    let provider: std::sync::Arc<dyn Provider> = match build_provider(&flags) {
+    let mut config = agent_config(&flags);
+    apply_credentials(&mut config);
+    let provider: std::sync::Arc<dyn Provider> = match build_provider(&flags, &config.broker) {
         Ok(p) => p.into(),
         Err(msg) => {
             eprintln!("overseer exec: {msg}");
             return 2;
         }
     };
-    let mut config = agent_config(&flags);
-    apply_credentials(&mut config);
 
     if flags.best_of >= 2 {
         return run_best_of(&flags, provider, config, session_dir);
@@ -1181,20 +1197,32 @@ fn render_human(e: &Event) {
 const FLEET_URL: &str = "https://inference.fleet.ai/v1";
 
 /// Build the provider from flags + env. Key resolution order:
-/// OVERSEER_API_KEY → provider-specific env → OVERSEER_API_KEY.
-fn build_provider(flags: &ExecFlags) -> Result<Box<dyn Provider>, String> {
+/// OVERSEER_API_KEY → provider-specific env → OVERSEER_API_KEY, then the same
+/// names inside the resolved credential payload (`apply_credentials`
+/// runs first — env stays authoritative; the keychain/env payload only
+/// fills names env never set).
+fn build_provider(
+    flags: &ExecFlags,
+    broker: &overseer_core::cred::Broker,
+) -> Result<Box<dyn Provider>, String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let cred = |k: &str| broker.real_for(k).map(str::to_string);
+    let provider_key = |get: &dyn Fn(&str) -> Option<String>| match flags.provider.as_str() {
+        "anthropic" => get("ANTHROPIC_API_KEY"),
+        "gemini" => get("GOOGLE_API_KEY").or_else(|| get("GEMINI_API_KEY")),
+        _ => get("OPENAI_API_KEY"),
+    };
     let key = env("OVERSEER_API_KEY")
-        .or_else(|| match flags.provider.as_str() {
-            "anthropic" => env("ANTHROPIC_API_KEY"),
-            "gemini" => env("GOOGLE_API_KEY").or_else(|| env("GEMINI_API_KEY")),
-            _ => env("OPENAI_API_KEY"),
-        })
+        .or_else(|| provider_key(&env))
         .or_else(|| env("OVERSEER_API_KEY"))
+        .or_else(|| cred("OVERSEER_API_KEY"))
+        .or_else(|| provider_key(&cred))
+        .or_else(|| cred("OVERSEER_API_KEY"))
         .ok_or_else(|| {
             format!(
                 "no API key for provider '{}' — set OVERSEER_API_KEY \
-                 (or ANTHROPIC_API_KEY / OPENAI_API_KEY / OVERSEER_API_KEY)",
+                 (or ANTHROPIC_API_KEY / OPENAI_API_KEY / OVERSEER_API_KEY), or \
+                 store one in the credential payload (--credential-store)",
                 flags.provider
             )
         })?;
@@ -1415,6 +1443,69 @@ fn cmd_inbox(args: &[String]) -> i32 {
         }
         Err(e) => {
             eprintln!("overseer inbox: {e}");
+            1
+        }
+    }
+}
+
+/// `overseer channel` — outbound messaging surface (P7-5): `send` only
+/// ever *drafts* (approval still flows through inbox.decide/act, so the
+/// ladder is never bypassed by a socket call), `digest` renders the
+/// attention view over the inbox, and `signal` pushes a manual desktop-
+/// attention fact (P7-6 — the testing path until the native shell lands).
+fn cmd_channel(args: &[String]) -> i32 {
+    let dirs = daemon_dirs(args);
+    use overseer_gateway::ctl::CtlRequest;
+    let val = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+    let truthy = |v: Option<String>| {
+        v.map(|s| matches!(s.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    };
+    let pos = positionals(args);
+    let req = match pos.first().map(|s| s.as_str()) {
+        Some("send") => {
+            let (Some(to), Some(text)) = (val("--to"), val("--text")) else {
+                eprintln!("overseer channel send: needs --to <dest> --text <msg>");
+                return 2;
+            };
+            CtlRequest::ChannelSend {
+                to,
+                thread: val("--thread"),
+                text,
+                channel: val("--via"),
+            }
+        }
+        Some("digest") => CtlRequest::DigestGet,
+        Some("signal") => CtlRequest::DesktopSignal {
+            focused: truthy(val("--focused")),
+            dnd: truthy(val("--dnd")),
+            calendar_busy: truthy(val("--calendar-busy")),
+            active_app: val("--app"),
+            idle_s: val("--idle").and_then(|s| s.parse().ok()),
+        },
+        _ => {
+            eprintln!(
+                "overseer channel: send --to <d> --text <m> [--thread <t>] [--via <c>] \
+                 | digest | signal [--focused --dnd --calendar-busy --app --idle <s>]"
+            );
+            return 2;
+        }
+    };
+    match ctl_call(&dirs, req) {
+        Ok(r) if r.ok => {
+            if let Some(d) = r.data {
+                println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default());
+            } else {
+                println!("queued");
+            }
+            0
+        }
+        Ok(r) => {
+            eprintln!("overseer channel: {}", r.error.unwrap_or_default());
+            1
+        }
+        Err(e) => {
+            eprintln!("overseer channel: {e}");
             1
         }
     }
