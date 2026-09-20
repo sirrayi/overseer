@@ -1,0 +1,25 @@
+# cargo-audit configuration for the overseer workspace.
+#
+# Run with `cargo audit` (cargo install cargo-audit --locked).
+# The ignore list stays empty and fail-closed: every advisory must be
+# fixed, not waived. To waive one, add its id below with a reason —
+# re-examine on every audit so waivers do not silently accumulate.
+#
+# Template:
+# [advisories]
+# ignore = [
+#     # <why the vulnerable path is unreachable here>.
+#     "RUSTSEC-YYYY-NNNN",
+# ]
+
+[database]
+path = "~/.cargo/advisory-dbs"
+url = "https://github.com/rustsec/advisory-db"
+
+[advisories]
+ignore = []
+informational_warnings = ["unmaintained"]
+severity_threshold = "low"
+
+[yanked]
+enabled = true

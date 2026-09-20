@@ -101,6 +101,20 @@ impl OpenAiCompatible {
                 super::Effort::High | super::Effort::Max => "high",
             });
         }
+        // Param filter (Ch.7 §2.2): the conservative LegionEdge fleet
+        // profile rejects reasoning_effort, so it is stripped there while
+        // unknown/OpenAI models keep it. Core keys are never stripped.
+        crate::profile::strip_optional_params(
+            &mut body,
+            req.model,
+            &[
+                "temperature",
+                "top_p",
+                "frequency_penalty",
+                "presence_penalty",
+                "reasoning_effort",
+            ],
+        );
         body
     }
 
@@ -531,6 +545,66 @@ mod tests {
         let body = OpenAiCompatible::build_body(&req);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "a\n\nb");
+    }
+    #[test]
+    fn param_filter_strips_reasoning_effort_on_fleet() {
+        // LegionEdge fleet profile rejects reasoning_effort: effort maps
+        // then strips, so vLLM never sees a gateway-specific knob.
+        let system: Vec<SystemSegment> = vec![];
+        let tools: Vec<ToolSpec> = vec![];
+        let msgs = vec![Message::user_text("hi")];
+        let req = Request {
+            model: "kimi-k3",
+            system: &system,
+            tools: &tools,
+            messages: &msgs,
+            max_tokens: 100,
+            thinking_budget: None,
+            effort: Some(super::super::Effort::High),
+            cache_breakpoints: false,
+        };
+        let body = OpenAiCompatible::build_body(&req);
+        assert!(body.get("reasoning_effort").is_none());
+        for core in ["model", "messages", "tools", "max_tokens"] {
+            assert!(body.get(core).is_some(), "{core} stripped");
+        }
+    }
+
+    #[test]
+    fn build_body_byte_stable_when_all_supported() {
+        // Unknown model → FALLBACK union: reasoning_effort survives, and a
+        // re-strip of the supported set is a byte-identical no-op.
+        let system: Vec<SystemSegment> = vec![];
+        let tools: Vec<ToolSpec> = vec![];
+        let msgs = vec![Message::user_text("hi")];
+        let req = Request {
+            model: "some-future-model",
+            system: &system,
+            tools: &tools,
+            messages: &msgs,
+            max_tokens: 100,
+            thinking_budget: None,
+            effort: Some(super::super::Effort::High),
+            cache_breakpoints: false,
+        };
+        let b1 = OpenAiCompatible::build_body(&req);
+        assert_eq!(b1["reasoning_effort"], "high");
+        let mut b2 = b1.clone();
+        crate::profile::strip_optional_params(
+            &mut b2,
+            "some-future-model",
+            &[
+                "temperature",
+                "top_p",
+                "frequency_penalty",
+                "presence_penalty",
+                "reasoning_effort",
+            ],
+        );
+        assert_eq!(
+            serde_json::to_string(&b1).unwrap(),
+            serde_json::to_string(&b2).unwrap()
+        );
     }
 
     #[test]

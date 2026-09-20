@@ -14,6 +14,8 @@
 //! ```
 //!
 //! - `event`  — `pre_tool_use` (may block) or `post_tool_use` (annotates).
+//!   `stop` blocks the session stop against the final result text (the
+//!   `tool` filter matches the pseudo-tool `session`, `*`, or absent).
 //! - `tool`   — optional; absent matches any tool.
 //! - `contains` — case-insensitive substring of the serialized payload
 //!   (the tool input for pre, the result text for post).
@@ -38,6 +40,8 @@ pub enum HookKind {
     PreToolUse,
     /// After dispatch: a hit annotates the result text.
     PostToolUse,
+    /// At session stop: a hit blocks the stop (see `maybe_block_stop`).
+    Stop,
 }
 
 impl HookKind {
@@ -45,6 +49,7 @@ impl HookKind {
         match self {
             HookKind::PreToolUse => "pre_tool_use",
             HookKind::PostToolUse => "post_tool_use",
+            HookKind::Stop => "stop",
         }
     }
 
@@ -52,8 +57,9 @@ impl HookKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "pre_tool_use" => Ok(HookKind::PreToolUse),
             "post_tool_use" => Ok(HookKind::PostToolUse),
+            "stop" => Ok(HookKind::Stop),
             other => Err(format!(
-                "hooks: bad event `{other}` — want pre_tool_use|post_tool_use"
+                "hooks: bad event `{other}` — want pre_tool_use|post_tool_use|stop"
             )),
         }
     }
@@ -154,6 +160,28 @@ pub fn post_notice(rules: &[HookRule], tool: &str, result: &str) -> Option<Strin
     hit(rules, HookKind::PostToolUse, tool, result).map(|r| r.reason.clone())
 }
 
+/// Stop verdict: `Some(reason)` blocks the agent loop from stopping.
+/// Callers pass the final result text as the payload.
+///
+/// Tool filter: a Stop rule observes no dispatch, so the `tool` field
+/// matches the session pseudo-tool `session`, or `*`, or is absent
+/// (absent matches all — same as pre/post). Any other `tool` value never
+/// matches: a Stop rule scoped to a real tool name is inert, not an
+/// error, so a shared hooks file cannot accidentally arm per-tool
+/// stop-blocks.
+// DEFERRED(owner): wiring Stop into agent loop — data lands now, dispatch hook needs loop owner.
+pub fn maybe_block_stop(rules: &[HookRule], result: &str) -> Option<String> {
+    let payload = result.to_lowercase();
+    rules
+        .iter()
+        .find(|r| {
+            r.kind == HookKind::Stop
+                && r.tool.as_deref().is_none_or(|t| t == "session" || t == "*")
+                && payload.contains(&r.contains.to_lowercase())
+        })
+        .map(|r| r.reason.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +254,46 @@ mod tests {
         std::fs::create_dir_all(dir.join(".overseer")).unwrap();
         std::fs::write(dir.join(HOOKS_FILE), "{not json").unwrap();
         assert!(load(&dir).is_empty(), "broken file → no rules (fail-open)");
+    }
+
+    #[test]
+    fn stop_kind_round_trips_through_parse_and_as_str() {
+        assert_eq!(HookKind::parse("stop").unwrap(), HookKind::Stop);
+        assert_eq!(HookKind::Stop.as_str(), "stop");
+        let rules = parse_rules(r#"[{"event":"stop","contains":"x"}]"#).unwrap();
+        assert_eq!(rules[0].kind, HookKind::Stop);
+    }
+
+    #[test]
+    fn stop_rule_blocks_matching_result_with_session_scope() {
+        // Absent tool, `session`, and `*` all observe the stop.
+        let cases = [
+            r#"[{"event":"stop","contains":"needs review","reason":"review it"}]"#,
+            r#"[{"event":"stop","tool":"session","contains":"needs review","reason":"review it"}]"#,
+            r#"[{"event":"stop","tool":"*","contains":"needs review","reason":"review it"}]"#,
+        ];
+        for rule in cases {
+            let rules = parse_rules(rule).unwrap();
+            assert_eq!(
+                maybe_block_stop(&rules, "this NEEDS REVIEW first").as_deref(),
+                Some("review it"),
+                "{rule}"
+            );
+            assert!(maybe_block_stop(&rules, "all clean").is_none());
+        }
+        // A Stop rule scoped to a real tool name is inert, never an error.
+        let scoped =
+            parse_rules(r#"[{"event":"stop","tool":"bash","contains":"x","reason":"nope"}]"#)
+                .unwrap();
+        assert!(maybe_block_stop(&scoped, "x marks it").is_none());
+        // First Stop hit wins, in file order.
+        let two = parse_rules(
+            r#"[{"event":"stop","contains":"x","reason":"first"},{"event":"stop","contains":"x","reason":"second"}]"#,
+        )
+        .unwrap();
+        assert_eq!(maybe_block_stop(&two, "x").as_deref(), Some("first"));
+        // A Stop rule never fires the pre/post paths.
+        assert!(maybe_block(&two, "bash", &json!({"command": "x"})).is_none());
+        assert!(post_notice(&two, "bash", "x").is_none());
     }
 }

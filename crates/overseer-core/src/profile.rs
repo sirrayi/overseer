@@ -56,6 +56,72 @@ impl EditFormat {
     }
 }
 
+/// Optional wire params per provider family (playbook Ch.7 §2.2). Adapters
+/// consult these via [`supports_param`] and strip anything not listed, so a
+/// cross-family knob never 400s the request. Names are wire-spelled per API
+/// (Anthropic snake_case, Gemini camelCase). No tabled OpenAI/Gemini rows
+/// exist yet — gpt-*/gemini-* resolve to FALLBACK, which carries the full
+/// OpenAI-compat + Gemini sets; the LegionEdge fleet rows carry only the
+/// conservative vLLM subset (no reasoning_effort).
+const ANTHROPIC_PARAMS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "top_k",
+    "stop_sequences",
+    "max_tokens",
+    "thinking",
+];
+
+/// Full OpenAI-compat set. No tabled row carries it yet (see FALLBACK);
+/// kept as the canonical reference — tests assert FALLBACK stays a superset.
+#[allow(dead_code)]
+const OPENAI_PARAMS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "max_tokens",
+    "reasoning_effort",
+];
+
+/// Full Gemini set (generationConfig-spelled). Same note as OPENAI_PARAMS.
+#[allow(dead_code)]
+const GEMINI_PARAMS: &[&str] = &[
+    "temperature",
+    "topP",
+    "topK",
+    "maxOutputTokens",
+    "thinkingConfig",
+];
+
+/// Conservative vLLM subset for the LegionEdge fleet: sampling knobs only.
+/// vLLM ignores unknown fields, but reasoning_effort is gateway-specific —
+/// stripped fail-closed until LegionEdge documents it.
+const FLEET_PARAMS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "max_tokens",
+];
+
+/// Unknown/brand-new models: permissive OpenAI-compat + Gemini union.
+/// Rationale: unknowns are overwhelmingly OpenAI-compatible endpoints or
+/// new Gemini snapshots (both ignore unknown fields), while Anthropic-only
+/// knobs (top_k/stop_sequences/thinking) stay stripped fail-closed.
+const FALLBACK_PARAMS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "max_tokens",
+    "reasoning_effort",
+    "topP",
+    "topK",
+    "maxOutputTokens",
+    "thinkingConfig",
+];
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelProfile {
     pub id: &'static str,
@@ -75,6 +141,11 @@ pub struct ModelProfile {
     /// registry, arsenal B2). Drives the `edit` tool's anchor strategy and
     /// the contract line that tells the model which tool to reach for.
     pub edit_format: EditFormat,
+    /// Optional wire params this model accepts (wire-spelled per API).
+    /// Adapters strip anything not listed before send, so a cross-family
+    /// knob never 400s the request. Core keys (model/messages/tools/
+    /// max_tokens) are never stripped — they are not params.
+    pub accepted_params: &'static [&'static str],
     pub price: PriceTable,
 }
 
@@ -105,6 +176,7 @@ static PROFILES: &[ModelProfile] = &[
         },
         compact_at: 0.83,
         edit_format: EditFormat::SearchReplace,
+        accepted_params: ANTHROPIC_PARAMS,
         price: PriceTable {
             input: 10.0,
             cache_read: 1.0,
@@ -130,6 +202,7 @@ static PROFILES: &[ModelProfile] = &[
         },
         compact_at: 0.83,
         edit_format: EditFormat::SearchReplace,
+        accepted_params: ANTHROPIC_PARAMS,
         price: PriceTable {
             input: 5.0,
             cache_read: 0.5,
@@ -150,6 +223,7 @@ static PROFILES: &[ModelProfile] = &[
         },
         compact_at: 0.83,
         edit_format: EditFormat::SearchReplace,
+        accepted_params: ANTHROPIC_PARAMS,
         price: PriceTable {
             input: 2.0,
             cache_read: 0.2,
@@ -170,6 +244,7 @@ static PROFILES: &[ModelProfile] = &[
         },
         compact_at: 0.83,
         edit_format: EditFormat::SearchReplace,
+        accepted_params: ANTHROPIC_PARAMS,
         price: PriceTable {
             input: 3.0,
             cache_read: 0.3,
@@ -194,6 +269,7 @@ static PROFILES: &[ModelProfile] = &[
         },
         compact_at: 0.70,
         edit_format: EditFormat::Diff,
+        accepted_params: FLEET_PARAMS,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -214,6 +290,7 @@ static PROFILES: &[ModelProfile] = &[
         },
         compact_at: 0.70,
         edit_format: EditFormat::Diff,
+        accepted_params: FLEET_PARAMS,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -234,6 +311,7 @@ static PROFILES: &[ModelProfile] = &[
         },
         compact_at: 0.70,
         edit_format: EditFormat::Diff,
+        accepted_params: FLEET_PARAMS,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -254,6 +332,7 @@ static PROFILES: &[ModelProfile] = &[
         },
         compact_at: 0.70,
         edit_format: EditFormat::Diff,
+        accepted_params: FLEET_PARAMS,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -274,6 +353,7 @@ static PROFILES: &[ModelProfile] = &[
         },
         compact_at: 0.70,
         edit_format: EditFormat::WholeFile,
+        accepted_params: FLEET_PARAMS,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -294,6 +374,7 @@ static PROFILES: &[ModelProfile] = &[
         },
         compact_at: 0.83,
         edit_format: EditFormat::SearchReplace,
+        accepted_params: ANTHROPIC_PARAMS,
         price: PriceTable {
             input: 1.0,
             cache_read: 0.1,
@@ -318,6 +399,7 @@ static FALLBACK: ModelProfile = ModelProfile {
     },
     compact_at: 0.80,
     edit_format: EditFormat::SearchReplace,
+    accepted_params: FALLBACK_PARAMS,
     price: PriceTable {
         input: 3.0,
         cache_read: 0.3,
@@ -325,6 +407,50 @@ static FALLBACK: ModelProfile = ModelProfile {
         output: 15.0,
     },
 };
+
+/// True when `model` accepts the optional wire param `param` (wire-spelled:
+/// Anthropic snake_case, Gemini camelCase). Unknown models consult FALLBACK
+/// (the permissive OpenAI-compat + Gemini union), never panic.
+///
+/// Core keys (`model`, `messages`, `tools`, `max_tokens`/`maxOutputTokens`)
+/// are NOT params: adapters build them unconditionally and must never strip
+/// them. Passing one here returns false so no caller can accidentally gate a
+/// required key. Comparison is exact-case: `top_p` (OpenAI/Anthropic) and
+/// `topP` (Gemini) are different wire names on purpose.
+pub fn supports_param(model: &str, param: &str) -> bool {
+    if matches!(
+        param,
+        "model" | "messages" | "tools" | "max_tokens" | "maxOutputTokens"
+    ) {
+        return false;
+    }
+    lookup(model).accepted_params.contains(&param)
+}
+/// Remove optional keys `body` carries that `model` does not accept. `keys`
+/// names the optional top-level (or generationConfig-level — each caller
+/// checks its own object) candidates the adapter supports emitting; only
+/// listed keys are touched, and only when [`supports_param`] says no.
+/// Deterministic: `keys` order decides removal order; untouched otherwise
+/// (byte-stable when every key is supported — see adapter tests). Core keys
+/// (`model`, `messages`, `tools`, `max_tokens`, `maxOutputTokens`) are never
+/// removed even if named in `keys` — they are required, not params.
+pub fn strip_optional_params(body: &mut serde_json::Value, model: &str, keys: &[&str]) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for key in keys {
+        // Core keys are required, not params — never remove even if named.
+        if matches!(
+            *key,
+            "model" | "messages" | "tools" | "max_tokens" | "maxOutputTokens"
+        ) {
+            continue;
+        }
+        if !supports_param(model, key) {
+            obj.remove(*key);
+        }
+    }
+}
 
 /// Resolve a model name/alias/snapshot ID to its profile.
 pub fn lookup(model: &str) -> &'static ModelProfile {
@@ -404,5 +530,56 @@ mod tests {
         for p in PROFILES {
             assert!(!p.edit_format.as_str().is_empty(), "{} has no format", p.id);
         }
+    }
+
+    #[test]
+    fn supports_param_per_family_and_fallback() {
+        // Anthropic family: own knobs accepted, cross-family rejected.
+        assert!(supports_param("claude-sonnet-5", "temperature"));
+        assert!(supports_param("claude-sonnet-5", "top_k"));
+        assert!(supports_param("claude-sonnet-5", "stop_sequences"));
+        assert!(supports_param("claude-sonnet-5", "thinking"));
+        assert!(!supports_param("claude-sonnet-5", "reasoning_effort"));
+        assert!(!supports_param("claude-sonnet-5", "frequency_penalty"));
+        // Wire spelling is exact-case: top_p ≠ topP.
+        assert!(!supports_param("claude-sonnet-5", "topP"));
+        // LegionEdge fleet: conservative vLLM subset, no reasoning_effort.
+        assert!(supports_param("kimi-k3", "temperature"));
+        assert!(supports_param("kimi-k3", "frequency_penalty"));
+        assert!(!supports_param("kimi-k3", "reasoning_effort"));
+        assert!(!supports_param("kimi-k3", "thinking"));
+        // Unknown models → FALLBACK union (OpenAI-compat + Gemini), so new
+        // gpt/gemini snapshots send their native knobs through.
+        assert!(!known("some-future-model"));
+        assert_eq!(lookup("some-future-model").id, "unknown");
+        assert!(supports_param("some-future-model", "reasoning_effort"));
+        assert!(supports_param("some-future-model", "thinkingConfig"));
+        assert!(supports_param("some-future-model", "topP"));
+        assert!(!supports_param("some-future-model", "thinking"));
+        // Core keys are never params — supports_param refuses to gate them
+        // so no strip call can remove a required key.
+        for core in [
+            "model",
+            "messages",
+            "tools",
+            "max_tokens",
+            "maxOutputTokens",
+        ] {
+            assert!(!supports_param("claude-sonnet-5", core), "{core} gated");
+            assert!(!supports_param("some-future-model", core), "{core} gated");
+        }
+        // FALLBACK stays a superset of the canonical family sets: if a row
+        // is ever added for gpt-*/gemini-*, its knobs already pass.
+        for p in OPENAI_PARAMS {
+            assert!(FALLBACK_PARAMS.contains(p), "fallback lacks {p}");
+        }
+        for p in GEMINI_PARAMS {
+            assert!(FALLBACK_PARAMS.contains(p), "fallback lacks {p}");
+        }
+        // Every tabled accepted_params list is non-empty (no dead row).
+        for p in PROFILES {
+            assert!(!p.accepted_params.is_empty(), "{} has no params", p.id);
+        }
+        assert!(!FALLBACK.accepted_params.is_empty());
     }
 }

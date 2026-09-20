@@ -121,6 +121,15 @@ pub static MODES: &[Mode] = &[
         model: None,
         edit_globs: &["**/*.md", "**/*.mdx", "**/*.txt"],
     },
+    Mode {
+        name: "orchestrator",
+        prompt_frag: "Coordinate via task; make no direct edits.",
+        allowed_tools: &[
+            "read", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol",
+        ],
+        model: None,
+        edit_globs: &[],
+    },
 ];
 
 /// Resolve a mode by name (exact match, case-insensitive).
@@ -182,5 +191,22 @@ mod tests {
             ..*docs
         };
         assert!(!bad.edit_allowed("README.md"));
+    }
+
+    #[test]
+    fn orchestrator_coordinates_without_edits() {
+        let m = for_mode("orchestrator").unwrap();
+        assert_eq!(m.prompt_frag, "Coordinate via task; make no direct edits.");
+        assert!(m.model.is_none());
+        assert!(m.edit_globs.is_empty());
+        for t in [
+            "read", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol",
+        ] {
+            assert!(m.allows(t), "{t} must be allowed");
+        }
+        for t in ["edit", "write", "bash"] {
+            assert!(!m.allows(t), "{t} must be removed");
+        }
+        assert_eq!(for_mode("ORCHESTRATOR").unwrap().name, "orchestrator");
     }
 }

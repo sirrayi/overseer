@@ -25,6 +25,10 @@ fn main() {
 }
 
 fn real_main() -> i32 {
+    // Process posture before anything touches a key, the network, or the
+    // filesystem: umask 0o077 + proxy-env scrub (harden.rs). Cheap enough
+    // that even --version pays it without noticing.
+    overseer_core::harden::harden_startup();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Fast paths first — no provider init, no env probing (Ch.10 §2.2:

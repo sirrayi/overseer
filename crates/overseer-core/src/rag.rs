@@ -1,6 +1,6 @@
 //! Retrieval patterns ported from the RAG batch (arsenal B2).
 //!
-//! Four ports, all zero-dependency and all *patterns* — no model weights, no
+//! Six ports, all zero-dependency and all *patterns* — no model weights, no
 //! server, no vector store:
 //!
 //! - **docling `to_chunks`** — document → chunk spans with byte offsets, so
@@ -16,6 +16,11 @@
 //! - **ragflow `chunk_text`** — the delimiter hierarchy (headings →
 //!   paragraphs → sentences → char window) with section-local overlap and
 //!   exact byte spans, so a chunk can be quoted and re-read.
+//! - **lightrag dual-level routing** — `RetrievalMode` + `route_query`
+//!   (entity names → local, why/how-relational words → global, both →
+//!   hybrid), `merge_hits` (alternating-zip dedupe of the two levels),
+//!   `split_budget` (per-role char budgets with the remainder to chunks),
+//!   and chunk `cite` (`doc_id#order[start..end]`).
 //!
 //! `HashingEmbedder` is the deterministic stand-in used by tests and by
 //! any offline path: a hashed bag of tokens, L2-normalized. It is a
@@ -29,6 +34,8 @@
 // the delivery gate forbids new dependencies, and every layout parser needs
 // one.
 
+use std::collections::BTreeSet;
+
 /// One chunk of a document: the text plus its byte span in the source, so
 /// every chunk is quotable and re-readable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +43,11 @@ pub struct Chunk {
     pub text: String,
     pub start: usize,
     pub end: usize,
+    /// Source document id (LightRAG `full_doc_id`); `None` when the chunker
+    /// ran on bare text with no document identity.
+    pub doc_id: Option<String>,
+    /// Position of this chunk inside its document; `None` for unordered spans.
+    pub order: Option<usize>,
 }
 
 /// Split `text` into chunks of at most `max_chars` characters (char
@@ -111,6 +123,8 @@ fn pack(pieces: &[(usize, usize)], text: &str, max_chars: usize, overlap: usize)
             text: text[start..end].to_string(),
             start,
             end,
+            doc_id: None,
+            order: None,
         });
         i = j;
     }
@@ -602,6 +616,212 @@ fn sentence_spans(paragraph: &str) -> Vec<(usize, usize)> {
     out
 }
 
+/// Query modes from LightRAG's `QueryParam::mode`: local (entity lookup),
+/// global (relation/community summary), hybrid/mix (both levels), naive
+/// (plain vector recall), bypass (no retrieval).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalMode {
+    Local,
+    Global,
+    Hybrid,
+    Naive,
+    Mix,
+    Bypass,
+}
+
+impl RetrievalMode {
+    /// Canonical lowercase name (`"local"`, `"global"`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetrievalMode::Local => "local",
+            RetrievalMode::Global => "global",
+            RetrievalMode::Hybrid => "hybrid",
+            RetrievalMode::Naive => "naive",
+            RetrievalMode::Mix => "mix",
+            RetrievalMode::Bypass => "bypass",
+        }
+    }
+
+    /// Parse a mode name case-insensitively. The error lists every accepted
+    /// name so a caller can surface the want-list verbatim.
+    pub fn parse(s: &str) -> Result<RetrievalMode, String> {
+        match s.trim().to_lowercase().as_str() {
+            "local" => Ok(RetrievalMode::Local),
+            "global" => Ok(RetrievalMode::Global),
+            "hybrid" => Ok(RetrievalMode::Hybrid),
+            "naive" => Ok(RetrievalMode::Naive),
+            "mix" => Ok(RetrievalMode::Mix),
+            "bypass" => Ok(RetrievalMode::Bypass),
+            other => Err(format!(
+                "rag: unknown retrieval mode {other:?} — want one of: \
+                 local, global, hybrid, naive, mix, bypass"
+            )),
+        }
+    }
+}
+
+/// Words that ask about relations/communities rather than named entities —
+/// LightRAG's `ll_keywords` half of the routing decision, lexical here
+/// (the real classifier is a model call, which this port never makes).
+const RELATIONAL_WORDS: &[&str] = &[
+    "why",
+    "how",
+    "relate",
+    "related",
+    "relation",
+    "relationship",
+    "compare",
+    "overview",
+    "summarize",
+    "summarise",
+    "summary",
+    "theme",
+    "pattern",
+    "trend",
+    "overall",
+    "global",
+];
+
+/// Route `q` to a retrieval mode from LightRAG's keyword split:
+/// `hl` are high-level (entity-name) keywords, `ll` are low-level
+/// (relational) keywords.
+///
+/// - an explicit `bypass:` prefix (case-insensitive, leading space allowed)
+///   forces [`RetrievalMode::Bypass`];
+/// - an empty (or whitespace-only) query is [`RetrievalMode::Naive`] — there
+///   is nothing to route on;
+/// - an entity-name hit routes [`RetrievalMode::Local`], a relational-word
+///   hit routes [`RetrievalMode::Global`], both together route
+///   [`RetrievalMode::Hybrid`];
+/// - no hit at all routes [`RetrievalMode::Naive`], including the case of
+///   empty keyword lists with a non-empty query.
+///
+/// [`RetrievalMode::Mix`] is never returned here: it blends both levels with
+/// rerank weights, which is a caller-side merge decision (`merge_hits`), not
+/// a routing outcome.
+pub fn route_query(q: &str, hl: &[&str], ll: &[&str]) -> RetrievalMode {
+    let trimmed = q.trim_start();
+    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bypass:") {
+        return RetrievalMode::Bypass;
+    }
+    if q.trim().is_empty() {
+        return RetrievalMode::Naive;
+    }
+    let ql = q.to_lowercase();
+    let entity_hit = hl
+        .iter()
+        .any(|k| !k.is_empty() && ql.contains(&k.to_lowercase()));
+    let relational_hit = ll
+        .iter()
+        .any(|k| !k.is_empty() && ql.contains(&k.to_lowercase()))
+        || RELATIONAL_WORDS.iter().any(|w| contains_word(&ql, w));
+    match (entity_hit, relational_hit) {
+        (true, true) => RetrievalMode::Hybrid,
+        (true, false) => RetrievalMode::Local,
+        (false, true) => RetrievalMode::Global,
+        (false, false) => RetrievalMode::Naive,
+    }
+}
+
+/// True when `word` occurs in the already-lowercased `text` as a whole
+/// word (alphanumeric boundaries on both sides), so `how` matches
+/// "how are" but not "somehow".
+fn contains_word(text: &str, word: &str) -> bool {
+    let mut start = 0usize;
+    while let Some(rel) = text[start..].find(word) {
+        let s = start + rel;
+        let e = s + word.len();
+        let left_ok = s == 0
+            || !text[..s]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let right_ok = e == text.len()
+            || !text[e..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if left_ok && right_ok {
+            return true;
+        }
+        start = e;
+    }
+    false
+}
+
+/// Merge the local (entity) and global (relation) hit lists into one
+/// deterministic ranking: alternating zip starting with local, first
+/// occurrence wins, capped at `top_k` (`0` → empty). `BTreeSet` keeps the
+/// membership test deterministic and allocation-light; the output order is
+/// the zip order, never set order.
+pub fn merge_hits(local: &[String], global: &[String], top_k: usize) -> Vec<String> {
+    if top_k == 0 {
+        return Vec::new();
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut li = 0usize;
+    let mut gi = 0usize;
+    while out.len() < top_k && (li < local.len() || gi < global.len()) {
+        if li < local.len() {
+            let h = local[li].as_str();
+            li += 1;
+            if seen.insert(h) {
+                out.push(h.to_string());
+                if out.len() == top_k {
+                    break;
+                }
+            }
+        }
+        if gi < global.len() {
+            let h = global[gi].as_str();
+            gi += 1;
+            if seen.insert(h) {
+                out.push(h.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Split a char budget (LightRAG's token budgets, lexical here — chars stand
+/// in for tokens because the delivery gate forbids a tokenizer dependency)
+/// into entity / relation / chunk shares. `e_pct + r_pct + c_pct` must sum
+/// to at most 100; the remainder (unclaimed percent points) goes to chunks.
+pub fn split_budget(
+    total: usize,
+    e_pct: u8,
+    r_pct: u8,
+    c_pct: u8,
+) -> Result<(usize, usize, usize), String> {
+    let sum = e_pct as u16 + r_pct as u16 + c_pct as u16;
+    if sum > 100 {
+        return Err(format!(
+            "rag: split_budget: percents sum to {sum} — want e_pct + r_pct + c_pct <= 100"
+        ));
+    }
+    let e = total * e_pct as usize / 100;
+    let r = total * r_pct as usize / 100;
+    let c = total.saturating_sub(e + r);
+    Ok((e, r, c))
+}
+
+/// Render a chunk citation as `doc_id#order[start..end]` with `?`
+/// fallbacks for missing identity (`?#3[0..9]`, `doc#?[0..9]`,
+/// `?#?[0..9]`).
+pub fn cite(c: &Chunk) -> String {
+    let doc = c.doc_id.as_deref().unwrap_or("?");
+    let order = c
+        .order
+        .map(|o| o.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    format!("{doc}#{order}[{}..{}]", c.start, c.end)
+}
+
+// DEFERRED(owner): LightRAG's MinerU/Docling/PDF/Office/table parsers, vector/graph
+// stores, LLM extraction/query/summary, Leiden communities, and API/WebUI —
+// every one needs a dependency, a server, or a model call.
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1239,155 @@ mod tests {
         .unwrap();
         assert_eq!(whole.len(), 1);
         assert_eq!(whole[0].text, text);
+    }
+
+    #[test]
+    fn retrieval_mode_parses_case_insensitively_with_a_want_list() {
+        for (s, want) in [
+            ("local", RetrievalMode::Local),
+            ("GLOBAL", RetrievalMode::Global),
+            ("Hybrid", RetrievalMode::Hybrid),
+            ("naive", RetrievalMode::Naive),
+            (" Mix ", RetrievalMode::Mix),
+            ("BYPASS", RetrievalMode::Bypass),
+        ] {
+            assert_eq!(RetrievalMode::parse(s).unwrap(), want, "{s:?}");
+            assert_eq!(want.as_str(), format!("{:?}", want).to_lowercase());
+        }
+        let e = RetrievalMode::parse("fuzzy").unwrap_err();
+        for name in ["local", "global", "hybrid", "naive", "mix", "bypass"] {
+            assert!(e.contains(name), "want-list names {name}: {e}");
+        }
+    }
+
+    #[test]
+    fn route_query_maps_entities_relations_and_prefixes() {
+        let hl = ["paris"];
+        let ll = ["founder"];
+        assert_eq!(
+            route_query("tell me about Paris", &hl, &[]),
+            RetrievalMode::Local
+        );
+        assert_eq!(
+            route_query("why did the fund collapse?", &[], &[]),
+            RetrievalMode::Global
+        );
+        assert_eq!(
+            route_query("how was Paris founded by its founder?", &hl, &ll),
+            RetrievalMode::Hybrid
+        );
+        assert_eq!(route_query("", &hl, &ll), RetrievalMode::Naive);
+        assert_eq!(route_query("   ", &hl, &ll), RetrievalMode::Naive);
+        assert_eq!(
+            route_query("bypass: raw passage lookup", &hl, &ll),
+            RetrievalMode::Bypass
+        );
+        assert_eq!(
+            route_query("  BYPASS: raw passage lookup", &hl, &ll),
+            RetrievalMode::Bypass
+        );
+        // No keywords at all: a non-empty query is plain recall.
+        assert_eq!(
+            route_query("some ordinary question", &[], &[]),
+            RetrievalMode::Naive
+        );
+        // Explicit low-level keywords route globally too.
+        assert_eq!(
+            route_query("who is the founder?", &[], &ll),
+            RetrievalMode::Global
+        );
+        // `how` inside another word is not a relational question.
+        assert_eq!(
+            route_query("show me the map", &[], &[]),
+            RetrievalMode::Naive
+        );
+    }
+
+    #[test]
+    fn merge_hits_zips_dedupes_and_caps() {
+        let l = |ss: &[&str]| ss.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            merge_hits(&l(&["a", "b"]), &l(&["x", "y"]), 4),
+            l(&["a", "x", "b", "y"])
+        );
+        // First occurrence wins across both lists; the zip never re-emits.
+        assert_eq!(
+            merge_hits(&l(&["a", "b"]), &l(&["b", "c"]), 4),
+            l(&["a", "b", "c"])
+        );
+        // Duplicates inside one list collapse too.
+        assert_eq!(merge_hits(&l(&["a", "a", "b"]), &l(&[]), 4), l(&["a", "b"]));
+        // The cap cuts the zip short; zero is empty.
+        assert_eq!(
+            merge_hits(&l(&["a", "b"]), &l(&["x", "y"]), 3),
+            l(&["a", "x", "b"])
+        );
+        assert!(merge_hits(&l(&["a"]), &l(&["x"]), 0).is_empty());
+        // Uneven lists drain the longer side.
+        assert_eq!(
+            merge_hits(&l(&["a"]), &l(&["x", "y", "z"]), 10),
+            l(&["a", "x", "y", "z"])
+        );
+    }
+
+    #[test]
+    fn split_budget_divides_and_hands_the_remainder_to_chunks() {
+        assert_eq!(split_budget(100, 20, 30, 40).unwrap(), (20, 30, 50));
+        // Percent points nobody claimed (100 − 90) land on chunks.
+        assert_eq!(split_budget(1000, 20, 30, 40).unwrap(), (200, 300, 500));
+        // Integer division floors the shares; chunks take the leftover.
+        assert_eq!(split_budget(101, 20, 30, 40).unwrap(), (20, 30, 51));
+        assert_eq!(split_budget(0, 20, 30, 40).unwrap(), (0, 0, 0));
+        let e = split_budget(100, 50, 40, 20).unwrap_err();
+        assert!(e.contains("110"), "{e}");
+        assert!(e.contains("<= 100"), "{e}");
+    }
+
+    #[test]
+    fn cite_names_doc_order_and_span_with_fallbacks() {
+        let full = Chunk {
+            text: "hello".into(),
+            start: 0,
+            end: 5,
+            doc_id: Some("doc1".into()),
+            order: Some(3),
+        };
+        assert_eq!(cite(&full), "doc1#3[0..5]");
+        let no_doc = Chunk {
+            doc_id: None,
+            ..full.clone()
+        };
+        assert_eq!(cite(&no_doc), "?#3[0..5]");
+        let no_order = Chunk {
+            doc_id: Some("doc1".into()),
+            order: None,
+            ..full.clone()
+        };
+        assert_eq!(cite(&no_order), "doc1#?[0..5]");
+        let neither = Chunk {
+            doc_id: None,
+            order: None,
+            ..full
+        };
+        assert_eq!(cite(&neither), "?#?[0..5]");
+    }
+
+    #[test]
+    fn chunkers_leave_new_identity_fields_empty() {
+        for c in to_chunks("one\n\ntwo\n", 9, 0) {
+            assert_eq!(c.doc_id, None, "{c:?}");
+            assert_eq!(c.order, None, "{c:?}");
+        }
+        let cs = chunk_text(
+            "hello world",
+            &ChunkOpts {
+                max_chars: 100,
+                overlap: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].doc_id, None);
+        assert_eq!(cs[0].order, None);
     }
 }

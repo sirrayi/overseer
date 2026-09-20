@@ -25,7 +25,7 @@
 //! this port lands the storage format, the temporal query, and the
 //! deterministic offline report; everything that needs a model stays out.`
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -59,8 +59,26 @@ pub struct Edge {
     pub source: String,
     pub valid_from: String,
     /// Absent/`null` means the fact is still believed (an open interval).
+    ///
+    /// Naming bridge to graphiti's `EntityEdge`: this end of the half-open
+    /// interval is what graphiti calls `invalid_at`/`expired_at` — the
+    /// instant the fact stopped being true, exclusive. Same instant,
+    /// different name; the log keeps `valid_to`.
     #[serde(default)]
     pub valid_to: Option<String>,
+    /// Lineage columns ported from graphiti's `EntityEdge` (`uuid`,
+    /// `group_id`, `episodes`): opaque identity, tenant partition, and
+    /// episode provenance. All serde-defaulted so pre-port lines without
+    /// them still parse (`None`/`None`/empty); [`validate_edge`] ignores
+    /// them entirely — even empty strings pass — and [`append`] writes them
+    /// as-is (`None`/empty unless the caller sets them). [`retire`]
+    /// preserves `group`/`episodes` onto the replacement edge.
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub episodes: Vec<String>,
 }
 
 impl Edge {
@@ -334,6 +352,50 @@ fn parse_object(line: &str) -> Result<Edge, String> {
                 ));
             }
         },
+        uuid: match obj.get("uuid") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(other) => {
+                return Err(format!(
+                    "field `uuid` must be a JSON string or null, got `{other}` — omit it when \
+                     the edge has no stable identity"
+                ));
+            }
+        },
+        group: match obj.get("group") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(other) => {
+                return Err(format!(
+                    "field `group` must be a JSON string or null, got `{other}` — omit it when \
+                     the edge belongs to no tenant partition"
+                ));
+            }
+        },
+        episodes: match obj.get("episodes") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        serde_json::Value::String(s) => out.push(s.clone()),
+                        other => {
+                            return Err(format!(
+                                "field `episodes` must be an array of JSON strings, got `{other}` \
+                                 inside it — quote every episode id"
+                            ));
+                        }
+                    }
+                }
+                out
+            }
+            Some(other) => {
+                return Err(format!(
+                    "field `episodes` must be a JSON array of strings, got `{other}` — omit it \
+                     (or use null) when the edge cites no episodes"
+                ));
+            }
+        },
     };
     validate_edge(&edge)?;
     Ok(edge)
@@ -424,6 +486,127 @@ pub fn neighbours(edges: &[Edge], node: &str, t: &str) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// Retire one live edge at the exact instant `t` (graphiti's contradiction
+/// invalidation, without the model): finds the live edge (`live_at(t)`)
+/// matching `from`/`to`/`kind` and returns `(closed, opened)` — a clone of
+/// the old edge with `valid_to = t`, and a new edge over the same
+/// `from`/`to`/`kind` carrying `new_fact`/`source` with `valid_from = t`
+/// and `valid_to = None`.
+///
+/// The handoff is exact because the interval is half-open: the old edge is
+/// live at every instant before `t` and dead at `t`, while the new edge is
+/// live at `t` itself, so no instant has zero or two live edges. The
+/// replacement preserves the old edge's `group`/`episodes` (lineage rides
+/// along) but takes no `uuid` — the new belief is a new identity. Neither
+/// edge is appended here; the caller writes both to keep the log
+/// append-only.
+///
+/// Fail-closed: no live edge matching `from`/`to`/`kind` at `t`, a `t`
+/// that is not a UTC stamp ([`valid_utc_stamp`]), a `t` not strictly after
+/// the old edge's `valid_from`, or a blank `new_fact`/`source` is an `Err`
+/// and nothing is returned. Reasons carry a `graph:` prefix like
+/// [`parse_line`].
+pub fn retire(
+    edges: &[Edge],
+    from: &str,
+    to: &str,
+    kind: &str,
+    new_fact: &str,
+    source: &str,
+    t: &str,
+) -> Result<(Edge, Edge), String> {
+    if !valid_utc_stamp(t) {
+        return Err(format!(
+            "graph: `t` = `{t}` is not a UTC stamp — want YYYY-MM-DDTHH:MM:SS[.fraction]Z"
+        ));
+    }
+    if new_fact.trim().is_empty() {
+        return Err(
+            "graph: field `fact` is empty — the replacement edge must state the new belief"
+                .to_string(),
+        );
+    }
+    if source.trim().is_empty() {
+        return Err(
+            "graph: field `source` is empty — the replacement edge must name its provenance"
+                .to_string(),
+        );
+    }
+    let old = edges
+        .iter()
+        .find(|e| e.from == from && e.to == to && e.kind == kind && e.live_at(t))
+        .ok_or_else(|| {
+            format!("graph: no live edge `{from}` -[{kind}]-> `{to}` at `{t}` — nothing to retire")
+        })?;
+    let mut closed = old.clone();
+    closed.valid_to = Some(t.to_string());
+    validate_edge(&closed).map_err(|e| format!("graph: cannot close edge at `{t}`: {e}"))?;
+    let opened = Edge {
+        from: old.from.clone(),
+        to: old.to.clone(),
+        kind: old.kind.clone(),
+        fact: new_fact.to_string(),
+        source: source.to_string(),
+        valid_from: t.to_string(),
+        valid_to: None,
+        uuid: None,
+        group: old.group.clone(),
+        episodes: old.episodes.clone(),
+    };
+    validate_edge(&opened).map_err(|e| format!("graph: cannot open replacement edge: {e}"))?;
+    Ok((closed, opened))
+}
+
+/// Bounded breadth-first walk from `start` over the edges live at `t`.
+///
+/// Each hop expands through [`neighbours`], so direction is ignored exactly
+/// as there. `depth` counts hops from `start` (`0` reaches nothing) and is
+/// capped at 4 — a traversal without a cap is a full-graph read wearing a
+/// query's clothes. Revisits are suppressed with a visited set (cycles
+/// terminate), output is sorted and deduplicated, and `start` itself is
+/// excluded even when a cycle leads back to it.
+pub fn walk(edges: &[Edge], start: &str, t: &str, depth: usize) -> Vec<String> {
+    let capped = depth.min(4);
+    if capped == 0 {
+        return Vec::new();
+    }
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    visited.insert(start.to_string());
+    let mut frontier: Vec<String> = vec![start.to_string()];
+    for _ in 0..capped {
+        let mut next: Vec<String> = Vec::new();
+        for node in &frontier {
+            for name in neighbours(edges, node, t) {
+                if visited.insert(name.clone()) {
+                    next.push(name);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    visited.remove(start);
+    visited.into_iter().collect()
+}
+
+/// The edges of one thread live at `t`, in log order: every edge whose
+/// `source` is exactly `thread:<id>` (the session-scoping convention
+/// ported from zep's thread/message grounding) and whose interval covers
+/// `t`. An empty `thread` matches nothing — failing closed rather than
+/// returning every edge whose source happens to be non-empty.
+pub fn thread_live<'a>(edges: &'a [Edge], thread: &str, t: &str) -> Vec<&'a Edge> {
+    if thread.trim().is_empty() {
+        return Vec::new();
+    }
+    let want = format!("thread:{thread}");
+    edges
+        .iter()
+        .filter(|e| e.source == want && e.live_at(t))
+        .collect()
 }
 
 // ── graphrag: the deterministic offline summary ──────────────────────────
@@ -564,6 +747,7 @@ mod tests {
     }
 
     /// A well-formed edge, with the fields the tests then break on purpose.
+    /// Lineage stays unset so archival fixtures exercise the defaults.
     fn mk(from: &str, to: &str, kind: &str, valid_from: &str, valid_to: Option<&str>) -> Edge {
         Edge {
             from: from.to_string(),
@@ -573,6 +757,9 @@ mod tests {
             source: "chat".to_string(),
             valid_from: valid_from.to_string(),
             valid_to: valid_to.map(str::to_string),
+            uuid: None,
+            group: None,
+            episodes: Vec::new(),
         }
     }
 
@@ -1051,5 +1238,248 @@ mod tests {
             "the cut backs up to a whole line, not a partial entity: {:?}",
             body.lines().last()
         );
+    }
+
+    #[test]
+    fn old_lines_parse_without_lineage_and_lineage_survives() {
+        let edge = parse_line(LINE).unwrap();
+        assert_eq!(edge.uuid, None);
+        assert_eq!(edge.group, None);
+        assert!(edge.episodes.is_empty());
+        // Lineage is accepted but ignored by the gate: empties still pass.
+        let mut with_empty = edge.clone();
+        with_empty.uuid = Some(String::new());
+        with_empty.group = Some(String::new());
+        assert!(validate_edge(&with_empty).is_ok());
+        assert!(parse_line(&serde_json::to_string(&with_empty).unwrap()).is_ok());
+        // Real lineage round-trips through parse/append/load.
+        let mut lined = edge.clone();
+        lined.uuid = Some("u-1".to_string());
+        lined.group = Some("tenant-a".to_string());
+        lined.episodes = vec!["ep-1".to_string(), "ep-2".to_string()];
+        let back = parse_line(&serde_json::to_string(&lined).unwrap()).unwrap();
+        assert_eq!(back, lined);
+        let dir = tmpdir();
+        let path = dir.join("graph.jsonl");
+        append(&path, &lined).unwrap();
+        assert_eq!(load(&path).unwrap(), vec![lined]);
+        // A fresh edge leaves lineage unset unless the caller sets it.
+        assert_eq!(mk("a", "b", "k", "2026-01-01T00:00:00Z", None).uuid, None);
+    }
+
+    #[test]
+    fn retire_hands_off_at_the_exact_instant_and_preserves_lineage() {
+        let mut old = mk("ada", "engine", "designs", "2026-01-01T00:00:00Z", None);
+        old.group = Some("tenant-a".to_string());
+        old.episodes = vec!["ep-1".to_string()];
+        let edges = vec![old.clone()];
+        let t = "2026-02-01T00:00:00Z";
+        let (closed, opened) = retire(
+            &edges,
+            "ada",
+            "engine",
+            "designs",
+            "ada redesigns the engine",
+            "chat",
+            t,
+        )
+        .unwrap();
+        assert_eq!(closed.valid_to.as_deref(), Some(t));
+        assert_eq!(closed.group, old.group);
+        assert_eq!(closed.episodes, old.episodes);
+        assert_eq!(opened.from, "ada");
+        assert_eq!(opened.to, "engine");
+        assert_eq!(opened.kind, "designs");
+        assert_eq!(opened.fact, "ada redesigns the engine");
+        assert_eq!(opened.source, "chat");
+        assert_eq!(opened.valid_from, t);
+        assert_eq!(opened.valid_to, None);
+        assert_eq!(opened.uuid, None);
+        assert_eq!(opened.group, old.group);
+        assert_eq!(opened.episodes, old.episodes);
+        // Exact instant: the instant before belongs to the old edge, the
+        // instant itself to the new one — never zero, never two.
+        assert!(closed.live_at("2026-01-31T23:59:59Z"));
+        assert!(!closed.live_at(t));
+        assert!(!opened.live_at("garbage"));
+        assert!(opened.live_at(t));
+        assert!(validate_edge(&closed).is_ok() && validate_edge(&opened).is_ok());
+    }
+
+    #[test]
+    fn retire_fails_closed() {
+        let edges = vec![mk("ada", "engine", "designs", "2026-01-01T00:00:00Z", None)];
+        // No live edge: wrong kind, wrong instant, already retired.
+        assert!(retire(
+            &edges,
+            "ada",
+            "engine",
+            "reviews",
+            "f",
+            "chat",
+            "2026-02-01T00:00:00Z"
+        )
+        .unwrap_err()
+        .contains("no live edge"));
+        assert!(retire(
+            &edges,
+            "ada",
+            "engine",
+            "designs",
+            "f",
+            "chat",
+            "2025-12-31T23:59:59Z"
+        )
+        .unwrap_err()
+        .contains("no live edge"));
+        let retired = vec![mk(
+            "ada",
+            "engine",
+            "designs",
+            "2026-01-01T00:00:00Z",
+            Some("2026-02-01T00:00:00Z"),
+        )];
+        assert!(retire(
+            &retired,
+            "ada",
+            "engine",
+            "designs",
+            "f",
+            "chat",
+            "2026-03-01T00:00:00Z"
+        )
+        .unwrap_err()
+        .contains("no live edge"));
+        // Bad clock, blank replacement fields, and a stamp that would close
+        // the interval to zero length are all refused.
+        for bad_t in ["not a stamp", "2026-01-02T15:04:05+02:00", ""] {
+            assert!(
+                retire(&edges, "ada", "engine", "designs", "f", "chat", bad_t)
+                    .unwrap_err()
+                    .contains("UTC stamp"),
+                "{bad_t}"
+            );
+        }
+        assert!(retire(
+            &edges,
+            "ada",
+            "engine",
+            "designs",
+            "   ",
+            "chat",
+            "2026-02-01T00:00:00Z"
+        )
+        .unwrap_err()
+        .contains("fact"));
+        assert!(retire(
+            &edges,
+            "ada",
+            "engine",
+            "designs",
+            "f",
+            "  ",
+            "2026-02-01T00:00:00Z"
+        )
+        .unwrap_err()
+        .contains("source"));
+        assert!(retire(
+            &edges,
+            "ada",
+            "engine",
+            "designs",
+            "f",
+            "chat",
+            "2026-01-01T00:00:00Z"
+        )
+        .unwrap_err()
+        .contains("valid_to"));
+    }
+
+    #[test]
+    fn walk_is_bounded_sorted_and_cycle_safe() {
+        let t0 = "2026-01-01T00:00:00Z";
+        // a-b-c-d-e chain plus a cycle back e->b and a side branch b->z.
+        let edges = vec![
+            mk("a", "b", "k", t0, None),
+            mk("b", "c", "k", t0, None),
+            mk("c", "d", "k", t0, None),
+            mk("d", "e", "k", t0, None),
+            mk("e", "b", "k", t0, None),
+            mk("b", "z", "k", t0, None),
+        ];
+        let t = "2026-06-01T00:00:00Z";
+        assert!(walk(&edges, "a", t, 0).is_empty());
+        assert_eq!(walk(&edges, "a", t, 1), vec!["b".to_string()]);
+        assert_eq!(
+            walk(&edges, "a", t, 2),
+            vec![
+                "b".to_string(),
+                "c".to_string(),
+                "e".to_string(),
+                "z".to_string()
+            ]
+        );
+        // Depth 3 reaches d through the cycle edge without looping forever.
+        assert!(walk(&edges, "a", t, 3).contains(&"d".to_string()));
+        assert!(!walk(&edges, "a", t, 3).contains(&"a".to_string()));
+        // The cap holds: asking for 99 hops is asking for 4.
+        assert_eq!(walk(&edges, "a", t, 99), walk(&edges, "a", t, 4));
+        let out = walk(&edges, "a", t, 4);
+        let mut sorted = out.clone();
+        sorted.sort();
+        assert_eq!(out, sorted, "output is sorted");
+        // Retired edges are invisible to the walk.
+        let mut with_dead = edges.clone();
+        with_dead.push(mk(
+            "a",
+            "ghost",
+            "k",
+            "2025-01-01T00:00:00Z",
+            Some("2025-02-01T00:00:00Z"),
+        ));
+        assert!(!walk(&with_dead, "a", t, 1).contains(&"ghost".to_string()));
+    }
+
+    #[test]
+    fn thread_live_filters_by_convention_and_time() {
+        let mk_thread = |fact: &str, source: &str, from: &str, to: &str| Edge {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: "says".to_string(),
+            fact: fact.to_string(),
+            source: source.to_string(),
+            valid_from: "2026-01-01T00:00:00Z".to_string(),
+            valid_to: None,
+            uuid: None,
+            group: None,
+            episodes: Vec::new(),
+        };
+        let edges = vec![
+            mk_thread("one", "thread:alpha", "a", "b"),
+            mk_thread("two", "thread:alpha", "b", "c"),
+            mk_thread("other", "thread:beta", "a", "z"),
+            mk_thread("plain", "chat", "a", "q"),
+        ];
+        let t = "2026-06-01T00:00:00Z";
+        let live: Vec<String> = thread_live(&edges, "alpha", t)
+            .iter()
+            .map(|e| e.fact.clone())
+            .collect();
+        assert_eq!(
+            live,
+            vec!["one".to_string(), "two".to_string()],
+            "log order kept"
+        );
+        assert!(thread_live(&edges, "beta", t)
+            .iter()
+            .all(|e| e.source == "thread:beta"));
+        assert!(thread_live(&edges, "", t).is_empty());
+        assert!(thread_live(&edges, "   ", t).is_empty());
+        assert!(thread_live(&edges, "alpha", "garbage").is_empty());
+        assert!(thread_live(&edges, "gamma", t).is_empty());
+        // A retired thread edge drops out of the snapshot.
+        let mut retired = edges.clone();
+        retired[0].valid_to = Some("2026-02-01T00:00:00Z".to_string());
+        assert_eq!(thread_live(&retired, "alpha", t).len(), 1);
     }
 }

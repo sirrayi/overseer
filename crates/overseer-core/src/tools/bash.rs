@@ -170,6 +170,67 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     o
 }
 
+/// Split a shell command into pipeline stages on `|`, respecting single
+/// quotes, double quotes and backticks (a `|` inside any of the three
+/// never splits). A `\` quotes the next character outside single quotes.
+/// Stages are trimmed and empties dropped. This is a shape helper for
+/// pipeline analysis, not a shell parser: it knows nothing of `||`,
+/// `|&`, redirections or nesting. Pure function of `cmd`; `run` and
+/// `wrap_command` are untouched by it.
+pub fn split_pipeline(cmd: &str) -> Vec<String> {
+    let mut stages = Vec::new();
+    let mut cur = String::new();
+    let mut single = false;
+    let mut double = false;
+    let mut backtick = false;
+    let mut chars = cmd.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' && !single {
+            cur.push(c);
+            if let Some(n) = chars.next() {
+                cur.push(n);
+            }
+            continue;
+        }
+        match c {
+            '\'' if !double && !backtick => single = !single,
+            '"' if !single && !backtick => double = !double,
+            '`' if !single && !double => backtick = !backtick,
+            '|' if !single && !double && !backtick => {
+                let stage = cur.trim().to_string();
+                if !stage.is_empty() {
+                    stages.push(stage);
+                }
+                cur.clear();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    let tail = cur.trim().to_string();
+    if !tail.is_empty() {
+        stages.push(tail);
+    }
+    stages
+}
+
+/// Middle-truncate tool output to `cap` chars (char-safe, never bytes),
+/// keeping head and tail around an explicit `…[trimmed N chars]…` marker
+/// (`N` is always `chars − cap`). Within `cap` returns whole. A twin of
+/// `super::middle_truncate` with a marker that names the dropped count;
+/// pure function of its inputs.
+pub fn shape_trim(output: &str, cap: usize) -> String {
+    let n = output.chars().count();
+    if n <= cap {
+        return output.to_string();
+    }
+    let half = cap / 2;
+    let head: String = output.chars().take(half).collect();
+    let tail: String = output.chars().skip(n - half).collect();
+    format!("{head}\n…[trimmed {} chars]…\n{tail}", n - cap)
+}
+
 /// Declared broker secrets as (selector, real) env pairs for the child.
 /// Empty without a broker — the allowlisted env above is untouched.
 fn broker_env(ctx: &ToolCtx) -> Vec<(String, String)> {
@@ -264,8 +325,10 @@ fn bubblewrap_invocation(
 /// macOS Seatbelt profile for `sandbox-exec -p` (P1.5): deny-by-default,
 /// exec/read freely, writes only to the workspace + temp dirs, network
 /// fully denied (deny overrides allow regardless of order). Secret dirs
-/// are read-denied on top of the broad read allow. A loopback egress
-/// proxy with domain allowlists is still open — v1 denies all egress.
+/// are read-denied on top of the broad read allow. Egress stays deny-all:
+/// the Phase-C gate (`backends::allowlist_match` + `is_public_ip_literal`)
+/// decides *which* domains a future loopback CONNECT/SOCKS5 proxy may dial.
+// DEFERRED(owner): loopback CONNECT+SOCKS5 proxy + per-session token — matcher lands now, proxy needs runtime.
 #[cfg(target_os = "macos")]
 fn macos_profile(cwd: &std::path::Path) -> String {
     let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
@@ -573,5 +636,37 @@ mod tests {
             vec![("API_TOKEN".to_string(), "tok-real-123".to_string())]
         );
         assert!(!env.iter().any(|(_, v)| v.contains(&sentinel)));
+    }
+
+    #[test]
+    fn split_pipeline_splits_bare_pipes_trims_and_drops_empties() {
+        assert_eq!(split_pipeline("a | b | c"), vec!["a", "b", "c"]);
+        assert_eq!(split_pipeline("  a||b |  "), vec!["a", "b"]);
+        assert_eq!(split_pipeline("single"), vec!["single"]);
+        assert!(split_pipeline("  |  ").is_empty());
+    }
+
+    #[test]
+    fn split_pipeline_respects_quotes_backticks_and_escapes() {
+        assert_eq!(
+            split_pipeline(r#"echo 'a|b' | grep "x|y""#),
+            vec!["echo 'a|b'", r#"grep "x|y""#]
+        );
+        assert_eq!(
+            split_pipeline("echo `a|b` | wc -l"),
+            vec!["echo `a|b`", "wc -l"]
+        );
+        // A backslash quotes the pipe outside single quotes.
+        assert_eq!(split_pipeline(r"echo a\|b | c"), vec![r"echo a\|b", "c"]);
+    }
+
+    #[test]
+    fn shape_trim_keeps_head_and_tail_around_a_counted_marker() {
+        assert_eq!(shape_trim("abc", 10), "abc");
+        let out = shape_trim("abcdefghij", 4);
+        assert_eq!(out, "ab\n…[trimmed 6 chars]…\nij");
+        // The dropped count is chars, not bytes: six `é` minus cap 2.
+        let out = shape_trim("éééééé", 2);
+        assert_eq!(out, "é\n…[trimmed 4 chars]…\né");
     }
 }
