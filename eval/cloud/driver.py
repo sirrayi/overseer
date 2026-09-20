@@ -16,6 +16,7 @@ Env:
 
 Usage:
   driver.py plan                     # print the shard matrix
+  driver.py matrix-json              # specs as JSON (GHA dynamic matrix)
   driver.py launch [--only <sel>]    # create sessions (dry-run w/o --go)
   driver.py poll [--watch]           # status table of tracked sessions
   driver.py track <session_id>       # register an externally-created session
@@ -161,7 +162,7 @@ def matrix() -> list[dict]:
                 "benchmark": "swe_bench",
                 "model": model,
                 "commands": [
-                    f'IDS=$(uv run python ../cloud/shard_ids.py '
+                    f'IDS=$(uv run python cloud/shard_ids.py '
                     f'--dataset SWE-bench/SWE-bench_Verified '
                     f'--shard {i} --of {SWEB_SHARDS}) && '
                     f'uv run python run.py --benchmark swe_bench '
@@ -232,7 +233,8 @@ def save_state(st: dict) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["plan", "launch", "poll", "track", "msg"])
+    ap.add_argument("cmd", choices=["plan", "matrix-json", "launch",
+                                    "poll", "track", "msg"])
     ap.add_argument("arg", nargs="?", default=None)
     ap.add_argument("--only", default=None, help="run-prefix filter (e.g. sweb-muse)")
     ap.add_argument("--go", action="store_true", help="actually create sessions")
@@ -249,6 +251,17 @@ def main() -> int:
         for s in specs:
             print(f"{s['run']:>20}  {s['benchmark']:<16} {s['model']}")
         print(f"\n{len(specs)} workers total")
+        return 0
+
+    if args.cmd == "matrix-json":
+        # Flat include-entries for GHA `strategy.matrix.include` — each
+        # worker job runs `cmd` verbatim inside eval/.
+        out = [{"run": s["run"], "benchmark": s["benchmark"],
+                "model": s["model"], "cmd": " && ".join(s["commands"])}
+               for s in specs]
+        if args.max:
+            out = out[: args.max]
+        print(json.dumps(out))
         return 0
 
     if args.cmd == "track":
