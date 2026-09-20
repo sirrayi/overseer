@@ -62,6 +62,16 @@ impl DaemonDirs {
         self.root.join("notify.jsonl")
     }
     pub fn ensure(&self) -> std::io::Result<()> {
+        // The root holds the ctl socket — the daemon's control plane —
+        // so it is pinned owner-only (the CLI's startup umask already
+        // covers fresh creates; this also fixes pre-hardening 0755 dirs).
+        // Gateway stays core-free, so the chmod rides libc directly.
+        std::fs::create_dir_all(&self.root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700));
+        }
         std::fs::create_dir_all(self.inbox())?;
         std::fs::create_dir_all(self.runs())?;
         std::fs::create_dir_all(self.channels())?;

@@ -17,6 +17,8 @@ fn ev(kind: EventKind) -> Event {
         id: 0,
         parent_id: None,
         ts_ms: 0,
+        prev_hash: 0,
+        hash: 0,
         kind,
     }
 }

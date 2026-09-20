@@ -26,6 +26,8 @@
 //! segments, not as a cache operator) — this batch lands the slots, the
 //! budgets, and the reports only.`
 
+use serde_json::Value;
+
 // ── llmlingua compression slot ───────────────────────────────────────────
 
 /// The compression slot (llmlingua's `PromptCompressor` shape): rewrite
@@ -302,6 +304,39 @@ impl ContextPress for SinkRecentPress {
             dropped_chars,
             note,
         }
+    }
+}
+
+// ── microcompact whitelist ─────────────────────────────────────────────────
+
+/// Keys a microcompact may keep (MiMo manifest port): the goal, the
+/// outstanding work, what already broke, which files matter, and what was
+/// decided. Everything else is dropped so a compacted manifest stays small
+/// and deterministic.
+pub const MICROCOMPACT_KEEP: &[&str] = &["goal", "pending", "errors", "files", "decisions"];
+
+/// Keep only [`MICROCOMPACT_KEEP`] keys of a JSON object. Non-objects pass
+/// through unchanged (there is nothing to trim). Deterministic: `serde_json`
+/// maps are `BTreeMap`s, so the surviving keys stay sorted with no extra
+/// work.
+pub fn microcompact_filter(value: &Value) -> Value {
+    let Value::Object(obj) = value else {
+        return value.clone();
+    };
+    obj.iter()
+        .filter(|(k, _)| MICROCOMPACT_KEEP.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
+/// True when [`microcompact_filter`] would drop nothing: non-objects are
+/// trivially safe, and objects are safe exactly when every key is
+/// whitelisted.
+pub fn is_microcompact_safe(value: &Value) -> bool {
+    match value {
+        Value::Object(obj) => obj.keys().all(|k| MICROCOMPACT_KEEP.contains(&k.as_str())),
+        _ => true,
     }
 }
 
@@ -677,5 +712,55 @@ mod tests {
             "an identity compressor still respects the budget"
         );
         assert!(out.note.is_some());
+    }
+
+    #[test]
+    fn microcompact_keeps_only_whitelisted_keys() {
+        use serde_json::json;
+        let value = json!({
+            "goal": "ship",
+            "pending": ["a"],
+            "errors": ["e"],
+            "files": ["f.rs"],
+            "decisions": ["d"],
+            "transcript": "drop me",
+            "scratch": 7,
+        });
+        let filtered = microcompact_filter(&value);
+        assert_eq!(
+            filtered,
+            json!({
+                "goal": "ship",
+                "pending": ["a"],
+                "errors": ["e"],
+                "files": ["f.rs"],
+                "decisions": ["d"],
+            })
+        );
+        assert!(
+            !is_microcompact_safe(&value),
+            "extra keys must read as unsafe"
+        );
+        assert!(is_microcompact_safe(&filtered));
+        assert!(is_microcompact_safe(&json!({"goal": "x"})));
+        assert!(
+            is_microcompact_safe(&json!({})),
+            "empty object drops nothing"
+        );
+    }
+
+    #[test]
+    fn microcompact_passes_non_objects_through() {
+        use serde_json::json;
+        for value in [
+            json!(7),
+            json!("text"),
+            json!([1, 2]),
+            json!(null),
+            json!(true),
+        ] {
+            assert_eq!(microcompact_filter(&value), value, "passthrough: {value}");
+            assert!(is_microcompact_safe(&value), "passthrough is safe: {value}");
+        }
     }
 }

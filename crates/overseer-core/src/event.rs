@@ -153,6 +153,28 @@ pub enum EventKind {
         price_in: f64,
         price_out: f64,
     },
+    /// The L4 permission gate decided a tool call (P6-4 audit trail):
+    /// which tool, the verdict (`allow`/`ask`/`deny`), and why.
+    /// Audit-only — never rehydrates into messages.
+    PermissionDecision {
+        tool: String,
+        verdict: String,
+        reason: String,
+    },
+    /// Policy rule files were loaded for this session: where from and
+    /// how many rules took effect. Audit-only, like `MemoryUpdated`;
+    /// carries paths/counts only, never secret material.
+    PolicyLoad {
+        path: String,
+        rules: u64,
+    },
+    /// A sandbox backend refused to run a command (pinned runtime
+    /// unavailable, seatbelt deny, seccomp violation…). Audit-only —
+    /// the failed call itself is recorded by its ToolResult.
+    SandboxDenial {
+        backend: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,8 +182,95 @@ pub struct Event {
     pub id: u64,
     pub parent_id: Option<u64>,
     pub ts_ms: u64,
+    /// Hash chain over (id, parent_id, kind tag, prev_hash) — FNV-1a,
+    /// see `event_hash`. `#[serde(default)]` keeps pre-chain logs
+    /// loadable; old events verify as chain genesis (prev 0).
+    #[serde(default)]
+    pub prev_hash: u64,
+    /// `event_hash(id, parent_id, kind tag, prev_hash)` at append time.
+    #[serde(default)]
+    pub hash: u64,
     #[serde(flatten)]
     pub kind: EventKind,
+}
+
+/// Tamper-evident chain hash for one event (FNV-1a, 64-bit).
+///
+/// Feeds `id` (LE bytes), `parent_id` (`u64::MAX` for `None` — distinct
+/// from any real id), the serde `type` tag of `kind` (stable across
+/// payload edits — payload bytes are NOT hashed), and `prev` (0 for the
+/// chain head). Deterministic, std-only, no new deps.
+pub fn event_hash(id: u64, parent_id: Option<u64>, type_str: &str, prev: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFFSET;
+    let mut mix = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    };
+    mix(&id.to_le_bytes());
+    mix(&parent_id.unwrap_or(u64::MAX).to_le_bytes());
+    mix(type_str.as_bytes());
+    mix(&prev.to_le_bytes());
+    h
+}
+
+/// The serde `type` tag for an [`EventKind`] — the stable string
+/// [`event_hash`] chains over. One arm per variant; update with the enum.
+pub fn event_type_str(kind: &EventKind) -> &'static str {
+    match kind {
+        EventKind::SessionStart { .. } => "session_start",
+        EventKind::UserInput { .. } => "user_input",
+        EventKind::ModelResponse { .. } => "model_response",
+        EventKind::ToolCallStart { .. } => "tool_call_start",
+        EventKind::ToolResult { .. } => "tool_result",
+        EventKind::TurnEnd { .. } => "turn_end",
+        EventKind::RunEnd { .. } => "run_end",
+        EventKind::SubagentDone { .. } => "subagent_done",
+        EventKind::Tainted { .. } => "tainted",
+        EventKind::ComputerAct { .. } => "computer_act",
+        EventKind::StuckDetected { .. } => "stuck_detected",
+        EventKind::Nudge { .. } => "nudge",
+        EventKind::Compaction { .. } => "compaction",
+        EventKind::MemoryUpdated { .. } => "memory_updated",
+        EventKind::ConsentGranted { .. } => "consent_granted",
+        EventKind::Error { .. } => "error",
+        EventKind::ModelSwitch { .. } => "model_switch",
+        EventKind::PermissionDecision { .. } => "permission_decision",
+        EventKind::PolicyLoad { .. } => "policy_load",
+        EventKind::SandboxDenial { .. } => "sandbox_denial",
+    }
+}
+
+/// Verify the hash chain over a replayed log: each event's `hash` must
+/// equal `event_hash(id, parent_id, type tag, prev_hash)`, and each
+/// `prev_hash` must equal the previous event's `hash` (0 for the head).
+/// Empty logs verify. Pre-chain events (both hashes 0) verify as genesis;
+/// a mixed log verifies while the chain is unbroken from the first
+/// hashed event on.
+pub fn verify_chain(events: &[Event]) -> bool {
+    let mut prev = 0u64;
+    let mut hashed_seen = false;
+    for e in events {
+        if e.prev_hash == 0 && e.hash == 0 {
+            // Pre-chain event: only valid before any hashed event.
+            if hashed_seen {
+                return false;
+            }
+            continue;
+        }
+        if e.prev_hash != prev {
+            return false;
+        }
+        if e.hash != event_hash(e.id, e.parent_id, event_type_str(&e.kind), e.prev_hash) {
+            return false;
+        }
+        prev = e.hash;
+        hashed_seen = true;
+    }
+    true
 }
 
 /// Writer for a session's `events.jsonl`. IDs are monotonic per session;
@@ -261,6 +370,9 @@ pub struct EventLog {
     next_id: u64,
     head: Option<u64>,
     last: Option<Event>,
+    /// Running chain hash: the `hash` of the last appended (or replayed)
+    /// event, 0 for an empty / pre-chain log. Seeds `prev_hash` on append.
+    prev_hash: u64,
 }
 
 impl EventLog {
@@ -277,6 +389,7 @@ impl EventLog {
             next_id: 1,
             head: None,
             last: None,
+            prev_hash: 0,
         })
     }
 
@@ -284,9 +397,9 @@ impl EventLog {
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let events = Self::replay(&path)?;
-        let (next_id, head, last) = match events.last() {
-            Some(e) => (e.id + 1, Some(e.id), Some(e.clone())),
-            None => (1, None, None),
+        let (next_id, head, last, prev_hash) = match events.last() {
+            Some(e) => (e.id + 1, Some(e.id), Some(e.clone()), e.hash),
+            None => (1, None, None, 0),
         };
         let file = OpenOptions::new().append(true).open(&path)?;
         Ok(EventLog {
@@ -295,6 +408,7 @@ impl EventLog {
             next_id,
             head,
             last,
+            prev_hash,
         })
     }
 
@@ -304,12 +418,18 @@ impl EventLog {
 
     /// Append an event; returns the assigned id. Buffer-flushed every call,
     /// fsync only on `flush()` (turn boundaries — durable-tail semantics).
+    /// Stamps the hash chain (`prev_hash` + `hash`); Invariant 1 still
+    /// holds — past lines are never rewritten.
     pub fn append(&mut self, kind: EventKind) -> std::io::Result<u64> {
         let id = self.next_id;
+        let prev_hash = self.prev_hash;
+        let hash = event_hash(id, self.head, event_type_str(&kind), prev_hash);
         let ev = Event {
             id,
             parent_id: self.head,
             ts_ms: now_ms(),
+            prev_hash,
+            hash,
             kind,
         };
         let mut line = serde_json::to_string(&ev).map_err(std::io::Error::other)?;
@@ -318,6 +438,7 @@ impl EventLog {
         self.file.flush()?;
         self.head = Some(id);
         self.next_id += 1;
+        self.prev_hash = hash;
         self.last = Some(ev);
         Ok(id)
     }
@@ -650,6 +771,8 @@ mod tests {
                 id: 0,
                 parent_id: None,
                 ts_ms: 1,
+                prev_hash: 0,
+                hash: 0,
                 kind: EventKind::SessionStart {
                     session_id: "s1".into(),
                     cwd: "/tmp".into(),
@@ -662,6 +785,8 @@ mod tests {
                 id: 1,
                 parent_id: Some(0),
                 ts_ms: 2,
+                prev_hash: 0,
+                hash: 0,
                 kind: EventKind::ModelResponse {
                     blocks: vec![],
                     usage: Usage {
@@ -678,6 +803,8 @@ mod tests {
                 id: 2,
                 parent_id: Some(1),
                 ts_ms: 3,
+                prev_hash: 0,
+                hash: 0,
                 kind: EventKind::ToolCallStart {
                     call_id: "c1".into(),
                     name: "read".into(),
@@ -688,6 +815,8 @@ mod tests {
                 id: 3,
                 parent_id: Some(2),
                 ts_ms: 4,
+                prev_hash: 0,
+                hash: 0,
                 kind: EventKind::ToolResult {
                     call_id: "c1".into(),
                     name: "read".into(),
@@ -738,5 +867,157 @@ mod tests {
                 "gen_ai.usage.reasoning_tokens",
             ]
         );
+    }
+
+    #[test]
+    fn chain_append_verifies_and_tamper_fails() {
+        let dir = tmpdir();
+        let path = dir.join("events.jsonl");
+        {
+            let mut log = EventLog::create(&path).unwrap();
+            log.append(EventKind::SessionStart {
+                session_id: "s1".into(),
+                cwd: "/tmp".into(),
+                model: "m".into(),
+                harness_version: "0.1.0".into(),
+                parent: None,
+            })
+            .unwrap();
+            log.append(EventKind::UserInput {
+                text: "hello".into(),
+            })
+            .unwrap();
+            log.append(EventKind::PermissionDecision {
+                tool: "bash".into(),
+                verdict: "deny".into(),
+                reason: "exfil gate".into(),
+            })
+            .unwrap();
+            log.flush().unwrap();
+        }
+        let events = EventLog::replay(&path).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(verify_chain(&events), "fresh appends must verify");
+        assert!(verify_chain(&[]), "empty log verifies");
+        // Resume continues the chain (open seeds prev_hash from the tail).
+        {
+            let mut log = EventLog::open(&path).unwrap();
+            log.append(EventKind::SandboxDenial {
+                backend: "seatbelt".into(),
+                reason: "deny net".into(),
+            })
+            .unwrap();
+        }
+        let resumed = EventLog::replay(&path).unwrap();
+        assert_eq!(resumed.len(), 4);
+        assert!(
+            verify_chain(&resumed),
+            "resumed append must extend the chain"
+        );
+        // Tamper with a payload tag (kind swap keeps the envelope): fails.
+        let mut tampered = resumed.clone();
+        tampered[1].kind = EventKind::UserInput {
+            text: "forged".into(),
+        };
+        // Same-tag content edit does NOT trip the tag chain (payloads are
+        // not hashed by design) — the tag swap below is what must fail.
+        assert!(verify_chain(&tampered));
+        tampered[1].kind = EventKind::Nudge {
+            text: "forged".into(),
+        };
+        assert!(!verify_chain(&tampered), "kind swap must fail verify");
+        // Splice (drop an event): prev link breaks.
+        let mut spliced = resumed.clone();
+        spliced.remove(1);
+        assert!(!verify_chain(&spliced), "splice must fail verify");
+        // Reorder: id/prev links break.
+        let mut reordered = resumed.clone();
+        reordered.swap(0, 1);
+        assert!(!verify_chain(&reordered), "reorder must fail verify");
+    }
+
+    #[test]
+    fn old_logs_load_and_verify_as_genesis() {
+        // Pre-chain line: no prev_hash/hash keys at all (defaults to 0).
+        let dir = tmpdir();
+        let path = dir.join("events.jsonl");
+        std::fs::write(
+            &path,
+            "{\"id\":1,\"ts_ms\":1,\"type\":\"session_start\",\"session_id\":\"old\",\"cwd\":\"/w\",\"model\":\"m\",\"harness_version\":\"0\"}\n\
+             {\"id\":2,\"parent_id\":1,\"ts_ms\":2,\"type\":\"user_input\",\"text\":\"hi\"}\n",
+        )
+        .unwrap();
+        let events = EventLog::replay(&path).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].prev_hash, 0);
+        assert_eq!(events[0].hash, 0);
+        assert!(verify_chain(&events), "old logs verify as genesis");
+        // Appending to an old log starts the chain from 0 (prev 0).
+        let mut log = EventLog::open(&path).unwrap();
+        log.append(EventKind::PolicyLoad {
+            path: "rules".into(),
+            rules: 3,
+        })
+        .unwrap();
+        let events = EventLog::replay(&path).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(verify_chain(&events));
+        assert_eq!(events[2].prev_hash, 0);
+    }
+
+    #[test]
+    fn new_kinds_round_trip() {
+        let dir = tmpdir();
+        let path = dir.join("events.jsonl");
+        {
+            let mut log = EventLog::create(&path).unwrap();
+            log.append(EventKind::PermissionDecision {
+                tool: "write".into(),
+                verdict: "ask".into(),
+                reason: "outside workspace".into(),
+            })
+            .unwrap();
+            log.append(EventKind::PolicyLoad {
+                path: "/tmp/rules".into(),
+                rules: 7,
+            })
+            .unwrap();
+            log.append(EventKind::SandboxDenial {
+                backend: "bubblewrap".into(),
+                reason: "pinned runtime missing".into(),
+            })
+            .unwrap();
+        }
+        let events = EventLog::replay(&path).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(verify_chain(&events));
+        match &events[0].kind {
+            EventKind::PermissionDecision {
+                tool,
+                verdict,
+                reason,
+            } => {
+                assert_eq!(tool, "write");
+                assert_eq!(verdict, "ask");
+                assert_eq!(reason, "outside workspace");
+            }
+            other => panic!("expected PermissionDecision, got {other:?}"),
+        }
+        match &events[1].kind {
+            EventKind::PolicyLoad { path, rules } => {
+                assert_eq!(path, "/tmp/rules");
+                assert_eq!(*rules, 7);
+            }
+            other => panic!("expected PolicyLoad, got {other:?}"),
+        }
+        match &events[2].kind {
+            EventKind::SandboxDenial { backend, reason } => {
+                assert_eq!(backend, "bubblewrap");
+                assert_eq!(reason, "pinned runtime missing");
+            }
+            other => panic!("expected SandboxDenial, got {other:?}"),
+        }
+        // Audit-only: none rehydrate into model messages.
+        assert!(rehydrate_messages(&events).is_empty());
     }
 }

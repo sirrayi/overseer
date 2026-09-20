@@ -38,9 +38,7 @@
 //! tool (`bash`, `edit`, …). Shadowing a permission-gated resident tool with
 //! an ungated remote one is a privilege escalation, not a naming preference.
 //!
-//! `// DEFERRED(owner): per-call timeouts and a hung-server watchdog (a server
-//! that accepts a line and never answers blocks `call` on `read_line`; only
-//! `shutdown` has a bounded grace window today), MCP revisions other than
+//! `// DEFERRED(owner): MCP revisions other than
 //! [`PROTOCOL_VERSION`] (a server that answers with a different revision is
 //! refused, per the spec's client rule for an unsupported version), MCP's
 //! HTTP/SSE and streamable-HTTP transports plus every auth flow, server-
@@ -51,9 +49,16 @@
 //! (`tools::ToolRegistry` owns that state and needs an ops surface plus a
 //! supervised server lifetime) — this batch lands the client, the framing,
 //! the tool-spec translation and the name-collision guard.`
+//!
+//! DONE, not deferred: per-call timeouts and the hung-server watchdog.
+//! [`CALL_TIMEOUT`] bounds every [`StdioClient::call`];
+//! [`StdioClient::call_with_timeout`] bounds one call, and a server with no
+//! answer inside its timeout is killed, so a hung server cannot block
+//! forever.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -80,10 +85,17 @@ pub const DEFAULT_TOOL_DESCRIPTION: &str = "MCP tool";
 pub const CODE_INVALID_REQUEST: i64 = -32600;
 
 /// How long [`StdioClient::shutdown`] lets a server exit after stdin closes
-/// before it kills it. Fixed rather than configurable because the per-call
-/// timeout/watchdog layer is deferred (see the module header) and one bounded
-/// grace window is the whole of today's liveness story.
+/// before it kills it. Fixed rather than configurable: shutdown is a
+/// transport teardown, not a call — per-call liveness lives in
+/// [`CALL_TIMEOUT`] and [`StdioClient::call_with_timeout`].
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(2_000);
+
+/// How long [`StdioClient::call`] waits for one response line before it kills
+/// the server and fails. A server that accepts a line and never answers must
+/// not wedge the engine: the bound is fixed (not per-call configurable) so
+/// every call site shares one liveness story; a caller that needs a different
+/// bound uses [`StdioClient::call_with_timeout`] directly.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Poll interval for the shutdown grace window.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -458,6 +470,82 @@ pub fn collides_with_resident(server: &str, tool: &str) -> bool {
     })
 }
 
+/// Inline budget for assembled MCP tool specs (Invariant 4: tool results
+/// are budgeted — ~30K chars inline, then spill to file). A caller that
+/// lays discovered specs into the model view ranks them with
+/// `search_tools` and trims their descriptions with `trim_description`
+/// so the assembled block stays inside this budget.
+pub const MCP_BUDGET: usize = 30_000;
+
+/// Rank `specs` against `query`, best first, deterministically.
+///
+/// Scoring per spec, first hit wins: an exact name match (ASCII
+/// case-insensitive) scores `1.0`; a substring match of the folded query
+/// in the folded name scores `0.7`; otherwise the fraction of folded
+/// query tokens present in the folded `name + description` token set
+/// (tokens split on non-alphanumerics). Specs scoring nothing are
+/// dropped. Output is sorted score-descending, name-ascending, and
+/// capped at `top_k`. A blank query or `top_k == 0` yields nothing.
+/// Pure function of its inputs: no I/O, no clock, no randomness.
+pub fn search_tools(specs: &[ToolSpec], query: &str, top_k: usize) -> Vec<(String, f32)> {
+    if top_k == 0 {
+        return Vec::new();
+    }
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let q_tokens: Vec<&str> = q
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut scored: Vec<(String, f32)> = Vec::new();
+    for spec in specs {
+        let name_fold = spec.name.to_lowercase();
+        let score = if name_fold == q {
+            1.0
+        } else if name_fold.contains(&q) {
+            0.7
+        } else if q_tokens.is_empty() {
+            continue;
+        } else {
+            let hay_owned = format!("{} {}", spec.name, spec.description).to_lowercase();
+            let hay: Vec<&str> = hay_owned
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .collect();
+            let hits = q_tokens.iter().filter(|t| hay.contains(t)).count();
+            if hits == 0 {
+                continue;
+            }
+            hits as f32 / q_tokens.len() as f32
+        };
+        scored.push((spec.name.clone(), score));
+    }
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    scored.truncate(top_k);
+    scored
+}
+
+/// Head-truncate a tool `description` to `cap` chars (never bytes — a cap
+/// must not split a multi-byte character), marking the cut with `…`.
+/// `cap == 0` yields empty; a description within `cap` returns whole.
+pub fn trim_description(desc: &str, cap: usize) -> String {
+    if cap == 0 {
+        return String::new();
+    }
+    if desc.chars().count() <= cap {
+        return desc.to_string();
+    }
+    let mut out: String = desc.chars().take(cap).collect();
+    out.push('…');
+    out
+}
+
 /// A live MCP server process speaking newline-delimited JSON-RPC on stdio.
 ///
 /// Invariants: stdout is read one line per request and every response's `id`
@@ -468,7 +556,9 @@ pub fn collides_with_resident(server: &str, tool: &str) -> bool {
 /// `Stdio::null()`, so a chatty server cannot fill a pipe buffer and deadlock
 /// the client while we wait on stdout; a child that exits (or closes stdout)
 /// is reported as an error naming the server and the method — a hang is never
-/// papered over as an empty success. Dropping the client kills and reaps the
+/// papered over as an empty success; a server that never answers is killed
+/// after [`CALL_TIMEOUT`] (see [`StdioClient::call_with_timeout`]).
+/// Dropping the client kills and reaps the
 /// child, so no path leaks a server process.
 ///
 /// The client reads only its own responses: a server-initiated message
@@ -479,7 +569,10 @@ pub struct StdioClient {
     /// `None` once [`shutdown`](Self::shutdown) has closed it; any later call
     /// then fails naming that state instead of writing to a dead pipe.
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    /// `None` while a reader thread owns the pipe mid-call, and `None`
+    /// forever after a timed-out call killed the server (stdin is closed with
+    /// it, so the next call still fails on the shutdown state first).
+    stdout: Option<BufReader<ChildStdout>>,
     next_id: u64,
     server: String,
 }
@@ -521,7 +614,7 @@ impl StdioClient {
         Ok(Self {
             child,
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            stdout: Some(BufReader::new(stdout)),
             next_id: 1,
             server: server.to_string(),
         })
@@ -540,14 +633,74 @@ impl StdioClient {
     /// a protocol answer, and the wrappers ([`initialize`](Self::initialize),
     /// [`list_tools`](Self::list_tools), [`call_tool`](Self::call_tool)) turn
     /// it into an `Err` with the server's own code and message.
+    ///
+    /// Bounded by [`CALL_TIMEOUT`]: this delegates to
+    /// [`call_with_timeout`](Self::call_with_timeout), so a hung server is
+    /// killed rather than waited on forever.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.call_with_timeout(method, params, CALL_TIMEOUT)
+    }
+
+    /// [`call`](Self::call) with an explicit bound: the response must arrive
+    /// within `timeout`, else the child is killed, reaped, and the call fails
+    /// with an error naming the server, the method, the id and the timeout —
+    /// plus `restart the server`, because the session is dead: stdin is closed
+    /// with it, so the next call fails naming that shutdown state instead of
+    /// writing to a dead pipe.
+    ///
+    /// The bound is enforced by a one-shot reader thread plus `recv_timeout`:
+    /// the blocking `read_line` runs off-thread, so no path blocks the caller
+    /// past `timeout`. The thread hands the reader back on success; on timeout
+    /// the kill closes the pipe, which releases the stranded reader (its send
+    /// then lands on a dropped receiver and is ignored). Ids burn exactly as
+    /// documented on the struct: the id is consumed before the write, even
+    /// when the call fails.
+    pub fn call_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id;
         let line = request(id, method, params)?;
         // The id is burned even if the write fails: ids are never reused.
         self.next_id = self.next_id.saturating_add(1);
         self.write_line(&line, method)?;
-        let mut buf = String::new();
-        let read = self.stdout.read_line(&mut buf).map_err(|e| {
+        // The blocking read moves off-thread: a server that never answers
+        // must not hold this call past `timeout`.
+        let reader = self.stdout.take().ok_or_else(|| {
+            format!(
+                "mcp server `{}`: stdout is already closed (an earlier call timed out and the server was killed), cannot read the response to `{method}` (id {id})",
+                self.server
+            )
+        })?;
+        let (tx, rx) = mpsc::channel::<(BufReader<ChildStdout>, std::io::Result<usize>, String)>();
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = String::new();
+            let read = reader.read_line(&mut buf);
+            let _ = tx.send((reader, read, buf));
+        });
+        let (reader, read, buf) = match rx.recv_timeout(timeout) {
+            Ok(out) => out,
+            Err(_) => {
+                // Hung server: kill and reap it so it cannot wedge a later
+                // call, then close stdin so the next call fails naming the
+                // shutdown state. `stdout` stays `None`: the stranded reader
+                // thread still owns it and exits once the kill closes the
+                // pipe.
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                self.stdin.take();
+                return Err(format!(
+                    "mcp server `{}`: call timeout — no response to `{method}` (id {id}) within {} ms; the hung server was killed, restart the server",
+                    self.server,
+                    timeout.as_millis()
+                ));
+            }
+        };
+        self.stdout = Some(reader);
+        let read = read.map_err(|e| {
             format!(
                 "mcp server `{}`: reading the response to `{method}` (id {id}) failed: {e}",
                 self.server
@@ -1148,5 +1301,120 @@ exit 0"#;
             err.contains("stub") && err.contains("-32601") && err.contains("no tools here"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn call_timeout_bounds_every_call_at_thirty_seconds() {
+        assert_eq!(CALL_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn call_with_timeout_returns_a_fast_answer() {
+        // Answers the request line at once, then exits.
+        let script = r#"read line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'
+exit 0"#;
+        let mut client = stub("fast", script);
+        let msg = client
+            .call_with_timeout("tools/list", json!({}), Duration::from_secs(5))
+            .expect("a fast server answers inside its timeout");
+        assert_eq!(result_of(&msg).unwrap(), &json!({"ok": true}));
+        assert_eq!(client.next_id, 2);
+        assert!(client.shutdown().is_ok());
+    }
+
+    #[test]
+    fn call_with_timeout_kills_a_hung_server_and_burns_the_id() {
+        // Reads our request and never answers: without the timeout this call
+        // would block until the child exits on its own. `exec` replaces the
+        // shell with `sleep`, so the kill lands on the sleeper itself and the
+        // pipe closes at once instead of lingering on an orphaned child.
+        let script = "read line\nexec sleep 30";
+        let mut client = stub("hung", script);
+        let err = client
+            .call_with_timeout("tools/list", json!({}), Duration::from_millis(50))
+            .unwrap_err();
+        assert!(err.contains("hung"), "{err}");
+        assert!(err.contains("tools/list"), "{err}");
+        assert!(err.contains("(id 1)"), "{err}");
+        assert!(err.contains("50"), "{err}");
+        assert!(err.contains("timeout"), "{err}");
+        assert!(err.contains("restart the server"), "{err}");
+        // The id is burned: the next call would carry id 2.
+        assert_eq!(client.next_id, 2);
+        // The child is dead and reaped: the kill already waited on it.
+        assert!(client.child.try_wait().unwrap().is_some());
+        // The session is dead: the next call fails naming the shutdown state
+        // instead of writing to a dead pipe ...
+        let err = client.call("tools/list", json!({})).unwrap_err();
+        assert!(err.contains("stdin is already closed"), "{err}");
+        // ... and it burns the next id too.
+        assert_eq!(client.next_id, 3);
+    }
+
+    #[test]
+    fn search_tools_ranks_exact_above_substring_above_overlap() {
+        assert_eq!(MCP_BUDGET, 30_000);
+        let specs = vec![
+            ToolSpec {
+                name: "read_file".into(),
+                description: "read a file from disk".into(),
+                input_schema: json!({}),
+            },
+            ToolSpec {
+                name: "grep_search".into(),
+                description: "search across files".into(),
+                input_schema: json!({}),
+            },
+            ToolSpec {
+                name: "write_file".into(),
+                description: "write content to disk".into(),
+                input_schema: json!({}),
+            },
+        ];
+        // Exact name match scores 1.0 and leads.
+        let hits = search_tools(&specs, "grep_search", 10);
+        assert_eq!(
+            hits,
+            vec![("grep_search".to_string(), 1.0)],
+            "only the exact name matches `grep_search` as a whole"
+        );
+        // Substring match scores 0.7.
+        let hits = search_tools(&specs, "grep", 10);
+        assert_eq!(hits, vec![("grep_search".to_string(), 0.7)]);
+        // Token overlap fraction: `disk content` fully covers write_file
+        // (content + disk → 1.0) and half-covers read_file (disk only →
+        // 0.5), so overlap outranks nothing here but orders the pair.
+        let hits = search_tools(&specs, "disk content", 10);
+        assert_eq!(
+            hits,
+            vec![
+                ("write_file".to_string(), 1.0),
+                ("read_file".to_string(), 0.5),
+            ]
+        );
+        // Equal scores tie-break by name ascending: both carry `disk`.
+        let hits = search_tools(&specs, "disk", 10);
+        assert_eq!(
+            hits,
+            vec![
+                ("read_file".to_string(), 1.0),
+                ("write_file".to_string(), 1.0),
+            ]
+        );
+        // Cap, empty query, zero top_k, and no-match all behave.
+        assert_eq!(search_tools(&specs, "disk content", 1).len(), 1);
+        assert!(search_tools(&specs, "   ", 10).is_empty());
+        assert!(search_tools(&specs, "grep", 0).is_empty());
+        assert!(search_tools(&specs, "zzz-no-such-tool", 10).is_empty());
+    }
+
+    #[test]
+    fn trim_description_keeps_a_char_boundary_head_with_marker() {
+        assert_eq!(trim_description("anything", 0), "");
+        assert_eq!(trim_description("short", 5), "short");
+        assert_eq!(trim_description("abcdef", 4), "abcd…");
+        // Multi-byte chars count as one char each; the cut never splits one.
+        assert_eq!(trim_description("héllo wörld", 5), "héllo…");
     }
 }

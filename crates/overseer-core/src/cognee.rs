@@ -27,6 +27,11 @@
 //! fan-out/fan-in, memoized re-runs, persistent graph state) — this batch
 //! lands the sequential stage contract, the traces, and offline graph
 //! validation only.`
+//!
+//! Landed since: [`status_report`] (pipeline_status observability) and
+//! [`ForgetTombstone`] / [`tombstone`] / [`apply_forget`] (deterministic
+//! forget key-stripper). Still deferred: parallel fan-out/fan-in,
+//! memoized re-runs, persistent graph state.
 
 use std::fmt;
 
@@ -199,6 +204,97 @@ pub fn summarize(value: &Value) -> String {
         Value::Array(a) => format!("array[{}]", a.len()),
         Value::Object(o) => format!("object{{{}}}", o.len()),
     }
+}
+
+/// One-line-per-stage status plus a final output-shape line, e.g.
+/// `load: ok object{1}`, `chunk: fail <reason>`, `output: object{2} keys=[a, b]`.
+/// Ports cognee's `pipeline_status` observability without its runtime:
+/// deterministic (declaration order, sorted object keys), shape-only (never
+/// dumps values), and capped so a wide object cannot flood a report.
+pub fn status_report(report: &RunReport) -> String {
+    let mut lines: Vec<String> = Vec::with_capacity(report.traces.len() + 1);
+    for t in &report.traces {
+        lines.push(format!(
+            "{}: {} {}",
+            t.name,
+            if t.ok { "ok" } else { "fail" },
+            t.detail
+        ));
+    }
+    lines.push(format!("output: {}", output_shape(&report.output)));
+    lines.join("\n")
+}
+
+/// Shape of a run output: objects list their sorted keys, arrays list their
+/// length, scalars reuse [`summarize`]. Capped at 200 chars (char count, not
+/// bytes) with a `…(truncated)` marker so a report never embeds a full value.
+fn output_shape(value: &Value) -> String {
+    let shape = match value {
+        Value::Object(o) => {
+            let mut keys: Vec<&str> = o.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            format!("object{{{}}} keys=[{}]", o.len(), keys.join(", "))
+        }
+        Value::Array(a) => format!("array[{}]", a.len()),
+        other => summarize(other),
+    };
+    truncate_chars(&shape, 200)
+}
+
+/// Char-prefix `s` to `limit` chars, appending a marker when truncated.
+/// Char (not byte) counting so multi-byte text is not split mid-codepoint.
+fn truncate_chars(s: &str, limit: usize) -> String {
+    if s.chars().count() <= limit {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(limit).collect();
+    out.push_str("…(truncated)");
+    out
+}
+
+/// A validated request to forget one top-level object key. `reason` records
+/// *why* the key must go (provenance for the trace), so a forget is
+/// explainable after the fact. Construct via [`tombstone`], which rejects
+/// blank keys/reasons; the fields stay public so a caller can still build
+/// one literally, but [`apply_forget`] only strips on exact key match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetTombstone {
+    pub key: String,
+    pub reason: String,
+}
+
+/// Validate a forget request: both `key` and `reason` must be non-blank after
+/// trimming. Fails closed — a blank key would match nothing (or the wrong
+/// thing) and a blank reason would make the forget unexplainable.
+pub fn tombstone(key: &str, reason: &str) -> Result<ForgetTombstone, String> {
+    if key.trim().is_empty() {
+        return Err(
+            "cognee: forget tombstone needs a non-blank key — refusing to build a tombstone that matches nothing".to_string(),
+        );
+    }
+    if reason.trim().is_empty() {
+        return Err(
+            "cognee: forget tombstone needs a non-blank reason — refusing to forget without an explainable cause".to_string(),
+        );
+    }
+    Ok(ForgetTombstone {
+        key: key.to_string(),
+        reason: reason.to_string(),
+    })
+}
+
+/// Strip top-level object keys named by `tombs` (exact match, in order) and
+/// return the value. Strip-only: surviving keys keep their values untouched,
+/// nested objects are never descended into, and non-objects pass through
+/// unchanged. Never fails — an empty tombstone list is a no-op.
+pub fn apply_forget(mut value: Value, tombs: &[ForgetTombstone]) -> Value {
+    let Value::Object(obj) = &mut value else {
+        return value;
+    };
+    for t in tombs {
+        obj.remove(t.key.as_str());
+    }
+    value
 }
 
 /// Declared shape of one stage in a graph: what it reads and what it writes.
@@ -626,6 +722,120 @@ mod tests {
             "{}",
             scalar_err.reason
         );
+    }
+
+    #[test]
+    fn status_report_lists_stages_and_output_shape() {
+        let mut p = Pipeline::new();
+        p.push(Box::new(SetKey {
+            key: "b",
+            value: json!(1),
+        }));
+        p.push(Box::new(SetKey {
+            key: "a",
+            value: json!(2),
+        }));
+        let report = p.run(json!({})).unwrap();
+        let text = status_report(&report);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines[0], "SetKey: ok object{1}", "{text}");
+        assert_eq!(lines[1], "SetKey: ok object{2}", "{text}");
+        // Sorted keys, shape only — no values leak.
+        assert_eq!(lines[2], "output: object{2} keys=[a, b]", "{text}");
+    }
+
+    #[test]
+    fn status_report_marks_fail_and_covers_scalar_and_array_output() {
+        let report = RunReport {
+            output: json!([1, 2, 3]),
+            traces: vec![
+                StageTrace {
+                    name: "load",
+                    ok: true,
+                    detail: "object{1}".to_string(),
+                },
+                StageTrace {
+                    name: "chunk",
+                    ok: false,
+                    detail: "missing `doc`".to_string(),
+                },
+            ],
+        };
+        let text = status_report(&report);
+        assert_eq!(
+            text, "load: ok object{1}\nchunk: fail missing `doc`\noutput: array[3]",
+            "{text}"
+        );
+        let scalar = RunReport {
+            output: json!("hi"),
+            traces: vec![],
+        };
+        assert_eq!(status_report(&scalar), "output: string[2]");
+    }
+
+    #[test]
+    fn status_report_truncates_wide_objects_with_marker() {
+        let mut map = serde_json::Map::new();
+        for i in 0..60 {
+            map.insert(format!("very_long_key_name_{i:02}"), json!(i));
+        }
+        let report = RunReport {
+            output: Value::Object(map),
+            traces: vec![],
+        };
+        let text = status_report(&report);
+        assert!(text.starts_with("output: object{60} keys=["), "{text}");
+        assert!(text.contains("…(truncated)"), "{text}");
+        assert!(
+            text.chars().count() <= "output: ".len() + 200 + "…(truncated)".len(),
+            "{text}"
+        );
+        // Full output never embedded: a value string must not appear.
+        assert!(!text.contains("very_long_key_name_59, "), "{text}");
+    }
+
+    #[test]
+    fn apply_forget_strips_exact_top_level_keys_only() {
+        let tombs = vec![tombstone("secret", "gdpr request").unwrap()];
+        let out = apply_forget(
+            json!({"secret": 1, "Secret": 2, "secret2": 3, "keep": 4}),
+            &tombs,
+        );
+        assert_eq!(out, json!({"Secret": 2, "secret2": 3, "keep": 4}));
+        // Nested objects are never descended into (strip, never rewrite).
+        let nested = apply_forget(json!({"outer": {"secret": 1}}), &tombs);
+        assert_eq!(nested, json!({"outer": {"secret": 1}}));
+        // Surviving values are untouched.
+        let keep = apply_forget(json!({"keep": [1, 2]}), &tombs);
+        assert_eq!(keep, json!({"keep": [1, 2]}));
+        // Empty tombstone list is a no-op.
+        let noop = apply_forget(json!({"a": 1}), &[]);
+        assert_eq!(noop, json!({"a": 1}));
+    }
+
+    #[test]
+    fn tombstone_rejects_blank_key_or_reason() {
+        assert!(tombstone("", "why").is_err());
+        assert!(tombstone("   ", "why").is_err());
+        assert!(tombstone("k", "").is_err());
+        assert!(tombstone("k", "  ").is_err());
+        let t = tombstone("k", "why").unwrap();
+        assert_eq!(
+            t,
+            ForgetTombstone {
+                key: "k".to_string(),
+                reason: "why".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_forget_passes_non_objects_through() {
+        let tombs = vec![tombstone("k", "why").unwrap()];
+        assert_eq!(apply_forget(json!([1, 2]), &tombs), json!([1, 2]));
+        assert_eq!(apply_forget(json!("s"), &tombs), json!("s"));
+        assert_eq!(apply_forget(json!(null), &tombs), json!(null));
     }
 
     #[test]

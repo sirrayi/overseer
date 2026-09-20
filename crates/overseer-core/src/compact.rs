@@ -358,6 +358,58 @@ fn truncate(s: &str, cap: usize) -> String {
     }
 }
 
+/// Vendor-native compaction seam (Phase-C gate).
+///
+/// A provider adapter implements [`NativeCompaction`] when the vendor API
+/// offers a native compaction/condensation endpoint. The default is
+/// opt-out: `supports_native()` returns `false` and `native_compact()`
+/// returns `None`, so the engine always falls back to the deterministic
+/// [`summarize`]/[`tail_anchor`] path. Zero behavior change to the existing
+/// compaction path while no adapter opts in.
+// DEFERRED(anthropic): Anthropic native-compaction endpoint hook — gate: vendor API + keys.
+// DEFERRED(gemini): Gemini native-compaction (context-condensation) endpoint hook — gate: vendor API + keys.
+pub trait NativeCompaction {
+    /// Run vendor-native compaction over `events`. Returns
+    /// `(summary, tail_from)` on success, `None` when the provider cannot
+    /// or declines to compact (engine falls back to [`summarize`]).
+    /// Default: `None` (opt-out).
+    fn native_compact(&self, events: &[Event]) -> Option<(String, u64)> {
+        let _ = events;
+        None
+    }
+
+    /// True when this provider implements a native compaction endpoint.
+    /// Default: `false` (opt-out).
+    fn supports_native(&self) -> bool {
+        false
+    }
+}
+
+/// Explicit vendor-native-compaction allowlist (model prefixes).
+///
+/// Empty: no model advertises native compaction yet, so the gate below is
+/// fail-closed `false` for every input. Entries are added only together
+/// with a real adapter-side `NativeCompaction` impl behind the DEFERRED
+/// vendor hooks above.
+const NATIVE_COMPACT_ALLOWLIST: &[&str] = &[];
+
+/// True when `model` may use vendor-native compaction.
+///
+/// Consults the profile registry (`known` models only; unknown models
+/// resolve to FALLBACK and stay `false`) and additionally requires a prefix
+/// hit in `NATIVE_COMPACT_ALLOWLIST`. Fail-closed default `false`; the local
+/// deterministic path (`summarize` + `tail_anchor`) remains the only active
+/// compaction until a vendor hook lands.
+// DEFERRED(profile): move this allowlist into `ModelProfile.native_compact` — gate: profile.rs owned by ParamFilter slice.
+pub fn provider_compact_capability(model: &str) -> bool {
+    if !crate::profile::known(model) {
+        return false;
+    }
+    NATIVE_COMPACT_ALLOWLIST
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +420,8 @@ mod tests {
             id,
             parent_id: id.checked_sub(1),
             ts_ms: 0,
+            prev_hash: 0,
+            hash: 0,
             kind,
         }
     }
@@ -546,5 +600,49 @@ mod tests {
         assert!(s.contains("supersedes 1 earlier compaction"));
         assert!(!s.contains("OLD SUMMARY"));
         assert!(s.contains("new.txt"));
+    }
+
+    struct OptOut;
+    impl NativeCompaction for OptOut {}
+
+    /// Blanket default: an adapter that does not opt in declines natively
+    /// and reports no native support — the engine keeps the deterministic path.
+    #[test]
+    fn native_compact_defaults_to_none() {
+        let events: Vec<Event> = vec![];
+        let p = OptOut;
+        assert!(!p.supports_native());
+        assert_eq!(p.native_compact(&events), None);
+    }
+
+    /// Fail-closed gate: false for known, unknown, and empty model ids
+    /// until a vendor hook + allowlist entry land.
+    #[test]
+    fn compact_capability_defaults_false() {
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "no-such-model-xyz",
+            "",
+        ] {
+            assert!(
+                !provider_compact_capability(model),
+                "native compaction must stay off for {model:?}"
+            );
+        }
+    }
+
+    /// The seam is additive: the deterministic path ignores it entirely.
+    #[test]
+    fn summarize_ignores_native_seam() {
+        let events = vec![ev(
+            1,
+            EventKind::UserInput {
+                text: "goal stays local".into(),
+            },
+        )];
+        let s = summarize(&events, 10);
+        assert!(s.contains("goal stays local"));
+        assert!(!provider_compact_capability("claude-sonnet-4-5"));
     }
 }

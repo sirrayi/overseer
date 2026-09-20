@@ -23,13 +23,49 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import manifest, store
 from . import BenchmarkUnavailable, ExternalTask, has_cli, has_docker
 
 HARBOR = ["uvx", "harbor"]
+
+def _parse_ts(s) -> datetime | None:
+    """Parse a harbor timestamp — py3.9-safe (fromisoformat has no Z).
+
+    Handles Z suffix, +HH:MM/+HHMM offsets, space separator;
+    naive stamps are assumed UTC. None on unparseable input.
+    """
+    if not isinstance(s, str) or not s.strip():
+        return None
+    t = s.strip()
+    if t[-1:] in ("Z", "z"):
+        t = t[:-1] + "+00:00"
+    tail = t[-5:]
+    if len(t) >= 5 and tail[0] in ("+", "-") and tail[1:].isdigit():
+        t = t[:-2] + ":" + t[-2:]
+    try:
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def parse_wall(t0, t1) -> float | None:
+    """Seconds between harbor started_at/finished_at, rounded to 1dp.
+
+    None when either stamp is missing or unparseable.
+    """
+    try:
+        a, b = _parse_ts(t0), _parse_ts(t1)
+        if a is None or b is None:
+            return None
+        return round((b - a).total_seconds(), 1)
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 class HarborAdapter:
@@ -164,17 +200,7 @@ class HarborAdapter:
             agent_done = bool((tr.get("agent_execution") or {}).get("finished_at"))
             infra = bool(exc is not None and not agent_done)
             t0, t1 = tr.get("started_at"), tr.get("finished_at")
-            wall = None
-            if t0 and t1:
-                try:
-                    wall = round(
-                        (
-                            datetime.fromisoformat(t1) - datetime.fromisoformat(t0)
-                        ).total_seconds(),
-                        1,
-                    )
-                except ValueError:
-                    pass
+            wall = parse_wall(t0, t1)
             steps = tr.get("step_results")
             outcome = {
                 "done": exc is None,

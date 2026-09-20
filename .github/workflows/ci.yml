@@ -88,3 +88,13 @@ jobs:
           print(f"startup: {best:.1f} ms (best of 5)")
           sys.exit(0 if best < budget else 1)
           EOF
+
+  supply-chain:
+    # cargo-deny per deny.toml: RustSEC advisories + yanked/unmaintained,
+    # permissive-license allow-list, dup/wildcard bans, registry sources.
+    # The local equivalent is `cargo audit` (.cargo/audit.toml).
+    # Linux runner: the action is a container action (no macOS support).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

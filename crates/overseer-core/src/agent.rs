@@ -331,7 +331,7 @@ impl Agent {
         session_id: String,
         get: impl Fn(&str) -> Option<String>,
     ) -> std::io::Result<Self> {
-        std::fs::create_dir_all(&session_dir)?;
+        crate::harden::ensure_private_dir(&session_dir)?;
         let log = EventLog::create(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::create(session_dir.join("ledger.jsonl"))?;
         let tools = Self::registry(&config);
