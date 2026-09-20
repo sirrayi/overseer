@@ -93,7 +93,8 @@ jobs:
     # cargo-deny per deny.toml: RustSEC advisories + yanked/unmaintained,
     # permissive-license allow-list, dup/wildcard bans, registry sources.
     # The local equivalent is `cargo audit` (.cargo/audit.toml).
-    runs-on: macos-15
+    # Linux runner: the action is a container action (no macOS support).
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
