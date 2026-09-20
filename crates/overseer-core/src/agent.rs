@@ -832,6 +832,26 @@ impl Agent {
                         continue;
                     }
                 }
+                // Stop hook (ECC `stop` event): a data rule may veto the
+                // stop itself on the final text. Blocks share the verify
+                // budget — one cap covers every stop-blocker — and hooks
+                // fail open at the cap (guardrail, not the gate): the
+                // stop is then allowed through.
+                if let Some(reason) =
+                    crate::hooks::maybe_block_stop(&self.tools.hooks, &last_text(&self.messages))
+                {
+                    self.verify_blocks += 1;
+                    if self.verify_blocks < self.config.verify_block_cap {
+                        let text = format!(
+                            "[overseer] Stop blocked by hooks rule — {reason} \
+                             (block {}/{}). Address it, then finish.",
+                            self.verify_blocks, self.config.verify_block_cap
+                        );
+                        self.messages.push(Message::user_text(text.clone()));
+                        self.emit(EventKind::Nudge { text }, on_event)?;
+                        continue;
+                    }
+                }
                 self.end_run(resp.stop_reason.as_str(), steps, on_event)?;
                 return Ok(RunOutcome::Completed {
                     steps,
@@ -1356,6 +1376,25 @@ fn count_tool_calls(blocks: &[Block]) -> usize {
 /// kills runaway checks. `Ok(())` = exit 0; `Err(tail)` = nonzero exit,
 /// spawn failure, or timeout — the tail keeps the last ~6K chars of output
 /// so the failure stays reviewable when injected back into context.
+/// Text of the last assistant message — what a stop hook observes as the
+/// session's "final result" (the `tool` side of the rule never matches a
+/// real dispatch, so payload = the text the model ended on).
+fn last_text(messages: &[Message]) -> String {
+    messages
+        .last()
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
 fn run_verify(cmd: &str, cwd: &std::path::Path) -> Result<(), String> {
     use std::process::{Command, Stdio};
 
@@ -2017,6 +2056,81 @@ mod tests {
         ));
         // Audit-only: never rehydrates into messages.
         assert!(crate::event::rehydrate_messages(&events).is_empty());
+    }
+
+    /// Stop-hook dispatch (ECC `stop` event): a matching rule nudges the
+    /// loop instead of letting it stop; blocks share the verify budget —
+    /// at the cap the hook fails open and the stop is allowed.
+    #[test]
+    fn stop_hook_blocks_then_fails_open() {
+        // Block-then-allow: first finish matches the rule, second doesn't.
+        let dir = tmpdir();
+        std::fs::create_dir_all(dir.join(".overseer")).unwrap();
+        std::fs::write(
+            dir.join(crate::hooks::HOOKS_FILE),
+            r#"[{"event":"stop","contains":"not yet","reason":"tests must pass first"}]"#,
+        )
+        .unwrap();
+        // WorkspaceWrite (not full_access): hooks load off the policy
+        // root, which only preset policies pin to `cwd`.
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            verify_block_cap: 3,
+            ..AgentConfig::default()
+        };
+        let unfinished = Response {
+            blocks: vec![Block::Text {
+                text: "wrapping up — not yet verified".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        };
+        let provider = Mock::new(vec![unfinished, done()]);
+        let mut agent = Agent::start(Arc::new(provider), cfg, dir.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        let out = agent.run_turn("finish when done", &mut sink).unwrap();
+        assert!(matches!(out, RunOutcome::Completed { steps: 2, .. }));
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        let nudges = events
+            .iter()
+            .filter(
+                |e| matches!(&e.kind, EventKind::Nudge { text } if text.contains("Stop blocked")),
+            )
+            .count();
+        assert_eq!(nudges, 1, "one stop-block nudge, then the clean finish");
+
+        // Cap: a rule that matches every finish counts to the cap and
+        // then lets the stop through (guardrail, not the gate).
+        let dir2 = tmpdir();
+        std::fs::create_dir_all(dir2.join(".overseer")).unwrap();
+        std::fs::write(
+            dir2.join(crate::hooks::HOOKS_FILE),
+            r#"[{"event":"stop","contains":"all done","reason":"never"}]"#,
+        )
+        .unwrap();
+        let cfg2 = AgentConfig {
+            cwd: dir2.clone(),
+            verify_block_cap: 3,
+            ..AgentConfig::default()
+        };
+        let provider2 = Mock::new(vec![done()]);
+        let mut agent2 = Agent::start(Arc::new(provider2), cfg2, dir2.clone(), "s".into()).unwrap();
+        let mut sink2 = |_: &Event| {};
+        let out2 = agent2.run_turn("go", &mut sink2).unwrap();
+        assert!(
+            matches!(out2, RunOutcome::Completed { steps: 3, .. }),
+            "cap reached → stop allowed through, got {out2:?}"
+        );
+        let nudges2 = EventLog::replay(dir2.join("events.jsonl"))
+            .unwrap()
+            .iter()
+            .filter(
+                |e| matches!(&e.kind, EventKind::Nudge { text } if text.contains("Stop blocked")),
+            )
+            .count();
+        assert_eq!(nudges2, 2, "cap-1 nudges; the last block opens the stop");
     }
 
     /// P1.10 verification gate: a failing DoD check blocks the finish and
