@@ -442,12 +442,12 @@ mod tests {
         let out = run(&json!({"prompt": "bg work", "background": true}), &mut c);
         assert!(!out.is_error);
         assert!(out.text.contains("Background task task-1 started"));
-        // Wait for the thread to write the marker.
+        // Wait for the thread to write the marker. Generous bound: under
+        // full-workspace parallel load the bg spawn can take seconds;
+        // the loop still exits the moment the marker lands.
         let marker = dir.join("session/subagents/bg-1/done.txt");
-        for _ in 0..100 {
-            if marker.exists() {
-                break;
-            }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(marker.exists(), "bg subagent must write done.txt");

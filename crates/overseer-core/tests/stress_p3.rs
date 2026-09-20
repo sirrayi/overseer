@@ -848,6 +848,8 @@ fn compaction_view_preserves_p3_audit() {
         id: next_id,
         parent_id: None,
         ts_ms: 0,
+        prev_hash: 0,
+        hash: 0,
         kind: EventKind::Compaction {
             summary: "sum".into(),
             tail_from: last_model_id,

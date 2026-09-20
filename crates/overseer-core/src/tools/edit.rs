@@ -79,6 +79,15 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
                  the two forms encode the same change differently.",
             );
         }
+        // Fail-closed pre-verification: hunk line numbers in range and
+        // context matching, checked before `apply_unified_diff` runs.
+        if let Err(e) = preverify_patch(&content, patch) {
+            return ToolOutput::err(format!(
+                "Edit rejected: the patch failed pre-verification for {} ({e}). \
+                 Re-read the file and regenerate the diff.",
+                path.display()
+            ));
+        }
         let replaced = match apply_unified_diff(&content, patch) {
             Ok(r) => r,
             Err(e) => {
@@ -318,6 +327,92 @@ fn find_ws_tolerant(content: &str, needle: &str) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// Pre-verify a unified diff against `content` without writing: parse every
+/// `@@` hunk, check its old line numbers sit in range, and check its old
+/// block (context plus `-` lines) matches the file where
+/// `apply_unified_diff` would locate it (declared position first, then a
+/// forward scan). Returns the affected 1-based old-file line numbers,
+/// sorted and deduplicated; a pure-insertion (zero-length) hunk covers no
+/// old lines and contributes none. Any failure names the hunk in its
+/// message — fail-closed: `run` refuses the patch on `Err` before
+/// `apply_unified_diff` runs, so a stale or out-of-range patch can never
+/// splice into the wrong place.
+pub fn preverify_patch(content: &str, patch: &str) -> Result<Vec<usize>, String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let n = lines.len();
+    let patch_lines: Vec<&str> = patch.lines().collect();
+    let mut idx = 0usize;
+    let mut hunks = 0usize;
+    let mut affected: Vec<usize> = Vec::new();
+    while idx < patch_lines.len() {
+        let header = patch_lines[idx];
+        if !header.starts_with("@@") {
+            idx += 1;
+            continue;
+        }
+        let (old_start, old_len) = parse_hunk_header(header)?;
+        idx += 1;
+        let mut body: Vec<&str> = Vec::new();
+        while idx < patch_lines.len() && !patch_lines[idx].starts_with("@@") {
+            body.push(patch_lines[idx]);
+            idx += 1;
+        }
+        let (old_block, _) = hunk_blocks(&body)?;
+        if old_block.len() != old_len {
+            return Err(format!(
+                "hunk {hunks} declares {old_len} old line(s) but carries {}",
+                old_block.len()
+            ));
+        }
+        // Old line numbers are 1-based. A zero-length hunk is a pure
+        // insertion anchored after line `old_start` (`0` = before line 1),
+        // so its anchor must sit in `0..=n`; any other hunk must sit
+        // wholly inside `1..=n`.
+        if old_len == 0 {
+            if old_start > n {
+                return Err(format!(
+                    "hunk {hunks} inserts after line {old_start} but the file has only {n} line(s)"
+                ));
+            }
+        } else if old_start == 0 || old_start + old_len - 1 > n {
+            return Err(format!(
+                "hunk {hunks} covers old lines {old_start}..{} but the file has only {n} line(s)",
+                old_start + old_len - 1
+            ));
+        }
+        // Context must match where `apply_unified_diff` would put the
+        // hunk: the declared position first, then a forward scan over the
+        // original content (hunk headers name old-file lines, so every
+        // hunk is checked against the original, never a half-patched
+        // buffer).
+        let found = if old_block.is_empty() {
+            Some(old_start.min(n))
+        } else {
+            let declared = old_start.saturating_sub(1);
+            (declared..n.saturating_sub(old_block.len()) + 1).find(|&s| {
+                lines[s..s + old_block.len()]
+                    .iter()
+                    .zip(old_block.iter())
+                    .all(|(a, b)| *a == b.as_str())
+            })
+        };
+        let Some(start) = found else {
+            return Err(format!(
+                "hunk {hunks} (declared at line {old_start}) does not match the file"
+            ));
+        };
+        affected.extend(start..start + old_block.len());
+        hunks += 1;
+    }
+    if hunks == 0 {
+        return Err("no `@@` hunk headers found".to_string());
+    }
+    let mut affected: Vec<usize> = affected.into_iter().map(|s| s + 1).collect();
+    affected.sort();
+    affected.dedup();
+    Ok(affected)
 }
 
 /// Apply a unified diff to `content` (one file's diff — no `---`/`+++`
@@ -744,6 +839,67 @@ mod tests {
         let neither = reg.call("edit", &json!({"path": "f.txt"}), &mut c);
         assert!(neither.is_error);
         assert!(neither.text.contains("old_string"), "{}", neither.text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preverify_accepts_a_good_patch_with_sorted_affected_lines() {
+        let content = "one\ntwo\nthree\nfour\nfive\nsix\n";
+        let patch = "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+        assert_eq!(preverify_patch(content, patch).unwrap(), vec![1, 2, 3]);
+        // A pure insertion (zero-length hunk) covers no old lines.
+        let ins = preverify_patch(content, "@@ -2,0 +3,1 @@\n+NEW\n").unwrap();
+        assert!(ins.is_empty(), "{ins:?}");
+        // No write happened: preverify is read-only.
+        assert_eq!(content, "one\ntwo\nthree\nfour\nfive\nsix\n");
+    }
+
+    #[test]
+    fn preverify_refuses_stale_out_of_range_and_hunkless_patches() {
+        let content = "one\ntwo\nthree\n";
+        let patch = "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+        let applied = apply_unified_diff(content, patch).unwrap();
+        // The same patch against the already-patched file is stale, and
+        // the error names the hunk — the same message apply reports.
+        let err = preverify_patch(&applied, patch).unwrap_err();
+        assert!(err.contains("hunk 0"), "{err}");
+        // Old line numbers past EOF are out of range, naming the hunk.
+        let err = preverify_patch(content, "@@ -9,1 +9,1 @@\n-x\n+X\n").unwrap_err();
+        assert!(err.contains("hunk 0") && err.contains("only 3"), "{err}");
+        // No hunks is an error, not a silent no-op.
+        assert!(preverify_patch(content, "--- a\n+++ b\n")
+            .unwrap_err()
+            .contains("no `@@`"));
+    }
+
+    #[test]
+    fn run_rejects_a_patch_that_fails_preverification_without_writing() {
+        use crate::tools::ToolCtx;
+        let dir = std::env::temp_dir().join(format!("overseer-preverify-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "a\nb\nc\n").unwrap();
+        let mut reg = crate::tools::ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut c = ToolCtx {
+            cwd: dir.clone(),
+            session_dir: dir.join("session"),
+            spill_seq: 0,
+            provider: None,
+            agent_config: None,
+            subagent_seq: 0,
+            checkpoint: None,
+            sandbox: false,
+            broker: None,
+        };
+        reg.call("read", &json!({"path": "f.txt"}), &mut c);
+        let out = reg.call(
+            "edit",
+            &json!({"path": "f.txt", "patch": "@@ -9,1 +9,1 @@\n-x\n+X\n"}),
+            &mut c,
+        );
+        assert!(out.is_error, "{}", out.text);
+        assert!(out.text.contains("pre-verification"), "{}", out.text);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nb\nc\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

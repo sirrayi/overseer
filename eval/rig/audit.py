@@ -22,6 +22,43 @@ from pathlib import Path
 
 CANARY_RE = re.compile(r"OVR-CANARY-[0-9a-f]{16}")
 
+def _word_5grams(text: str) -> set[tuple[str, ...]]:
+    toks = re.findall(r"[a-z0-9_]+", text.lower())
+    if len(toks) < 5:
+        return set()
+    return {tuple(toks[i:i + 5]) for i in range(len(toks) - 4)}
+
+
+def overlap_5gram(a: str, b: str) -> float:
+    """5-gram Jaccard-ish overlap over normalized word tokens.
+
+    |intersection| / |union|; 0.0 when either side yields no 5-grams.
+    """
+    ga, gb = _word_5grams(a or ""), _word_5grams(b or "")
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / len(ga | gb)
+
+
+_PATH_RE = re.compile(
+    r"(?:^|[\s\"'`(\[])"
+    r"((?:[\w.\-]+/)+[\w.\-]+(?:\.[\w]+)?|[\w.\-]+\.(?:py|rs|ts|tsx|js|jsx|go|java|rb|sh|md|toml|yaml|yml|json))"
+)
+
+
+def localization_probe(issue: str, patch: str) -> bool:
+    """True when a file path named in the issue text appears in the patch."""
+    issue = issue or ""
+    patch = patch or ""
+    if not issue.strip() or not patch.strip():
+        return False
+    paths = {m.group(1).strip().strip(",;:") for m in _PATH_RE.finditer(issue)}
+    paths = {p for p in paths if p}
+    if not paths:
+        return False
+    pl = patch.lower()
+    return any(p.lower() in pl for p in paths)
+
 
 def _scan_text(path: Path) -> set[str]:
     try:

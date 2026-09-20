@@ -107,6 +107,21 @@ impl Gemini {
                 "includeThoughts": true,
             });
         }
+        // Param filter (Ch.7 §2.2): drop generationConfig keys the profile
+        // rejects (unknown models keep the full Gemini set via FALLBACK).
+        // maxOutputTokens is a core key — never stripped (supports_param
+        // refuses it) — but listed for symmetry with the other adapters.
+        crate::profile::strip_optional_params(
+            &mut gen,
+            req.model,
+            &[
+                "temperature",
+                "topP",
+                "topK",
+                "maxOutputTokens",
+                "thinkingConfig",
+            ],
+        );
 
         json!({
             "contents": contents,
@@ -543,6 +558,98 @@ mod tests {
         assert!(nested["properties"]["x"].get("default").is_none());
         // Supported keys survive.
         assert_eq!(s["properties"]["items"]["type"], "array");
+    }
+    #[test]
+    fn param_filter_strips_cross_family_gen_keys() {
+        // "gemini-3-pro" has no tabled row → FALLBACK union (accepts Gemini
+        // keys). Prove the filter path directly: a hypothetical strict
+        // profile (fleet-k3 rejects everything Gemini-spelled) strips.
+        let mut gen = json!({
+            "maxOutputTokens": 100,
+            "thinkingConfig": {"thinkingBudget": 777},
+            "reasoning_effort": "high",
+        });
+        crate::profile::strip_optional_params(
+            &mut gen,
+            "fleet-k3",
+            &["reasoning_effort", "frequency_penalty", "thinkingConfig"],
+        );
+        assert!(gen.get("reasoning_effort").is_none());
+        assert!(gen.get("thinkingConfig").is_none());
+        // Core key survives even when named.
+        crate::profile::strip_optional_params(&mut gen, "fleet-k3", &["maxOutputTokens"]);
+        assert!(gen.get("maxOutputTokens").is_some());
+        // And the real Gemini path keeps thinkingConfig via FALLBACK.
+        let system = vec![SystemSegment {
+            name: "test",
+            text: "s".into(),
+            cacheable: true,
+        }];
+        let msgs = vec![Message::user_text("x")];
+        let tools: Vec<ToolSpec> = vec![];
+        let req = Request {
+            model: "gemini-3-pro",
+            system: &system,
+            tools: &tools,
+            messages: &msgs,
+            max_tokens: 100,
+            thinking_budget: Some(777),
+            effort: None,
+            cache_breakpoints: false,
+        };
+        let body = Gemini::build_body(&req);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            777
+        );
+        // Schema sanitizer still strips 400-trigger keys (no regress).
+        let mut s = json!({"type": "object", "additionalProperties": false});
+        sanitize_schema(&mut s);
+        assert!(s.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn build_body_byte_stable_when_all_supported() {
+        // Unknown model → FALLBACK union: thinkingConfig survives, and a
+        // re-strip of the supported set is a byte-identical no-op.
+        let system = vec![SystemSegment {
+            name: "test",
+            text: "s".into(),
+            cacheable: true,
+        }];
+        let msgs = vec![Message::user_text("x")];
+        let tools: Vec<ToolSpec> = vec![];
+        let req = Request {
+            model: "some-future-model",
+            system: &system,
+            tools: &tools,
+            messages: &msgs,
+            max_tokens: 100,
+            thinking_budget: Some(777),
+            effort: None,
+            cache_breakpoints: false,
+        };
+        let b1 = Gemini::build_body(&req);
+        assert_eq!(
+            b1["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            777
+        );
+        let mut b2 = b1.clone();
+        crate::profile::strip_optional_params(
+            &mut b2["generationConfig"],
+            "some-future-model",
+            &[
+                "temperature",
+                "topP",
+                "topK",
+                "maxOutputTokens",
+                "thinkingConfig",
+            ],
+        );
+        assert_eq!(
+            serde_json::to_string(&b1).unwrap(),
+            serde_json::to_string(&b2).unwrap()
+        );
     }
 
     #[test]

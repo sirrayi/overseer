@@ -19,6 +19,7 @@ pub mod event;
 pub mod extract;
 pub mod fuzzy;
 pub mod graph;
+pub mod harden;
 pub mod hooks;
 pub mod ir;
 pub mod ledger;

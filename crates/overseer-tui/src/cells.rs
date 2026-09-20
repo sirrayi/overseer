@@ -354,10 +354,14 @@ pub fn feed(ev: &Event) -> Feed {
         }]),
         // Audit-only engine events (P6-2 memory commits, P6-4 consent
         // grants, P8-B model switches) are provenance, not conversation —
-        // never rendered.
+        // never rendered. The SecurityCore audit kinds (PermissionDecision /
+        // PolicyLoad / SandboxDenial) are log-only too — transcript stays clean.
         EventKind::MemoryUpdated { .. }
         | EventKind::ConsentGranted { .. }
-        | EventKind::ModelSwitch { .. } => Feed::Ignore,
+        | EventKind::ModelSwitch { .. }
+        | EventKind::PermissionDecision { .. }
+        | EventKind::PolicyLoad { .. }
+        | EventKind::SandboxDenial { .. } => Feed::Ignore,
         EventKind::RunEnd {
             stop_reason,
             steps,
@@ -454,6 +458,8 @@ mod tests {
             id: 1,
             parent_id: None,
             ts_ms: 0,
+            prev_hash: 0,
+            hash: 0,
             kind,
         };
         match feed(&ev(EventKind::ToolCallStart {
