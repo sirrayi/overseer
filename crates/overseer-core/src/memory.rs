@@ -736,20 +736,13 @@ fn core_block(dir: &Path) -> String {
     if text.is_empty() {
         return String::new();
     }
-    if text.len() > CORE_CAP {
-        let cut = text
-            .char_indices()
-            .map(|(i, c)| i + c.len_utf8())
-            .take_while(|end| *end <= CORE_CAP)
-            .last()
-            .unwrap_or(0);
-        return format!(
-            "\n\n## Memory core ({CORE_NAME})\n{}\n\n[overseer] {CORE_NAME} exceeds \
-             2KB — keep it to the lines that must survive every compaction.",
-            &text[..cut]
-        );
+    // Capped through the shared `core_budget` helper (letta P1): the
+    // rendered bytes are unchanged — truncation plus repair note.
+    let (kept, note) = core_budget(text, CORE_CAP);
+    match note {
+        None => format!("\n\n## Memory core ({CORE_NAME})\n{kept}"),
+        Some(note) => format!("\n\n## Memory core ({CORE_NAME})\n{kept}\n\n{note}"),
     }
-    format!("\n\n## Memory core ({CORE_NAME})\n{text}")
 }
 
 /// Sensitivity-filtered index view (P6-2): the quarantined subagent
@@ -1019,6 +1012,184 @@ pub fn reconcile(dir: &Path, index_text: &str) -> ReconcilePlan {
     plan
 }
 
+/// Minimum confidence for an episodic entry to qualify for promotion to
+/// semantic memory: settled is not enough, the entry must also be sure.
+const PROMOTE_MIN_CONFIDENCE: f64 = 0.8;
+/// Cap on promotion candidates per consolidation pass: the PROMOTE prompt
+/// section must stay a bounded pointer list, not a second topic dump.
+const PROMOTE_MAX: usize = 20;
+/// Settling age: an episodic entry counts as settled when its clock is
+/// older than 30 days — recent events are still being written, not
+/// distilled.
+const PROMOTE_AGE_SECS: u64 = 30 * 86_400;
+
+/// Episodic→semantic promotion candidates: settled, high-confidence,
+/// still-current episodic entries the consolidation model may distill
+/// into durable facts.
+///
+/// Promotion is an index pointer add, never a body rewrite: the model
+/// adds a `semantic/` pointer line to the new index while the episodic
+/// file stays on disk untouched (bodies are append-only — see
+/// `invalidate`). Qualification (every clause must hold):
+///
+/// - the file lives directly under `episodic/` and ends in `.md`;
+/// - `entry_valid` (header parses, `valid_to`/TTL not elapsed);
+/// - not superseded (`superseded_by` trailer absent — part of
+///   `entry_valid`, listed because a superseded event must never be
+///   re-distilled as fact);
+/// - `confidence >= 0.8`;
+/// - settled: the file's mtime is older than 30 days, or `valid_from`
+///   is older than 30 days (either clock suffices — a backfilled event
+///   carries an old `valid_from` on a freshly written file).
+///
+/// Sorted ascending and capped at 20, so the prompt section is
+/// deterministic and bounded. Missing `episodic/` dir → empty (a fresh
+/// memory has nothing to promote, which is not an error).
+pub fn promote_candidates(dir: &Path) -> Vec<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let settled = |secs: u64| secs.saturating_add(PROMOTE_AGE_SECS) < now;
+    let epi = dir.join(Layer::Episodic.name());
+    let Ok(entries) = std::fs::read_dir(&epi) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let p = epi.join(&name);
+        if !p.is_file() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+        if !entry_valid(&text, mtime) {
+            continue;
+        }
+        let Ok((meta, _)) = parse_meta(&text) else {
+            continue; // Unreachable (entry_valid just parsed) — fail closed.
+        };
+        if meta.confidence < PROMOTE_MIN_CONFIDENCE {
+            continue;
+        }
+        let mtime_settled = mtime
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|d| settled(d.as_secs()));
+        let from_settled = meta
+            .valid_from
+            .as_deref()
+            .and_then(rfc3339_epoch)
+            .is_some_and(settled);
+        if !(mtime_settled || from_settled) {
+            continue;
+        }
+        out.push(name);
+    }
+    out.sort();
+    out.truncate(PROMOTE_MAX);
+    out
+}
+
+/// Parse an RFC3339 timestamp to Unix epoch seconds (`None` on any
+/// malformed input — callers treat unparseable as "not settled", never
+/// as settled). Zero-dep companion to `format_utc_stamp`: days-from-civil
+/// in reverse (Howard Hinnant's algorithm), with the numeric zone offset
+/// applied. A leap second (`:60`) reads as `:59` — a one-second slop far
+/// below the 30-day promotion bar. Inputs here already passed
+/// `valid_rfc3339` via `parse_meta`, so this re-checks ranges lightly.
+fn rfc3339_epoch(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    let num = |o: usize, n: usize| -> Option<i64> {
+        let mut v = 0i64;
+        for k in 0..n {
+            let c = *b.get(o + k)?;
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + i64::from(c - b'0');
+        }
+        Some(v)
+    };
+    let at = |o: usize, c: u8| -> bool { b.get(o) == Some(&c) };
+    if b.len() < 20 {
+        return None;
+    }
+    let y = num(0, 4)?;
+    if !at(4, b'-') {
+        return None;
+    }
+    let mo = num(5, 2)?;
+    if !at(7, b'-') {
+        return None;
+    }
+    let d = num(8, 2)?;
+    if !at(10, b'T') && !at(10, b't') {
+        return None;
+    }
+    let h = num(11, 2)?;
+    if !at(13, b':') {
+        return None;
+    }
+    let mi = num(14, 2)?;
+    if !at(16, b':') {
+        return None;
+    }
+    let se = num(17, 2)?;
+    let mut i = 19;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        let start = i;
+        while b.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+    }
+    let mut off_secs = 0i64;
+    if b.get(i) == Some(&b'Z') || b.get(i) == Some(&b'z') {
+        i += 1;
+    } else if b.get(i) == Some(&b'+') || b.get(i) == Some(&b'-') {
+        let sign = if b.get(i) == Some(&b'-') { -1 } else { 1 };
+        let th = num(i + 1, 2)?;
+        if !at(i + 3, b':') {
+            return None;
+        }
+        let tm = num(i + 4, 2)?;
+        if th > 23 || tm > 59 {
+            return None;
+        }
+        off_secs = sign * (th * 3_600 + tm * 60);
+        i += 6;
+    } else {
+        return None;
+    }
+    if i != b.len() {
+        return None;
+    }
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    if h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    let yp = if mo <= 2 { y - 1 } else { y };
+    let era = if yp >= 0 { yp } else { yp - 399 } / 400;
+    let yoe = yp - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let stamp = days * 86_400 + h * 3_600 + mi * 60 + se.min(59) - off_secs;
+    u64::try_from(stamp).ok()
+}
+
 /// Sleep-time consolidation (P3.8): a small-tier call that dedupes and
 /// tightens `INDEX.md`, then a git commit. Topic files are read for
 /// context but only the index is rewritten — merging topic bodies is the
@@ -1081,10 +1252,30 @@ pub fn consolidate(
     // model sees exactly what changed) and is enforced afterwards (so a
     // stale pointer cannot survive a lazy reply).
     let plan = reconcile(dir, &old_index);
+    // Episodic→semantic promotion: settled, high-confidence, still-current
+    // episodic entries the model may distill into durable facts. Rides the
+    // prompt as a candidate list only — the engine enforces ADD-only
+    // afterwards (a promotion only ADDS a semantic/ pointer line; episodic
+    // bodies are never moved, rewritten, or deleted).
+    let candidates = promote_candidates(dir);
+    let promote = if candidates.is_empty() {
+        "PROMOTE (episodic→semantic candidates): (none — no settled \
+         high-confidence episodic entries this pass)"
+            .to_string()
+    } else {
+        format!(
+            "PROMOTE (episodic→semantic candidates — you MAY promote these \
+             episodic entries to semantic facts by ADDING a `semantic/` \
+             pointer line per promoted fact; never move, rewrite, or delete \
+             the episodic bodies): {}",
+            candidates.join(", ")
+        )
+    };
     let prompt = format!(
         "You are consolidating an agent's file-based memory. Below is \
          INDEX.md (one-line pointers) and the heads of the topic files.\n\
          Reconcile plan (computed deterministically — honor it):\n{}\n\
+         {promote}\n\
          Rewrite INDEX.md only: dedupe pointers, drop stale entries whose \
          topic file is gone, keep one line per topic in the form \
          `name.md — what it's about`. Validity: if a topic's content says \
@@ -1093,7 +1284,9 @@ pub fn consolidate(
          drop stale pointers — never rewrite a topic file smaller and \
          never overwrite a quarantined entry; mark superseded entries \
          with a `superseded_by` trailer instead of deleting them; keep \
-         entries whose validity window still covers now.\n\
+         entries whose validity window still covers now. Promotion is \
+         ADD-only too: promoting an episodic entry only ADDS a semantic/ \
+         pointer line — the episodic file stays on disk untouched.\n\
          Reply with the full new index between ---INDEX--- markers.\n\n\
          == CURRENT INDEX.md ==\n{old_index}\n== TOPIC HEADS =={topics}",
         plan.render()
@@ -1489,6 +1682,269 @@ fn snippet_for(body: &str, term: &str, head: usize) -> (String, usize) {
         Some(i) => (cut_chars(lines[i].trim(), SNIPPET_CHARS), head + i + 1),
         None => (String::new(), 0),
     }
+}
+
+/// mem0 additive fusion (`score_and_rank` inner loop, arsenal B2): gate
+/// `sem` on `threshold` first, then average the present signals. The
+/// caller supplies `[0,1]` signals; the divisor is the max possible
+/// mass — sem-only 1.0, +keyword 2.0, +entity 2.5, sem+entity 1.5 (the
+/// entity boost caps at 0.5, see `entity_link`, so full house sums to
+/// 2.5). Fail-closed: a gated or non-finite input fuses to 0.0; the
+/// result clamps to 0..1.
+pub fn fuse_scores(
+    sem: f32,
+    kw: f32,
+    ent: f32,
+    has_kw: bool,
+    has_ent: bool,
+    threshold: f32,
+) -> f32 {
+    if !sem.is_finite() || !kw.is_finite() || !ent.is_finite() || !threshold.is_finite() {
+        return 0.0;
+    }
+    if sem < threshold {
+        return 0.0;
+    }
+    let denom = match (has_kw, has_ent) {
+        (false, false) => 1.0,
+        (true, false) => 2.0,
+        (true, true) => 2.5,
+        (false, true) => 1.5,
+    };
+    let num = sem + if has_kw { kw } else { 0.0 } + if has_ent { ent } else { 0.0 };
+    (num / denom).clamp(0.0, 1.0)
+}
+
+/// mem0 BM25 sigmoid (`get_bm25_params`/`normalize_bm25`): the
+/// (midpoint, steepness) pair is picked by term count clamped to the
+/// table ends — a one-term query saturates early, a long one late.
+/// No lemmatizer here by design: the caller passes the raw BM25 sum
+/// and the pre-lemmatization term count.
+pub fn normalize_keyword(raw: f64, n_terms: u64) -> f64 {
+    if !raw.is_finite() {
+        return 0.0;
+    }
+    const TABLE: [(f64, f64); 5] = [(5.0, 0.7), (7.0, 0.6), (9.0, 0.5), (10.0, 0.5), (12.0, 0.5)];
+    let idx = n_terms.clamp(1, TABLE.len() as u64) as usize - 1;
+    let (mid, steep) = TABLE[idx];
+    1.0 / (1.0 + (-steep * (raw - mid)).exp())
+}
+
+/// mem0 entity boost (v3 `_upsert_entity`): an exact normalized match
+/// pays the full 0.5; otherwise the best per-entity token-overlap
+/// fraction (covered entity tokens over entity tokens) pays
+/// proportionally. Capped at 0.5 — the fusion divisor (2.5) already
+/// reserves exactly that mass, so a boost above it would double-count.
+pub fn entity_link(memories: &[&str], entities: &[&str]) -> Vec<f32> {
+    use std::collections::BTreeSet;
+    let ent_norm: Vec<String> = entities.iter().map(|e| word_tokens(e).join(" ")).collect();
+    let ent_sets: Vec<BTreeSet<String>> = entities
+        .iter()
+        .map(|e| word_tokens(e).into_iter().collect())
+        .collect();
+    memories
+        .iter()
+        .map(|m| {
+            let norm = word_tokens(m).join(" ");
+            if !norm.is_empty() && ent_norm.iter().any(|e| e == &norm) {
+                return 0.5;
+            }
+            let mem_set: BTreeSet<String> = word_tokens(m).into_iter().collect();
+            if mem_set.is_empty() {
+                return 0.0;
+            }
+            let best = ent_sets
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.intersection(&mem_set).count() as f32 / s.len() as f32)
+                .fold(0.0f32, f32::max);
+            (best * 0.5).min(0.5)
+        })
+        .collect()
+}
+
+/// cognee content-hash dedup (the `(dataset,owner,content_hash)` index):
+/// sha256 hex of the body bytes. The hash covers content only — the
+/// caller scopes dataset/owner by which entries it passes to
+/// `dedupe_by_hash`.
+pub fn content_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(text.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// First-seen wins by `content_hash` of the body: the earliest entry
+/// with a hash keeps its name in `unique`, later collisions land in
+/// `dupes`. Both outputs sorted ascending, so the verdict is
+/// deterministic regardless of input order ties.
+pub fn dedupe_by_hash(entries: &[(String, String)]) -> (Vec<String>, Vec<String>) {
+    use std::collections::BTreeSet;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut unique = Vec::new();
+    let mut dupes = Vec::new();
+    for (name, body) in entries {
+        if seen.insert(content_hash(body)) {
+            unique.push(name.clone());
+        } else {
+            dupes.push(name.clone());
+        }
+    }
+    unique.sort();
+    dupes.sort();
+    (unique, dupes)
+}
+
+/// letta P1: the `core_block` cap as a reusable pure fn. Under budget
+/// the (trimmed) text rides with no note; over budget the head is cut
+/// on a char boundary (a multibyte char is never split) and rides with
+/// a repair note — never a silent cut.
+pub fn core_budget(text: &str, cap: usize) -> (String, Option<String>) {
+    let text = text.trim();
+    if text.len() <= cap {
+        return (text.to_string(), None);
+    }
+    let cut = text
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .take_while(|end| *end <= cap)
+        .last()
+        .unwrap_or(0);
+    (
+        text[..cut].to_string(),
+        Some(format!(
+            "[overseer] {CORE_NAME} exceeds {cap} bytes — keep it to the lines \
+             that must survive every compaction."
+        )),
+    )
+}
+
+/// letta archival paging over `filter_entries` output: sorted ascending
+/// for determinism, sliced from `cursor`, taking `page_len`. The next
+/// cursor is `Some` only while names remain; a zero page or a cursor
+/// past the end yields empty with no continuation.
+pub fn archive_page(
+    names: &[String],
+    cursor: usize,
+    page_len: usize,
+) -> (Vec<String>, Option<usize>) {
+    let mut sorted: Vec<String> = names.to_vec();
+    sorted.sort();
+    if page_len == 0 || cursor >= sorted.len() {
+        return (Vec::new(), None);
+    }
+    let end = (cursor + page_len).min(sorted.len());
+    let page = sorted[cursor..end].to_vec();
+    let next = if end < sorted.len() { Some(end) } else { None };
+    (page, next)
+}
+
+/// cognee `improve` proposal renderer (P4): a line diff between the
+/// stored note and the session note — dropped lines (`- drop:`) in old
+/// order, added lines (`+ add:`) in new order, multiset-aware so a
+/// repeated line dropped once reports once. Render only: the model
+/// decides, the engine writes. Empty when the notes agree.
+pub fn improve_note(old: &str, new: &str) -> String {
+    use std::collections::BTreeMap;
+    let lines = |s: &str| -> Vec<String> {
+        s.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let old_lines = lines(old);
+    let new_lines = lines(new);
+    let mut avail: BTreeMap<&str, usize> = BTreeMap::new();
+    for l in &new_lines {
+        *avail.entry(l.as_str()).or_insert(0) += 1;
+    }
+    let mut out = Vec::new();
+    for l in &old_lines {
+        match avail.get_mut(l.as_str()) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => out.push(format!("- drop: {l}")),
+        }
+    }
+    avail.clear();
+    for l in &old_lines {
+        *avail.entry(l.as_str()).or_insert(0) += 1;
+    }
+    for l in &new_lines {
+        match avail.get_mut(l.as_str()) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => out.push(format!("+ add: {l}")),
+        }
+    }
+    out.join("\n")
+}
+
+/// MiMo phrase-OR CJK tokenizer (`fts-query.ts`): lowercase word tokens
+/// for alphanumeric runs, one token per CJK char (no word segmentation
+/// — each ideograph matches alone), deduped and sorted so the term
+/// list is deterministic.
+pub fn tokenize_fts(query: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    fn is_cjk(c: char) -> bool {
+        matches!(
+            c as u32,
+            0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0xF900..=0xFAFF
+                | 0x3040..=0x30FF
+                | 0xAC00..=0xD7AF
+                | 0x20000..=0x2EBE0
+        )
+    }
+    let mut terms: BTreeSet<String> = BTreeSet::new();
+    let mut buf = String::new();
+    for c in query.chars() {
+        if is_cjk(c) {
+            if !buf.is_empty() {
+                terms.insert(std::mem::take(&mut buf));
+            }
+            terms.insert(c.to_lowercase().collect::<String>());
+        } else if c.is_alphanumeric() {
+            for l in c.to_lowercase() {
+                buf.push(l);
+            }
+        } else if !buf.is_empty() {
+            terms.insert(std::mem::take(&mut buf));
+        }
+    }
+    if !buf.is_empty() {
+        terms.insert(buf);
+    }
+    terms.into_iter().collect()
+}
+
+/// MiMo BM25 floor (`service.ts`): term-hit fraction over the
+/// lowercased text, substring (phrase-OR) per term. A non-empty term
+/// list never scores below 0.05 — an FTS miss is weak evidence, not
+/// disproof; an empty term list matches nothing (0.0).
+pub fn fts_score(terms: &[&str], text: &str) -> f32 {
+    let terms: Vec<&str> = terms.iter().copied().filter(|t| !t.is_empty()).collect();
+    if terms.is_empty() {
+        return 0.0;
+    }
+    let lowered = text.to_lowercase();
+    let hits = terms
+        .iter()
+        .filter(|t| lowered.contains(&t.to_lowercase()))
+        .count();
+    ((hits as f32) / (terms.len() as f32)).max(0.05)
+}
+
+/// MiMo fingerprint reconcile: lowercase alnum-only collapse, then
+/// `content_hash`. Bodies differing only in case/punctuation share a
+/// fingerprint; anything else differs.
+pub fn fingerprint(text: &str) -> String {
+    let collapsed: String = text
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    content_hash(&collapsed)
 }
 
 #[cfg(test)]
@@ -2448,5 +2904,305 @@ mod tests {
         );
         let absent = EntryMeta::default();
         assert!(!matches_filter(&absent, Layer::Semantic, &same));
+    }
+
+    #[test]
+    fn promote_candidates_filters_and_sorts() {
+        // Qualification: episodic/*.md, entry_valid, confidence>=0.8,
+        // settled (mtime>30d or valid_from>30d), not superseded.
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        // Settled via a 2020 valid_from (fresh mtime — the backfill clock).
+        put(
+            &dir,
+            "episodic/old-sure.md",
+            "---\nconfidence: 0.9\nvalid_from: 2020-01-01T00:00:00Z\n---\nsettled event\n",
+        );
+        // Boundary confidence 0.8 is inclusive.
+        put(
+            &dir,
+            "episodic/boundary.md",
+            "---\nconfidence: 0.8\nvalid_from: 2020-06-01T00:00:00Z\n---\nboundary\n",
+        );
+        // Young: fresh mtime, no valid_from — still being written.
+        put(
+            &dir,
+            "episodic/young.md",
+            "---\nconfidence: 0.95\n---\njust happened\n",
+        );
+        // Low confidence despite age.
+        put(
+            &dir,
+            "episodic/unsure.md",
+            "---\nconfidence: 0.5\nvalid_from: 2020-01-01T00:00:00Z\n---\nshaky\n",
+        );
+        // Expired (valid_to past) despite age and confidence.
+        put(
+            &dir,
+            "episodic/expired.md",
+            "---\nconfidence: 0.95\nvalid_from: 2020-01-01T00:00:00Z\n\
+             valid_to: 2000-01-01T00:00:00Z\n---\nstale\n",
+        );
+        // Superseded despite age and confidence — never re-distilled.
+        put(
+            &dir,
+            "episodic/superseded.md",
+            "---\nconfidence: 0.95\nvalid_from: 2020-01-01T00:00:00Z\n---\nold\n\
+             superseded_by other.md\n",
+        );
+        // Wrong layer: an old, confident semantic fact is not a candidate.
+        put(
+            &dir,
+            "semantic/fact.md",
+            "---\nconfidence: 0.95\nvalid_from: 2020-01-01T00:00:00Z\n---\nfact\n",
+        );
+        // Non-topic extension ignored.
+        put(&dir, "episodic/notes.txt", "notes\n");
+
+        assert_eq!(
+            promote_candidates(&dir),
+            vec!["boundary.md".to_string(), "old-sure.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn promote_candidates_caps_at_twenty_sorted() {
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        for i in 0..25 {
+            put(
+                &dir,
+                &format!("episodic/n{i:02}.md"),
+                "---\nconfidence: 0.9\nvalid_from: 2020-01-01T00:00:00Z\n---\nbody\n",
+            );
+        }
+        let got = promote_candidates(&dir);
+        assert_eq!(got.len(), 20, "the PROMOTE section is a bounded list");
+        let mut sorted = got.clone();
+        sorted.sort();
+        assert_eq!(got, sorted, "deterministic ascending order");
+        assert!(
+            !got.contains(&"n24.md".to_string()),
+            "over-cap tail is cut: {got:?}"
+        );
+    }
+
+    #[test]
+    fn consolidate_promote_section_is_add_only() {
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        put(
+            &dir,
+            "episodic/old-sure.md",
+            "---\nconfidence: 0.9\nvalid_from: 2020-01-01T00:00:00Z\n---\nsettled event\n",
+        );
+        let before = std::fs::read(dir.join("episodic/old-sure.md")).unwrap();
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\nold-sure.md — event\n\
+             semantic/distilled.md — distilled fact\n---INDEX---",
+        );
+        consolidate(&p, "tiny", &dir).unwrap();
+        let seen = p.seen.lock().unwrap().join("\n");
+        assert!(seen.contains("PROMOTE"), "{seen}");
+        assert!(seen.contains("old-sure.md"), "{seen}");
+        assert!(seen.contains("never move"), "{seen}");
+        assert!(seen.contains("ADD"), "{seen}");
+        // The episodic body is untouched: promotion adds a semantic/
+        // pointer line to the index, never moves/rewrites/deletes.
+        let after = std::fs::read(dir.join("episodic/old-sure.md")).unwrap();
+        assert_eq!(before, after, "promotion rewrote the episodic body");
+    }
+
+    #[test]
+    fn consolidate_prompt_marks_empty_promote() {
+        let dir = tmpdir();
+        ensure(&dir).unwrap();
+        let p = FixedProvider::with_reply("---INDEX---\n# Memory Index\n---INDEX---");
+        consolidate(&p, "tiny", &dir).unwrap();
+        let seen = p.seen.lock().unwrap().join("\n");
+        assert!(seen.contains("PROMOTE"), "{seen}");
+        assert!(seen.contains("(none"), "{seen}");
+    }
+
+    #[test]
+    fn fuse_scores_gates_and_denoms() {
+        assert_eq!(
+            fuse_scores(0.4, 0.9, 0.5, true, true, 0.5),
+            0.0,
+            "sem under threshold gates"
+        );
+        assert!((fuse_scores(0.8, 0.0, 0.0, false, false, 0.0) - 0.8).abs() < 1e-6);
+        assert!((fuse_scores(0.8, 0.6, 0.0, true, false, 0.0) - 0.7).abs() < 1e-6);
+        assert!((fuse_scores(0.8, 0.6, 0.5, true, true, 0.0) - 0.76).abs() < 1e-6);
+        assert!((fuse_scores(0.8, 0.0, 0.5, false, true, 0.0) - 1.3 / 1.5).abs() < 1e-6);
+        assert_eq!(
+            fuse_scores(f32::NAN, 0.5, 0.5, true, true, 0.0),
+            0.0,
+            "non-finite fails closed"
+        );
+        assert!(
+            fuse_scores(1.0, 1.0, 1.0, true, true, 0.0) <= 1.0,
+            "clamped"
+        );
+    }
+
+    #[test]
+    fn normalize_keyword_hits_table_midpoints() {
+        for (raw, n) in [(5.0, 1), (7.0, 2), (9.0, 3), (10.0, 4), (12.0, 5)] {
+            let got = normalize_keyword(raw, n);
+            assert!(
+                (got - 0.5).abs() < 1e-9,
+                "midpoint saturates at .5: raw={raw} n={n} got={got}"
+            );
+        }
+        assert!(
+            (normalize_keyword(5.0, 0) - 0.5).abs() < 1e-9,
+            "n_terms clamps to table head"
+        );
+        assert!(
+            (normalize_keyword(12.0, 99) - 0.5).abs() < 1e-9,
+            "n_terms clamps to table tail"
+        );
+        assert!(normalize_keyword(100.0, 1) > 0.99, "saturates high");
+        assert!(normalize_keyword(-100.0, 1) < 0.01, "saturates low");
+        assert_eq!(normalize_keyword(f64::NAN, 1), 0.0);
+    }
+
+    #[test]
+    fn entity_link_exact_and_capped_overlap() {
+        let boosts = entity_link(&["Paris trip"], &["paris trip"]);
+        assert_eq!(boosts, vec![0.5], "exact normalized match pays full boost");
+        let partial = entity_link(&["loves paris cafes"], &["paris trip"])[0];
+        assert!(
+            (partial - 0.25).abs() < 1e-6,
+            "one of two entity tokens covered: {partial}"
+        );
+        assert!(entity_link(&["unrelated text"], &["paris trip"])[0] < 0.25);
+        assert_eq!(entity_link(&[""], &["paris"])[0], 0.0);
+        assert!(
+            entity_link(&["anything"], &["a b c d"])
+                .iter()
+                .all(|b| *b <= 0.5),
+            "cap holds"
+        );
+    }
+
+    #[test]
+    fn content_hash_stable_hex() {
+        assert_eq!(
+            content_hash(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(content_hash("abc"), content_hash("abc"));
+        assert_ne!(content_hash("abc"), content_hash("abd"));
+        assert_eq!(content_hash("abc").len(), 64);
+    }
+
+    #[test]
+    fn dedupe_by_hash_first_wins_sorted() {
+        let entries = vec![
+            ("b.md".to_string(), "same".to_string()),
+            ("a.md".to_string(), "same".to_string()),
+            ("c.md".to_string(), "other".to_string()),
+        ];
+        let (unique, dupes) = dedupe_by_hash(&entries);
+        assert_eq!(
+            unique,
+            vec!["b.md".to_string(), "c.md".to_string()],
+            "first-seen keeps its name"
+        );
+        assert_eq!(dupes, vec!["a.md".to_string()]);
+    }
+
+    #[test]
+    fn core_budget_truncates_with_note() {
+        let (kept, note) = core_budget("small", 100);
+        assert_eq!(kept, "small");
+        assert!(note.is_none());
+        let (kept, note) = core_budget(&"y".repeat(CORE_CAP + 10), CORE_CAP);
+        assert!(
+            note.unwrap().contains("exceeds"),
+            "repair note, never silent"
+        );
+        assert!(kept.len() <= CORE_CAP);
+        let (kept, note) = core_budget("héllo wörld tail here", 8);
+        assert!(note.is_some());
+        assert!(kept.len() <= 8, "char-boundary cut, never split mid-char");
+        assert!(std::str::from_utf8(kept.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn archive_page_sorts_and_continues() {
+        let names = vec!["c.md".to_string(), "a.md".to_string(), "b.md".to_string()];
+        let (page, next) = archive_page(&names, 0, 2);
+        assert_eq!(page, vec!["a.md".to_string(), "b.md".to_string()]);
+        assert_eq!(next, Some(2));
+        let (page, next) = archive_page(&names, 2, 2);
+        assert_eq!(page, vec!["c.md".to_string()]);
+        assert_eq!(next, None);
+        assert_eq!(archive_page(&names, 9, 2), (Vec::new(), None));
+        assert_eq!(archive_page(&names, 0, 0), (Vec::new(), None));
+    }
+
+    #[test]
+    fn improve_note_renders_drop_add_lines() {
+        assert_eq!(improve_note("a\nb", "a\nb"), "", "agreement renders empty");
+        let diff = improve_note("a\nb\nc", "b\nc\nd");
+        assert!(diff.contains("- drop: a"), "{diff}");
+        assert!(diff.contains("+ add: d"), "{diff}");
+        let dup = improve_note("x\nx\ny", "x\ny");
+        assert_eq!(
+            dup.lines().filter(|l| l.starts_with("- drop:")).count(),
+            1,
+            "{dup}"
+        );
+    }
+
+    #[test]
+    fn tokenize_fts_cjk_phrase_or_sorted() {
+        let toks = tokenize_fts("hello 世界");
+        assert!(toks.contains(&"hello".to_string()), "{toks:?}");
+        assert!(toks.contains(&"世".to_string()), "{toks:?}");
+        assert!(toks.contains(&"界".to_string()), "{toks:?}");
+        let mut sorted = toks.clone();
+        sorted.sort();
+        assert_eq!(toks, sorted, "deterministic order");
+        assert_eq!(
+            tokenize_fts("hi, hi! HI"),
+            vec!["hi".to_string()],
+            "dedup + lowercase"
+        );
+        assert!(tokenize_fts("").is_empty());
+    }
+
+    #[test]
+    fn fts_score_fraction_and_floor() {
+        assert_eq!(fts_score(&[], "anything"), 0.0, "no terms matches nothing");
+        let half = fts_score(&["hello", "world"], "hello there");
+        assert!((half - 0.5).abs() < 1e-6, "{half}");
+        assert!(
+            (fts_score(&["zzz"], "hello there") - 0.05).abs() < 1e-6,
+            "miss is weak evidence, not disproof"
+        );
+        assert!(
+            (fts_score(&["世"], "世界") - 1.0).abs() < 1e-6,
+            "CJK single-char matches"
+        );
+    }
+
+    #[test]
+    fn fingerprint_ignores_case_punct() {
+        assert_eq!(fingerprint("Hello, World!"), fingerprint("hello world"));
+        assert_ne!(fingerprint("hello world"), fingerprint("hello worlds"));
+        assert_eq!(fingerprint("abc").len(), 64);
+    }
+
+    #[test]
+    fn rfc3339_epoch_handles_z_and_offset() {
+        let z = rfc3339_epoch("2020-01-01T00:00:00Z").unwrap();
+        let off = rfc3339_epoch("2020-01-01T02:00:00+02:00").unwrap();
+        assert_eq!(z, off, "the zone offset must shift the epoch");
+        assert!(rfc3339_epoch("not-a-date").is_none());
+        assert!(rfc3339_epoch("2020-01-02 00:00:00").is_none());
     }
 }

@@ -106,6 +106,21 @@ impl Anthropic {
         }) {
             body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
         }
+        // Param filter (Ch.7 §2.2): drop optional keys the profile rejects
+        // so a cross-family knob never 400s the request. Only emitted
+        // optionals are named; core keys (model/messages/tools/max_tokens)
+        // are never stripped (supports_param refuses them anyway).
+        crate::profile::strip_optional_params(
+            &mut body,
+            req.model,
+            &[
+                "temperature",
+                "top_p",
+                "top_k",
+                "stop_sequences",
+                "thinking",
+            ],
+        );
         body
     }
 
@@ -376,6 +391,66 @@ mod tests {
         assert_eq!(body["system"][1]["cache_control"]["type"], "ephemeral");
         assert!(body["system"][0].get("cache_control").is_none());
         assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn param_filter_strips_cross_family_and_keeps_core() {
+        // Cross-family key injected post-build is stripped for Claude.
+        let system = vec![];
+        let tools = vec![];
+        let msgs = vec![Message::user_text("hi")];
+        let mut body = Anthropic::build_body(&sample_req(&system, &tools, &msgs));
+        body["reasoning_effort"] = json!("high");
+        body["frequency_penalty"] = json!(0.5);
+        crate::profile::strip_optional_params(
+            &mut body,
+            "claude-sonnet-5",
+            &["reasoning_effort", "frequency_penalty", "thinking"],
+        );
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("frequency_penalty").is_none());
+        // Core keys are never stripped even when named.
+        crate::profile::strip_optional_params(
+            &mut body,
+            "claude-sonnet-5",
+            &["model", "messages", "tools", "max_tokens"],
+        );
+        for core in ["model", "messages", "tools", "max_tokens"] {
+            assert!(body.get(core).is_some(), "{core} stripped");
+        }
+    }
+
+    #[test]
+    fn build_body_byte_stable_when_all_supported() {
+        // All-supported path: filter touches nothing, bytes identical.
+        let system = vec![SystemSegment {
+            name: "test",
+            text: "static system".into(),
+            cacheable: true,
+        }];
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let msgs = vec![Message::user_text("first")];
+        let b1 = Anthropic::build_body(&sample_req(&system, &tools, &msgs));
+        let mut b2 = b1.clone();
+        crate::profile::strip_optional_params(
+            &mut b2,
+            "claude-sonnet-5",
+            &[
+                "temperature",
+                "top_p",
+                "top_k",
+                "stop_sequences",
+                "thinking",
+            ],
+        );
+        assert_eq!(
+            serde_json::to_string(&b1).unwrap(),
+            serde_json::to_string(&b2).unwrap()
+        );
     }
 
     #[test]

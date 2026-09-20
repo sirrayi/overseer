@@ -1,0 +1,79 @@
+# cargo-deny configuration for the overseer workspace.
+#
+# Run locally with `cargo deny check` (cargo install cargo-deny --locked);
+# CI runs it on every PR (see .github/workflows/ci.yml, `supply-chain`).
+# Fail-closed: every crate must resolve against the advisory DB and the
+# license allow-list below; the only waivers are the documented
+# cross-major `skip` entries under [bans].
+
+[graph]
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+# RustSEC advisory database. Any unpatched vulnerability fails the check.
+db-path = "~/.cargo/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+version = 2
+yanked = "warn"
+unmaintained = "workspace"
+# Advisory IDs to ignore, each with a reason; re-examine on every audit so
+# they do not silently accumulate.
+ignore = []
+
+[licenses]
+version = 2
+# The workspace is `MIT OR Apache-2.0` (root Cargo.toml). The allow-list
+# is permissive-only, pinned to what the current tree actually carries:
+# ISC/BSD-3/Zlib (ratatui, ureq, rustls-platform-verifier), Unicode-3.0
+# (syn's bundled unicode-ident data), CDLA-Permissive-2.0 (webpki-roots).
+# Anything else — a new copyleft dep, a crate with no machine-readable
+# license — fails the check instead of slipping in.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = true
+[bans]
+# Exactly one version of each crate in this small tree: duplicates fail so
+# a second copy of a dep cannot slip in unreviewed. Feature flags stay
+# "allow": several transitive deps build with their defaults and there is
+# no local cargo-deny run in this slice to pin down an allow-list.
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+# Waived duplicates — each is a cross-major transitive pair that cannot
+# unify (the consumers pin different majors); a NEW duplicate still fails.
+# Re-examine on every dep bump so the list does not silently accumulate.
+skip = [
+    # rand_core 0.6 line vs the 0.9+ line via getrandom's own deps.
+    { crate = "getrandom" },
+    # indexmap/hashbrown 0.16 vs 0.17 — two semver-incompatible lines.
+    { crate = "hashbrown" },
+    # syn 2.x (most proc-macros) vs syn 3.x (newer macro crates).
+    { crate = "syn" },
+    # windows-sys 0.52 vs 0.61 — different transitive pins, win-only.
+    { crate = "windows-sys" },
+]
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

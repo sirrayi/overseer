@@ -31,6 +31,12 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   to unsandboxed exec with a visible warning when no backend exists;
   `--no-sandbox` disables. A loopback egress proxy with domain
   allowlists is still open — v1 denies all egress.
+  `harden.rs` is the startup posture: the CLI calls `harden_startup()`
+  first (umask 0o077 + proxy-env scrub) and session/daemon roots are
+  pinned owner-only via `ensure_private_dir`. The injection-ASR corpus
+  (`tests/injection_asr.rs`) gates the Rule-of-Two latches in CI, and
+  `cargo deny check` (deny.toml, `.cargo/audit.toml` locally) runs in the
+  supply-chain job.
   `session.rs` enumerates sessions (SessionStart id/cwd/model, recency,
   previews, checkpoint lists) and implements `fork` (copied log cut at a
   boundary + surviving checkpoints + fresh SessionStart); `rewind.rs` is

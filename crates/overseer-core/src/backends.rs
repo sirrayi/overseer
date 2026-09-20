@@ -896,6 +896,252 @@ pub fn effective_grants<'a>(grants: &'a [Grant], subject: &str, now: &str) -> Ve
     out
 }
 
+// ── Egress allowlist (Phase-C gate) ──────────────────────────────────────────
+//
+// Pure domain/IP decision for the future loopback egress proxy. No DNS, no
+// sockets, no I/O: the proxy calls `allowlist_match` on the (already
+// resolved-and-rechecked) hostname and `is_public_ip_literal` to refuse
+// direct IP literals and DNS-rebinding targets. Deny-wins across lists is
+// handled by the caller (the proxy), not here.
+//
+// DNS-rebinding note: matching the hostname is not enough — the proxy MUST
+// re-resolve after matching and refuse private/loopback results (see
+// `is_public_ip_literal`), or `trusted.com` can rebind to `127.0.0.1`.
+
+/// Normalize a hostname for matching: trim, lowercase, strip one trailing dot.
+fn normalize_host(s: &str) -> String {
+    let t = s.trim().to_lowercase();
+    t.strip_suffix('.').unwrap_or(&t).to_string()
+}
+
+/// Whether `domain` is allowed by `patterns`.
+///
+/// Rules, in order:
+/// - empty domain or empty pattern list matches nothing (fail closed);
+/// - a domain containing `*` is never a real hostname: refused;
+/// - exact entries match exactly (after normalization);
+/// - `*.example.com` matches subdomains only (`a.example.com`,
+///   `a.b.example.com`) and never the bare `example.com`;
+/// - `*` alone, empty entries, and any other entry containing `*` are ignored.
+///
+/// Matching is case-insensitive with trailing-dot tolerance; deny-wins across
+/// separate allow/deny lists is the caller's job.
+pub fn allowlist_match(domain: &str, patterns: &[&str]) -> bool {
+    let d = normalize_host(domain);
+    if d.is_empty() || d.contains('*') || patterns.is_empty() {
+        return false;
+    }
+    for p in patterns {
+        let raw = p.trim().to_lowercase();
+        let pat = raw.strip_suffix('.').unwrap_or(&raw);
+        if pat.is_empty() || pat == "*" {
+            continue;
+        }
+        if let Some(suffix) = pat.strip_prefix("*.") {
+            if suffix.is_empty() || suffix.contains('*') {
+                continue;
+            }
+            if d.len() > suffix.len()
+                && d.ends_with(suffix)
+                && d.as_bytes()[d.len() - suffix.len() - 1] == b'.'
+            {
+                return true;
+            }
+        } else {
+            if pat.contains('*') {
+                continue;
+            }
+            if d == pat {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when `s` is exactly four decimal octets (`1-3` digits each, `0-255`).
+fn is_ipv4_literal(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    parts.iter().all(|p| {
+        !p.is_empty()
+            && p.len() <= 3
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u32>().map(|v| v <= 255).unwrap_or(false)
+    })
+}
+
+/// Octets of a string already known to satisfy `is_ipv4_literal`.
+fn ipv4_octets(s: &str) -> [u32; 4] {
+    let mut out = [0u32; 4];
+    for (i, p) in s.split('.').enumerate().take(4) {
+        out[i] = p.parse::<u32>().unwrap_or(256);
+    }
+    out
+}
+
+/// Shape check for an IPv6 literal (brackets/zone already stripped): hex
+/// groups, at most one `::`, optional embedded dotted-quad tail.
+fn is_ipv6_shape(s: &str) -> bool {
+    if s.is_empty() || !s.contains(':') {
+        return false;
+    }
+    if s.chars()
+        .any(|c| !(c.is_ascii_hexdigit() || c == ':' || c == '.'))
+    {
+        return false;
+    }
+    let (v6part, v4part) = match s.rfind(':') {
+        Some(idx) if s[idx + 1..].contains('.') => (&s[..idx], Some(&s[idx + 1..])),
+        _ => (s, None),
+    };
+    if let Some(v4) = v4part {
+        if !is_ipv4_literal(v4) {
+            return false;
+        }
+    }
+    let mut pieces = v6part.split("::");
+    let first = pieces.next().unwrap_or("");
+    let second = pieces.next();
+    if pieces.next().is_some() {
+        return false;
+    }
+    for part in [first, second.unwrap_or("")] {
+        if part.is_empty() {
+            continue;
+        }
+        for g in part.split(':') {
+            if g.is_empty() || g.len() > 4 || !g.chars().all(|c| c.is_ascii_hexdigit()) {
+                return false;
+            }
+        }
+    }
+    let count = |p: &str| {
+        if p.is_empty() {
+            0
+        } else {
+            p.split(':').count()
+        }
+    };
+    let groups = count(first) + count(second.unwrap_or("")) + usize::from(v4part.is_some()) * 2;
+    if second.is_some() {
+        groups < 8
+    } else {
+        groups == 8
+    }
+}
+
+/// First non-empty colon group of an IPv6 literal as a `u16`, if any.
+fn ipv6_first_group(host: &str) -> Option<u16> {
+    for g in host.split(':') {
+        if g.is_empty() || g.contains('.') {
+            continue;
+        }
+        if g.len() <= 4 && g.chars().all(|c| c.is_ascii_hexdigit()) {
+            return u16::from_str_radix(g, 16).ok();
+        }
+        return None;
+    }
+    None
+}
+
+/// Whether `s` is an IP literal with a globally routable address.
+///
+/// - IPv4 dotted quads: `10/8`, `172.16/12`, `192.168/16`, `127/8`,
+///   CGNAT `100.64/10`, `0/8` (this-host), `169.254/16` (link-local), and
+///   `224.0.0.0/4`+ (multicast/reserved) are NOT public; the rest is.
+/// - IPv6 literals (optional `[brackets]`, optional `%zone`): `::`,
+///   `::1`, `fe80::/10`, `fc00::/7` (`fc00`/`fd00`), `ff00::/8`, and
+///   `::ffff:`-mapped private IPv4 are NOT public; the rest is.
+/// - hostnames, empty strings, and malformed numerics are NOT IP literals:
+///   returns `false` (fail closed — a hostname is never a "public IP").
+pub fn is_public_ip_literal(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if is_ipv4_literal(t) {
+        let o = ipv4_octets(t);
+        if o[0] == 10 {
+            return false;
+        }
+        if o[0] == 172 && (16..=31).contains(&o[1]) {
+            return false;
+        }
+        if o[0] == 192 && o[1] == 168 {
+            return false;
+        }
+        if o[0] == 127 {
+            return false;
+        }
+        if o[0] == 100 && (64..=127).contains(&o[1]) {
+            return false;
+        }
+        if o[0] == 0 {
+            return false;
+        }
+        if o[0] == 169 && o[1] == 254 {
+            return false;
+        }
+        if o[0] >= 224 {
+            return false;
+        }
+        return true;
+    }
+    let bracketed = if t.starts_with('[') && t.ends_with(']') && t.len() >= 2 {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    };
+    let host = bracketed.split('%').next().unwrap_or("");
+    if !host.contains(':') {
+        // Hostname, or dotted digits that failed IPv4 validation: never public.
+        return false;
+    }
+    let lower = host.to_lowercase();
+    if lower == "::" || lower == "::1" {
+        return false;
+    }
+    // v4-mapped (`::ffff:1.2.3.4`): the embedded quad decides.
+    if let Some(idx) = lower.rfind(':') {
+        if lower[idx + 1..].contains('.') {
+            let raw_tail = host.rsplit(':').next().unwrap_or("");
+            if !is_ipv4_literal(raw_tail) {
+                return false;
+            }
+            let o = ipv4_octets(raw_tail);
+            return !(o[0] == 10
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || o[0] == 127
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || o[0] == 0
+                || (o[0] == 169 && o[1] == 254)
+                || o[0] >= 224);
+        }
+    }
+    if !is_ipv6_shape(host) {
+        return false;
+    }
+    match ipv6_first_group(&lower) {
+        Some(g) => {
+            if g & 0xffc0 == 0xfe80 {
+                return false; // fe80::/10 link-local
+            }
+            if g & 0xfe00 == 0xfc00 {
+                return false; // fc00::/7 unique-local
+            }
+            if g & 0xff00 == 0xff00 {
+                return false; // ff00::/8 multicast
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1783,5 +2029,121 @@ mod tests {
         );
         assert_eq!(live[1].tools, vec!["read", "edit"]);
         assert_eq!(live[2].server, "git");
+    }
+
+    // ── Egress allowlist ─────────────────────────────────────────────────
+
+    #[test]
+    fn allowlist_matches_exact_and_subdomains_but_not_the_bare_domain() {
+        assert!(allowlist_match("api.example.com", &["api.example.com"]));
+        assert!(allowlist_match("a.example.com", &["*.example.com"]));
+        assert!(allowlist_match("a.b.example.com", &["*.example.com"]));
+        assert!(
+            !allowlist_match("example.com", &["*.example.com"]),
+            "a wildcard never authorizes the bare domain"
+        );
+        assert!(!allowlist_match("evil.com", &["*.example.com"]));
+        assert!(!allowlist_match("example.com.evil.com", &["*.example.com"]));
+        assert!(!allowlist_match("example.com", &["api.example.com"]));
+    }
+
+    #[test]
+    fn allowlist_star_is_always_refused_and_lists_are_deny_open() {
+        assert!(!allowlist_match("anything.com", &["*"]));
+        assert!(!allowlist_match("api.example.com", &["*"]));
+        assert!(
+            !allowlist_match("api.example.com", &[]),
+            "empty list denies"
+        );
+        assert!(
+            !allowlist_match("", &["api.example.com"]),
+            "empty domain denies"
+        );
+        assert!(
+            !allowlist_match("api.example.com", &[""]),
+            "empty entry denies"
+        );
+        assert!(
+            !allowlist_match("*", &["*"]),
+            "a wildcard domain is never real"
+        );
+        assert!(
+            !allowlist_match("api.example.com", &["api.*", "pre-*.example.com"]),
+            "partial wildcards are refused, not matched"
+        );
+        assert!(
+            allowlist_match(" api.EXAMPLE.com. ", &["API.example.COM"]),
+            "matching is case-insensitive with trim/trailing-dot tolerance"
+        );
+        // Deny-wins is the caller's composition, not the matcher's: the
+        // matcher answers "is it listed", the proxy intersects allow minus deny.
+        let allowed = allowlist_match("a.example.com", &["*.example.com"]);
+        let denied = allowlist_match("a.example.com", &["a.example.com"]);
+        assert!(allowed && denied, "both lists hit; the proxy must deny");
+    }
+
+    #[test]
+    fn public_ip_refuses_private_loopback_and_hostnames() {
+        assert!(is_public_ip_literal("8.8.8.8"));
+        assert!(is_public_ip_literal("1.1.1.1"));
+        assert!(!is_public_ip_literal("10.0.0.5"), "RFC1918 10/8");
+        assert!(
+            !is_public_ip_literal("172.16.0.1"),
+            "RFC1918 172.16/12 low edge"
+        );
+        assert!(
+            !is_public_ip_literal("172.31.255.255"),
+            "RFC1918 172.16/12 high edge"
+        );
+        assert!(
+            is_public_ip_literal("172.32.0.1"),
+            "just above 172.16/12 is public"
+        );
+        assert!(!is_public_ip_literal("192.168.1.1"), "RFC1918 192.168/16");
+        assert!(!is_public_ip_literal("127.0.0.1"), "loopback");
+        assert!(
+            !is_public_ip_literal("100.64.0.1"),
+            "CGNAT 100.64/10 low edge"
+        );
+        assert!(
+            !is_public_ip_literal("100.127.255.255"),
+            "CGNAT 100.64/10 high edge"
+        );
+        assert!(
+            is_public_ip_literal("100.128.0.1"),
+            "just above CGNAT is public"
+        );
+        assert!(!is_public_ip_literal("0.0.0.0"), "this-host");
+        assert!(
+            !is_public_ip_literal("169.254.169.254"),
+            "link-local metadata"
+        );
+        assert!(!is_public_ip_literal("224.0.0.1"), "multicast");
+        assert!(
+            !is_public_ip_literal("example.com"),
+            "a hostname is never a public IP"
+        );
+        assert!(!is_public_ip_literal(""), "empty is never public");
+        assert!(
+            !is_public_ip_literal("999.1.1.1"),
+            "malformed numerics are never public"
+        );
+        assert!(
+            is_public_ip_literal("2606:4700:4700::1111"),
+            "global unicast v6"
+        );
+        assert!(!is_public_ip_literal("::1"), "v6 loopback");
+        assert!(!is_public_ip_literal("fe80::1"), "v6 link-local");
+        assert!(!is_public_ip_literal("fc00::1"), "v6 unique-local low");
+        assert!(!is_public_ip_literal("fd00::1"), "v6 unique-local high");
+        assert!(!is_public_ip_literal("ff02::1"), "v6 multicast");
+        assert!(
+            !is_public_ip_literal("::ffff:127.0.0.1"),
+            "a v4-mapped private quad is still private: the rebinding target"
+        );
+        assert!(
+            is_public_ip_literal("::ffff:8.8.8.8"),
+            "a v4-mapped public quad stays public"
+        );
     }
 }

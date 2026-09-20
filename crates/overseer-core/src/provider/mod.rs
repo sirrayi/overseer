@@ -13,6 +13,11 @@ pub mod local;
 pub mod openai;
 pub mod router;
 
+/// Native-compaction seam, defined in [`crate::compact`]: adapters opt in
+/// via `NativeCompaction`; routing gates on `provider_compact_capability`.
+/// Re-export only — no existing item touched.
+pub use crate::compact::{provider_compact_capability, NativeCompaction};
+
 /// Cross-provider effort ladder (P3.2). Each adapter maps the enum onto
 /// its native knob — Anthropic `thinking.budget_tokens`, OpenAI
 /// `reasoning_effort`, Gemini `thinkingConfig.thinkingBudget`. A raw

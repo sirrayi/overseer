@@ -437,6 +437,50 @@ impl StepMemo {
     }
 }
 
+/// Backoff delay before attempt `attempt` (1-based): `base_ms *
+/// factor^(attempt-1)`. `attempt = 0` returns `base_ms`; a non-finite or
+/// sub-1.0 factor is clamped to 1.0 (no shrink); overflow saturates at
+/// `u64::MAX` instead of wrapping.
+pub fn retry_delay(attempt: u32, base_ms: u64, factor: f32) -> u64 {
+    if attempt <= 1 {
+        return base_ms;
+    }
+    let factor = if factor.is_finite() && factor >= 1.0 {
+        factor
+    } else {
+        1.0
+    };
+    let exp = attempt.saturating_sub(1).min(i32::MAX as u32) as i32;
+    let delay = base_ms as f64 * f64::from(factor).powi(exp);
+    if delay.is_finite() && delay >= 0.0 {
+        delay.min(u64::MAX as f64) as u64
+    } else {
+        u64::MAX
+    }
+}
+
+/// Retry scope for a coordinator: how many attempts a step may take and how
+/// the delay grows between them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryScope {
+    /// Total attempts allowed, including the first (1 = no retries).
+    pub max_attempts: u32,
+    /// First retry delay in ms.
+    pub base_ms: u64,
+    /// Multiplier applied per further attempt (>= 1.0).
+    pub factor: f32,
+}
+
+/// Whether the coordinator retries after attempt `attempt` (count of attempts
+/// already made). A timeout is terminal even with attempts left; otherwise
+/// retry while `attempt < max_attempts`.
+pub fn coordinator_should_retry(scope: &RetryScope, attempt: u32, timeout_hit: bool) -> bool {
+    if timeout_hit {
+        return false;
+    }
+    attempt < scope.max_attempts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,5 +758,58 @@ mod tests {
             vec![("load".to_string(), true), ("index".to_string(), true),]
         );
         assert!(memo.step_plan("unknown-run").is_empty());
+    }
+
+    #[test]
+    fn retry_delay_grows_geometrically_and_saturates() {
+        assert_eq!(retry_delay(0, 100, 2.0), 100, "attempt 0 → base");
+        assert_eq!(retry_delay(1, 100, 2.0), 100);
+        assert_eq!(retry_delay(2, 100, 2.0), 200);
+        assert_eq!(retry_delay(3, 100, 2.0), 400);
+        assert_eq!(
+            retry_delay(2, 100, 0.5),
+            100,
+            "sub-1.0 factor clamps to 1.0"
+        );
+        assert_eq!(
+            retry_delay(2, 100, f32::NAN),
+            100,
+            "non-finite factor clamps to 1.0"
+        );
+        assert_eq!(
+            retry_delay(2, 100, f32::INFINITY),
+            100,
+            "infinite factor clamps to 1.0"
+        );
+        assert_eq!(retry_delay(200, u64::MAX, 2.0), u64::MAX, "saturates");
+        assert_eq!(retry_delay(200, 1_000, 10.0), u64::MAX, "saturates");
+    }
+
+    #[test]
+    fn coordinator_retry_stops_on_timeout_or_ceiling() {
+        let scope = RetryScope {
+            max_attempts: 3,
+            base_ms: 100,
+            factor: 2.0,
+        };
+        assert!(coordinator_should_retry(&scope, 0, false));
+        assert!(coordinator_should_retry(&scope, 2, false));
+        assert!(
+            !coordinator_should_retry(&scope, 3, false),
+            "ceiling reached"
+        );
+        assert!(!coordinator_should_retry(&scope, 4, false));
+        assert!(
+            !coordinator_should_retry(&scope, 0, true),
+            "timeout terminal"
+        );
+        assert!(!coordinator_should_retry(&scope, 2, true));
+        let once = RetryScope {
+            max_attempts: 1,
+            base_ms: 50,
+            factor: 2.0,
+        };
+        assert!(coordinator_should_retry(&once, 0, false));
+        assert!(!coordinator_should_retry(&once, 1, false));
     }
 }

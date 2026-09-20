@@ -241,7 +241,7 @@ pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::i
             .collect(),
         None => text.lines().collect(),
     };
-    std::fs::create_dir_all(new_dir)?;
+    crate::harden::ensure_private_dir(new_dir)?;
     std::fs::write(new_dir.join("events.jsonl"), kept.join("\n") + "\n")?;
 
     // Checkpoints at or before the boundary come along so rewind still

@@ -171,6 +171,28 @@ impl StuckDetector {
     }
 }
 
+/// Try-best stop rule: stop when the last `patience` results are all equal
+/// (all success or all failure) and at least `patience` results exist.
+/// `patience < 2` never stops — a single result is signal, not a streak.
+pub fn try_best_stop(results: &[bool], patience: usize) -> bool {
+    if patience < 2 || results.len() < patience {
+        return false;
+    }
+    let tail = &results[results.len() - patience..];
+    tail.iter().all(|&r| r == tail[0])
+}
+
+/// Keep at most the last `max_streak` items, reporting how many oldest items
+/// were dropped. Deterministic tail-crop; empty in, empty out.
+pub fn streak_crop<T: Clone>(items: &[T], max_streak: usize) -> (&[T], usize) {
+    if items.len() > max_streak {
+        let dropped = items.len() - max_streak;
+        (&items[dropped..], dropped)
+    } else {
+        (items, 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +291,43 @@ mod tests {
         for (n, i) in calls {
             assert_eq!(step(&mut d, n, i, false, "ok"), None);
         }
+    }
+
+    #[test]
+    fn try_best_stop_needs_a_full_equal_tail() {
+        assert!(!try_best_stop(&[], 2));
+        assert!(
+            !try_best_stop(&[true], 2),
+            "one result is signal, not a streak"
+        );
+        assert!(!try_best_stop(&[true, true], 0));
+        assert!(!try_best_stop(&[true, true], 1), "patience < 2 never stops");
+        assert!(try_best_stop(&[true, true], 2));
+        assert!(try_best_stop(&[false, false, false], 3));
+        assert!(try_best_stop(&[true, false, false], 2), "last N all-equal");
+        assert!(!try_best_stop(&[true, false, true], 2));
+        assert!(
+            !try_best_stop(&[false, true, false], 3),
+            "mixed tail keeps going"
+        );
+        assert!(!try_best_stop(&[true], 3), "fewer than patience");
+    }
+
+    #[test]
+    fn streak_crop_keeps_the_tail_and_counts_the_dropped() {
+        let items = vec![1, 2, 3, 4, 5];
+        let (tail, dropped) = streak_crop(&items, 3);
+        assert_eq!(tail, &[3, 4, 5]);
+        assert_eq!(dropped, 2);
+        let (all, dropped) = streak_crop(&items, 5);
+        assert_eq!(all, &[1, 2, 3, 4, 5]);
+        assert_eq!(dropped, 0);
+        let (all, dropped) = streak_crop(&items, 99);
+        assert_eq!(all.len(), 5);
+        assert_eq!(dropped, 0);
+        let empty: Vec<i32> = vec![];
+        let (tail, dropped) = streak_crop(&empty, 3);
+        assert!(tail.is_empty());
+        assert_eq!(dropped, 0);
     }
 }
