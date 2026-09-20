@@ -26,6 +26,10 @@ pub struct OpenAiCompatible {
     agent: ureq::Agent,
     api_key: String,
     base_url: String,
+    /// Extra request headers (e.g. opencode Go's `x-opencode-session`,
+    /// required for routing on `opencode.ai/zen/go`). Applied after the
+    /// standard auth/content-type headers on every call.
+    extra_headers: Vec<(String, String)>,
 }
 
 impl OpenAiCompatible {
@@ -39,7 +43,15 @@ impl OpenAiCompatible {
             agent: ureq::Agent::new_with_config(config),
             api_key: api_key.into(),
             base_url: base_url.into(),
+            extra_headers: Vec::new(),
         }
+    }
+
+    /// Attach an extra header sent on every request (endpoint-required
+    /// routing headers like `x-opencode-session`).
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
     }
 
     pub fn openai(api_key: impl Into<String>) -> Self {
@@ -384,11 +396,15 @@ impl Provider for OpenAiCompatible {
         }
 
         let started = Instant::now();
-        let mut resp = self
+        let mut call = self
             .agent
             .post(&self.url())
             .header("authorization", &format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        for (name, value) in &self.extra_headers {
+            call = call.header(name, value);
+        }
+        let mut resp = call
             .send_json(&body)
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
         let latency_ms = started.elapsed().as_millis() as u64;
@@ -546,6 +562,60 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "a\n\nb");
     }
+    /// `with_header` extras must reach the wire — opencode Go 400s without
+    /// `x-opencode-session`, so this proves the header is really sent
+    /// (a body-only test would miss a dropped header).
+    #[test]
+    fn extra_headers_reach_the_wire() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Read until end of headers — the body may still be in flight.
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).unwrap();
+                assert!(n > 0, "connection closed before headers complete");
+                head.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+            write!(
+                sock,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            String::from_utf8_lossy(&head).to_string()
+        });
+
+        let system: Vec<SystemSegment> = vec![];
+        let tools: Vec<ToolSpec> = vec![];
+        let msgs = vec![Message::user_text("hi")];
+        let req = Request {
+            model: "m",
+            system: &system,
+            tools: &tools,
+            messages: &msgs,
+            max_tokens: 10,
+            thinking_budget: None,
+            effort: None,
+            cache_breakpoints: false,
+        };
+        let provider = OpenAiCompatible::new("k", format!("http://127.0.0.1:{port}/v1"))
+            .with_header("x-opencode-session", "overseer-test");
+        let resp = provider.complete(&req).unwrap();
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let head = server.join().unwrap();
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("x-opencode-session: overseer-test"),
+            "session header missing from request head: {head}"
+        );
+    }
+
     #[test]
     fn param_filter_strips_reasoning_effort_on_fleet() {
         // Fleet fleet profile rejects reasoning_effort: effort maps

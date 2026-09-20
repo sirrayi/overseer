@@ -784,7 +784,7 @@ fn usage() {
          \x20 --session <dir>     Session directory (default: ~/.overseer/sessions/<ts>)\n\
          \x20 --cwd <dir>         Working directory for tools (default: .)\n\
          \x20 --model <id>        Model id (default: claude-sonnet-5)\n\
-         \x20 --provider <name>   anthropic | openai | fleet | gemini (default: anthropic)\n\
+         \x20 --provider <name>   anthropic | openai | fleet | opencode | gemini (default: anthropic)\n\
          \x20 --effort <level>    min | low | medium | high | max (default: medium)\n\
          \x20 --small-model <id>  small-tier model for aux calls (titles, consolidation)\n\
          \x20 --base-url <url>    API base URL for openai-compatible providers\n\
@@ -829,6 +829,7 @@ fn usage() {
          \x20 OPENAI_API_KEY      OpenAI-compatible key\n\
          \x20 GOOGLE_API_KEY      Gemini key (GEMINI_API_KEY also works)\n\
          \x20 OVERSEER_API_KEY         Fleet key (fallback)\n\
+         \x20 OPENCODE_API_KEY    opencode Go key (provider=opencode)\n\
          \x20 OVERSEER_CREDENTIALS  credential payload for --credential-store env\n\
          \x20                     (`NAME=value` lines, `grant …` lines)"
     );
@@ -1195,6 +1196,9 @@ fn render_human(e: &Event) {
 }
 
 const FLEET_URL: &str = "https://inference.fleet.ai/v1";
+/// opencode subscription (Go tier) — OpenAI-compatible chat/completions.
+/// Requires the `x-opencode-session` routing header on every call.
+const OPENCODE_URL: &str = "https://opencode.ai/zen/go/v1";
 
 /// Build the provider from flags + env. Key resolution order:
 /// OVERSEER_API_KEY → provider-specific env → OVERSEER_API_KEY, then the same
@@ -1210,6 +1214,7 @@ fn build_provider(
     let provider_key = |get: &dyn Fn(&str) -> Option<String>| match flags.provider.as_str() {
         "anthropic" => get("ANTHROPIC_API_KEY"),
         "gemini" => get("GOOGLE_API_KEY").or_else(|| get("GEMINI_API_KEY")),
+        "opencode" => get("OPENCODE_API_KEY"),
         _ => get("OPENAI_API_KEY"),
     };
     let key = env("OVERSEER_API_KEY")
@@ -1249,9 +1254,35 @@ fn build_provider(
                 .clone()
                 .unwrap_or_else(|| FLEET_URL.into()),
         )),
+        "opencode" => {
+            // Go routes on x-opencode-session; any stable per-process tag
+            // gives session-affinity routing (verified live 2026-09).
+            let tag = format!(
+                "overseer-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            );
+            let base = flags
+                .base_url
+                .clone()
+                .unwrap_or_else(|| OPENCODE_URL.into());
+            // muse-spark-* is Responses-API-only on Go (chat/completions
+            // 500s upstream) — those models take the responses adapter.
+            if flags.model.starts_with("muse-") {
+                Box::new(
+                    overseer_core::provider::responses::ResponsesApi::new(key, base)
+                        .with_header("x-opencode-session", tag),
+                )
+            } else {
+                Box::new(OpenAiCompatible::new(key, base).with_header("x-opencode-session", tag))
+            }
+        }
         other => {
             return Err(format!(
-                "unknown provider '{other}' (anthropic|openai|fleet)"
+                "unknown provider '{other}' (anthropic|openai|fleet|opencode)"
             ))
         }
     })
