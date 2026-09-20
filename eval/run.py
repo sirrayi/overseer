@@ -71,7 +71,8 @@ def main() -> int:
     ap.add_argument(
         "--benchmark",
         default="local",
-        choices=["local", "tau2", "lcb", "swe_bench", "terminal_bench", "swe_rebench"],
+        choices=["local", "tau2", "lcb", "swe_bench", "terminal_bench",
+                 "swe_rebench", "swe_live", "polyglot"],
     )
     ap.add_argument("--tau2-domain", default="airline", choices=["airline", "retail"])
     ap.add_argument("--tau2-trials", type=int, default=8)
@@ -100,6 +101,18 @@ def main() -> int:
         help="cap the number of SWE-bench instances (first N, deterministic order)",
     )
     ap.add_argument("--swebench-max-workers", type=int, default=4)
+    ap.add_argument(
+        "--swe-live-dataset",
+        default="SWE-bench-Live/SWE-bench-Live",
+        help="SWE-bench-Live HF dataset (Python split default; "
+             "SWE-bench-Live/MultiLang for multi-language)",
+    )
+    ap.add_argument(
+        "--polyglot-lang",
+        default="python",
+        choices=["python", "rust", "go", "javascript"],
+        help="polyglot exercise track to run",
+    )
     ap.add_argument(
         "--n-tasks",
         type=int,
@@ -192,6 +205,30 @@ def main() -> int:
         if args.benchmark == "swe_rebench":
             return harbor.run_cli(
                 harbor.SweRebenchAdapter(jobs_root=RESULTS / "harbor"),
+                args,
+                st,
+                harness_commit(),
+                progress,
+            )
+        if args.benchmark == "swe_live":
+            from rig.benchmarks import swe_live
+            return swe_live.run_cli(
+                swe_live.SweLiveAdapter(
+                    dataset=args.swe_live_dataset,
+                    logs_root=RESULTS / "swe_live",
+                ),
+                args,
+                st,
+                harness_commit(),
+                progress,
+            )
+        if args.benchmark == "polyglot":
+            from rig.benchmarks import polyglot
+            return polyglot.run_cli(
+                polyglot.PolyglotAdapter(
+                    lang=args.polyglot_lang,
+                    logs_root=RESULTS / "polyglot",
+                ),
                 args,
                 st,
                 harness_commit(),

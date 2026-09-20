@@ -9,3 +9,5 @@ eval/vendor/
 eval/.venv/
 __pycache__/
 *.pyc
+eval/cloud/state.json
+eval/stress/out/

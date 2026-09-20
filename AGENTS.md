@@ -115,7 +115,15 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   off via `caps.osc`); REDUCE_MOTION freezes the spinner;
   `--no-tui` is a plain-text REPL sharing the same worker (`run_line`,
   asks answered by one-line replies, /quit or Ctrl+D exits).
-- `eval/` — Inspect AI evaluation rig (scaffold)
+- `eval/` — evaluation rig: local taskspecs + scheduler + run-store
+  (`rig/`), external adapters (`rig/benchmarks/` — swe_bench, tau2, lcb,
+  terminal_bench/swe_rebench via harbor, swe_live, polyglot), a custom
+  harbor agent (`rig/harbor_agents/overseer_agent.py` runs the release
+  binary inside task containers), the live memory/orch stress suite
+  (`stress/suite.py`), and the Devin-Cloud worker orchestrator
+  (`cloud/driver.py` — shard matrix + `cloud/shard_ids.py` deterministic
+  id slicing + `cloud/relay.py` localhost x-opencode-session injector
+  for clients that can't set headers).
 
 ## Invariants (do not violate)
 
