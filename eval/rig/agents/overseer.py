@@ -5,8 +5,10 @@ trajectory. The solver never grades — the deterministic grader sees only
 the workdir afterwards. The session's manifest.json (overseer-core
 manifest.rs, P4.5) is harvested into the record's provenance block.
 
-Env: OVERSEER_BIN (default target/release/overseer), LEK_API_KEY,
-LEK_BASE_URL, LEK_MODEL.
+Env: OVERSEER_BIN (default target/release/overseer), LEK_PROVIDER
+(default "openai" — use "opencode" for the opencode.ai/zen/go
+subscription endpoint), LEK_API_KEY / OPENCODE_API_KEY, LEK_BASE_URL,
+LEK_MODEL.
 """
 
 from __future__ import annotations
@@ -22,10 +24,11 @@ DEFAULT_BIN = str(
 )
 
 
-def _cfg() -> tuple[str, str, str]:
+def _cfg() -> tuple[str, str, str, str]:
     """Resolved per call — module-level env binding would freeze --model."""
     return (
         os.environ.get("OVERSEER_BIN", DEFAULT_BIN),
+        os.environ.get("LEK_PROVIDER", "openai"),
         os.environ.get("LEK_BASE_URL", "https://inference.legionedge.ai/v1"),
         os.environ.get("LEK_MODEL", "kimi-k3-turbo"),
     )
@@ -44,7 +47,7 @@ def solve(
     limits = limits or {}
     max_steps = int(limits.get("max_steps", 30))
     wall_cap = int(limits.get("wall_s", 900))
-    binary, base_url, model = _cfg()
+    binary, provider, base_url, model = _cfg()
     Path(session_dir).mkdir(parents=True, exist_ok=True)
 
     cmd = [
@@ -52,7 +55,7 @@ def solve(
         "exec",
         "--json",
         "--provider",
-        "openai",
+        provider,
         "--base-url",
         base_url,
         "--model",
