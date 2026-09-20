@@ -361,6 +361,54 @@ static PROFILES: &[ModelProfile] = &[
             output: 0.0,
         },
     },
+    // --- opencode Go fleet (opencode.ai/zen/go, subscription, Sept 2026) ---
+    // Context windows unpublished → conservative defaults, $0 cost
+    // (subscription-included; the endpoint reports cost "0"). Both rows
+    // reason → max_output keeps headroom for thinking traces.
+    ModelProfile {
+        id: "deepseek-v4.1-flash",
+        match_prefixes: &["deepseek-v4.1-flash", "deepseek-v4-flash"],
+        context_in: 131_072,
+        max_output: 16_384,
+        vision: false,
+        parallel_calls: true,
+        reasoning: ReasoningSpec {
+            supported: true,
+            min_budget: 0,
+        },
+        compact_at: 0.70,
+        edit_format: EditFormat::Diff,
+        accepted_params: FLEET_PARAMS,
+        price: PriceTable {
+            input: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            output: 0.0,
+        },
+    },
+    // muse-spark is Responses-API-only on Go (chat/completions 500s) —
+    // the opencode provider arm routes muse-* to provider/responses.rs.
+    ModelProfile {
+        id: "muse-spark-1.3-contributor",
+        match_prefixes: &["muse-spark-1.3-contributor", "muse-spark-1.2-contributor"],
+        context_in: 131_072,
+        max_output: 16_384,
+        vision: false,
+        parallel_calls: true,
+        reasoning: ReasoningSpec {
+            supported: true,
+            min_budget: 0,
+        },
+        compact_at: 0.70,
+        edit_format: EditFormat::Diff,
+        accepted_params: FLEET_PARAMS,
+        price: PriceTable {
+            input: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            output: 0.0,
+        },
+    },
     ModelProfile {
         id: "claude-haiku-4-5",
         match_prefixes: &["claude-haiku-4-5"],

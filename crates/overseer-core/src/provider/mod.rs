@@ -11,6 +11,7 @@ pub mod anthropic;
 pub mod gemini;
 pub mod local;
 pub mod openai;
+pub mod responses;
 pub mod router;
 
 /// Native-compaction seam, defined in [`crate::compact`]: adapters opt in
