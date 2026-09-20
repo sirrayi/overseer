@@ -50,7 +50,10 @@ fn libc_umask(mask: u32) -> u32 {
 /// (`cred.rs`); child tool envs are scrubbed separately at spawn.
 ///
 /// Idempotent: safe to call more than once (umask set + vars removed).
-// DEFERRED(backend): keychain-backed LEK_* storage + spawn-time child-env scrub — gate: cred.rs rollout.
+// FIXED SINCE (P9): keychain-backed LEK_* — provider-key resolution falls
+// back to the credential payload (broker.real_for) in main.rs, and bash
+// children already spawn env-clear + allowlist (bash.rs) so no key leaks
+// into tool scope.
 pub fn harden_startup() {
     #[cfg(unix)]
     {

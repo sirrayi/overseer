@@ -169,7 +169,10 @@ pub fn post_notice(rules: &[HookRule], tool: &str, result: &str) -> Option<Strin
 /// matches: a Stop rule scoped to a real tool name is inert, not an
 /// error, so a shared hooks file cannot accidentally arm per-tool
 /// stop-blocks.
-// DEFERRED(owner): wiring Stop into agent loop — data lands now, dispatch hook needs loop owner.
+///
+/// The dispatch lives in `agent.rs` (the zero-tool-call stop path, after
+/// the verify gate): a hit nudges instead of stopping, blocks share the
+/// verify block budget, and at the cap the hook fails open.
 pub fn maybe_block_stop(rules: &[HookRule], result: &str) -> Option<String> {
     let payload = result.to_lowercase();
     rules
