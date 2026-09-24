@@ -8,7 +8,7 @@ harness_commit, env_digest, ts}. Report is pass@1 + cost + tokens + cache-hit
 
 Usage:
   OVERSEER_API_KEY=... python3 eval/run.py [--solver overseer|mini|both]
-      [--tasks id1,id2|all] [--model fleet-turbo] [--max-steps N]
+      [--tasks id1,id2|all] [--model claude-haiku-4-5] [--max-steps N]
 """
 from __future__ import annotations
 
@@ -80,7 +80,7 @@ def run_one(task: dict, solver_name: str, args) -> dict:
         "task": task["id"], "task_version": task["version"],
         "solver": solver_name, "pass": passed,
         "grader_exit": g.returncode, **result,
-        "harness_commit": harness_commit(), "model": os.environ.get("OVERSEER_MODEL", "fleet-turbo"),
+        "harness_commit": harness_commit(), "model": os.environ.get("OVERSEER_MODEL", "claude-haiku-4-5"),
         "env_digest": task.get("env", {}).get("image_digest") or "local-sh",
         "ts": int(time.time()),
     }
@@ -96,8 +96,8 @@ def main() -> int:
 
     if args.model:
         os.environ["OVERSEER_MODEL"] = args.model
-    if not os.environ.get("OVERSEER_API_KEY") and not os.environ.get("OVERSEER_API_KEY"):
-        sys.exit("OVERSEER_API_KEY (or OVERSEER_API_KEY) required")
+    if not os.environ.get("OVERSEER_API_KEY"):
+        sys.exit("OVERSEER_API_KEY required")
 
     task_files = sorted((ROOT / "tasks").glob("*.json"))
     tasks = [json.loads(f.read_text()) for f in task_files]
