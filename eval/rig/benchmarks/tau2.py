@@ -108,13 +108,13 @@ class Tau2Adapter:
         if num_tasks:
             cmd += ["--num-tasks", str(num_tasks)]
         env = dict(os.environ)
-        # Fleet OpenAI-compatible gateway: litellm resolves
+        # Configured OpenAI-compatible gateway: litellm resolves
         # openai/<model> against OPENAI_BASE_URL.
         if agent_llm.startswith("openai/") or user_llm.startswith("openai/"):
             env.setdefault("OPENAI_API_KEY", os.environ.get("OVERSEER_API_KEY", ""))
             env.setdefault(
                 "OPENAI_BASE_URL",
-                os.environ.get("OVERSEER_BASE_URL", "https://inference.fleet.ai/v1"),
+                os.environ.get("OVERSEER_BASE_URL", "https://opencode.ai/zen/go/v1"),
             )
         proc = subprocess.run(cmd, cwd=self.dir, env=env)
         if proc.returncode != 0:
@@ -232,7 +232,7 @@ def run_cli(
         return 2
     agent = args.agents.split(",")[0].strip()  # τ² runs one agent arm
     agent_llm = (
-        f"openai/{args.model or os.environ.get('OVERSEER_MODEL', 'fleet-turbo')}"
+        f"openai/{args.model or os.environ.get('OVERSEER_MODEL', 'deepseek-v4.1-flash')}"
         if agent == "overseer"
         else agent
     )

@@ -11,8 +11,8 @@ self-tests the rig.
   uv run python run.py --agents oracle          # solvability check, no API
   uv run python run.py --report                 # report card from store
 
-Env: OVERSEER_API_KEY (required for overseer/mini), OVERSEER_BASE_URL, OVERSEER_MODEL,
-OVERSEER_BIN.
+Env: OVERSEER_API_KEY (required for overseer/mini), OVERSEER_BASE_URL,
+OVERSEER_MODEL, OVERSEER_BIN.
 """
 
 from __future__ import annotations

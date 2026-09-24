@@ -40,17 +40,18 @@ fn libc_umask(mask: u32) -> u32 {
 ///
 /// - unix: set umask `0o077` (new files/dirs owner-only) via libc.
 /// - Remove proxy env vars from the process (see [`PROXY_ENV_VARS`]).
-///   `OVERSEER_*` provider keys are NOT scrubbed here — scrubbing the key out
-///   of our own env would break auth; the note below documents the rule.
+///   Provider keys (`*_API_KEY`) are NOT scrubbed here — scrubbing the
+///   key out of our own env would break auth; the note below documents
+///   the rule.
 /// - Session-dir perms are enforced by [`ensure_private_dir`], not here
 ///   (this fn never touches the filesystem).
 ///
-/// `OVERSEER_*` note: provider keys live only in process memory once read;
-/// never log them, never persist them outside the OS keychain path
-/// (`cred.rs`); child tool envs are scrubbed separately at spawn.
+/// Provider-key note: keys live only in process memory once read; never
+/// log them, never persist them outside the OS keychain path (`cred.rs`);
+/// child tool envs are scrubbed separately at spawn.
 ///
 /// Idempotent: safe to call more than once (umask set + vars removed).
-// FIXED SINCE (P9): keychain-backed OVERSEER_* — provider-key resolution falls
+// FIXED SINCE (P9): keychain-backed provider keys — key resolution falls
 // back to the credential payload (broker.real_for) in main.rs, and bash
 // children already spawn env-clear + allowlist (bash.rs) so no key leaks
 // into tool scope.

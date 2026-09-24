@@ -98,7 +98,7 @@ class TestTau2:
             domain="airline",
             agent_name="overseer",
             user_llm="openai/fixed-user",
-            model_id="openai/kimi",
+            model_id="openai/deepseek",
             harness_commit="abc",
             run_set_id="rs",
         )
@@ -194,7 +194,7 @@ class TestLcb:
         recs = lcb.LcbAdapter(tmp_path).parse_results(
             p,
             agent_name="overseer",
-            model_id="kimi",
+            model_id="deepseek",
             harness_commit="abc",
             run_set_id="rs",
             release_version="v6",
@@ -306,17 +306,17 @@ class TestHarbor:
         t["agent_info"] = {
             "name": "terminus",
             "version": "1",
-            "model_info": {"name": "openai/fleet-turbo"},
+            "model_info": {"name": "openai/deepseek-v4.1-flash"},
         }
         job = self._job(tmp_path, [t])
         recs = harbor.TerminalBenchAdapter(jobs_root=tmp_path).parse_results(
             job,
             agent_name="terminus",
-            model_id="openai/fleet-turbo",
+            model_id="openai/deepseek-v4.1-flash",
             harness_commit="c",
             run_set_id="rs",
         )
-        assert recs[0]["model"] == "openai/fleet-turbo"
+        assert recs[0]["model"] == "openai/deepseek-v4.1-flash"
 
     def test_none_git_commit_id(self, tmp_path):
         t = dict(HARBOR_TRIAL)
@@ -352,7 +352,7 @@ class TestSweBench:
         self,
         tmp_path,
         report=SWEBENCH_REPORT,
-        model="kimi",
+        model="deepseek",
         iid="sympy__sympy-22914",
         run_id="r1",
     ):
@@ -366,7 +366,7 @@ class TestSweBench:
         recs = swebench.SweBenchAdapter(logs_root=tmp_path).parse_results(
             log_dir,
             agent_name="overseer",
-            model_id="kimi",
+            model_id="deepseek",
             seed=0,
             harness_commit="abc",
             run_set_id="rs",
@@ -375,7 +375,7 @@ class TestSweBench:
         r = recs[0]
         assert r["task_id"] == "swe_bench-sympy__sympy-22914"
         assert r["pass"] is True and r["infra_error"] is False
-        assert r["model"] == "kimi"  # dir name when no rollout sidecar
+        assert r["model"] == "deepseek"  # dir name when no rollout sidecar
         assert r["judge_version"].startswith("swebench@")
         assert r["swe_bench"]["tests_status"]["FAIL_TO_PASS"]["success"] == ["t1"]
 
@@ -434,7 +434,7 @@ class TestSweBench:
                         "done": True,
                         "tokens_in": 1234,
                         "cost_usd": 0.01,
-                        "model": "fleet-k3",
+                        "model": "deepseek-v4.1-flash",
                     },
                 }
             )
@@ -442,7 +442,7 @@ class TestSweBench:
         recs = swebench.SweBenchAdapter(logs_root=tmp_path).parse_results(
             log_dir,
             agent_name="overseer",
-            model_id="kimi",
+            model_id="deepseek",
             seed=0,
             harness_commit="abc",
             run_set_id="rs",
@@ -452,7 +452,7 @@ class TestSweBench:
         assert r["tokens_in"] == 1234
         assert r["cost_usd"] == 0.01
         assert r["session_dir"] == "/sessions/rid1"
-        assert r["model"] == "fleet-k3"  # rollout model wins over dir name
+        assert r["model"] == "deepseek-v4.1-flash"  # rollout model wins over dir name
 
     def test_image_arch_rewrite(self):
         import platform

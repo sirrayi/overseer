@@ -34,7 +34,7 @@ class TestArmGrouping:
         """Infra-only rows carry model=None — sort must not TypeError."""
         recs = [
             _rec("t1", 0, False, model=None, infra_error=True),
-            _rec("t1", 0, True, model="kimi"),
+            _rec("t1", 0, True, model="deepseek"),
         ]
         md, _ = report.render(recs, k=1, n_boot=100)
         assert "—" in md  # None model renders as dash
@@ -112,6 +112,6 @@ class TestPaired:
     def test_string_manifest_fields_no_crash(self):
         """A manifest with model/harness as plain strings must not crash
         the provenance block."""
-        recs = [_rec("t1", 0, True, provenance={"model": "kimi", "harness": "x"})]
+        recs = [_rec("t1", 0, True, provenance={"model": "deepseek", "harness": "x"})]
         md, _ = report.render(recs, k=1, n_boot=50)
         assert "Provenance" in md

@@ -32,6 +32,8 @@ pub enum EditFormat {
     Diff,
     /// Whole-file rewrites: `write` is the intended path, and the contract
     /// segment says so instead of advertising an anchor that will miss.
+    /// DEFERRED(owner): no tabled row carries this dialect — prompt/edit
+    /// coverage is dormant until a WholeFile profile returns.
     WholeFile,
 }
 
@@ -61,7 +63,7 @@ impl EditFormat {
 /// cross-family knob never 400s the request. Names are wire-spelled per API
 /// (Anthropic snake_case, Gemini camelCase). No tabled OpenAI/Gemini rows
 /// exist yet — gpt-*/gemini-* resolve to FALLBACK, which carries the full
-/// OpenAI-compat + Gemini sets; the Fleet fleet rows carry only the
+/// OpenAI-compat + Gemini sets; the opencode Go rows carry only the
 /// conservative vLLM subset (no reasoning_effort).
 const ANTHROPIC_PARAMS: &[&str] = &[
     "temperature",
@@ -94,9 +96,9 @@ const GEMINI_PARAMS: &[&str] = &[
     "thinkingConfig",
 ];
 
-/// Conservative vLLM subset for the Fleet fleet: sampling knobs only.
-/// vLLM ignores unknown fields, but reasoning_effort is gateway-specific —
-/// stripped fail-closed until Fleet documents it.
+/// Conservative vLLM subset for the hosted open-model rows: sampling knobs
+/// only. vLLM ignores unknown fields, but reasoning_effort is
+/// gateway-specific — stripped fail-closed until the gateway documents it.
 const FLEET_PARAMS: &[&str] = &[
     "temperature",
     "top_p",
@@ -250,115 +252,6 @@ static PROFILES: &[ModelProfile] = &[
             cache_read: 0.3,
             cache_write: 3.75,
             output: 15.0,
-        },
-    },
-    // --- Fleet fleet (inference.fleet.ai, vLLM-served, Sept 2026) ---
-    // Context windows + pricing unpublished → conservative defaults, $0 cost.
-    // Re-verify when Fleet publishes limits; ledger cost stays honest
-    // (zero, flagged) rather than invented.
-    ModelProfile {
-        id: "fleet-g53",
-        match_prefixes: &["fleet-g53", "fleet/g53"],
-        context_in: 131_072,
-        max_output: 8_192,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
-        compact_at: 0.70,
-        edit_format: EditFormat::Diff,
-        accepted_params: FLEET_PARAMS,
-        price: PriceTable {
-            input: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            output: 0.0,
-        },
-    },
-    ModelProfile {
-        id: "fleet-g52",
-        match_prefixes: &["fleet-g52", "fleet/g52"],
-        context_in: 131_072,
-        max_output: 8_192,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
-        compact_at: 0.70,
-        edit_format: EditFormat::Diff,
-        accepted_params: FLEET_PARAMS,
-        price: PriceTable {
-            input: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            output: 0.0,
-        },
-    },
-    ModelProfile {
-        id: "fleet-turbo",
-        match_prefixes: &["fleet-turbo"],
-        context_in: 131_072,
-        max_output: 8_192,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
-        compact_at: 0.70,
-        edit_format: EditFormat::Diff,
-        accepted_params: FLEET_PARAMS,
-        price: PriceTable {
-            input: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            output: 0.0,
-        },
-    },
-    ModelProfile {
-        id: "fleet-k3",
-        match_prefixes: &["fleet-k3", "fleet/k3"],
-        context_in: 131_072,
-        max_output: 8_192,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
-        compact_at: 0.70,
-        edit_format: EditFormat::Diff,
-        accepted_params: FLEET_PARAMS,
-        price: PriceTable {
-            input: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            output: 0.0,
-        },
-    },
-    ModelProfile {
-        id: "fleet-q27",
-        match_prefixes: &["fleet-q27", "fleet/q27"],
-        context_in: 131_072,
-        max_output: 8_192,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
-        compact_at: 0.70,
-        edit_format: EditFormat::WholeFile,
-        accepted_params: FLEET_PARAMS,
-        price: PriceTable {
-            input: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            output: 0.0,
         },
     },
     // --- opencode Go fleet (opencode.ai/zen/go, subscription, Sept 2026) ---
@@ -554,15 +447,14 @@ mod tests {
     #[test]
     fn edit_format_is_per_family_and_parses() {
         // The edit dialect rides the profile: anchors for the Claude
-        // family, diffs for the vLLM fleet, whole-file for the small model.
+        // family, diffs for the hosted open-model rows.
         assert_eq!(edit_format("claude-sonnet-5"), EditFormat::SearchReplace);
         assert_eq!(
             edit_format("claude-opus-4-8-20260301"),
             EditFormat::SearchReplace
         );
-        assert_eq!(edit_format("fleet-turbo"), EditFormat::Diff);
-        assert_eq!(edit_format("fleet-g53"), EditFormat::Diff);
-        assert_eq!(edit_format("fleet-q27"), EditFormat::WholeFile);
+        assert_eq!(edit_format("deepseek-v4.1-flash"), EditFormat::Diff);
+        assert_eq!(edit_format("muse-spark-1.3-contributor"), EditFormat::Diff);
         // Unknown model → the FALLBACK profile's dialect, never a panic.
         assert_eq!(edit_format("some-future-model"), EditFormat::SearchReplace);
 
@@ -591,11 +483,12 @@ mod tests {
         assert!(!supports_param("claude-sonnet-5", "frequency_penalty"));
         // Wire spelling is exact-case: top_p ≠ topP.
         assert!(!supports_param("claude-sonnet-5", "topP"));
-        // Fleet fleet: conservative vLLM subset, no reasoning_effort.
-        assert!(supports_param("fleet-k3", "temperature"));
-        assert!(supports_param("fleet-k3", "frequency_penalty"));
-        assert!(!supports_param("fleet-k3", "reasoning_effort"));
-        assert!(!supports_param("fleet-k3", "thinking"));
+        // Hosted open-model rows: conservative vLLM subset, no
+        // reasoning_effort.
+        assert!(supports_param("deepseek-v4.1-flash", "temperature"));
+        assert!(supports_param("deepseek-v4.1-flash", "frequency_penalty"));
+        assert!(!supports_param("deepseek-v4.1-flash", "reasoning_effort"));
+        assert!(!supports_param("deepseek-v4.1-flash", "thinking"));
         // Unknown models → FALLBACK union (OpenAI-compat + Gemini), so new
         // gpt/gemini snapshots send their native knobs through.
         assert!(!known("some-future-model"));
