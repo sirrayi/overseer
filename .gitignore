@@ -5,3 +5,6 @@ playbook.txt
 .DS_Store
 eval/results/
 eval/workspaces/
+eval/cloud/state.json
+__pycache__/
+*.pyc

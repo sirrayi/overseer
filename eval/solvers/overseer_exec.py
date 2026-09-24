@@ -19,8 +19,8 @@ OVERSEER_BIN = os.environ.get(
     "OVERSEER_BIN",
     str(Path(__file__).resolve().parents[2] / "target" / "release" / "overseer"),
 )
-BASE_URL = os.environ.get("OVERSEER_BASE_URL", "https://inference.fleet.ai/v1")
-MODEL = os.environ.get("OVERSEER_MODEL", "fleet-turbo")
+BASE_URL = os.environ.get("OVERSEER_BASE_URL", "https://opencode.ai/zen/go/v1")
+MODEL = os.environ.get("OVERSEER_MODEL", "deepseek-v4.1-flash")
 
 
 def solve(instruction: str, workdir: str, session_dir: str,

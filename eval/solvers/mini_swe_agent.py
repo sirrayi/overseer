@@ -16,8 +16,8 @@ import subprocess
 import sys
 import urllib.request
 
-BASE_URL = os.environ.get("OVERSEER_BASE_URL", "https://inference.fleet.ai/v1")
-MODEL = os.environ.get("OVERSEER_MODEL", "fleet-turbo")
+BASE_URL = os.environ.get("OVERSEER_BASE_URL", "https://opencode.ai/zen/go/v1")
+MODEL = os.environ.get("OVERSEER_MODEL", "deepseek-v4.1-flash")
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "30"))
 OUT_CAP = 4000
 
