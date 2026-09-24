@@ -35,7 +35,7 @@ fn chars_per_token(model: &str) -> f64 {
         || m.starts_with("qwen")
         || m.starts_with("deepseek")
     {
-        3.2 // Fleet fleet: dense code/stdint, conservative
+        3.2 // hosted rows: dense code/stdint, conservative
     } else {
         3.5 // FALLBACK family: match the mid-tier default
     }
@@ -57,10 +57,10 @@ mod tests {
     fn estimator_is_family_differentiated() {
         let text: String = "x".repeat(400);
         let openai = count_tokens(&text, "gpt-4o");
-        let fleet = count_tokens(&text, "fleet-turbo");
+        let dense = count_tokens(&text, "claude-haiku-4-5");
         // 400/4.0=100 vs 400/3.2=125 — denser family estimates more tokens.
-        assert!(fleet > openai, "fleet {fleet} vs openai {openai}");
+        assert!(dense > openai, "dense {dense} vs openai {openai}");
         assert_eq!(openai, 100);
-        assert_eq!(fleet, 125);
+        assert_eq!(dense, 125);
     }
 }

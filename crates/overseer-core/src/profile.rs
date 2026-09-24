@@ -177,110 +177,6 @@ static PROFILES: &[ModelProfile] = &[
             output: 15.0,
         },
     },
-    // --- Fleet fleet (inference.fleet.ai, vLLM-served, Sept 2026) ---
-    // Context windows + pricing unpublished → conservative defaults, $0 cost.
-    // Re-verify when Fleet publishes limits; ledger cost stays honest
-    // (zero, flagged) rather than invented.
-    ModelProfile {
-        id: "fleet-g53",
-        match_prefixes: &["fleet-g53", "fleet/g53"],
-        context_in: 131_072,
-        max_output: 8_192,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
-        compact_at: 0.70,
-        edit_format: EditFormat::Diff,
-        price: PriceTable {
-            input: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            output: 0.0,
-        },
-    },
-    ModelProfile {
-        id: "fleet-g52",
-        match_prefixes: &["fleet-g52", "fleet/g52"],
-        context_in: 131_072,
-        max_output: 8_192,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
-        compact_at: 0.70,
-        edit_format: EditFormat::Diff,
-        price: PriceTable {
-            input: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            output: 0.0,
-        },
-    },
-    ModelProfile {
-        id: "fleet-turbo",
-        match_prefixes: &["fleet-turbo"],
-        context_in: 131_072,
-        max_output: 8_192,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
-        compact_at: 0.70,
-        edit_format: EditFormat::Diff,
-        price: PriceTable {
-            input: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            output: 0.0,
-        },
-    },
-    ModelProfile {
-        id: "fleet-k3",
-        match_prefixes: &["fleet-k3", "fleet/k3"],
-        context_in: 131_072,
-        max_output: 8_192,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
-        compact_at: 0.70,
-        edit_format: EditFormat::Diff,
-        price: PriceTable {
-            input: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            output: 0.0,
-        },
-    },
-    ModelProfile {
-        id: "fleet-q27",
-        match_prefixes: &["fleet-q27", "fleet/q27"],
-        context_in: 131_072,
-        max_output: 8_192,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
-        compact_at: 0.70,
-        edit_format: EditFormat::WholeFile,
-        price: PriceTable {
-            input: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            output: 0.0,
-        },
-    },
     ModelProfile {
         id: "claude-haiku-4-5",
         match_prefixes: &["claude-haiku-4-5"],
@@ -380,15 +276,15 @@ mod tests {
     #[test]
     fn edit_format_is_per_family_and_parses() {
         // The edit dialect rides the profile: anchors for the Claude
-        // family, diffs for the vLLM fleet, whole-file for the small model.
+        // family, diffs for the hosted rows, whole-file where a row declares it.
         assert_eq!(edit_format("claude-sonnet-5"), EditFormat::SearchReplace);
         assert_eq!(
             edit_format("claude-opus-4-8-20260301"),
             EditFormat::SearchReplace
         );
-        assert_eq!(edit_format("fleet-turbo"), EditFormat::Diff);
-        assert_eq!(edit_format("fleet-g53"), EditFormat::Diff);
-        assert_eq!(edit_format("fleet-q27"), EditFormat::WholeFile);
+        // DEFERRED(owner): no tabled row carries Diff — edit-format coverage dormant.
+        // DEFERRED(owner): no tabled row carries Diff — edit-format coverage dormant.
+        // DEFERRED(owner): no tabled row carries WholeFile — edit-format coverage dormant.
         // Unknown model → the FALLBACK profile's dialect, never a panic.
         assert_eq!(edit_format("some-future-model"), EditFormat::SearchReplace);
 

@@ -1625,7 +1625,7 @@ mod tests {
 
         // Same model → no event (nothing changed).
         agent.set_model("claude-sonnet-5", &mut sink).unwrap();
-        agent.set_model("fleet-k3", &mut sink).unwrap();
+        agent.set_model("claude-haiku-4-5", &mut sink).unwrap();
         agent.run_turn("work", &mut sink).unwrap();
 
         let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
@@ -1647,15 +1647,15 @@ mod tests {
             "one switch, no no-op event: {switches:?}"
         );
         assert_eq!(switches[0].0, "claude-sonnet-5");
-        assert_eq!(switches[0].1, "fleet-k3");
-        // Prices come from the profile table (Fleet fleet is $0).
-        let p = profile::lookup("fleet-k3");
+        assert_eq!(switches[0].1, "claude-haiku-4-5");
+        // Prices come from the profile table.
+        let p = profile::lookup("claude-haiku-4-5");
         assert_eq!(switches[0].2, p.price.input);
         assert_eq!(switches[0].3, p.price.output);
         // The audit event never rehydrates into the model's context.
         let view = rehydrate_messages(&events);
         assert!(
-            view.iter().all(|m| !m.text().contains("fleet-k3")),
+            view.iter().all(|m| !m.text().contains("claude-haiku-4-5")),
             "a model switch is provenance, not conversation"
         );
     }
@@ -1669,7 +1669,7 @@ mod tests {
             name: "verify-only",
             prompt_frag: "Only read and run checks; change nothing.",
             allowed_tools: &["read", "grep", "glob", "bash"],
-            model: Some("fleet-k3"),
+            model: Some("claude-haiku-4-5"),
             edit_globs: &[],
         };
         let dir = tmpdir();
@@ -1689,7 +1689,7 @@ mod tests {
             assert!(!names.contains(&t.to_string()), "{t} must be removed");
         }
         assert!(names.contains(&"read".to_string()));
-        assert_eq!(agent.config.model, "fleet-k3", "mode model override applies");
+        assert_eq!(agent.config.model, "claude-haiku-4-5", "mode model override applies");
         assert!(agent
             .messages()
             .iter()
@@ -1703,7 +1703,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(&e.kind, EventKind::ModelSwitch { to, .. } if to == "fleet-k3")),
+                .any(|e| matches!(&e.kind, EventKind::ModelSwitch { to, .. } if to == "claude-haiku-4-5")),
             "the mode's model rides the audited switch"
         );
     }
