@@ -65,7 +65,7 @@ fn usage() {
          \x20 --session <dir>     Session directory (default: ~/.overseer/sessions/<ts>)\n\
          \x20 --cwd <dir>         Working directory for tools (default: .)\n\
          \x20 --model <id>        Model id (default: claude-sonnet-5)\n\
-         \x20 --provider <name>   anthropic | openai | fleet (default: anthropic)\n\
+         \x20 --provider <name>   anthropic | openai (default: anthropic)\n\
          \x20 --base-url <url>    API base URL for openai-compatible providers\n\
          \x20 --max-steps <n>     Step budget (default: 100)\n\
          \x20 --max-cost <usd>    Cost budget in USD (default: 5.0)\n\
@@ -81,7 +81,6 @@ fn usage() {
          \x20 OVERSEER_API_KEY    Provider key (preferred, any provider)\n\
          \x20 ANTHROPIC_API_KEY   Anthropic key\n\
          \x20 OPENAI_API_KEY      OpenAI-compatible key\n\
-         \x20 OVERSEER_API_KEY         Fleet key (fallback)"
     );
 }
 
@@ -301,10 +300,8 @@ fn render_human(e: &Event) {
     }
 }
 
-const FLEET_URL: &str = "https://inference.fleet.ai/v1";
-
 /// Build the provider from flags + env. Key resolution order:
-/// OVERSEER_API_KEY → provider-specific env → OVERSEER_API_KEY.
+/// OVERSEER_API_KEY → provider-specific env.
 fn build_provider(flags: &ExecFlags) -> Result<Box<dyn Provider>, String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let key = env("OVERSEER_API_KEY")
@@ -312,11 +309,10 @@ fn build_provider(flags: &ExecFlags) -> Result<Box<dyn Provider>, String> {
             "anthropic" => env("ANTHROPIC_API_KEY"),
             _ => env("OPENAI_API_KEY"),
         })
-        .or_else(|| env("OVERSEER_API_KEY"))
         .ok_or_else(|| {
             format!(
                 "no API key for provider '{}' — set OVERSEER_API_KEY \
-                 (or ANTHROPIC_API_KEY / OPENAI_API_KEY / OVERSEER_API_KEY)",
+                 (or ANTHROPIC_API_KEY / OPENAI_API_KEY)",
                 flags.provider
             )
         })?;
@@ -329,16 +325,10 @@ fn build_provider(flags: &ExecFlags) -> Result<Box<dyn Provider>, String> {
                 .clone()
                 .unwrap_or_else(|| "https://api.openai.com/v1".into()),
         )),
-        "fleet" => Box::new(OpenAiCompatible::new(
-            key,
-            flags
-                .base_url
-                .clone()
-                .unwrap_or_else(|| FLEET_URL.into()),
         )),
         other => {
             return Err(format!(
-                "unknown provider '{other}' (anthropic|openai|fleet)"
+                "unknown provider '{other}' (anthropic|openai)"
             ))
         }
     })
