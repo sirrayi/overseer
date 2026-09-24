@@ -85,7 +85,7 @@ class LcbAdapter:
         env.setdefault("OPENAI_API_KEY", os.environ.get("OVERSEER_API_KEY", ""))
         env.setdefault(
             "OPENAI_BASE_URL",
-            os.environ.get("OVERSEER_BASE_URL", "https://inference.fleet.ai/v1"),
+            os.environ.get("OVERSEER_BASE_URL", "https://opencode.ai/zen/go/v1"),
         )
         proc = subprocess.run(cmd, cwd=self.dir, env=env)
         if proc.returncode != 0:
@@ -178,7 +178,7 @@ def run_cli(
     if not ok:
         print(f"lcb unavailable: {why}", file=sys.stderr)
         return 2
-    model_repr = args.model or os.environ.get("OVERSEER_MODEL", "fleet-turbo")
+    model_repr = args.model or os.environ.get("OVERSEER_MODEL", "claude-haiku-4-5")
     release = getattr(args, "release_version", "v6")
     agent = args.agents.split(",")[0].strip()
     header = st.matrix_header(

@@ -563,7 +563,7 @@ mod tests {
     fn param_filter_strips_cross_family_gen_keys() {
         // "gemini-3-pro" has no tabled row → FALLBACK union (accepts Gemini
         // keys). Prove the filter path directly: a hypothetical strict
-        // profile (fleet-k3 rejects everything Gemini-spelled) strips.
+        // profile (claude-haiku-4-5 rejects everything Gemini-spelled) strips.
         let mut gen = json!({
             "maxOutputTokens": 100,
             "thinkingConfig": {"thinkingBudget": 777},
@@ -571,13 +571,13 @@ mod tests {
         });
         crate::profile::strip_optional_params(
             &mut gen,
-            "fleet-k3",
+            "claude-haiku-4-5",
             &["reasoning_effort", "frequency_penalty", "thinkingConfig"],
         );
         assert!(gen.get("reasoning_effort").is_none());
         assert!(gen.get("thinkingConfig").is_none());
         // Core key survives even when named.
-        crate::profile::strip_optional_params(&mut gen, "fleet-k3", &["maxOutputTokens"]);
+        crate::profile::strip_optional_params(&mut gen, "claude-haiku-4-5", &["maxOutputTokens"]);
         assert!(gen.get("maxOutputTokens").is_some());
         // And the real Gemini path keeps thinkingConfig via FALLBACK.
         let system = vec![SystemSegment {

@@ -136,7 +136,7 @@ class HarborAdapter:
             env.setdefault("OPENAI_API_KEY", os.environ.get("OVERSEER_API_KEY", ""))
             env.setdefault(
                 "OPENAI_BASE_URL",
-                os.environ.get("OVERSEER_BASE_URL", "https://inference.fleet.ai/v1"),
+                os.environ.get("OVERSEER_BASE_URL", "https://opencode.ai/zen/go/v1"),
             )
         proc = subprocess.run(
             cmd, env=env, capture_output=True, text=True, timeout=86400
@@ -288,8 +288,8 @@ def run_cli(
         print(f"{adapter.name} unavailable: {why}", file=sys.stderr)
         return 2
     agent = args.agents.split(",")[0].strip()
-    model = args.model or os.environ.get("OVERSEER_MODEL", "fleet-turbo")
-    # harbor's built-in LLM agents take openai/<model> against the FLEET
+    model = args.model or os.environ.get("OVERSEER_MODEL", "claude-haiku-4-5")
+    # harbor's built-in LLM agents take openai/<model> against the configured
     # gateway; oracle/nop take no model at all.
     model_arg = None if agent in ("oracle", "nop") else f"openai/{model}"
     if model_arg and not os.environ.get("OVERSEER_API_KEY"):
