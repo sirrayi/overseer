@@ -181,21 +181,33 @@ def s2_consolidation_storm(ctx: Ctx, root: Path) -> dict:
 
     proc = subprocess.run(
         [BIN, "consolidate", "--cwd", str(wd),
-         "--provider", ctx.provider, "--small-model", ctx.model],
+         "--provider", ctx.provider,
+         # model must match small-model's transport family on opencode:
+         # muse-* needs the Responses adapter, chosen from --model.
+         "--model", ctx.model, "--small-model", ctx.model],
         capture_output=True, text=True, timeout=ctx.timeout * 2,
     )
     check(res, "s2.consolidate_ran", proc.returncode == 0,
           (proc.stderr or proc.stdout)[-200:])
     idx = (mem / "INDEX.md").read_text()
     sem_files = list((mem / "semantic").glob("*.md"))
-    promoted_refs = sum(1 for s in ("K3Y-991", "/tmp/r9", "alice@corp")
-                        if s in idx or any(s in f.read_text() for f in sem_files))
-    check(res, "s2.promoted", promoted_refs >= 1,
-          f"{promoted_refs}/3 settled clusters reached semantic/index")
+    # Promotion is ADD-only: the index gains `semantic/<entry>` pointer
+    # lines; the model paraphrases content, so count pointer lines, not
+    # literal tokens. Settled old-* entries qualify; fresh-*/weak-* must
+    # stay unpromoted.
+    promoted = [ln for ln in idx.splitlines() if "semantic/" in ln]
+    old_promoted = sum(1 for ln in promoted if "/old-" in ln)
+    bad_promoted = sum(1 for ln in promoted
+                       if "/fresh-" in ln or "/weak-" in ln)
+    check(res, "s2.promoted", old_promoted >= 1,
+          f"{old_promoted} settled entries promoted to semantic/")
+    check(res, "s2.gate_held", bad_promoted == 0,
+          f"{bad_promoted} unsettled/weak entries wrongly promoted")
     check(res, "s2.index_bounded", len(idx) <= 25 * 1024,
           f"INDEX.md {len(idx)}B")
     return {"scenario": "s2_consolidation_storm", "checks": res,
-            "metrics": {"promoted_clusters": promoted_refs,
+            "metrics": {"promoted": old_promoted,
+                        "wrongly_promoted": bad_promoted,
                         "semantic_files": len(sem_files)}}
 
 
@@ -240,6 +252,7 @@ def s3_rewind_churn(ctx: Ctx, root: Path) -> dict:
 
 def s4_subagent_swarm(ctx: Ctx, root: Path) -> dict:
     wd = fresh_dir(root, "s4")
+    sess = root / "s4-session"
     res = []
     ev, p = exec_run(
         ctx,
@@ -247,19 +260,21 @@ def s4_subagent_swarm(ctx: Ctx, root: Path) -> dict:
         "writes: files s1.txt through s8.txt, each containing 'worker N' "
         "for its N. Launch all of them, wait for all to finish, then "
         "confirm how many files exist.",
-        wd, extra=["--max-steps", "30"], timeout=ctx.timeout * 3)
+        wd, session=sess, extra=["--max-steps", "30"], timeout=ctx.timeout * 3)
     starts = [e for e in ev if e.get("type") == "tool_call_start"
               and e.get("name") == "task"]
-    dones = [e for e in ev if "subagent" in json.dumps(e.get("kind", e))
-             .lower() or e.get("type") == "subagent_done"]
-    files = [f for f in wd.glob("s*.txt")]
+    # Subagent writes land in the main wd OR isolated worktrees
+    # (<session>/subagents/wt-N/wt/) depending on the spawn mode the
+    # model picked — count both.
+    found = {f.name for f in wd.glob("s*.txt")}
+    found |= {f.name for f in sess.glob("subagents/*/wt/s*.txt")}
     check(res, "s4.spawned", len(starts) >= 6,
           f"{len(starts)} task calls")
-    check(res, "s4.files_written", len(files) >= 6,
-          f"{len(files)}/8 worker files")
+    check(res, "s4.files_written", len(found) >= 6,
+          f"{len(found)}/8 worker files ({sorted(found)})")
     check(res, "s4.completed", p.returncode == 0, f"rc={p.returncode}")
     return {"scenario": "s4_subagent_swarm", "checks": res,
-            "metrics": {"task_calls": len(starts), "files": len(files)}}
+            "metrics": {"task_calls": len(starts), "files": len(found)}}
 
 
 # ---------- S5: best-of worktree race ----------
