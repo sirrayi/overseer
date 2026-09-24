@@ -11,7 +11,7 @@
 //! ```markdown
 //! ---
 //! allowed_tools: read, grep, glob, edit
-//! model: fleet-k3
+//! model: claude-haiku-4-5
 //! ---
 //! ```
 //!
@@ -145,11 +145,11 @@ mod tests {
         let dir = tmpdir();
         std::fs::write(
             dir.join(RECIPE_FILE),
-            "---\nallowed_tools: read, grep, glob\nmodel: fleet-k3\n---\nnotes\n",
+            "---\nallowed_tools: read, grep, glob\nmodel: claude-haiku-4-5\n---\nnotes\n",
         )
         .unwrap();
         let r = load(&dir).unwrap().expect("recipe present");
-        assert_eq!(r.model.as_deref(), Some("fleet-k3"));
+        assert_eq!(r.model.as_deref(), Some("claude-haiku-4-5"));
         let disabled = r.disable_list();
         assert!(!disabled.iter().any(|d| d == "read"));
         assert!(!disabled.iter().any(|d| d == "grep"));

@@ -294,7 +294,7 @@ mod tests {
             "anchored models keep the plain contract"
         );
         let wf = assemble(&AgentConfig {
-            model: "fleet-q27".into(),
+            model: "claude-haiku-4-5".into(),
             ..Default::default()
         });
         assert!(wf[1].text.contains("whole-file"), "{}", wf[1].text);
@@ -302,7 +302,7 @@ mod tests {
         assert!(boundary_ok(&wf), "the extra line stays inside one segment");
         // Ablating `task` still takes the task line out, dialect or not.
         let wf_ablated = assemble(&AgentConfig {
-            model: "fleet-q27".into(),
+            model: "claude-haiku-4-5".into(),
             disabled_tools: vec!["task".into()],
             ..Default::default()
         });
