@@ -5,7 +5,7 @@ deferred. Every claim below cites a check that actually ran.
 
 ## Decisions (user-approved)
 
-- Model access: **Fleet gateway only** (`OVERSEER_API_KEY`/`OVERSEER_BASE_URL`).
+- Model access: **hosted gateway only** (`OVERSEER_API_KEY`/`OVERSEER_BASE_URL`).
 - Container runtime: **OrbStack** (installed, daemon verified via
   `docker info`).
 - Spending posture: **zero spend until approved** — no paid benchmark
@@ -162,7 +162,7 @@ deferred. Every claim below cites a check that actually ran.
 
 - **No paid run has executed.** τ²/LCB `run()` paths are written but
   have never run against the real harnesses — expect first-run fixes
-  (litellm model naming for FLEET, LCB runner deps, output paths).
+  (litellm model naming for the gateway, LCB runner deps, output paths).
 - overseer/mini arms require `OVERSEER_API_KEY`; not exercised this round.
 - SWE-bench **rollout** generation (agent solves instances → patches)
   is written and key-gated but unexercised — only the eval path ran.

@@ -49,7 +49,7 @@ class Store:
 
     def runs(self, **eq) -> list[dict]:
         """Run rows matching equality filters, e.g. runs(harness='overseer',
-        model='fleet-turbo', benchmark='local')."""
+        model='claude-haiku-4-5', benchmark='local')."""
         return [
             r
             for r in self.load()

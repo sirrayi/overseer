@@ -26,8 +26,8 @@ def _cfg() -> tuple[str, str, str]:
     """Resolved per call — module-level env binding would freeze --model."""
     return (
         os.environ.get("OVERSEER_BIN", DEFAULT_BIN),
-        os.environ.get("OVERSEER_BASE_URL", "https://inference.fleet.ai/v1"),
-        os.environ.get("OVERSEER_MODEL", "fleet-turbo"),
+        os.environ.get("OVERSEER_BASE_URL", "https://opencode.ai/zen/go/v1"),
+        os.environ.get("OVERSEER_MODEL", "claude-haiku-4-5"),
     )
 
 
