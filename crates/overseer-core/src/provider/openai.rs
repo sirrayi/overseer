@@ -1,6 +1,6 @@
 //! OpenAI-compatible Chat Completions adapter (playbook Ch.7 §1.2).
-//! Covers api.openai.com and OpenAI-compatible gateways (vLLM, Fleet,
-//! Groq, Together, etc.) — verified against Fleet's vLLM fleet.
+//! Covers api.openai.com and OpenAI-compatible gateways (vLLM, Groq,
+//! Together, etc.) — verified against hosted vLLM fleets.
 //!
 //! Wire conventions handled here:
 //! - tool_calls are separate `tool` role messages per result (NOT merged
