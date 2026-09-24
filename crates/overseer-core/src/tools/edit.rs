@@ -132,7 +132,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
 
     // The model's edit dialect (aider edit-format registry): anchors for
     // the Claude family, whitespace-tolerant line blocks for the vLLM
-    // fleet, whole-file rewrites pointed at `write`.
+    // dense, whole-file rewrites pointed at `write`.
     let format = ctx
         .agent_config
         .as_ref()
@@ -686,10 +686,10 @@ mod tests {
             miss.text
         );
 
-        // Diff profile (fleet-k3): the same anchor applies as a trimmed
+        // Diff profile (claude-haiku-4-5): the same anchor applies as a trimmed
         // block, and the result notes which strategy fired.
         c.agent_config = Some(crate::agent::AgentConfig {
-            model: "fleet-k3".into(),
+            model: "claude-haiku-4-5".into(),
             cwd: dir.clone(),
             ..Default::default()
         });
@@ -705,9 +705,9 @@ mod tests {
             "alpha\nBETA\nGAMMA\ndelta\n"
         );
 
-        // WholeFile profile (fleet-q27): the miss points at `write`.
+        // WholeFile profile (claude-haiku-4-5): the miss points at `write`.
         c.agent_config = Some(crate::agent::AgentConfig {
-            model: "fleet-q27".into(),
+            model: "claude-haiku-4-5".into(),
             cwd: dir.clone(),
             ..Default::default()
         });
