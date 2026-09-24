@@ -140,8 +140,8 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
     }
 
     // The model's edit dialect (aider edit-format registry): anchors for
-    // the Claude family, whitespace-tolerant line blocks for the vLLM
-    // fleet, whole-file rewrites pointed at `write`.
+    // the Claude family, whitespace-tolerant line blocks for diff-dialect
+    // models, whole-file rewrites pointed at `write`.
     let format = ctx
         .agent_config
         .as_ref()
@@ -781,10 +781,10 @@ mod tests {
             miss.text
         );
 
-        // Diff profile (fleet-k3): the same anchor applies as a trimmed
-        // block, and the result notes which strategy fired.
+        // Diff profile (deepseek-v4.1-flash): the same anchor applies as a
+        // trimmed block, and the result notes which strategy fired.
         c.agent_config = Some(crate::agent::AgentConfig {
-            model: "fleet-k3".into(),
+            model: "deepseek-v4.1-flash".into(),
             cwd: dir.clone(),
             ..Default::default()
         });
@@ -799,21 +799,6 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             "alpha\nBETA\nGAMMA\ndelta\n"
         );
-
-        // WholeFile profile (fleet-q27): the miss points at `write`.
-        c.agent_config = Some(crate::agent::AgentConfig {
-            model: "fleet-q27".into(),
-            cwd: dir.clone(),
-            ..Default::default()
-        });
-        let wf = reg.call(
-            "edit",
-            &json!({"path": "f.txt", "old_string": "nope-not-here", "new_string": "x"}),
-            &mut c,
-        );
-        assert!(wf.is_error);
-        assert!(wf.text.contains("whole-file"), "{}", wf.text);
-        assert!(wf.text.contains("`write`"), "{}", wf.text);
 
         // The patch form works regardless of the profile, and mixing forms
         // is refused rather than guessed.

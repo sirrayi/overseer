@@ -6,9 +6,8 @@ the workdir afterwards. The session's manifest.json (overseer-core
 manifest.rs, P4.5) is harvested into the record's provenance block.
 
 Env: OVERSEER_BIN (default target/release/overseer), OVERSEER_PROVIDER
-(default "openai" — use "opencode" for the opencode.ai/zen/go
-subscription endpoint), OVERSEER_API_KEY / OPENCODE_API_KEY, OVERSEER_BASE_URL,
-OVERSEER_MODEL.
+(default "opencode" — the opencode.ai/zen/go subscription endpoint),
+OVERSEER_API_KEY / OPENCODE_API_KEY, OVERSEER_BASE_URL, OVERSEER_MODEL.
 """
 
 from __future__ import annotations
@@ -26,11 +25,17 @@ DEFAULT_BIN = str(
 
 def _cfg() -> tuple[str, str, str, str]:
     """Resolved per call — module-level env binding would freeze --model."""
+    provider = os.environ.get("OVERSEER_PROVIDER", "opencode")
+    default_base = (
+        "https://opencode.ai/zen/go/v1"
+        if provider == "opencode"
+        else "https://api.openai.com/v1"
+    )
     return (
         os.environ.get("OVERSEER_BIN", DEFAULT_BIN),
-        os.environ.get("OVERSEER_PROVIDER", "openai"),
-        os.environ.get("OVERSEER_BASE_URL", "https://inference.fleet.ai/v1"),
-        os.environ.get("OVERSEER_MODEL", "fleet-turbo"),
+        provider,
+        os.environ.get("OVERSEER_BASE_URL", default_base),
+        os.environ.get("OVERSEER_MODEL", "deepseek-v4.1-flash"),
     )
 
 

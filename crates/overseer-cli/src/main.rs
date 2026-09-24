@@ -784,7 +784,7 @@ fn usage() {
          \x20 --session <dir>     Session directory (default: ~/.overseer/sessions/<ts>)\n\
          \x20 --cwd <dir>         Working directory for tools (default: .)\n\
          \x20 --model <id>        Model id (default: claude-sonnet-5)\n\
-         \x20 --provider <name>   anthropic | openai | fleet | opencode | gemini (default: anthropic)\n\
+         \x20 --provider <name>   anthropic | openai | opencode | gemini (default: anthropic)\n\
          \x20 --effort <level>    min | low | medium | high | max (default: medium)\n\
          \x20 --small-model <id>  small-tier model for aux calls (titles, consolidation)\n\
          \x20 --base-url <url>    API base URL for openai-compatible providers\n\
@@ -828,7 +828,6 @@ fn usage() {
          \x20 ANTHROPIC_API_KEY   Anthropic key\n\
          \x20 OPENAI_API_KEY      OpenAI-compatible key\n\
          \x20 GOOGLE_API_KEY      Gemini key (GEMINI_API_KEY also works)\n\
-         \x20 OVERSEER_API_KEY         Fleet key (fallback)\n\
          \x20 OPENCODE_API_KEY    opencode Go key (provider=opencode)\n\
          \x20 OVERSEER_CREDENTIALS  credential payload for --credential-store env\n\
          \x20                     (`NAME=value` lines, `grant …` lines)"
@@ -1195,16 +1194,15 @@ fn render_human(e: &Event) {
     }
 }
 
-const FLEET_URL: &str = "https://inference.fleet.ai/v1";
 /// opencode subscription (Go tier) — OpenAI-compatible chat/completions.
 /// Requires the `x-opencode-session` routing header on every call.
 const OPENCODE_URL: &str = "https://opencode.ai/zen/go/v1";
 
 /// Build the provider from flags + env. Key resolution order:
-/// OVERSEER_API_KEY → provider-specific env → OVERSEER_API_KEY, then the same
-/// names inside the resolved credential payload (`apply_credentials`
-/// runs first — env stays authoritative; the keychain/env payload only
-/// fills names env never set).
+/// OVERSEER_API_KEY → provider-specific env, then the same names inside
+/// the resolved credential payload (`apply_credentials` runs first — env
+/// stays authoritative; the keychain/env payload only fills names env
+/// never set).
 fn build_provider(
     flags: &ExecFlags,
     broker: &overseer_core::cred::Broker,
@@ -1219,15 +1217,13 @@ fn build_provider(
     };
     let key = env("OVERSEER_API_KEY")
         .or_else(|| provider_key(&env))
-        .or_else(|| env("OVERSEER_API_KEY"))
         .or_else(|| cred("OVERSEER_API_KEY"))
         .or_else(|| provider_key(&cred))
-        .or_else(|| cred("OVERSEER_API_KEY"))
         .ok_or_else(|| {
             format!(
                 "no API key for provider '{}' — set OVERSEER_API_KEY \
-                 (or ANTHROPIC_API_KEY / OPENAI_API_KEY / OVERSEER_API_KEY), or \
-                 store one in the credential payload (--credential-store)",
+                 (or ANTHROPIC_API_KEY / OPENAI_API_KEY), or store one in \
+                 the credential payload (--credential-store)",
                 flags.provider
             )
         })?;
@@ -1246,13 +1242,6 @@ fn build_provider(
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".into()),
-        )),
-        "fleet" => Box::new(OpenAiCompatible::new(
-            key,
-            flags
-                .base_url
-                .clone()
-                .unwrap_or_else(|| FLEET_URL.into()),
         )),
         "opencode" => {
             // Go routes on x-opencode-session; any stable per-process tag
@@ -1297,7 +1286,7 @@ fn build_provider(
         }
         other => {
             return Err(format!(
-                "unknown provider '{other}' (anthropic|openai|fleet|opencode)"
+                "unknown provider '{other}' (anthropic|openai|opencode|gemini)"
             ))
         }
     })

@@ -60,7 +60,6 @@ jobs:
     env:
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       OVERSEER_PROVIDER: opencode
-      OVERSEER_MODEL: ${{ matrix.model }}
       OVERSEER_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       OVERSEER_MODEL: ${{ matrix.model }}
       OVERSEER_BIN: ${{ github.workspace }}/target/release/overseer

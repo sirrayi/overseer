@@ -108,7 +108,6 @@ runbook EXACTLY — do not improvise extra tasks.
    `export OVERSEER_BIN=~/overseer/target/release/overseer`
    `export OVERSEER_PROVIDER=opencode` `export OVERSEER_MODEL={spec['model']}`
    `export OVERSEER_API_KEY=$OPENCODE_API_KEY`
-   `export OVERSEER_MODEL={spec['model']}`
    (OPENCODE_API_KEY is already in your environment via org secret —
    never print or commit it).
 

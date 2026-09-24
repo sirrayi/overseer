@@ -9,7 +9,8 @@ The loop semantics are frozen — it must stay minimal to remain a valid
 null scaffold. Changes are limited to protocol plumbing (usage capture,
 limits/seed params, trajectory path).
 
-Env: OVERSEER_API_KEY (required), OVERSEER_BASE_URL, OVERSEER_MODEL.
+Env: OVERSEER_API_KEY (required), OVERSEER_BASE_URL, OVERSEER_MODEL,
+OVERSEER_PROVIDER.
 """
 
 from __future__ import annotations
@@ -25,11 +26,18 @@ from pathlib import Path
 OUT_CAP = 4000
 
 
-def _cfg() -> tuple[str, str]:
+def _cfg() -> tuple[str, str, str]:
     """Resolved per call — module-level env binding would freeze --model."""
+    provider = os.environ.get("OVERSEER_PROVIDER", "opencode")
+    default_base = (
+        "https://opencode.ai/zen/go/v1"
+        if provider == "opencode"
+        else "https://api.openai.com/v1"
+    )
     return (
-        os.environ.get("OVERSEER_BASE_URL", "https://inference.fleet.ai/v1"),
-        os.environ.get("OVERSEER_MODEL", "fleet-turbo"),
+        provider,
+        os.environ.get("OVERSEER_BASE_URL", default_base),
+        os.environ.get("OVERSEER_MODEL", "deepseek-v4.1-flash"),
     )
 
 
@@ -50,7 +58,7 @@ task directory; prefer simple, verifiable steps."""
 
 
 def chat(messages: list[dict]) -> tuple[str, dict]:
-    base_url, model = _cfg()
+    provider, base_url, model = _cfg()
     body = json.dumps(
         {
             "model": model,
@@ -58,13 +66,17 @@ def chat(messages: list[dict]) -> tuple[str, dict]:
             "messages": [{"role": "system", "content": SYSTEM}] + messages,
         }
     ).encode()
+    headers = {
+        "Authorization": f"Bearer {os.environ['OVERSEER_API_KEY']}",
+        "Content-Type": "application/json",
+    }
+    # The opencode Go gateway requires its routing header on every call.
+    if provider == "opencode":
+        headers["x-opencode-session"] = "overseer-eval-mini"
     req = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=body,
-        headers={
-            "Authorization": f"Bearer {os.environ['OVERSEER_API_KEY']}",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=120) as r:
         data = json.loads(r.read())
@@ -88,7 +100,12 @@ def extract_action(text: str) -> tuple[str, str]:
 def run_bash(cmd: str, cwd: str) -> str:
     # Model-controlled commands run without credentials — the key is for the
     # API call only, it must never be readable from inside a task shell.
-    env = {k: v for k, v in os.environ.items() if not k.startswith("OVERSEER_")}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("OVERSEER_")
+        and not k.endswith(("_KEY", "_TOKEN"))
+    }
     try:
         p = subprocess.run(
             ["sh", "-c", cmd],
@@ -115,7 +132,7 @@ def solve(
 ) -> dict:
     limits = limits or {}
     max_steps = int(limits.get("max_steps", 30))
-    _, model = _cfg()
+    _, _, model = _cfg()
     Path(session_dir).mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 

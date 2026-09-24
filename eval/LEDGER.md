@@ -5,7 +5,8 @@ deferred. Every claim below cites a check that actually ran.
 
 ## Decisions (user-approved)
 
-- Model access: **Fleet gateway only** (`OVERSEER_API_KEY`/`OVERSEER_BASE_URL`).
+- Model access: **opencode Go subscription** (`OVERSEER_API_KEY` /
+  `OVERSEER_BASE_URL`; the rig env namespace is `OVERSEER_*`).
 - Container runtime: **OrbStack** (installed, daemon verified via
   `docker info`).
 - Spending posture: **zero spend until approved** — no paid benchmark
@@ -88,8 +89,8 @@ deferred. Every claim below cites a check that actually ran.
 9. Retry bookkeeping: session_dir could point at the failed attempt;
    successful retry unmarked. Fixed: retry is always the recorded attempt.
 10. `extra` keys could clobber matrix-header fields. Fixed: core keys win.
-11. `mini` ran model-controlled bash with `OVERSEER_API_KEY` in env. Fixed:
-    OVERSEER_* scrubbed from the task shell.
+11. `mini` ran model-controlled bash with the provider key in env. Fixed:
+    `OVERSEER_*` and `*_KEY`/`*_TOKEN` scrubbed from the task shell.
 12. Stale `eval/solvers/` + Inspect-AI-era README. Removed/rewritten.
 
 ## Independent review — round 2 findings, all addressed
@@ -162,15 +163,15 @@ deferred. Every claim below cites a check that actually ran.
 
 - **No paid run has executed.** τ²/LCB `run()` paths are written but
   have never run against the real harnesses — expect first-run fixes
-  (litellm model naming for FLEET, LCB runner deps, output paths).
+  (litellm model naming, LCB runner deps, output paths).
 - overseer/mini arms require `OVERSEER_API_KEY`; not exercised this round.
 - SWE-bench **rollout** generation (agent solves instances → patches)
   is written and key-gated but unexercised — only the eval path ran.
 - `--no-tools` ablation still leaves non-tool prompt text unchanged
   except the task/skill mentions that are now gated; other references
   to removed capabilities (e.g. memory index) are not conditioned.
-- Single model family available (Fleet) — the playbook's ≥3-family
-  comparison is blocked on additional provider access.
+- Single provider family wired (opencode subscription) — the playbook's
+  ≥3-family comparison is blocked on additional provider access.
 - `temperature` is pinned to 0.0 in the LCB adapter call; τ² uses the
   harness defaults. Make explicit when runs are approved.
 

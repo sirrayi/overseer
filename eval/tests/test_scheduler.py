@@ -128,14 +128,14 @@ class TestOracle:
                     {
                         "schema": "m",
                         "harness": {"version": "0.1", "commit": "abc"},
-                        "model": {"name": "kimi"},
+                        "model": {"name": "deepseek"},
                         "tools": {"count": 11},
                         "system_prompt": {"sha256": "x"},
                     }
                 )
             )
             graders.run_script("echo done > done.txt", workdir)
-            return {"done": True, "model": "kimi", "ts": 0}
+            return {"done": True, "model": "deepseek", "ts": 0}
 
         agents.REGISTRY["mw"] = type("M", (), {"solve": staticmethod(writes_manifest)})
         try:
@@ -209,7 +209,7 @@ class TestManifestMerge:
         sess.mkdir()
         (sess / "manifest.json").write_text(
             '{"schema":"m","harness":{"commit":"abc"},'
-            '"model":{"name":"kimi"},"system_prompt":{"sha256":"x"},'
+            '"model":{"name":"deepseek"},"system_prompt":{"sha256":"x"},'
             '"tools":{"count":3}}'
         )
         m = manifest.load_manifest(sess)
@@ -228,4 +228,4 @@ class TestManifestMerge:
             harness_commit="c",
         )
         assert rec["provenance"]["tools"]["count"] == 3
-        assert rec["model"] == "kimi"  # manifest model wins
+        assert rec["model"] == "deepseek"  # manifest model wins

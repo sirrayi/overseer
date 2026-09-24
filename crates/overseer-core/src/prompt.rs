@@ -284,33 +284,6 @@ mod tests {
     }
 
     #[test]
-    fn whole_file_edit_dialect_is_advertised_in_contract() {
-        // P8-B: the contract names the file-writing tool for a whole-file
-        // model; every other dialect's contract is byte-identical to the
-        // pre-B2 text (the static prefix stays cache-stable).
-        let default = assemble(&AgentConfig::default());
-        assert!(
-            !default[1].text.contains("whole-file"),
-            "anchored models keep the plain contract"
-        );
-        let wf = assemble(&AgentConfig {
-            model: "fleet-q27".into(),
-            ..Default::default()
-        });
-        assert!(wf[1].text.contains("whole-file"), "{}", wf[1].text);
-        assert!(wf[1].text.contains("`write`"));
-        assert!(boundary_ok(&wf), "the extra line stays inside one segment");
-        // Ablating `task` still takes the task line out, dialect or not.
-        let wf_ablated = assemble(&AgentConfig {
-            model: "fleet-q27".into(),
-            disabled_tools: vec!["task".into()],
-            ..Default::default()
-        });
-        assert!(!wf_ablated[1].text.contains("task` subagent"));
-        assert!(wf_ablated[1].text.contains("whole-file"));
-    }
-
-    #[test]
     fn hygiene_lint_flags_leaks_and_passes_a_clean_assembly() {
         // P8-B accept (leaked-prompts reading → lint): the default prompt is
         // clean; each detected failure class names its segment.

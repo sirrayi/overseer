@@ -10,9 +10,9 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   (`profile.rs`), tool registry + tools (`tools/`), provider trait +
   Anthropic + OpenAI-compatible + Gemini adapters (`provider/`; Gemini
   pairs tool calls by name, thought/thoughtSignature parts ride the
-  opaque Reasoning block; `--provider fleet` and `--provider
-  opencode` name hosted OpenAI-compat endpoints — env keys OVERSEER_API_KEY /
-  OPENCODE_API_KEY, opencode sends the required `x-opencode-session`
+  opaque Reasoning block; `--provider opencode` names a hosted
+  OpenAI-compat endpoint — env key OPENCODE_API_KEY, and every call sends
+  the required `x-opencode-session`
   header; opencode muse-spark-* is Responses-API-only and routed to the
   `provider/responses.rs` adapter (encrypted reasoning round-trips as
   opaque Reasoning blocks, `store:false` — the event log replays full
