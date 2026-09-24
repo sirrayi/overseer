@@ -522,7 +522,7 @@ fn usage() {
          \x20 --session <dir>     Session directory (default: ~/.overseer/sessions/<ts>)\n\
          \x20 --cwd <dir>         Working directory for tools (default: .)\n\
          \x20 --model <id>        Model id (default: claude-sonnet-5)\n\
-         \x20 --provider <name>   anthropic | openai | fleet | gemini (default: anthropic)\n\
+         \x20 --provider <name>   anthropic | openai | gemini (default: anthropic)\n\
          \x20 --effort <level>    min | low | medium | high | max (default: medium)\n\
          \x20 --small-model <id>  small-tier model for aux calls (titles, consolidation)\n\
          \x20 --base-url <url>    API base URL for openai-compatible providers\n\
@@ -561,7 +561,6 @@ fn usage() {
          \x20 ANTHROPIC_API_KEY   Anthropic key\n\
          \x20 OPENAI_API_KEY      OpenAI-compatible key\n\
          \x20 GOOGLE_API_KEY      Gemini key (GEMINI_API_KEY also works)\n\
-         \x20 OVERSEER_API_KEY         Fleet key (fallback)"
     );
 }
 
@@ -903,10 +902,8 @@ fn render_human(e: &Event) {
     }
 }
 
-const FLEET_URL: &str = "https://inference.fleet.ai/v1";
-
 /// Build the provider from flags + env. Key resolution order:
-/// OVERSEER_API_KEY → provider-specific env → OVERSEER_API_KEY.
+/// OVERSEER_API_KEY → provider-specific env.
 fn build_provider(flags: &ExecFlags) -> Result<Box<dyn Provider>, String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let key = env("OVERSEER_API_KEY")
@@ -915,11 +912,10 @@ fn build_provider(flags: &ExecFlags) -> Result<Box<dyn Provider>, String> {
             "gemini" => env("GOOGLE_API_KEY").or_else(|| env("GEMINI_API_KEY")),
             _ => env("OPENAI_API_KEY"),
         })
-        .or_else(|| env("OVERSEER_API_KEY"))
         .ok_or_else(|| {
             format!(
                 "no API key for provider '{}' — set OVERSEER_API_KEY \
-                 (or ANTHROPIC_API_KEY / OPENAI_API_KEY / OVERSEER_API_KEY)",
+                 (or ANTHROPIC_API_KEY / OPENAI_API_KEY)",
                 flags.provider
             )
         })?;
@@ -939,16 +935,10 @@ fn build_provider(flags: &ExecFlags) -> Result<Box<dyn Provider>, String> {
                 .clone()
                 .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".into()),
         )),
-        "fleet" => Box::new(OpenAiCompatible::new(
-            key,
-            flags
-                .base_url
-                .clone()
-                .unwrap_or_else(|| FLEET_URL.into()),
         )),
         other => {
             return Err(format!(
-                "unknown provider '{other}' (anthropic|openai|fleet)"
+                "unknown provider '{other}' (anthropic|openai)"
             ))
         }
     })
