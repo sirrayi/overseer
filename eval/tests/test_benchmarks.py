@@ -306,17 +306,17 @@ class TestHarbor:
         t["agent_info"] = {
             "name": "terminus",
             "version": "1",
-            "model_info": {"name": "openai/fleet-turbo"},
+            "model_info": {"name": "openai/deepseek-v4.1-flash"},
         }
         job = self._job(tmp_path, [t])
         recs = harbor.TerminalBenchAdapter(jobs_root=tmp_path).parse_results(
             job,
             agent_name="terminus",
-            model_id="openai/fleet-turbo",
+            model_id="openai/deepseek-v4.1-flash",
             harness_commit="c",
             run_set_id="rs",
         )
-        assert recs[0]["model"] == "openai/fleet-turbo"
+        assert recs[0]["model"] == "openai/deepseek-v4.1-flash"
 
     def test_none_git_commit_id(self, tmp_path):
         t = dict(HARBOR_TRIAL)
@@ -434,7 +434,7 @@ class TestSweBench:
                         "done": True,
                         "tokens_in": 1234,
                         "cost_usd": 0.01,
-                        "model": "fleet-k3",
+                        "model": "deepseek-v4.1-flash",
                     },
                 }
             )
@@ -452,7 +452,7 @@ class TestSweBench:
         assert r["tokens_in"] == 1234
         assert r["cost_usd"] == 0.01
         assert r["session_dir"] == "/sessions/rid1"
-        assert r["model"] == "fleet-k3"  # rollout model wins over dir name
+        assert r["model"] == "deepseek-v4.1-flash"  # rollout model wins over dir name
 
     def test_image_arch_rewrite(self):
         import platform
