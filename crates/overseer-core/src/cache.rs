@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(a, b, "the same request must hash the same");
         assert_ne!(
             a,
-            ExactCache::key("fleet-k3", "hello"),
+            ExactCache::key("deepseek-v4.1-flash", "hello"),
             "the same prompt to another model is another request"
         );
         assert_ne!(a, ExactCache::key("claude-sonnet-5", "hello!"));
