@@ -481,7 +481,7 @@ def run_cli(
     else:
         seeds = list(range(args.seeds))
     agent = args.agents.split(",")[0].strip()
-    model_id = args.model or os.environ.get("OVERSEER_MODEL", "fleet-turbo")
+    model_id = args.model or os.environ.get("OVERSEER_MODEL", "claude-haiku-4-5")
     if preds_arg is None and not os.environ.get("OVERSEER_API_KEY"):
         print(
             "OVERSEER_API_KEY required for swe_bench rollouts "
