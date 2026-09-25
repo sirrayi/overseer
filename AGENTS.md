@@ -84,7 +84,11 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   plain-text transcript handoff into scrollback on exit. `run_inline`
   (`--inline`) keeps the old contract: fixed-height `Viewport::Inline`
   region (ratatui inline height is init-only) + `insert_before` for
-  scrollback handoff. DECRQM/XTVERSION probe; BSU/ESU
+  scrollback handoff. `run_web` (`--web [--web-port]`, web.rs) draws
+  the same Full surface into a `TestBackend` and streams the buffer as
+  JSON over a std-only localhost server (SSE frames out, POST input in
+  via `on_ct_event`; assets in `web/` served disk-first so styling is
+  a refresh, not a rebuild). DECRQM/XTVERSION probe; BSU/ESU
   frame batching when sync output probes positive. `Control` =
   interrupt + steer queue (checked at tool-launch boundaries only —
   skipped calls get synthetic results so tool pairing survives);

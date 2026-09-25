@@ -81,12 +81,24 @@ fn cmd_tui(args: &[String]) -> i32 {
     // --inline: the scrollback-preserving live-strip surface.
     let line_mode = args.iter().any(|a| a == "--no-tui");
     let inline = args.iter().any(|a| a == "--inline");
-    let args: Vec<String> = args
-        .iter()
-        .filter(|a| *a != "--no-tui" && *a != "--inline")
-        .cloned()
-        .collect();
-    let flags = match parse_exec(&args) {
+    // --web: same session, rendered into a browser tab on localhost
+    // (the fullscreen surface, drawn to a DOM grid).
+    let web = args.iter().any(|a| a == "--web");
+    let mut web_port = 8641u16;
+    let mut rest: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--no-tui" | "--inline" | "--web" => {}
+            "--web-port" => {
+                if let Some(v) = it.next().and_then(|v| v.parse::<u16>().ok()) {
+                    web_port = v;
+                }
+            }
+            _ => rest.push(a.clone()),
+        }
+    }
+    let flags = match parse_exec(&rest) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("overseer tui: {e}");
@@ -97,7 +109,7 @@ fn cmd_tui(args: &[String]) -> i32 {
         eprintln!("overseer tui: no positional prompt — type inside the session");
         return 2;
     }
-    if !line_mode && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    if !line_mode && !web && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         eprintln!("overseer: stdout is not a terminal — use `overseer exec` for pipes/CI");
         return 2;
     }
@@ -119,6 +131,8 @@ fn cmd_tui(args: &[String]) -> i32 {
     };
     match if line_mode {
         overseer_tui::run_line(cfg)
+    } else if web {
+        overseer_tui::web::run_web(cfg, web_port)
     } else if inline {
         overseer_tui::run_inline(cfg)
     } else {
@@ -769,6 +783,7 @@ fn usage() {
          USAGE:\n\
          \x20 overseer [tui] [FLAGS]          interactive TUI (bare `overseer`)\n\
          \x20 overseer tui --inline           live-strip surface (native scrollback)\n\
+         \x20 overseer tui --web [--web-port <n>]   browser surface on localhost (default 8641)\n\
          \x20 overseer tui --no-tui           line mode (screen readers, plain REPL)\n\
          \x20 overseer exec [FLAGS] <prompt>\n\
          \x20 overseer stats <session-dir>   ledger dashboard (tokens, cache-hit, cost)\n\

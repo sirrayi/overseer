@@ -13,6 +13,7 @@ pub mod markdown;
 pub mod notify;
 pub mod probe;
 pub mod theme;
+pub mod web;
 pub mod widgets;
 
 use std::io::{IsTerminal, Write};

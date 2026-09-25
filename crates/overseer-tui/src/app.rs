@@ -294,7 +294,7 @@ impl App {
         self.poll_input()?;
         self.step(term, caps)?;
         if self.quit {
-            let _ = self.worker_tx.send(WorkerCmd::Shutdown);
+            self.shutdown();
         }
         Ok(())
     }
@@ -554,12 +554,32 @@ impl App {
             Duration::from_millis(250)
         };
         if !event::poll(wait)? {
-            if self.running() || self.dialog.is_some() {
-                self.dirty = true; // spinner/elapsed/dialog-arming tick
-            }
+            self.wake_tick();
             return Ok(());
         }
-        match event::read()? {
+        let ev = event::read()?;
+        self.on_ct_event(ev);
+        Ok(())
+    }
+
+    /// Tell the worker thread to stop — called on quit by `pump` and
+    /// by the web loop (which has no `pump`).
+    pub fn shutdown(&self) {
+        let _ = self.worker_tx.send(WorkerCmd::Shutdown);
+    }
+
+    /// Timeout side of `poll_input`: spinner/elapsed/dialog re-arm
+    /// cadence. The web surface calls the same hook on input-idle.
+    pub fn wake_tick(&mut self) {
+        if self.running() || self.dialog.is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Input-source-agnostic event dispatch — the terminal reader and
+    /// the web server's `/input` handler both land here.
+    pub fn on_ct_event(&mut self, ev: CtEvent) {
+        match ev {
             CtEvent::Key(key) => self.on_key(key),
             CtEvent::Paste(text) => {
                 self.composer.paste(&text);
@@ -584,7 +604,6 @@ impl App {
             CtEvent::Resize(_, _) => self.dirty = true,
             _ => {}
         }
-        Ok(())
     }
 
     fn on_key(&mut self, key: KeyEvent) {
