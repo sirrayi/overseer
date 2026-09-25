@@ -2,22 +2,14 @@
 source: crates/overseer-tui/tests/snapshots.rs
 expression: s
 ---
-
-
-
-
-
-
-
-
-
-
-
 ❯
 
- panel  dashboard  settings  keys            ↑/↓ · ←/→ · esc
+ dashboard  settings  keys                   ↑/↓ · ←/→ · esc
   session     session
   cwd         /repo
   model       test-model
   mode        workspace
   state       idle
+  tokens      0
+  cost        $0.0000
+  transcript  0 cells

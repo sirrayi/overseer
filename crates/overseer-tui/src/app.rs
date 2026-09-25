@@ -945,8 +945,8 @@ impl App {
         if let Some(r) = self.panel_band {
             if row >= r.y && row < r.y + r.height {
                 if row == r.y {
-                    // Strip layout: " panel " (7 cols) + " name " per tab.
-                    let mut x = 7u16;
+                    // Strip layout: " name " per tab from column 0.
+                    let mut x = 0u16;
                     for (i, name) in PANEL_TABS.iter().enumerate() {
                         let w = name.len() as u16 + 2;
                         if col >= x && col < x + w {
@@ -1795,10 +1795,10 @@ impl App {
         // transcript gets the rest. The live stack renders last inside
         // the transcript region (pinned) — overlays and the permission
         // dialog therefore never hide above the fold. An open control
-        // panel takes a further 6-row band under the prompt (~108px),
+        // panel takes a further 17-row band under the prompt (~306px),
         // which slides the whole window up.
         let panel_open = matches!(self.overlay, Some(Overlay::Panel { .. }));
-        let panel_h: u16 = if panel_open { 6 } else { 0 };
+        let panel_h: u16 = if panel_open { 17 } else { 0 };
         let t_rows = size.height.saturating_sub(3 + panel_h) as usize;
         self.view_h = t_rows as u16;
         let live_shown = live.len().min(t_rows);
@@ -2409,12 +2409,12 @@ impl App {
         }
     }
 
-    /// The panel's 6-row bottom band (Full mode): tab strip with the
-    /// key hint right-aligned, then five content rows at `scroll`.
+    /// The panel's 17-row bottom band (Full mode): a bare tab strip
+    /// (key hint right-aligned), then sixteen content rows at `scroll`.
     fn panel_band_lines(&self, tab: usize, scroll: usize, width: u16) -> Vec<Line<'static>> {
         use crate::theme;
-        let mut strip = vec![Span::styled(" panel ", theme::meta())];
-        let mut used = 7usize;
+        let mut strip = Vec::new();
+        let mut used = 0usize;
         for (i, name) in PANEL_TABS.iter().enumerate() {
             strip.push(Span::styled(
                 format!(" {name} "),
@@ -2432,9 +2432,9 @@ impl App {
         strip.push(Span::styled(hint.to_string(), theme::dim()));
         let mut out = vec![Line::from(strip)];
         let rows = self.panel_rows(tab);
-        let start = scroll.min(rows.len().saturating_sub(5));
-        out.extend(rows.into_iter().skip(start).take(5));
-        while out.len() < 6 {
+        let start = scroll.min(rows.len().saturating_sub(16));
+        out.extend(rows.into_iter().skip(start).take(16));
+        while out.len() < 17 {
             out.push(Line::default());
         }
         out
