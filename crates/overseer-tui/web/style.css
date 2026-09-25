@@ -73,6 +73,27 @@ html, body {
   pointer-events: none;
 }
 
+/* Minimal bottom-center mark — three hairlines, fainter than the
+   divider, lighter than the arrow. */
+#win { position: relative; }
+#mark {
+  position: absolute;
+  left: 50%;
+  bottom: 5px;
+  transform: translateX(-50%) scale(.5);
+  transform-origin: center bottom;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  pointer-events: none;
+}
+#mark i {
+  display: block;
+  width: 16px;
+  height: 1px;
+  background: rgba(255,255,255,.18);
+}
+
 #bye {
   position: fixed;
   inset: 0;
@@ -84,3 +105,8 @@ html, body {
   background: rgba(23,24,28,.7);
 }
 #bye.on { display: flex; }
+
+/* Unfocused = dimmed; one click inside returns input. */
+#win { transition: opacity .12s; }
+body.blur #win { opacity: .55; }
+body.blur #title::after { content: " — click to type"; }

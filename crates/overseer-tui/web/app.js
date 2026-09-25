@@ -59,10 +59,13 @@ function spanCss(s) {
 const esc = t => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 // Whole-grid vertical nudge inside the window (tuning pass).
-const TOP_OFF = -9.5;
+const TOP_OFF = 10.5;
 // Prompt rows sit a further 8px low — visual breathing room above
 // the (now chromeless) footer row.
 const PROMPT_OFF = 8;
+// …and 3px right, so the ❯'s left edge meets the divider's left
+// inset (left:3px on #divider).
+const PROMPT_L = 3;
 
 const divider = document.createElement('div');
 divider.id = 'divider';
@@ -89,6 +92,7 @@ function render(f) {
     // Always reposition — resize shifts which band a row belongs to
     // even when its content is identical.
     el.style.top = (y * LH + TOP_OFF + (inPrompt ? PROMPT_OFF : 0)) + 'px';
+    el.style.left = (inPrompt ? PROMPT_L : 0) + 'px';
     const key = JSON.stringify(row);
     if (rowCache[y] === key) continue;
     rowCache[y] = key;
@@ -99,8 +103,8 @@ function render(f) {
   }
   // 1px separator 3px above the prompt arrow, inset 3px each side.
   divider.style.top = ((f.h - 3) * LH + TOP_OFF + PROMPT_OFF - 4) + 'px';
-  cursor.style.left = (f.cur[0] * CH) + 'px';
   const curInPrompt = f.cur[1] >= f.h - 3 && f.cur[1] <= f.h - 2;
+  cursor.style.left = (f.cur[0] * CH + (curInPrompt ? PROMPT_L : 0)) + 'px';
   cursor.style.top = (f.cur[1] * LH + TOP_OFF + (curInPrompt ? PROMPT_OFF : 0)) + 'px';
   cursor.style.width = CH + 'px';
   cursor.style.height = LH + 'px';
@@ -108,7 +112,9 @@ function render(f) {
 
 // ── server link ────────────────────────────────────────────────────
 let es;
-const post = o => fetch('/input', { method: 'POST', body: JSON.stringify(o) });
+// GET with the payload in ?d= — some preview proxies forward POST
+// requests but drop their bodies; GET passes through untouched.
+const post = o => fetch('/input?d=' + encodeURIComponent(JSON.stringify(o)));
 
 function fit() {
   // Fill the viewport: 10px page margin either side, 30px title bar.
@@ -135,7 +141,13 @@ const KEYS = {
   PageDown: 'pagedown',
 };
 
+const titleEl = document.getElementById('title');
 addEventListener('keydown', e => {
+  // Echo the key in the title bar — proves keydown reached the page
+  // even if the POST round-trip dies elsewhere.
+  titleEl.textContent = 'overseer · ' + e.key;
+  clearTimeout(titleEl._t);
+  titleEl._t = setTimeout(() => (titleEl.textContent = 'overseer'), 900);
   if (e.metaKey) return; // leave cmd-* to the browser
   const mods = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey };
   if (e.key === 'Tab' && e.shiftKey) {
@@ -168,8 +180,19 @@ addEventListener('wheel', e => {
 }, { passive: true });
 
 addEventListener('resize', fit);
-addEventListener('focus', () => post({ type: 'focus', gained: true }));
-addEventListener('blur', () => post({ type: 'focus', gained: false }));
+addEventListener('focus', () => {
+  document.body.classList.remove('blur');
+  post({ type: 'focus', gained: true });
+});
+addEventListener('blur', () => {
+  document.body.classList.add('blur');
+  post({ type: 'focus', gained: false });
+});
+// A click anywhere reclaims focus — the screen element is tabindex=0
+// so this gives the document a real focus target in iframes.
+addEventListener('mousedown', () => screen.focus());
+if (!document.hasFocus()) document.body.classList.add('blur');
+addEventListener('load', () => screen.focus());
 
 measure();
 connect();

@@ -253,7 +253,8 @@ fn handle_conn(mut stream: TcpStream, input: InputTx, clients: Clients, last: La
     let mut body = vec![0u8; body_len];
     let _ = stream.read_exact(&mut body);
 
-    match (method, path.split('?').next().unwrap_or("/")) {
+    let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    match (method, route) {
         ("GET", "/events") => {
             let _ = stream.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n",
@@ -265,11 +266,25 @@ fn handle_conn(mut stream: TcpStream, input: InputTx, clients: Clients, last: La
                 clients.lock().unwrap().push(stream);
             }
         }
-        ("POST", "/input") => {
-            if let Some(ev) = parse_input(&body) {
-                let _ = input.send(ev);
+        // Some preview proxies forward POSTs but drop the body — the
+        // page also speaks `GET /input?d=<json>`, which survives.
+        ("POST", "/input") | ("GET", "/input") => {
+            let decoded = query.strip_prefix("d=").map(url_decode);
+            let payload: &[u8] = if method == "GET" {
+                decoded.as_deref().unwrap_or(&[])
+            } else {
+                &body
+            };
+            match parse_input(payload) {
+                Some(ev) => {
+                    let _ = input.send(ev);
+                    let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+                }
+                None => {
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length:0\r\n\r\n");
+                }
             }
-            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
         }
         ("GET", p) => {
             let (file, ctype) = match p {
@@ -307,6 +322,33 @@ fn serve_file(stream: &mut TcpStream, name: &str, ctype: &str) {
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&content);
+}
+
+/// Minimal percent-decoder for the `?d=` payload — `%XX` and `+`
+/// are all the page emits via `encodeURIComponent` (which actually
+/// uses `%20`, but `+` is harmless to support).
+fn url_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        out.push(match b[i] {
+            b'%' if i + 2 < b.len() => {
+                let hv = u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap_or(0);
+                i += 3;
+                hv
+            }
+            b'+' => {
+                i += 1;
+                b' '
+            }
+            c => {
+                i += 1;
+                c
+            }
+        });
+    }
+    out
 }
 
 // ── input mapping ───────────────────────────────────────────────────
