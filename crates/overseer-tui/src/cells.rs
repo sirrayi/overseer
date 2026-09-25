@@ -89,16 +89,24 @@ impl Cell {
         let w = width.max(8) as usize;
         match self {
             Cell::User { text } => {
+                let bg = theme::user_bg();
                 let mut out = Vec::new();
                 for (i, l) in text.lines().enumerate() {
                     let prefix = if i == 0 { "❯ " } else { "  " };
-                    out.extend(wrap_styled(
+                    for line in wrap_styled(
                         vec![
                             Span::styled(prefix, theme::prompt()),
                             Span::styled(l.to_string(), theme::user()),
                         ],
                         w,
-                    ));
+                    ) {
+                        let pad = w.saturating_sub(line.width());
+                        let mut line = line.patch_style(bg);
+                        if pad > 0 {
+                            line.spans.push(Span::styled(" ".repeat(pad), bg));
+                        }
+                        out.push(line);
+                    }
                 }
                 out
             }
@@ -362,6 +370,9 @@ pub fn feed(ev: &Event) -> Feed {
         | EventKind::PermissionDecision { .. }
         | EventKind::PolicyLoad { .. }
         | EventKind::SandboxDenial { .. } => Feed::Ignore,
+        // A provider_error end follows an Error cell carrying the same
+        // message — skip the summary so the failure lands as one line.
+        EventKind::RunEnd { stop_reason, .. } if stop_reason == "provider_error" => Feed::Ignore,
         EventKind::RunEnd {
             stop_reason,
             steps,

@@ -466,12 +466,8 @@ impl App {
             _ => "done",
         };
         self.notify("overseer", &format!("run {done_kind}"));
-        if let O::Provider(msg) = &out {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: format!("provider error: {msg}"),
-            });
-        }
+        // A provider failure already rendered as one `error:` transcript
+        // cell via the engine's own Error event — nothing extra here.
         // Undelivered steers: interrupt hands them back to the composer
         // for editing (nothing fires unattended); a normal end auto-
         // drains the queue FIFO, per the queued≠sent contract.

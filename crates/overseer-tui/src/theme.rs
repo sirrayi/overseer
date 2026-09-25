@@ -32,6 +32,8 @@ pub struct Theme {
     pub code: Style,
     pub prompt: Style,
     pub link: Style,
+    /// Full-row band behind a sent user prompt.
+    pub user_bg: Style,
 }
 
 impl Theme {
@@ -73,6 +75,7 @@ impl Theme {
             link: Style::new()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::UNDERLINED),
+            user_bg: Style::new().bg(Color::Rgb(38, 42, 54)),
         }
     }
 
@@ -100,6 +103,7 @@ impl Theme {
             code: Style::new(),
             prompt: Style::new(),
             link: Style::new().add_modifier(Modifier::UNDERLINED),
+            user_bg: Style::new().add_modifier(Modifier::REVERSED),
         }
     }
 
@@ -118,6 +122,7 @@ impl Theme {
             .add_modifier(Modifier::BOLD);
         t.meta = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
         t.error = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
+        t.user_bg = Style::new().bg(Color::DarkGray);
         t
     }
 
@@ -159,5 +164,5 @@ macro_rules! accessors {
 accessors! {
     user, assistant, dim, reasoning, tool, tool_ok, tool_err, meta, error,
     badge, badge_plan, badge_ro, status, spinner, queue, dialog, dialog_key,
-    dialog_sel, code, prompt, link,
+    dialog_sel, code, prompt, link, user_bg,
 }
