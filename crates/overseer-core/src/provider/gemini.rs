@@ -577,7 +577,11 @@ mod tests {
         assert!(gen.get("reasoning_effort").is_none());
         assert!(gen.get("thinkingConfig").is_none());
         // Core key survives even when named.
-        crate::profile::strip_optional_params(&mut gen, "deepseek-v4.1-flash", &["maxOutputTokens"]);
+        crate::profile::strip_optional_params(
+            &mut gen,
+            "deepseek-v4.1-flash",
+            &["maxOutputTokens"],
+        );
         assert!(gen.get("maxOutputTokens").is_some());
         // And the real Gemini path keeps thinkingConfig via FALLBACK.
         let system = vec![SystemSegment {

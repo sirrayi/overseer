@@ -1704,7 +1704,8 @@ mod tests {
         // The audit event never rehydrates into the model's context.
         let view = rehydrate_messages(&events);
         assert!(
-            view.iter().all(|m| !m.text().contains("deepseek-v4.1-flash")),
+            view.iter()
+                .all(|m| !m.text().contains("deepseek-v4.1-flash")),
             "a model switch is provenance, not conversation"
         );
     }
