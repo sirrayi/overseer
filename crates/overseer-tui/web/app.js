@@ -60,9 +60,9 @@ const esc = t => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&
 
 // Whole-grid vertical nudge inside the window (tuning pass).
 const TOP_OFF = 10.5;
-// Prompt rows sit a further 8px low — visual breathing room above
+// Prompt rows sit a further 6px low — visual breathing room above
 // the (now chromeless) footer row.
-const PROMPT_OFF = 8;
+const PROMPT_OFF = 6;
 // …and 3px right, so the ❯'s left edge meets the divider's left
 // inset (left:3px on #divider).
 const PROMPT_L = 3;
