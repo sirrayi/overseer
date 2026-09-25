@@ -138,8 +138,14 @@ const KEYS = {
   Enter: 'enter', Escape: 'esc', Backspace: 'backspace', Delete: 'delete',
   Tab: 'tab', ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left',
   ArrowRight: 'right', Home: 'home', End: 'end', PageUp: 'pageup',
-  PageDown: 'pagedown',
+  PageDown: 'pagedown', F1: 'f1',
 };
+
+// The bottom mark is the panel button — same as F1 / ↑ on empty input.
+document.getElementById('mark').addEventListener('click', e => {
+  post({ type: 'panel' });
+  e.stopPropagation();
+});
 
 const titleEl = document.getElementById('title');
 addEventListener('keydown', e => {

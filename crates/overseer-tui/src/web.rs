@@ -389,10 +389,16 @@ fn parse_input(body: &[u8]) -> Option<CtEvent> {
                 "end" => KeyCode::End,
                 "pageup" => KeyCode::PageUp,
                 "pagedown" => KeyCode::PageDown,
+                "f1" => KeyCode::F(1),
                 _ => return None,
             };
             Some(CtEvent::Key(KeyEvent::new(code, mods)))
         }
+        // The bottom mark — opens the control panel (same as F1).
+        "panel" => Some(CtEvent::Key(KeyEvent::new(
+            KeyCode::F(1),
+            KeyModifiers::NONE,
+        ))),
         "paste" => Some(CtEvent::Paste(get("text")?.as_str()?.to_string())),
         "scroll" => Some(CtEvent::Mouse(MouseEvent {
             kind: if get("up").and_then(|b| b.as_bool()).unwrap_or(false) {

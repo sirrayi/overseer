@@ -82,11 +82,13 @@ html, body {
   bottom: 7px;
   transform: translateX(-50%) scale(.5);
   transform-origin: center bottom;
+  cursor: pointer;
   display: flex;
   flex-direction: column;
   gap: 3px;
-  pointer-events: none;
 }
+
+#mark:hover i { background: rgba(255, 255, 255, 0.34); }
 #mark i {
   display: block;
   width: 16px;

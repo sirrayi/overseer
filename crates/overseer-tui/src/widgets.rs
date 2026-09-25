@@ -233,7 +233,7 @@ pub fn help_panel() -> Vec<Line<'static>> {
         "shift+tab    cycle mode (workspace → read-only → plan)",
         "ctrl+t       toggle plan    ctrl+x  cancel queued msg",
         "ctrl+s       stash draft    ctrl+_  undo    ctrl+w  del word",
-        "up/down      history        ctrl+c  clear   ctrl+d  quit",
+        "up/down      history (empty: panel)   ctrl+c/d clear/quit",
         "ctrl+p       sessions       ctrl+o  search  ctrl+y  copy reply",
         "alt+e / /edit               draft in $EDITOR",
         "tab          complete /cmd or @path    !cmd   run shell locally",

@@ -118,7 +118,18 @@ pub enum Overlay {
         /// Selected hunk within `rows[sel]` (preview mode only).
         hunk_sel: usize,
     },
+    /// Control panel — the bottom mark / ↑ on an empty composer.
+    /// Tab strip on top, the selected tab's rows listed below.
+    Panel {
+        /// Index into PANEL_TABS.
+        tab: usize,
+        /// Scroll offset into the tab's row list.
+        scroll: usize,
+    },
 }
+
+/// Panel tab order — ←/→ and Tab cycle, digits are not bound.
+const PANEL_TABS: [&str; 3] = ["dashboard", "settings", "keys"];
 
 /// One `/diff` row: a checkpoint-tracked path vs its working-tree state.
 pub struct DiffRow {
@@ -730,6 +741,11 @@ impl App {
             (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) => self.composer.word_right(),
             (KeyCode::Left, _) => self.composer.left(),
             (KeyCode::Right, _) => self.composer.right(),
+            // ↑ on an empty composer opens the control panel; history
+            // recall still works once anything is typed.
+            (KeyCode::Up, _) if self.composer.is_empty() => {
+                self.overlay = Some(Overlay::Panel { tab: 0, scroll: 0 });
+            }
             (KeyCode::Up, _) => self.composer.up(),
             (KeyCode::Down, _) => self.composer.down(),
             (KeyCode::Home, _) => self.composer.home(),
@@ -738,6 +754,10 @@ impl App {
             (KeyCode::Delete, _) => self.composer.delete(),
             (KeyCode::Char('?'), _) if self.composer.is_empty() => {
                 self.show_help = !self.show_help;
+            }
+            // F1 = the bottom mark — toggles the control panel.
+            (KeyCode::F(1), _) => {
+                self.overlay = Some(Overlay::Panel { tab: 0, scroll: 0 });
             }
             (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
                 self.composer.insert_str(&c.to_string());
@@ -752,18 +772,34 @@ impl App {
             (KeyCode::Esc, _) => {
                 self.overlay = None;
             }
-            (KeyCode::Up, _) => match &mut self.overlay {
-                Some(Overlay::Transcript { scroll, .. }) => {
-                    *scroll = scroll.saturating_sub(1);
+            // F1 toggles the panel back off (it's also the mark click).
+            (KeyCode::F(1), _) => {
+                if matches!(self.overlay, Some(Overlay::Panel { .. })) {
+                    self.overlay = None;
                 }
-                Some(o) => {
-                    let (sel, len) = overlay_sel(o);
-                    *sel = sel.saturating_sub(1).min(len);
+            }
+            (KeyCode::Up, _) => {
+                // Read scroll BEFORE the decrement: ↑ at the panel's
+                // top closes it (symmetric with the ↑-opens binding),
+                // but scrolling down to 0 must not close under you.
+                let was_top = matches!(self.overlay, Some(Overlay::Panel { scroll: 0, .. }));
+                match &mut self.overlay {
+                    Some(Overlay::Transcript { scroll, .. })
+                    | Some(Overlay::Panel { scroll, .. }) => {
+                        *scroll = scroll.saturating_sub(1);
+                    }
+                    Some(o) => {
+                        let (sel, len) = overlay_sel(o);
+                        *sel = sel.saturating_sub(1).min(len);
+                    }
+                    None => {}
                 }
-                None => {}
-            },
+                if was_top && matches!(self.overlay, Some(Overlay::Panel { .. })) {
+                    self.overlay = None;
+                }
+            }
             (KeyCode::Down, _) => match &mut self.overlay {
-                Some(Overlay::Transcript { scroll, .. }) => {
+                Some(Overlay::Transcript { scroll, .. }) | Some(Overlay::Panel { scroll, .. }) => {
                     *scroll = scroll.saturating_add(1);
                 }
                 Some(o) => {
@@ -793,10 +829,22 @@ impl App {
                 Some(Overlay::Transcript { expand_tools, .. }) => {
                     *expand_tools = !*expand_tools;
                 }
+                Some(Overlay::Panel { tab, scroll }) => {
+                    *tab = (*tab + 1) % PANEL_TABS.len();
+                    *scroll = 0;
+                }
                 _ => {}
             },
             (KeyCode::Left, _) | (KeyCode::Right, _) => {
-                if let Some(Overlay::Diff {
+                if let Some(Overlay::Panel { tab, scroll }) = &mut self.overlay {
+                    let d = if key.code == KeyCode::Left {
+                        PANEL_TABS.len() - 1
+                    } else {
+                        1
+                    };
+                    *tab = (*tab + d) % PANEL_TABS.len();
+                    *scroll = 0;
+                } else if let Some(Overlay::Diff {
                     rows,
                     sel,
                     preview,
@@ -1702,8 +1750,8 @@ fn overlay_sel(o: &mut Overlay) -> (&mut usize, usize) {
         Overlay::Rewind { rows, sel } => (sel, rows.len().saturating_sub(1)),
         Overlay::Tree { rows, sel } => (sel, rows.len().saturating_sub(1)),
         Overlay::Diff { rows, sel, .. } => (sel, rows.len().saturating_sub(1)),
-        // Transcript scrolls lines, not rows — handled by its own arms.
-        Overlay::Transcript { scroll, .. } => (scroll, usize::MAX),
+        // Transcript/Panel scroll lines, not rows — handled by their own arms.
+        Overlay::Transcript { scroll, .. } | Overlay::Panel { scroll, .. } => (scroll, usize::MAX),
     }
 }
 
@@ -2169,6 +2217,111 @@ impl App {
                 )));
                 out
             }
+            Overlay::Panel { tab, scroll } => {
+                let mut out = Vec::new();
+                let mut strip = vec![Span::styled(" panel ", theme::meta())];
+                for (i, name) in PANEL_TABS.iter().enumerate() {
+                    let st = if i == *tab {
+                        theme::dialog_sel()
+                    } else {
+                        theme::dim()
+                    };
+                    strip.push(Span::styled(format!(" {name} "), st));
+                }
+                out.push(Line::from(strip));
+                let rows = self.panel_rows(*tab);
+                // The scroll offset can't see the row count — clamp here.
+                let start = (*scroll).min(rows.len().saturating_sub(1));
+                out.extend(rows.into_iter().skip(start).take(10));
+                out.push(Line::from(Span::styled(
+                    "←/→/tab switch · ↑/↓ scroll · esc close",
+                    theme::dim(),
+                )));
+                out
+            }
+        }
+    }
+
+    /// One `label  value` row list per panel tab — read-only v1.
+    fn panel_rows(&self, tab: usize) -> Vec<Line<'static>> {
+        use crate::theme;
+        let kv = |k: &str, v: String| {
+            Line::from(vec![
+                Span::styled(format!("  {k:<12}"), theme::dim()),
+                Span::styled(v, theme::dialog()),
+            ])
+        };
+        match tab {
+            0 => {
+                let state = match &self.run {
+                    RunState::Running { started, phase, .. } => format!(
+                        "running — {phase} · {}s · {} queued",
+                        started.elapsed().as_secs(),
+                        self.pending_queue.len()
+                    ),
+                    RunState::Idle if !self.pending_queue.is_empty() => {
+                        format!("idle · {} queued", self.pending_queue.len())
+                    }
+                    RunState::Idle => "idle".to_string(),
+                };
+                vec![
+                    kv(
+                        "session",
+                        self.session_dir
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| self.session_dir.display().to_string()),
+                    ),
+                    kv("cwd", self.cwd.clone()),
+                    kv("model", self.model.clone()),
+                    kv(
+                        "mode",
+                        crate::widgets::preset_badge(self.preset)
+                            .0
+                            .trim()
+                            .to_string(),
+                    ),
+                    kv("state", state),
+                    kv("tokens", self.tokens.to_string()),
+                    kv("cost", format!("${:.4}", self.cost)),
+                    kv("transcript", format!("{} cells", self.history.len())),
+                ]
+            }
+            1 => vec![
+                kv(
+                    "theme",
+                    std::env::var("OVERSEER_THEME").unwrap_or_else(|_| "auto".into()),
+                ),
+                kv(
+                    "osc",
+                    if self.osc {
+                        "on — links · clipboard · marks"
+                    } else {
+                        "off"
+                    }
+                    .to_string(),
+                ),
+                kv(
+                    "motion",
+                    if self.reduce_motion {
+                        "reduced"
+                    } else {
+                        "animated"
+                    }
+                    .to_string(),
+                ),
+                kv(
+                    "surface",
+                    match self.mode {
+                        UiMode::Full => "full-window",
+                        UiMode::Inline => "inline",
+                    }
+                    .to_string(),
+                ),
+                kv("session dir", self.session_dir.display().to_string()),
+                kv("rules", "~/.overseer/rules".to_string()),
+            ],
+            _ => crate::widgets::help_panel(),
         }
     }
 }
