@@ -58,6 +58,16 @@ function spanCss(s) {
 
 const esc = t => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+// Whole-grid vertical nudge inside the window (tuning pass).
+const TOP_OFF = -9.5;
+// Prompt rows sit a further 8px low — visual breathing room above
+// the (now chromeless) footer row.
+const PROMPT_OFF = 8;
+
+const divider = document.createElement('div');
+divider.id = 'divider';
+screen.appendChild(divider);
+
 // ── frame rendering ────────────────────────────────────────────────
 const rowEls = [];
 const rowCache = [];
@@ -74,18 +84,24 @@ function render(f) {
   }
   for (let y = 0; y < f.h; y++) {
     const row = f.rows[y];
+    const el = rowEls[y];
+    const inPrompt = y >= f.h - 3 && y <= f.h - 2;
+    // Always reposition — resize shifts which band a row belongs to
+    // even when its content is identical.
+    el.style.top = (y * LH + TOP_OFF + (inPrompt ? PROMPT_OFF : 0)) + 'px';
     const key = JSON.stringify(row);
     if (rowCache[y] === key) continue;
     rowCache[y] = key;
-    const el = rowEls[y];
-    el.style.top = (y * LH) + 'px';
     el.style.height = LH + 'px';
     let html = '';
     for (const s of row) html += '<span style="' + spanCss(s) + '">' + esc(s.t) + '</span>';
     el.innerHTML = html;
   }
+  // 1px separator 3px above the prompt arrow, inset 3px each side.
+  divider.style.top = ((f.h - 3) * LH + TOP_OFF + PROMPT_OFF - 4) + 'px';
   cursor.style.left = (f.cur[0] * CH) + 'px';
-  cursor.style.top = (f.cur[1] * LH) + 'px';
+  const curInPrompt = f.cur[1] >= f.h - 3 && f.cur[1] <= f.h - 2;
+  cursor.style.top = (f.cur[1] * LH + TOP_OFF + (curInPrompt ? PROMPT_OFF : 0)) + 'px';
   cursor.style.width = CH + 'px';
   cursor.style.height = LH + 'px';
 }
@@ -95,8 +111,9 @@ let es;
 const post = o => fetch('/input', { method: 'POST', body: JSON.stringify(o) });
 
 function fit() {
-  const cols = Math.max(40, Math.floor((innerWidth * 0.94) / CH));
-  const rows = Math.max(10, Math.floor((innerHeight * 0.88 - 30) / LH));
+  // Fill the viewport: 10px page margin either side, 30px title bar.
+  const cols = Math.max(40, Math.floor((innerWidth - 20) / CH));
+  const rows = Math.max(10, Math.floor((innerHeight - 30 - 20) / LH));
   post({ type: 'resize', cols, rows });
 }
 
@@ -104,6 +121,10 @@ function connect() {
   es = new EventSource('/events');
   es.onmessage = e => render(JSON.parse(e.data));
   fit();
+  // Re-fit once layout/fonts settle — first measure can run before
+  // the preview iframe reaches its final size.
+  requestAnimationFrame(fit);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(fit);
 }
 
 // ── input ──────────────────────────────────────────────────────────

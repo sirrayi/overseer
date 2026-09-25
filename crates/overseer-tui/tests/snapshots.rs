@@ -736,9 +736,10 @@ fn full_layout_transcript_prompt_footer() {
     // The last row is the footer; the prompt's ❯ sits in the 2-row
     // window directly above it.
     let rows: Vec<&str> = s.trim_end_matches('\n').split('\n').collect();
-    assert_eq!(rows.len(), 20);
-    assert!(rows[19].contains("workspace"), "footer row: {}", rows[19]);
-    assert!(rows[17].contains('❯'), "prompt row: {}", rows[17]);
+    // Chromeless footer: the empty footer row is trimmed from the
+    // dump entirely — the prompt's ❯ is the last visible row.
+    let last = rows.last().unwrap();
+    assert!(last.contains('❯'), "last row is the prompt: {last}");
 }
 
 #[test]

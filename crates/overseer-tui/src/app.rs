@@ -1640,23 +1640,22 @@ impl App {
         let end = self.tbuf.len().saturating_sub(scroll);
         let start = end.saturating_sub(tbuf_visible);
 
-        // Footer: preset badge left, `↑N` right — dir/model/cost are
-        // deliberately off this surface (UI pass); the marker stays
-        // because it's functional, not decoration.
+        // Footer: nothing but the functional `↑N` scroll marker —
+        // badge/dir/model/cost are all off this surface (UI pass).
         let marker = if scroll > 0 {
             format!(" ↑{scroll}")
         } else {
             String::new()
         };
-        let (label, badge) = widgets::preset_badge(self.preset);
-        let mut status = Line::from(vec![Span::styled(label, badge)]);
-        if !marker.is_empty() {
-            let pad = (width as usize)
-                .saturating_sub(label.len() + marker.len())
-                .max(1);
-            status.spans.push(Span::raw(" ".repeat(pad)));
-            status.spans.push(Span::styled(marker, crate::theme::dim()));
-        }
+        let status = if marker.is_empty() {
+            Line::default()
+        } else {
+            let pad = (width as usize).saturating_sub(marker.len()).max(1);
+            Line::from(vec![
+                Span::raw(" ".repeat(pad)),
+                Span::styled(marker, crate::theme::dim()),
+            ])
+        };
         // Bottom-anchored: blank rows precede a short transcript.
         let mut region: Vec<Line<'static>> =
             vec![Line::default(); tbuf_visible.saturating_sub(end - start)];

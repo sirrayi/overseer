@@ -64,6 +64,15 @@ html, body {
   pointer-events: none;
 }
 
+#divider {
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  height: 1px;
+  background: rgba(255,255,255,.14);
+  pointer-events: none;
+}
+
 #bye {
   position: fixed;
   inset: 0;

@@ -69,7 +69,7 @@ impl Theme {
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
             code: Style::new().fg(Color::Green),
-            prompt: Style::new().fg(Color::Green),
+            prompt: Style::new().fg(Color::Rgb(255, 255, 255)),
             link: Style::new()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::UNDERLINED),
