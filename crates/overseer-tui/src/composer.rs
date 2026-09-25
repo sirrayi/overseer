@@ -447,7 +447,7 @@ impl Composer {
                 match e {
                     Elem::Text(g) => {
                         col_px += UnicodeWidthStr::width(g.as_str());
-                        spans.push(Span::raw(g.clone()));
+                        spans.push(Span::styled(g.clone(), theme::prompt()));
                     }
                     Elem::Chip(id) => {
                         let label = format!("[Pasted #{id}]");
