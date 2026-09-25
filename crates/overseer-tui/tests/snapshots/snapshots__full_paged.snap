@@ -1,5 +1,6 @@
 ---
 source: crates/overseer-tui/tests/snapshots.rs
+assertion_line: 768
 expression: s
 ---
 ❯ prompt 0
@@ -21,4 +22,4 @@ answer 3 line c
 ❯ prompt 4
 ❯
 
-                                                       ↑15
+                                                      ↑15

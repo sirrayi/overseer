@@ -1821,7 +1821,7 @@ impl App {
         let status = if marker.is_empty() {
             Line::default()
         } else {
-            let pad = (width as usize).saturating_sub(marker.len()).max(1);
+            let pad = (width as usize).saturating_sub(marker.len() + 1).max(1);
             Line::from(vec![
                 Span::raw(" ".repeat(pad)),
                 Span::styled(marker, crate::theme::dim()),
@@ -2427,7 +2427,9 @@ impl App {
             used += name.len() + 2;
         }
         let hint = "↑/↓ · ←/→ · esc";
-        let pad = (width as usize).saturating_sub(used + hint.chars().count());
+        // 1-col right margin — flush-to-edge reads as clipped at the
+        // window border, same reason the divider insets 3px.
+        let pad = (width as usize).saturating_sub(used + hint.chars().count() + 1);
         strip.push(Span::raw(" ".repeat(pad)));
         strip.push(Span::styled(hint.to_string(), theme::dim()));
         let mut out = vec![Line::from(strip)];
