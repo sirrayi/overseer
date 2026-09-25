@@ -53,6 +53,16 @@ pub enum WorkerCmd {
     Shutdown,
 }
 
+/// Which surface the app renders on. `Inline` is the scrollback-
+/// preserving live strip (`Viewport::Inline` + `insert_before`);
+/// `Full` owns the entire window on the alternate screen — transcript
+/// above, a 2-row prompt, then the footer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UiMode {
+    Inline,
+    Full,
+}
+
 enum RunState {
     Idle,
     Running {
@@ -129,8 +139,23 @@ pub struct App {
     engine_rx: mpsc::Receiver<EngineMsg>,
     worker_tx: mpsc::Sender<WorkerCmd>,
     run: RunState,
-    /// Completed cells awaiting `insert_before`.
+    /// Render surface — `run` sets Full, `run_inline` keeps Inline.
+    pub mode: UiMode,
+    /// Completed cells awaiting `insert_before` (Inline) or `tbuf`
+    /// append (Full).
     pending: Vec<Cell>,
+    /// Flattened transcript lines (Full only) — rendered from
+    /// `history` cells at `tbuf_w`; rebuilt on resize.
+    tbuf: Vec<Line<'static>>,
+    /// Width `tbuf` was rendered at — a resize mismatch triggers a
+    /// rebuild from `history`.
+    tbuf_w: u16,
+    /// Full mode: lines scrolled up from the transcript tail (0 =
+    /// follow). Applies to `tbuf` only — the live stack stays pinned.
+    scroll: usize,
+    /// Transcript region height from the last full draw — PageUp/Down
+    /// step size.
+    view_h: u16,
     /// In-flight tool cells (call_id order) rendered in the live region.
     live: Vec<Cell>,
     /// Steers that missed delivery (run ended first) — drain on idle.
@@ -183,7 +208,12 @@ impl App {
             engine_rx,
             worker_tx,
             run: RunState::Idle,
+            mode: UiMode::Inline,
             pending: Vec::new(),
+            tbuf: Vec::new(),
+            tbuf_w: 0,
+            scroll: 0,
+            view_h: 0,
             live: Vec::new(),
             pending_queue: Vec::new(),
             composer: Composer::new(),
@@ -214,6 +244,35 @@ impl App {
 
     fn running(&self) -> bool {
         matches!(self.run, RunState::Running { .. })
+    }
+
+    pub fn full(&self) -> bool {
+        self.mode == UiMode::Full
+    }
+
+    /// `tbuf` lines at `width`, rebuilding from `history` when the
+    /// width changed (resize) or on first fill.
+    fn tbuf_at(&mut self, width: u16) {
+        if self.tbuf_w != width {
+            self.tbuf = self.history.iter().flat_map(|c| c.lines(width)).collect();
+            self.tbuf_w = width;
+        }
+    }
+
+    /// Plain-text transcript for the exit handoff — Full mode leaves
+    /// the alternate screen, so the session's record is printed into
+    /// native scrollback on the way out (styled lines can't leave the
+    /// buffer; links/marks are an Inline-stream feature).
+    pub fn transcript_plain(&self) -> String {
+        let mut out = String::new();
+        for c in &self.history {
+            let p = c.plain();
+            if !p.is_empty() {
+                out.push_str(&p);
+                out.push('\n');
+            }
+        }
+        out
     }
 
     /// Feed one replayed event into the transcript (resume seeding).
@@ -439,6 +498,8 @@ impl App {
         self.session_dir = dir.clone();
         self.live.clear();
         self.history.clear();
+        self.tbuf.clear();
+        self.scroll = 0;
         self.tokens = 0;
         self.file_index = std::cell::OnceCell::new();
         let name = dir
@@ -503,6 +564,20 @@ impl App {
             CtEvent::Paste(text) => {
                 self.composer.paste(&text);
                 self.dirty = true;
+            }
+            CtEvent::Mouse(m) if self.full() => {
+                use crossterm::event::MouseEventKind;
+                match m.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.scroll = self.scroll.saturating_add(3);
+                        self.dirty = true;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.scroll = self.scroll.saturating_sub(3);
+                        self.dirty = true;
+                    }
+                    _ => {}
+                }
             }
             CtEvent::FocusGained => self.focused = true,
             CtEvent::FocusLost => self.focused = false,
@@ -619,6 +694,15 @@ impl App {
             }
             (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => self.composer.stash(),
             (KeyCode::Char('_'), m) if m.contains(KeyModifiers::CONTROL) => self.composer.undo(),
+            // Full mode: the transcript scrolls inside the window —
+            // PageUp/Down (and the wheel, in poll_input) walk `tbuf`
+            // while the live stack stays pinned to the region bottom.
+            (KeyCode::PageUp, _) if self.full() => {
+                self.scroll = self.scroll.saturating_add(self.view_h.max(1) as usize);
+            }
+            (KeyCode::PageDown, _) if self.full() => {
+                self.scroll = self.scroll.saturating_sub(self.view_h.max(1) as usize);
+            }
             (KeyCode::Char('k'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.composer.kill_to_eol()
             }
@@ -1230,6 +1314,7 @@ impl App {
     }
 
     fn on_submit(&mut self, text: String) {
+        self.dirty = true; // submits outside on_key (tests, /approve) still repaint
         if let Some(cmd) = text.strip_prefix('/') {
             self.slash(cmd.trim());
             return;
@@ -1238,6 +1323,7 @@ impl App {
             self.run_shell(cmd.trim());
             return;
         }
+        self.scroll = 0; // submitting snaps the transcript to the tail
         match &self.run {
             RunState::Running { control, .. } => {
                 // Mid-run input steers at the next tool-launch boundary.
@@ -1279,7 +1365,9 @@ impl App {
 
     // ── rendering ────────────────────────────────────────────────────
 
-    /// Flush completed cells into native scrollback.
+    /// Flush completed cells — Inline emits them to native scrollback
+    /// via `insert_before`; Full appends their rendered lines to `tbuf`
+    /// (the transcript lives inside the managed window there).
     fn flush_cells<B: ratatui::backend::Backend>(
         &mut self,
         term: &mut Terminal<B>,
@@ -1296,6 +1384,18 @@ impl App {
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .width
             .max(1);
+        if self.full() {
+            self.tbuf_at(width);
+            for cell in std::mem::take(&mut self.pending) {
+                self.tbuf.extend(cell.lines(width));
+                self.history.push(cell);
+            }
+            // DEFERRED(tui): OSC 8 link lines + OSC 133 prompt/output
+            // marks can't ride a ratatui buffer — the transcript
+            // overlay covers navigation; exit handoff is plain text.
+            self.dirty = true;
+            return Ok(());
+        }
         for cell in std::mem::take(&mut self.pending) {
             self.history.push(cell.clone());
             let lines = cell.lines(width);
@@ -1474,6 +1574,9 @@ impl App {
     where
         B::Error: std::fmt::Display,
     {
+        if self.full() {
+            return self.draw_full(term, caps);
+        }
         let width = term
             .size()
             .map_err(|e| std::io::Error::other(e.to_string()))?
@@ -1510,9 +1613,111 @@ impl App {
         self.dirty = false;
         Ok(())
     }
-}
 
-/// (selection index, last valid index) for the open overlay.
+    /// Full-window frame: the transcript owns every row except the
+    /// bottom three — a 2-row prompt window hanging directly above the
+    /// 1-row footer.
+    ///
+    /// Inside the transcript region the committed `tbuf` scrolls
+    /// (`scroll` = lines up from its tail) while the live stack —
+    /// running tools, dialog, overlay, queue, indicator, toast — stays
+    /// pinned to the region's bottom rows, so a permission ask is
+    /// visible even mid-scroll.
+    ///
+    /// DEFERRED(tui): `tbuf` rebuilds whole-cell →lines on resize and
+    /// the frame slices a shared Vec — O(transcript) per frame.
+    /// Cell-granularity caching belongs with an incremental renderer.
+    fn draw_full<B: ratatui::backend::Backend>(
+        &mut self,
+        term: &mut Terminal<B>,
+        caps: &Caps,
+    ) -> std::io::Result<()>
+    where
+        B::Error: std::fmt::Display,
+    {
+        let size = term
+            .size()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let width = size.width.max(1);
+        self.tbuf_at(width);
+        let (composer_lines, (cx, cy)) = self.composer.render(width);
+        let live = self.live_lines(width);
+
+        // 2 prompt rows + 1 footer row are pinned at the bottom; the
+        // transcript gets the rest. The live stack renders last inside
+        // the transcript region (pinned) — overlays and the permission
+        // dialog therefore never hide above the fold.
+        let t_rows = size.height.saturating_sub(3) as usize;
+        self.view_h = t_rows as u16;
+        let live_shown = live.len().min(t_rows);
+        let tbuf_visible = t_rows.saturating_sub(live_shown);
+        // Dialogs/overlays force-follow the tail: they own the region.
+        let pin = self.dialog.is_some() || self.overlay.is_some();
+        let max_scroll = self.tbuf.len().saturating_sub(tbuf_visible);
+        let scroll = if pin { 0 } else { self.scroll.min(max_scroll) };
+        self.scroll = scroll; // clamped value stays honest for ↑N
+        let end = self.tbuf.len().saturating_sub(scroll);
+        let start = end.saturating_sub(tbuf_visible);
+
+        // The scroll marker is part of the right edge — reserve its
+        // cells before status_line pads, or it lands past the clip.
+        let marker = if scroll > 0 {
+            format!(" ↑{scroll}")
+        } else {
+            String::new()
+        };
+        let mut status = widgets::status_line(
+            self.preset,
+            &self.cwd,
+            &self.model,
+            self.cost,
+            width.saturating_sub(marker.len() as u16).max(1),
+        );
+        if !marker.is_empty() {
+            status.spans.push(Span::styled(marker, crate::theme::dim()));
+        }
+        // Bottom-anchored: blank rows precede a short transcript.
+        let mut region: Vec<Line<'static>> =
+            vec![Line::default(); tbuf_visible.saturating_sub(end - start)];
+        region.extend(self.tbuf[start..end].iter().cloned());
+        region.extend(live[live.len() - live_shown..].iter().cloned());
+
+        // Composer clipped to 2 rows with the cursor kept visible.
+        let c_rows = composer_lines.len().clamp(1, 2);
+        let c_top = (cy as usize)
+            .saturating_sub(c_rows - 1)
+            .min(composer_lines.len() - 1);
+        let cy_screen = (cy as usize).saturating_sub(c_top) as u16;
+
+        sync_wrap(caps, || {
+            term.draw(|f| {
+                let area = f.area();
+                let transcript = ratatui::layout::Rect {
+                    height: area.height.saturating_sub(3),
+                    ..area
+                };
+                let prompt = ratatui::layout::Rect {
+                    y: area.y + area.height.saturating_sub(3),
+                    height: 2.min(area.height),
+                    ..area
+                };
+                let footer = ratatui::layout::Rect {
+                    y: area.y + area.height.saturating_sub(1),
+                    height: 1,
+                    ..area
+                };
+                f.render_widget(Paragraph::new(region), transcript);
+                f.render_widget(Paragraph::new(composer_lines[c_top..].to_vec()), prompt);
+                f.render_widget(Paragraph::new(vec![status.clone()]), footer);
+                f.set_cursor_position((area.x + cx, prompt.y + cy_screen));
+            })
+            .map(|_| ())
+            .map_err(|e: B::Error| std::io::Error::other(e.to_string()))
+        })?;
+        self.dirty = false;
+        Ok(())
+    }
+}
 fn overlay_sel(o: &mut Overlay) -> (&mut usize, usize) {
     match o {
         Overlay::Sessions {

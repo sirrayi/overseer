@@ -1,6 +1,6 @@
 ---
 source: crates/overseer-tui/tests/snapshots.rs
-expression: screen(&term)
+expression: s
 ---
 
 
@@ -12,7 +12,13 @@ expression: screen(&term)
 
 
 
-  queued[0] also rename the helper
-⠹ working  0s  0 tok  (esc to interrupt)
+
+
+
+
+
+❯ fix the flaky test
+Looking at the test now.
 ❯
+
  workspace  /repo                        test-model · $0.000

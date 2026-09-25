@@ -75,9 +75,16 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   time; an unavailable runtime fails the call rather than downgrading).
 - `crates/overseer-proto` — wire protocol types (request/notification)
 - `crates/overseer-tui` — ratatui/crossterm TUI (library). Agent runs on a
-  worker thread; UI renders `Event`s over a channel. Fixed-height
-  `Viewport::Inline` region (ratatui inline height is init-only) +
-  `insert_before` for scrollback handoff; DECRQM/XTVERSION probe; BSU/ESU
+  worker thread; UI renders `Event`s over a channel. Two surfaces share
+  one `App` state machine (`app.rs`, `UiMode`): `run` (the default)
+  owns the whole window on the alternate screen — transcript
+  region over a 2-row prompt over a 1-row footer, `tbuf` line buffer
+  with PageUp/PageDn/wheel scroll and a `↑N` footer marker, live stack
+  (dialog/overlay/queue/indicator) pinned to the region bottom, and a
+  plain-text transcript handoff into scrollback on exit. `run_inline`
+  (`--inline`) keeps the old contract: fixed-height `Viewport::Inline`
+  region (ratatui inline height is init-only) + `insert_before` for
+  scrollback handoff. DECRQM/XTVERSION probe; BSU/ESU
   frame batching when sync output probes positive. `Control` =
   interrupt + steer queue (checked at tool-launch boundaries only —
   skipped calls get synthetic results so tool pairing survives);

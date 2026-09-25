@@ -77,9 +77,15 @@ fn real_main() -> i32 {
 /// `exec` (minus --json and the positional prompt).
 fn cmd_tui(args: &[String]) -> i32 {
     // --no-tui: line mode — same session plumbing, plain-text REPL
-    // (screen readers, terminals the inline viewport can't drive).
+    // (screen readers, terminals a managed surface can't drive).
+    // --inline: the scrollback-preserving live-strip surface.
     let line_mode = args.iter().any(|a| a == "--no-tui");
-    let args: Vec<String> = args.iter().filter(|a| *a != "--no-tui").cloned().collect();
+    let inline = args.iter().any(|a| a == "--inline");
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| *a != "--no-tui" && *a != "--inline")
+        .cloned()
+        .collect();
     let flags = match parse_exec(&args) {
         Ok(f) => f,
         Err(e) => {
@@ -113,6 +119,8 @@ fn cmd_tui(args: &[String]) -> i32 {
     };
     match if line_mode {
         overseer_tui::run_line(cfg)
+    } else if inline {
+        overseer_tui::run_inline(cfg)
     } else {
         overseer_tui::run(cfg)
     } {
@@ -760,6 +768,7 @@ fn usage() {
          \n\
          USAGE:\n\
          \x20 overseer [tui] [FLAGS]          interactive TUI (bare `overseer`)\n\
+         \x20 overseer tui --inline           live-strip surface (native scrollback)\n\
          \x20 overseer tui --no-tui           line mode (screen readers, plain REPL)\n\
          \x20 overseer exec [FLAGS] <prompt>\n\
          \x20 overseer stats <session-dir>   ledger dashboard (tokens, cache-hit, cost)\n\

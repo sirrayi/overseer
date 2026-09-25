@@ -687,3 +687,121 @@ fn at_mention_completes_paths() {
     insta::assert_snapshot!("at_completed", norm(&term));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── full-window surface: transcript + 2-row prompt + 1-row footer ──
+
+fn full_harness() -> (
+    App,
+    mpsc::Sender<EngineMsg>,
+    mpsc::Receiver<WorkerCmd>,
+    Terminal<TestBackend>,
+    Caps,
+) {
+    let (etx, erx) = mpsc::channel();
+    let (wtx, wrx) = mpsc::channel();
+    let mut app = App::new(
+        erx,
+        wtx,
+        Preset::WorkspaceWrite,
+        "/repo".into(),
+        "test-model".into(),
+        PathBuf::from("/tmp/session"),
+    );
+    app.mode = overseer_tui::app::UiMode::Full;
+    let term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    (app, etx, wrx, term, Caps::default())
+}
+
+#[test]
+fn full_layout_transcript_prompt_footer() {
+    let (mut app, etx, _w, mut term, caps) = full_harness();
+    etx.send(EngineMsg::Event(ev(EventKind::UserInput {
+        text: "fix the flaky test".into(),
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(model_response("Looking at the test now.")))
+        .unwrap();
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    insta::assert_snapshot!("full_layout", s);
+    // The last row is the footer; the prompt's ❯ sits in the 2-row
+    // window directly above it.
+    let rows: Vec<&str> = s.trim_end_matches('\n').split('\n').collect();
+    assert_eq!(rows.len(), 20);
+    assert!(rows[19].contains("workspace"), "footer row: {}", rows[19]);
+    assert!(rows[17].contains('❯'), "prompt row: {}", rows[17]);
+}
+
+#[test]
+fn full_transcript_pages_up_with_footer_marker() {
+    let (mut app, etx, _w, mut term, caps) = full_harness();
+    // Overflow the transcript region (17 rows) so paging is real.
+    for i in 0..8 {
+        etx.send(EngineMsg::Event(ev(EventKind::UserInput {
+            text: format!("prompt {i}"),
+        })))
+        .unwrap();
+        etx.send(EngineMsg::Event(model_response(&format!(
+            "answer {i} line a\nanswer {i} line b\nanswer {i} line c"
+        ))))
+        .unwrap();
+    }
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("answer 7"), "tail follows by default:\n{s}");
+
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::PageUp,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    insta::assert_snapshot!("full_paged", s);
+    assert!(s.contains('↑'), "footer scroll marker:\n{s}");
+    assert!(
+        !s.contains("answer 7"),
+        "paged view should hide the tail:\n{s}"
+    );
+
+    // Submitting snaps back to the tail.
+    app.submit_text("next task");
+    app.step(&mut term, &caps).unwrap();
+    assert!(!screen(&term).contains('↑'), "submit resets scroll");
+}
+
+#[test]
+fn full_dialog_pins_over_transcript() {
+    let (mut app, etx, _w, mut term, caps) = full_harness();
+    // Scroll up, then open a permission dialog — it pins at the bottom.
+    for i in 0..8 {
+        etx.send(EngineMsg::Event(ev(EventKind::UserInput {
+            text: format!("p{i}"),
+        })))
+        .unwrap();
+        etx.send(EngineMsg::Event(model_response(&format!(
+            "r{i}a\nr{i}b\nr{i}c"
+        ))))
+        .unwrap();
+    }
+    app.step(&mut term, &caps).unwrap();
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::PageUp,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    assert!(screen(&term).contains('↑'), "scrolled");
+
+    let (rtx, _rrx) = mpsc::channel();
+    etx.send(EngineMsg::Ask(
+        AskRequest {
+            tool: "bash".into(),
+            input: serde_json::json!({"command": "rm -rf /tmp/x"}),
+            reason: "destructive".into(),
+        },
+        rtx,
+    ))
+    .unwrap();
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("permission"), "dialog visible:\n{s}");
+    assert!(s.contains("rm -rf /tmp/x"), "typed preview:\n{s}");
+    assert!(!s.contains('↑'), "dialog force-follows the tail:\n{s}");
+}
