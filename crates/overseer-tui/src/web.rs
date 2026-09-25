@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{
-    Event as CtEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+    Event as CtEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::backend::{Backend, TestBackend};
 use ratatui::layout::Rect;
@@ -90,7 +90,7 @@ pub fn run_web(cfg: TuiConfig, port: u16) -> std::io::Result<i32> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         app.step(&mut term, &caps)?;
-        let frame = frame_json(&mut term);
+        let frame = frame_json(&mut term, app.prompt_top);
         let h = fnv(frame.as_bytes());
         if h != last_hash {
             last_hash = h;
@@ -118,10 +118,11 @@ fn fnv(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Serialize the terminal buffer as `{w,h,cur,rows:[ [span] ]}` where a
-/// span is `{t,f,b,m}` — text, css fg, css bg, modifier bits. Blank
-/// trailing cells are trimmed per row; the browser pads implicitly.
-fn frame_json(term: &mut Terminal<TestBackend>) -> String {
+/// Serialize the terminal buffer as `{w,h,p,cur,rows:[ [span] ]}` where
+/// a span is `{t,f,b,m}` — text, css fg, css bg, modifier bits. `p` is
+/// the prompt band's first row (the client shifts it for its dip).
+/// Blank trailing cells are trimmed per row; the browser pads.
+fn frame_json(term: &mut Terminal<TestBackend>, prompt_top: u16) -> String {
     let backend = term.backend_mut();
     let pos = backend
         .get_cursor_position()
@@ -133,7 +134,7 @@ fn frame_json(term: &mut Terminal<TestBackend>) -> String {
         height: h,
         ..
     } = buf.area;
-    let mut out = format!("{{\"w\":{w},\"h\":{h},");
+    let mut out = format!("{{\"w\":{w},\"h\":{h},\"p\":{prompt_top},");
     out.push_str(&format!("\"cur\":[{},{}],\"rows\":[", pos.0, pos.1));
     for (y, row) in buf.content.chunks(w as usize).enumerate() {
         if y > 0 {
@@ -399,6 +400,14 @@ fn parse_input(body: &[u8]) -> Option<CtEvent> {
             KeyCode::F(1),
             KeyModifiers::NONE,
         ))),
+        // A left click in the grid — row/col land on the same hit
+        // regions the terminal's mouse events use.
+        "click" => Some(CtEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: get("col")?.as_u64()? as u16,
+            row: get("row")?.as_u64()? as u16,
+            modifiers: KeyModifiers::empty(),
+        })),
         "paste" => Some(CtEvent::Paste(get("text")?.as_str()?.to_string())),
         "scroll" => Some(CtEvent::Mouse(MouseEvent {
             kind: if get("up").and_then(|b| b.as_bool()).unwrap_or(false) {

@@ -1,0 +1,23 @@
+---
+source: crates/overseer-tui/tests/snapshots.rs
+expression: s
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+❯
+
+ panel  dashboard  settings  keys            ↑/↓ · ←/→ · esc
+  session     session
+  cwd         /repo

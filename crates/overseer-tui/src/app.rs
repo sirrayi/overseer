@@ -203,6 +203,16 @@ pub struct App {
     /// Engine channel hit the per-frame drain cap — zero-wait polling
     /// until cleared so input echo stays under 50 ms during bursts.
     backlogged: bool,
+    /// Full mode: the control panel's bottom band (absolute rows) —
+    /// the click hit-test reads it. None when the panel is closed.
+    panel_band: Option<ratatui::layout::Rect>,
+    /// Full mode: the rendered overlay block's first absolute row +
+    /// shown line count + lines clipped off its top — click→row map.
+    overlay_block: Option<(u16, usize, usize)>,
+    /// Full mode: the prompt band's first grid row — the web frame
+    /// carries it (`"p"`) so the client can seat the prompt dip and
+    /// divider regardless of what sits below.
+    pub prompt_top: u16,
     pub quit: bool,
 }
 
@@ -249,6 +259,9 @@ impl App {
             tick: 0,
             dirty: true,
             backlogged: false,
+            panel_band: None,
+            overlay_block: None,
+            prompt_top: 0,
             quit: false,
         }
     }
@@ -593,18 +606,34 @@ impl App {
                 self.dirty = true;
             }
             CtEvent::Mouse(m) if self.full() => {
-                use crossterm::event::MouseEventKind;
+                use crossterm::event::{MouseButton, MouseEventKind};
+                let in_band = self
+                    .panel_band
+                    .map(|r| m.row >= r.y && m.row < r.y + r.height)
+                    .unwrap_or(false);
                 match m.kind {
+                    // Wheel over the panel band scrolls the panel's
+                    // rows; anywhere else scrolls the transcript.
+                    MouseEventKind::ScrollUp if in_band => {
+                        if let Some(Overlay::Panel { scroll, .. }) = &mut self.overlay {
+                            *scroll = scroll.saturating_sub(1);
+                        }
+                    }
+                    MouseEventKind::ScrollDown if in_band => {
+                        if let Some(Overlay::Panel { scroll, .. }) = &mut self.overlay {
+                            *scroll = scroll.saturating_add(1);
+                        }
+                    }
                     MouseEventKind::ScrollUp => {
                         self.scroll = self.scroll.saturating_add(3);
-                        self.dirty = true;
                     }
                     MouseEventKind::ScrollDown => {
                         self.scroll = self.scroll.saturating_sub(3);
-                        self.dirty = true;
                     }
+                    MouseEventKind::Down(MouseButton::Left) => self.on_click(m.column, m.row),
                     _ => {}
                 }
+                self.dirty = true;
             }
             CtEvent::FocusGained => self.focused = true,
             CtEvent::FocusLost => self.focused = false,
@@ -906,6 +935,96 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Mouse hit-test against the rects `draw_full` recorded. Panel
+    /// strip: click a tab to switch. List overlays: click selects the
+    /// row, clicking the selected row confirms (double-click shape).
+    fn on_click(&mut self, col: u16, row: u16) {
+        if let Some(r) = self.panel_band {
+            if row >= r.y && row < r.y + r.height {
+                if row == r.y {
+                    // Strip layout: " panel " (7 cols) + " name " per tab.
+                    let mut x = 7u16;
+                    for (i, name) in PANEL_TABS.iter().enumerate() {
+                        let w = name.len() as u16 + 2;
+                        if col >= x && col < x + w {
+                            if let Some(Overlay::Panel { tab, scroll }) = &mut self.overlay {
+                                *tab = i;
+                                *scroll = 0;
+                            }
+                            break;
+                        }
+                        x += w;
+                    }
+                }
+                return;
+            }
+        }
+        if let Some((top, len, clip)) = self.overlay_block {
+            if row >= top && row < top + len as u16 {
+                let li = (row - top) as usize + clip;
+                // Sessions/Transcript lead with a filter line — clicks
+                // there don't select a row.
+                let header = match &self.overlay {
+                    Some(Overlay::Sessions { .. }) | Some(Overlay::Transcript { .. }) => 1,
+                    _ => 0,
+                };
+                if li < header {
+                    return;
+                }
+                let idx = li - header;
+                let mut confirm = false;
+                match &mut self.overlay {
+                    Some(Overlay::Sessions {
+                        rows, sel, filter, ..
+                    }) => {
+                        let cap = filtered_sessions(rows, filter).len().min(6);
+                        if idx < cap {
+                            if *sel == idx {
+                                confirm = true;
+                            } else {
+                                *sel = idx;
+                            }
+                        }
+                    }
+                    Some(Overlay::Tree { rows, sel }) => {
+                        let cap = rows.len().min(6);
+                        if idx < cap {
+                            if *sel == idx {
+                                confirm = true;
+                            } else {
+                                *sel = idx;
+                            }
+                        }
+                    }
+                    Some(Overlay::Rewind { rows, sel }) => {
+                        let cap = rows.len().min(6);
+                        if idx < cap {
+                            if *sel == idx {
+                                confirm = true;
+                            } else {
+                                *sel = idx;
+                            }
+                        }
+                    }
+                    Some(Overlay::Diff { rows, sel, .. }) => {
+                        let cap = rows.len().min(4);
+                        if idx < cap {
+                            if *sel == idx {
+                                confirm = true;
+                            } else {
+                                *sel = idx;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if confirm {
+                    self.overlay_confirm();
+                }
+            }
         }
     }
 
@@ -1530,7 +1649,11 @@ impl App {
         // (the engine is blocked on that answer).
         if self.dialog.is_none() {
             if let Some(o) = &self.overlay {
-                out.extend(self.overlay_lines(o, width));
+                // Full mode gives Panel its own bottom band — rendering
+                // it here would double it inside the transcript region.
+                if !(self.full() && matches!(o, Overlay::Panel { .. })) {
+                    out.extend(self.overlay_lines(o, width));
+                }
                 if let Some((text, _)) = &self.toast {
                     out.push(Line::from(Span::styled(
                         format!("◆ {text}"),
@@ -1671,8 +1794,12 @@ impl App {
         // 2 prompt rows + 1 footer row are pinned at the bottom; the
         // transcript gets the rest. The live stack renders last inside
         // the transcript region (pinned) — overlays and the permission
-        // dialog therefore never hide above the fold.
-        let t_rows = size.height.saturating_sub(3) as usize;
+        // dialog therefore never hide above the fold. An open control
+        // panel takes a further 3-row band under the prompt (~54px),
+        // which slides the whole window up.
+        let panel_open = matches!(self.overlay, Some(Overlay::Panel { .. }));
+        let panel_h: u16 = if panel_open { 3 } else { 0 };
+        let t_rows = size.height.saturating_sub(3 + panel_h) as usize;
         self.view_h = t_rows as u16;
         let live_shown = live.len().min(t_rows);
         let tbuf_visible = t_rows.saturating_sub(live_shown);
@@ -1713,16 +1840,53 @@ impl App {
             .min(composer_lines.len() - 1);
         let cy_screen = (cy as usize).saturating_sub(c_top) as u16;
 
+        // Click hit regions + the web client's prompt-row index —
+        // computed from the same math the layout below uses.
+        self.prompt_top = size.height.saturating_sub(3 + panel_h);
+        self.panel_band = if panel_open {
+            Some(ratatui::layout::Rect {
+                x: 0,
+                y: size.height.saturating_sub(1 + panel_h),
+                width,
+                height: panel_h,
+            })
+        } else {
+            None
+        };
+        let overlay_len = if self.dialog.is_none() && !panel_open && self.overlay.is_some() {
+            live.len() - usize::from(self.toast.is_some())
+        } else {
+            0
+        };
+        let clip = live.len() - live_shown;
+        self.overlay_block = if overlay_len > 0 {
+            // Clip eats top lines first, so shown overlay lines shrink
+            // by the clip and screen row j maps to overlay line clip+j.
+            Some((tbuf_visible as u16, overlay_len.saturating_sub(clip), clip))
+        } else {
+            None
+        };
+        let band = if let Some(Overlay::Panel { tab, scroll }) = &self.overlay {
+            self.panel_band_lines(*tab, *scroll, width)
+        } else {
+            Vec::new()
+        };
+
         sync_wrap(caps, || {
             term.draw(|f| {
                 let area = f.area();
                 let transcript = ratatui::layout::Rect {
-                    height: area.height.saturating_sub(3),
+                    height: area.height.saturating_sub(3 + panel_h),
                     ..area
                 };
                 let prompt = ratatui::layout::Rect {
-                    y: area.y + area.height.saturating_sub(3),
+                    y: area.y + area.height.saturating_sub(3 + panel_h),
                     height: 2.min(area.height),
+                    ..area
+                };
+                let panel = ratatui::layout::Rect {
+                    y: area.y + area.height.saturating_sub(1 + panel_h),
+                    height: panel_h,
                     ..area
                 };
                 let footer = ratatui::layout::Rect {
@@ -1732,6 +1896,9 @@ impl App {
                 };
                 f.render_widget(Paragraph::new(region), transcript);
                 f.render_widget(Paragraph::new(composer_lines[c_top..].to_vec()), prompt);
+                if panel_h > 0 {
+                    f.render_widget(Paragraph::new(band.clone()), panel);
+                }
                 f.render_widget(Paragraph::new(vec![status.clone()]), footer);
                 f.set_cursor_position((area.x + cx, prompt.y + cy_screen));
             })
@@ -2240,6 +2407,37 @@ impl App {
                 out
             }
         }
+    }
+
+    /// The panel's 3-row bottom band (Full mode): tab strip with the
+    /// key hint right-aligned, then two content rows at `scroll`.
+    fn panel_band_lines(&self, tab: usize, scroll: usize, width: u16) -> Vec<Line<'static>> {
+        use crate::theme;
+        let mut strip = vec![Span::styled(" panel ", theme::meta())];
+        let mut used = 7usize;
+        for (i, name) in PANEL_TABS.iter().enumerate() {
+            strip.push(Span::styled(
+                format!(" {name} "),
+                if i == tab {
+                    theme::dialog_sel()
+                } else {
+                    theme::dim()
+                },
+            ));
+            used += name.len() + 2;
+        }
+        let hint = "↑/↓ · ←/→ · esc";
+        let pad = (width as usize).saturating_sub(used + hint.chars().count());
+        strip.push(Span::raw(" ".repeat(pad)));
+        strip.push(Span::styled(hint.to_string(), theme::dim()));
+        let mut out = vec![Line::from(strip)];
+        let rows = self.panel_rows(tab);
+        let start = scroll.min(rows.len().saturating_sub(2));
+        out.extend(rows.into_iter().skip(start).take(2));
+        while out.len() < 3 {
+            out.push(Line::default());
+        }
+        out
     }
 
     /// One `label  value` row list per panel tab — read-only v1.

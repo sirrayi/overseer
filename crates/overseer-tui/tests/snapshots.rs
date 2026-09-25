@@ -815,3 +815,59 @@ fn full_dialog_pins_over_transcript() {
     assert!(s.contains("rm -rf /tmp/x"), "typed preview:\n{s}");
     assert!(!s.contains('↑'), "dialog force-follows the tail:\n{s}");
 }
+
+#[test]
+fn full_panel_band_sits_below_prompt() {
+    let (mut app, _etx, _w, mut term, caps) = full_harness();
+    // ↑ on an empty composer opens the control panel.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Up,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    insta::assert_snapshot!("full_panel_band", s);
+    // 3-row band sits below the prompt: strip lands two rows under ❯.
+    let rows: Vec<&str> = s.trim_end_matches('\n').split('\n').collect();
+    let prow = rows.iter().position(|r| r.contains('❯')).unwrap();
+    assert!(
+        rows[prow + 2].contains("dashboard"),
+        "strip two rows below prompt: {:?}",
+        rows[prow + 2]
+    );
+    assert!(s.contains("/repo"), "dashboard rows visible");
+}
+
+#[test]
+fn full_panel_click_switches_tabs() {
+    let (mut app, _etx, _w, mut term, caps) = full_harness();
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::F(1),
+    ));
+    app.step(&mut term, &caps).unwrap();
+    assert!(screen(&term).contains("session"), "dashboard open");
+
+    // Strip row = band top (height-4); " keys " is the third tab
+    // (x 28..34 after " panel " + " dashboard " + " settings ").
+    app.on_ct_event(crossterm::event::Event::Mouse(
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 30,
+            row: 16,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        },
+    ));
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    // First help line proves the keys tab — the band shows 2 rows.
+    assert!(
+        s.contains("ctrl+j / alt+enter"),
+        "keys tab after click:\n{s}"
+    );
+
+    // Esc closes; the band gives the rows back to the transcript.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Esc,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    assert!(!screen(&term).contains("dashboard"), "panel closed");
+}

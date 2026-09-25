@@ -85,10 +85,14 @@ function render(f) {
     screen.insertBefore(d, cursor);
     rowEls.push(d);
   }
+  // f.p = the prompt band's first grid row — the server reports it so
+  // the dip+divider track the layout whether or not the panel band is
+  // open below it.
+  const pt = f.p ?? f.h - 3;
   for (let y = 0; y < f.h; y++) {
     const row = f.rows[y];
     const el = rowEls[y];
-    const inPrompt = y >= f.h - 3 && y <= f.h - 2;
+    const inPrompt = y >= pt && y < pt + 2;
     // Always reposition — resize shifts which band a row belongs to
     // even when its content is identical.
     el.style.top = (y * LH + TOP_OFF + (inPrompt ? PROMPT_OFF : 0)) + 'px';
@@ -102,8 +106,8 @@ function render(f) {
     el.innerHTML = html;
   }
   // 1px separator 3px above the prompt arrow, inset 3px each side.
-  divider.style.top = ((f.h - 3) * LH + TOP_OFF + PROMPT_OFF - 4) + 'px';
-  const curInPrompt = f.cur[1] >= f.h - 3 && f.cur[1] <= f.h - 2;
+  divider.style.top = (pt * LH + TOP_OFF + PROMPT_OFF - 4) + 'px';
+  const curInPrompt = f.cur[1] >= pt && f.cur[1] < pt + 2;
   cursor.style.left = (f.cur[0] * CH + (curInPrompt ? PROMPT_L : 0)) + 'px';
   cursor.style.top = (f.cur[1] * LH + TOP_OFF + (curInPrompt ? PROMPT_OFF : 0)) + 'px';
   cursor.style.width = CH + 'px';
@@ -169,6 +173,14 @@ addEventListener('keydown', e => {
     post({ type: 'key', code: 'char', ch: e.key, ...mods });
     e.preventDefault();
   }
+});
+
+// Clicks → grid coords → the same hit regions the terminal uses.
+screen.addEventListener('click', e => {
+  const r = screen.getBoundingClientRect();
+  const row = Math.floor((e.clientY - r.top - TOP_OFF) / LH);
+  const col = Math.floor((e.clientX - r.left) / CH);
+  if (row >= 0 && col >= 0) post({ type: 'click', col, row });
 });
 
 addEventListener('paste', e => {
