@@ -40,7 +40,7 @@ impl Theme {
     /// The shipped palette — ANSI-16 hues only.
     pub const fn default() -> Self {
         Theme {
-            user: Style::new().fg(Color::Cyan),
+            user: Style::new().fg(Color::Rgb(255, 255, 255)),
             assistant: Style::new(),
             dim: Style::new().fg(Color::DarkGray),
             reasoning: Style::new().fg(Color::DarkGray),
