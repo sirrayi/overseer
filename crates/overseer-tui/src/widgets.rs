@@ -202,13 +202,18 @@ impl Dialog {
     }
 }
 
-/// Bottom status line: mode badge + cwd + model + session cost.
-pub fn status_line(preset: Preset, cwd: &str, model: &str, cost: f64, width: u16) -> Line<'static> {
-    let (label, badge) = match preset {
+/// Mode badge chip for footers: (label, style).
+pub fn preset_badge(preset: Preset) -> (&'static str, ratatui::style::Style) {
+    match preset {
         Preset::WorkspaceWrite => (" workspace ", theme::badge()),
         Preset::ReadOnly => (" read-only ", theme::badge_ro()),
         Preset::Plan => (" plan ", theme::badge_plan()),
-    };
+    }
+}
+
+/// Bottom status line: mode badge + cwd + model + session cost.
+pub fn status_line(preset: Preset, cwd: &str, model: &str, cost: f64, width: u16) -> Line<'static> {
+    let (label, badge) = preset_badge(preset);
     let right = format!("{model} · ${:.4}", cost);
     let left_w = 10 + cwd.len();
     let pad = (width as usize).saturating_sub(left_w + right.len()).max(1);

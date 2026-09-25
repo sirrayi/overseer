@@ -501,23 +501,32 @@ fn tree_overlay_shows_fork_hierarchy() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Fuzzy `/` menu: "tr" is a subsequence of tree/transcript — both
-/// listed even though neither starts with it.
+/// Fuzzy matching still drives Tab completion — the visible menu
+/// strip was removed in the UI pass. `/t` is a subsequence of
+/// tree/transcript → Tab lands on the common `/tr`; `/tre` then
+/// completes to `/tree`.
 #[test]
-fn slash_menu_matches_fuzzy() {
+fn slash_tab_completes_fuzzy() {
     let (mut app, _etx, _wrx, mut term, caps) = harness();
-    for c in "/tr".chars() {
+    for c in "/t".chars() {
         app.key(crossterm::event::KeyEvent::from(
             crossterm::event::KeyCode::Char(c),
         ));
     }
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Tab,
+    ));
+    for c in "e".chars() {
+        app.key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char(c),
+        ));
+    }
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Tab,
+    ));
     app.step(&mut term, &caps).unwrap();
     let s = screen(&term);
-    assert!(s.contains("tree"), "fuzzy /tr should list /tree:\n{s}");
-    assert!(
-        s.contains("transcript"),
-        "fuzzy /tr should list /transcript:\n{s}"
-    );
+    assert!(s.contains("/tree"), "fuzzy Tab should complete /tree:\n{s}");
 }
 
 /// Transcript overlay: Tab expands completed tool blocks (their

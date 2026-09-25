@@ -1509,9 +1509,8 @@ impl App {
         };
         out.extend(widgets::queue_strip(&queued));
         out.extend(widgets::queue_strip(&self.pending_queue));
-        // `/` and `@` completion strip — visible while a fragment is
-        // being typed, completed by Tab.
-        out.extend(self.suggestion_lines());
+        // UI pass: the `/`/`@` suggestion strip is gone — Tab still
+        // completes silently, `/help`/`?` carry discoverability.
         if let RunState::Running { started, phase, .. } = &self.run {
             out.push(widgets::indicator(
                 phase,
@@ -1545,43 +1544,6 @@ impl App {
         if self.show_help {
             out.extend(widgets::help_panel());
         }
-        out
-    }
-
-    /// Completion menu above the composer: `/cmd` or `@path` fragment.
-    fn suggestion_lines(&self) -> Vec<Line<'static>> {
-        let text = self.composer.text();
-        let rows: Vec<String> = if let Some(frag) = text.strip_prefix('/') {
-            if frag.contains(char::is_whitespace) {
-                return Vec::new();
-            }
-            COMMANDS
-                .iter()
-                .filter(|(n, _)| subseq_match(n, frag))
-                .take(4)
-                .map(|(n, d)| format!("/{n} — {d}"))
-                .collect()
-        } else if let Some(frag) = at_fragment(&text) {
-            self.file_index()
-                .iter()
-                .filter(|p| subseq_match(p, frag))
-                .take(4)
-                .map(|p| format!("@{p}"))
-                .collect()
-        } else {
-            return Vec::new();
-        };
-        if rows.is_empty() {
-            return Vec::new();
-        }
-        let mut out: Vec<Line<'static>> = rows
-            .into_iter()
-            .map(|r| Line::from(Span::styled(r, crate::theme::dim())))
-            .collect();
-        out.push(Line::from(Span::styled(
-            "tab to complete",
-            crate::theme::dim(),
-        )));
         out
     }
 
@@ -1678,21 +1640,21 @@ impl App {
         let end = self.tbuf.len().saturating_sub(scroll);
         let start = end.saturating_sub(tbuf_visible);
 
-        // The scroll marker is part of the right edge — reserve its
-        // cells before status_line pads, or it lands past the clip.
+        // Footer: preset badge left, `↑N` right — dir/model/cost are
+        // deliberately off this surface (UI pass); the marker stays
+        // because it's functional, not decoration.
         let marker = if scroll > 0 {
             format!(" ↑{scroll}")
         } else {
             String::new()
         };
-        let mut status = widgets::status_line(
-            self.preset,
-            &self.cwd,
-            &self.model,
-            self.cost,
-            width.saturating_sub(marker.len() as u16).max(1),
-        );
+        let (label, badge) = widgets::preset_badge(self.preset);
+        let mut status = Line::from(vec![Span::styled(label, badge)]);
         if !marker.is_empty() {
+            let pad = (width as usize)
+                .saturating_sub(label.len() + marker.len())
+                .max(1);
+            status.spans.push(Span::raw(" ".repeat(pad)));
             status.spans.push(Span::styled(marker, crate::theme::dim()));
         }
         // Bottom-anchored: blank rows precede a short transcript.
