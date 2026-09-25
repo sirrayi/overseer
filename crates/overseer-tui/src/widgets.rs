@@ -216,7 +216,10 @@ pub fn status_line(preset: Preset, cwd: &str, model: &str, cost: f64, width: u16
     let (label, badge) = preset_badge(preset);
     let right = format!("{model} · ${:.4}", cost);
     let left_w = 10 + cwd.len();
-    let pad = (width as usize).saturating_sub(left_w + right.len()).max(1);
+    // 1-col right inset — flush-to-edge grazes the window border.
+    let pad = (width as usize)
+        .saturating_sub(left_w + right.len() + 1)
+        .max(1);
     Line::from(vec![
         Span::styled(label, badge),
         Span::styled(format!(" {cwd}"), theme::status()),

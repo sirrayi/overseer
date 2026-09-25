@@ -17,4 +17,4 @@ expression: "screen(&term).replace(&dirname, \"[root]\")"
     -line 9
 ↑↓ file · ←→ hunk · space reject · enter revert · esc
 ❯
- workspace  /repo                        test-model · $0.000
+ workspace  /repo                       test-model · $0.0000

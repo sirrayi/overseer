@@ -15,4 +15,4 @@ expression: norm(&term)
 › modified +2 -1 …/[root]/app.txt
 ↑↓ file · tab diff · enter revert · esc
 ❯
- workspace  /repo                        test-model · $0.000
+ workspace  /repo                       test-model · $0.0000

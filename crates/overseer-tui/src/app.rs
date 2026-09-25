@@ -1797,8 +1797,14 @@ impl App {
         // dialog therefore never hide above the fold. An open control
         // panel takes a further 17-row band under the prompt (~306px),
         // which slides the whole window up.
+        // Cap keeps the layout valid on short windows: transcript ≥2,
+        // prompt 2, footer 1 — the band shrinks before rects overlap.
         let panel_open = matches!(self.overlay, Some(Overlay::Panel { .. }));
-        let panel_h: u16 = if panel_open { 17 } else { 0 };
+        let panel_h: u16 = if panel_open {
+            17.min(size.height.saturating_sub(5))
+        } else {
+            0
+        };
         let t_rows = size.height.saturating_sub(3 + panel_h) as usize;
         self.view_h = t_rows as u16;
         let live_shown = live.len().min(t_rows);
@@ -1867,7 +1873,7 @@ impl App {
             None
         };
         let band = if let Some(Overlay::Panel { tab, scroll }) = &self.overlay {
-            self.panel_band_lines(*tab, *scroll, width)
+            self.panel_band_lines(*tab, *scroll, width, panel_h)
         } else {
             Vec::new()
         };
@@ -2409,9 +2415,15 @@ impl App {
         }
     }
 
-    /// The panel's 17-row bottom band (Full mode): a bare tab strip
-    /// (key hint right-aligned), then sixteen content rows at `scroll`.
-    fn panel_band_lines(&self, tab: usize, scroll: usize, width: u16) -> Vec<Line<'static>> {
+    /// The panel's bottom band (Full mode): a bare tab strip (key hint
+    /// right-aligned), then `cap`-1 content rows at `scroll`.
+    fn panel_band_lines(
+        &self,
+        tab: usize,
+        scroll: usize,
+        width: u16,
+        cap: u16,
+    ) -> Vec<Line<'static>> {
         use crate::theme;
         let mut strip = Vec::new();
         let mut used = 0usize;
@@ -2434,9 +2446,10 @@ impl App {
         strip.push(Span::styled(hint.to_string(), theme::dim()));
         let mut out = vec![Line::from(strip)];
         let rows = self.panel_rows(tab);
-        let start = scroll.min(rows.len().saturating_sub(16));
-        out.extend(rows.into_iter().skip(start).take(16));
-        while out.len() < 17 {
+        let body = (cap as usize).saturating_sub(1);
+        let start = scroll.min(rows.len().saturating_sub(body));
+        out.extend(rows.into_iter().skip(start).take(body));
+        while out.len() < cap as usize {
             out.push(Line::default());
         }
         out

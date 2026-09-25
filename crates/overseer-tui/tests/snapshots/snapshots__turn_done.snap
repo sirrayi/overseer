@@ -17,4 +17,4 @@ I'll look at the test file first.
 ✓ bash cargo test flaky
 — end_turn · 1 step(s) · $0.0010
 ❯
- workspace  /repo                        test-model · $0.001
+ workspace  /repo                       test-model · $0.0010

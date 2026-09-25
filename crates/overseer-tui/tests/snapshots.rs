@@ -846,14 +846,14 @@ fn full_panel_click_switches_tabs() {
     app.step(&mut term, &caps).unwrap();
     assert!(screen(&term).contains("session"), "dashboard open");
 
-    // Strip row = band top (height-18 → row 2 on a 20-row grid);
-    // " keys " is the third tab — x 21..27 after " dashboard " +
-    // " settings " (no leading " panel " label any more).
+    // Strip row = band top: on a 20-row grid the cap gives 15 rows
+    // (min(17, 20-5)) → strip at row 4. " keys " is the third tab —
+    // x 21..27 after " dashboard " + " settings ".
     app.on_ct_event(crossterm::event::Event::Mouse(
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 23,
-            row: 2,
+            row: 4,
             modifiers: crossterm::event::KeyModifiers::empty(),
         },
     ));

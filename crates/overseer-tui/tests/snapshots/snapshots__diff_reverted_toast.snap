@@ -14,4 +14,4 @@ expression: norm(&term)
 
 ◆ reverted app.txt (stash in revert-stash)
 ❯
- workspace  /repo                        test-model · $0.000
+ workspace  /repo                       test-model · $0.0000

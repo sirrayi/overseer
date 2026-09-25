@@ -16,4 +16,4 @@ permission: bash — outside allowlist
   $ git push origin main
 …
 ❯
- workspace  /repo                        test-model · $0.000
+ workspace  /repo                       test-model · $0.0000
