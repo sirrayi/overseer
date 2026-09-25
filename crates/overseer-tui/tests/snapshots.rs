@@ -846,13 +846,13 @@ fn full_panel_click_switches_tabs() {
     app.step(&mut term, &caps).unwrap();
     assert!(screen(&term).contains("session"), "dashboard open");
 
-    // Strip row = band top (height-4); " keys " is the third tab
+    // Strip row = band top (height-7); " keys " is the third tab
     // (x 28..34 after " panel " + " dashboard " + " settings ").
     app.on_ct_event(crossterm::event::Event::Mouse(
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 30,
-            row: 16,
+            row: 13,
             modifiers: crossterm::event::KeyModifiers::empty(),
         },
     ));

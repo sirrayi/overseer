@@ -13,11 +13,11 @@ expression: s
 
 
 
-
-
-
 ❯
 
  panel  dashboard  settings  keys            ↑/↓ · ←/→ · esc
   session     session
   cwd         /repo
+  model       test-model
+  mode        workspace
+  state       idle
