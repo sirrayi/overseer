@@ -145,16 +145,58 @@ pub struct Response {
 }
 
 /// Failure classes per the Ch.7 §6 matrix — never collapse these into "error".
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ProviderError {
-    #[error("rate limited ({status}); retry after {retry_after_ms}ms")]
     RateLimit { status: u16, retry_after_ms: u64 },
-    #[error("HTTP {status}: {body}")]
     Http { status: u16, body: String },
-    #[error("transport: {0}")]
     Transport(String),
-    #[error("malformed response: {0}")]
     Malformed(String),
+}
+
+impl std::error::Error for ProviderError {}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimit {
+                status,
+                retry_after_ms,
+            } => write!(f, "rate limited ({status}); retry after {retry_after_ms}ms"),
+            Self::Http { status, body } => write!(f, "{}", http_plain(*status, body)),
+            Self::Transport(m) => write!(f, "transport: {m}"),
+            Self::Malformed(m) => write!(f, "malformed response: {m}"),
+        }
+    }
+}
+
+/// Render an HTTP failure as one plain-English line: a status gloss
+/// plus the provider's own `error.message` when the body is the usual
+/// `{"error":{…}}` envelope (Anthropic, OpenAI, and Gemini all use it);
+/// non-JSON bodies fall back to a trimmed raw excerpt.
+fn http_plain(status: u16, body: &str) -> String {
+    let gloss = match status {
+        400 => "the request was rejected",
+        401 | 403 => "authentication failed — check the API key",
+        404 => "model or endpoint not found",
+        408 | 504 => "the request timed out",
+        429 => "rate limited",
+        500..=599 => "the provider had a server error",
+        _ => "the request failed",
+    };
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v["error"]["message"]
+                .as_str()
+                .or_else(|| v["message"].as_str())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| body.trim().chars().take(160).collect());
+    if detail.is_empty() {
+        format!("{gloss} (HTTP {status})")
+    } else {
+        format!("{gloss} (HTTP {status}): {detail}")
+    }
 }
 
 /// Providers must be safe to share with a worker thread: frontends (TUI)
