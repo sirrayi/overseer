@@ -847,12 +847,12 @@ fn full_panel_click_switches_tabs() {
     assert!(screen(&term).contains("session"), "dashboard open");
 
     // Strip row = band top: on a 20-row grid the cap gives 15 rows
-    // (min(17, 20-5)) → strip at row 4. " keys " is the third tab —
-    // x 21..27 after " dashboard " + " settings ".
+    // (min(17, 20-5)) → strip at row 4. " keys " is the fourth tab —
+    // x 30..36 after " dashboard " + " agents " + " settings ".
     app.on_ct_event(crossterm::event::Event::Mouse(
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: 23,
+            column: 32,
             row: 4,
             modifiers: crossterm::event::KeyModifiers::empty(),
         },
@@ -871,4 +871,39 @@ fn full_panel_click_switches_tabs() {
     ));
     app.step(&mut term, &caps).unwrap();
     assert!(!screen(&term).contains("dashboard"), "panel closed");
+}
+
+#[test]
+fn panel_open_composer_still_types() {
+    let (mut app, _etx, _w, mut term, caps) = full_harness();
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::F(1),
+    ));
+    // The panel is passive chrome — plain keys land in the composer.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Char('h'),
+    ));
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Char('i'),
+    ));
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("❯ hi"), "typed through the panel:\n{s}");
+    // Backspace edits; arrows only leave the composer once it's empty.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Backspace,
+    ));
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Left,
+    ));
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Right,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("❯ h"), "backspace lands:\n{s}");
+    assert!(
+        s.contains("dashboard"),
+        "arrows with text stay in the composer, panel stays:\n{s}"
+    );
 }

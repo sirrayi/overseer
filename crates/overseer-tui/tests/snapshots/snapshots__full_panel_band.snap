@@ -1,11 +1,12 @@
 ---
 source: crates/overseer-tui/tests/snapshots.rs
-assertion_line: 828
 expression: s
 ---
+
+
 ❯
 
- dashboard  settings  keys                  ↑/↓ · ←/→ · esc
+ dashboard  agents  settings  keys          ↑/↓ · ←/→ · esc
   session     session
   cwd         /repo
   model       test-model

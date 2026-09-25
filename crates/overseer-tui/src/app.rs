@@ -129,7 +129,27 @@ pub enum Overlay {
 }
 
 /// Panel tab order — ←/→ and Tab cycle, digits are not bound.
-const PANEL_TABS: [&str; 3] = ["dashboard", "settings", "keys"];
+const PANEL_TABS: [&str; 4] = ["dashboard", "agents", "settings", "keys"];
+
+/// One `task`-tool spawn seen in the event stream — drives the panel's
+/// agents tab. Foreground spawns close on their `ToolResult`;
+/// background ones only acknowledge the spawn there and close on the
+/// later `SubagentDone` (matched via the `bg-N` dir in the ack text).
+struct AgentEnt {
+    /// `ToolCallStart.call_id` — links the spawn to its result.
+    call_id: String,
+    /// `background: true` in the call input.
+    bg: bool,
+    /// `bg-N` parsed from the spawn ack's trace path — the id
+    /// `SubagentDone` reports under.
+    bg_id: Option<String>,
+    /// "read" | "write"
+    mode: &'static str,
+    /// "running" | "done" | "failed"
+    state: &'static str,
+    /// First prompt line, shortened — the row's at-a-glance label.
+    prompt: String,
+}
 
 /// One `/diff` row: a checkpoint-tracked path vs its working-tree state.
 pub struct DiffRow {
@@ -194,6 +214,10 @@ pub struct App {
     cwd: String,
     model: String,
     session_dir: std::path::PathBuf,
+    /// `task` spawns in spawn order — the agents tab renders them
+    /// newest-first. Cleared on session switch (the reseed replays
+    /// the new log's task calls back in).
+    agents: Vec<AgentEnt>,
     tokens: u64,
     cost: f64,
     show_help: bool,
@@ -252,6 +276,7 @@ impl App {
             cwd,
             model,
             session_dir,
+            agents: Vec::new(),
             tokens: 0,
             cost: 0.0,
             show_help: false,
@@ -435,9 +460,70 @@ impl App {
         if let EventKind::RunEnd { total_cost_usd, .. } = ev.kind {
             self.cost = total_cost_usd;
         }
-        if let EventKind::ToolCallStart { name, .. } = &ev.kind {
+        if let EventKind::ToolCallStart {
+            call_id,
+            name,
+            input,
+        } = &ev.kind
+        {
             if let RunState::Running { phase, .. } = &mut self.run {
                 *phase = format!("running {name}");
+            }
+            if name == "task" {
+                let v = serde_json::Value::as_str;
+                let b = serde_json::Value::as_bool;
+                self.agents.push(AgentEnt {
+                    call_id: call_id.clone(),
+                    bg: input.get("background").and_then(b).unwrap_or(false),
+                    bg_id: None,
+                    mode: match input.get("mode").and_then(v) {
+                        Some("write") => "write",
+                        _ => "read",
+                    },
+                    state: "running",
+                    prompt: input
+                        .get("prompt")
+                        .and_then(v)
+                        .unwrap_or("")
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(48)
+                        .collect(),
+                });
+            }
+        }
+        if let EventKind::ToolResult {
+            call_id,
+            name,
+            is_error,
+            content,
+            ..
+        } = &ev.kind
+        {
+            if name == "task" {
+                if let Some(a) = self.agents.iter_mut().rev().find(|a| a.call_id == *call_id) {
+                    if *is_error {
+                        a.state = "failed";
+                    } else if a.bg {
+                        // The ack isn't the finish — record the dir
+                        // name so `SubagentDone` can close the row.
+                        a.bg_id = bg_id_of(content);
+                    } else {
+                        a.state = "done";
+                    }
+                }
+            }
+        }
+        if let EventKind::SubagentDone { task_id, .. } = &ev.kind {
+            if let Some(a) = self
+                .agents
+                .iter_mut()
+                .rev()
+                .find(|a| a.bg_id.as_deref() == Some(task_id.as_str()))
+            {
+                a.state = "done";
             }
         }
         match cells::feed(ev) {
@@ -518,6 +604,7 @@ impl App {
         self.session_dir = dir.clone();
         self.live.clear();
         self.history.clear();
+        self.agents.clear();
         self.tbuf.clear();
         self.scroll = 0;
         self.tokens = 0;
@@ -646,9 +733,27 @@ impl App {
         // Modal pickers own the keyboard entirely (the sessions filter
         // is a text input by design). Esc always closes first.
         if self.overlay.is_some() {
-            self.on_overlay_key(key);
-            self.dirty = true;
-            return;
+            // The control panel is passive chrome — it claims only its
+            // own nav keys, and those only while the composer is empty,
+            // so typing a draft keeps working with the dashboard open:
+            // chars/Backspace edit, Tab completes, Enter submits,
+            // arrows move the cursor. Esc/F1 always close it.
+            let claimed = if matches!(self.overlay, Some(Overlay::Panel { .. })) {
+                match key.code {
+                    KeyCode::Esc | KeyCode::F(1) => true,
+                    KeyCode::Tab | KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                        self.composer.is_empty()
+                    }
+                    _ => false,
+                }
+            } else {
+                true
+            };
+            if claimed {
+                self.on_overlay_key(key);
+                self.dirty = true;
+                return;
+            }
         }
         // Dialog claims only its own keys — arrows/Enter/digits/Esc.
         // Everything else keeps flowing to the composer (no focus theft;
@@ -2500,7 +2605,41 @@ impl App {
                     kv("transcript", format!("{} cells", self.history.len())),
                 ]
             }
-            1 => vec![
+            1 => {
+                if self.agents.is_empty() {
+                    return vec![Line::from(Span::styled(
+                        "  none yet — task-tool spawns land here",
+                        theme::dim(),
+                    ))];
+                }
+                self.agents
+                    .iter()
+                    .rev()
+                    .map(|a| {
+                        let st = match a.state {
+                            "done" => theme::tool_ok(),
+                            "failed" => theme::tool_err(),
+                            _ => theme::spinner(),
+                        };
+                        Line::from(vec![
+                            Span::styled(format!("  {:<9}", a.state), st),
+                            Span::styled(
+                                format!(
+                                    "{:<9}",
+                                    if a.bg {
+                                        format!("{}·bg", a.mode)
+                                    } else {
+                                        a.mode.to_string()
+                                    }
+                                ),
+                                theme::dim(),
+                            ),
+                            Span::styled(a.prompt.clone(), theme::dialog()),
+                        ])
+                    })
+                    .collect()
+            }
+            2 => vec![
                 kv(
                     "theme",
                     std::env::var("OVERSEER_THEME").unwrap_or_else(|_| "auto".into()),
@@ -2555,6 +2694,17 @@ fn display_path(cwd: &str, path: &std::path::Path) -> String {
     } else {
         s
     }
+}
+
+/// `bg-N` out of a background spawn ack — the trace dir is the id
+/// `SubagentDone` reports under ("…subagents/bg-3)").
+fn bg_id_of(content: &str) -> Option<String> {
+    let i = content.rfind("/bg-")? + 1;
+    let id: String = content[i..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    (!id.is_empty()).then_some(id)
 }
 
 fn short_id(id: &str) -> String {
