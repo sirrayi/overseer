@@ -44,11 +44,11 @@
 //! HTTP/SSE and streamable-HTTP transports plus every auth flow, server-
 //! initiated messages (logging notifications, `sampling`/`roots`/
 //! `elicitation` requests), which desynchronize the one-line-per-call reader
-//! and need a demultiplexing reader task, the server registry/supervisor, and
-//! wiring a discovered tool into the engine's registry
-//! (`tools::ToolRegistry` owns that state and needs an ops surface plus a
-//! supervised server lifetime) — this batch lands the client, the framing,
-//! the tool-spec translation and the name-collision guard.`
+//! and need a demultiplexing reader task, and a server supervisor beyond
+//! lazy spawn + drop-on-failure (health probes, restart policy, per-server
+//! resource limits) — this batch lands the client, the framing, the
+//! tool-spec translation, the name-collision guard and the `mcp` resident
+//! tool (`tools::mcp_tool`) that drives the servers through the engine.`
 //!
 //! DONE, not deferred: per-call timeouts and the hung-server watchdog.
 //! [`CALL_TIMEOUT`] bounds every [`StdioClient::call`];
@@ -429,7 +429,11 @@ pub fn namespaced(server: &str, tool: &str) -> String {
 
 /// Map every character outside `[A-Za-z0-9_]` to `_`, char by char, and
 /// collapse a blank result to `_`.
-fn sanitized(part: &str) -> String {
+///
+/// Public because it is the inverse direction a caller needs: given a full
+/// [`namespaced`] name, the server segment is the sanitized server id, and
+/// `tools::mcp_tool` matches that segment back to a configured server.
+pub fn sanitized(part: &str) -> String {
     let mut out: String = part
         .chars()
         .map(|c| {
@@ -586,8 +590,48 @@ impl StdioClient {
     /// operator's, taken verbatim — the client ships no server and never
     /// guesses one. Both names must be non-blank; a spawn failure names the
     /// server, the program and the OS error, so a missing binary is one line
-    /// to diagnose.
+    /// to diagnose. This form **inherits the parent environment** and exists
+    /// for callers that already control the child's environment; the engine's
+    /// registry spawns through [`spawn_with_env`](Self::spawn_with_env), which
+    /// is the allowlisted path.
     pub fn spawn(server: &str, program: &str, args: &[String]) -> Result<Self, String> {
+        Self::spawn_inner(server, program, args, None)
+    }
+
+    /// [`spawn`](Self::spawn) with an explicit child environment instead of
+    /// the inherited one: the child gets a **cleared** environment holding
+    /// only `PATH` and `HOME` (taken from the parent when they are set) plus
+    /// the `env` pairs the operator declared in the server's config.
+    ///
+    /// This is the engine's default spawn path, and the allowlist is the
+    /// point: a third-party MCP server is untrusted code, so it must not
+    /// inherit whatever the operator's shell happens to export — provider
+    /// API keys (`ANTHROPIC_API_KEY`), broker secrets, CI tokens. A secret a
+    /// server genuinely needs is declared in its config and pulled from the
+    /// parent env there (`${VAR}` expansion in `mcp_config`), which makes the
+    /// grant visible in the file instead of implicit. `PATH`/`HOME` ride
+    /// along because a server that cannot find its own interpreter, or a
+    /// home for its cache, is not a hardened server — just a broken one.
+    /// Declared pairs win over the inherited two.
+    pub fn spawn_with_env(
+        server: &str,
+        program: &str,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> Result<Self, String> {
+        Self::spawn_inner(server, program, args, Some(env))
+    }
+
+    /// Shared spawn: `env: None` inherits the parent environment (the
+    /// pre-allowlist behavior [`spawn`](Self::spawn) keeps), `env: Some` is
+    /// the cleared-environment path described on
+    /// [`spawn_with_env`](Self::spawn_with_env).
+    fn spawn_inner(
+        server: &str,
+        program: &str,
+        args: &[String],
+        env: Option<&[(String, String)]>,
+    ) -> Result<Self, String> {
         if server.trim().is_empty() {
             return Err(format!(
                 "an MCP server id must be a non-blank name (it namespaces the server's tools), got {server:?}"
@@ -598,11 +642,24 @@ impl StdioClient {
                 "mcp server `{server}`: the program to spawn must be a non-blank path, got {program:?}"
             ));
         }
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(pairs) = env {
+            command.env_clear();
+            for key in ["PATH", "HOME"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            for (key, value) in pairs {
+                command.env(key, value);
+            }
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| format!("mcp server `{server}`: could not spawn `{program}`: {e}"))?;
         let stdin = child.stdin.take().ok_or_else(|| {
@@ -779,7 +836,30 @@ impl StdioClient {
     /// call did not happen" and "the call happened and the tool said no".
     /// Only a JSON-RPC `error` (no result at all) becomes an `Err`.
     pub fn call_tool(&mut self, tool: &str, args: Value) -> Result<Value, String> {
-        let msg = self.call("tools/call", json!({ "name": tool, "arguments": args }))?;
+        self.call_tool_with_timeout(tool, args, CALL_TIMEOUT)
+    }
+
+    /// [`call_tool`](Self::call_tool) with an explicit bound: identical
+    /// request envelope and identical result mapping, but the response must
+    /// arrive within `timeout` (see
+    /// [`call_with_timeout`](Self::call_with_timeout), which enforces it —
+    /// a server with no answer is killed, and the next call fails naming
+    /// that shutdown state).
+    ///
+    /// The registry's `mcp` tool carries the bound so a test can drive the
+    /// timeout path quickly instead of waiting out the fixed
+    /// [`CALL_TIMEOUT`]; the shipped default is that same constant.
+    pub fn call_tool_with_timeout(
+        &mut self,
+        tool: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let msg = self.call_with_timeout(
+            "tools/call",
+            json!({ "name": tool, "arguments": args }),
+            timeout,
+        )?;
         let result =
             result_of(&msg).map_err(|e| self.rpc_error(&format!("tools/call of `{tool}`"), e))?;
         Ok(result.clone())

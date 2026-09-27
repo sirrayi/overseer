@@ -96,6 +96,24 @@ pub fn assemble(config: &AgentConfig) -> Vec<SystemSegment> {
             });
         }
     }
+    // MCP (R7): one line naming the configured servers, so the model knows
+    // the `mcp` tool has somewhere to go. Present only when servers are
+    // configured AND the tool is resident (an ablated arm must not advertise
+    // a tool the model cannot call — same rule as `task`/`computer`). Sorted
+    // names: the config's own order must not move a byte of the prefix.
+    // `// DEFERRED(owner): a TUI `/mcp` panel (browse connected servers, toggle trust per server, see spawn failures live) — needs the frontend state machine to own MCP session state — gate: TUI panel work.`
+    if !config.mcp_servers.is_empty() && !config.disabled_tools.iter().any(|t| t == "mcp") {
+        let mut names: Vec<&str> = config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        segments.push(SystemSegment {
+            name: "mcp",
+            text: format!(
+                "MCP servers (use the mcp tool, op=search first): {}",
+                names.join(", ")
+            ),
+            cacheable: true,
+        });
+    }
     // Persona (P6-5): the approved identity/relationship/preference files,
     // or a one-line pending notice while onboarding is unapproved — draft
     // text never reaches the prompt. Static and cacheable: approval is a
@@ -212,14 +230,14 @@ fn has_user_path(text: &str) -> bool {
     false
 }
 
-/// Frozen static section order — the P6/P7 union (R1-F2): the static/// Frozen static section order — the P6/P7 union (R1-F2): the static
-/// sections assemble identity→contract→safety→memory→skills with each
-/// branch adding only its own segment (`persona` on P6, `computer` on
-/// P7). Absent optionals are skipped; order among the present must be
-/// preserved. Reordering a cacheable section breaks prefix-cache hits and
-/// must be deliberate.
+/// Frozen static section order — the P6/P7/R7 union (R1-F2): the static
+/// sections assemble identity→contract→safety→memory→skills, with each
+/// branch adding only its own segment (`mcp` on R7, `persona` on P6,
+/// `computer` on P7). Absent optionals are skipped; order among the present
+/// must be preserved. Reordering a cacheable section breaks prefix-cache
+/// hits and must be deliberate.
 pub const ORDER: &[&str] = &[
-    "identity", "contract", "safety", "memory", "skills", "persona", "computer",
+    "identity", "contract", "safety", "memory", "skills", "mcp", "persona", "computer",
 ];
 /// Boundary lint used by tests and future assemblers: every cacheable
 /// segment must precede every non-cacheable one.
@@ -272,6 +290,63 @@ pub fn prefix_fingerprint(segments: &[SystemSegment]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R7 prompt half: the `mcp` segment names the configured servers, sits
+    /// in the frozen ORDER slot, and is absent whenever there is nothing for
+    /// the `mcp` tool to reach.
+    #[test]
+    fn mcp_segment_lists_configured_servers_and_is_absent_by_default() {
+        // Absent by default — the pre-MCP assembly, byte for byte.
+        let default = assemble(&AgentConfig::default());
+        assert!(default.iter().all(|s| s.name != "mcp"));
+        assert!(hygiene_lint(&default).is_empty());
+        assert!(boundary_ok(&default));
+
+        let server = |name: &str| crate::mcp_config::McpServer {
+            name: name.to_string(),
+            command: "mcp-server".to_string(),
+            args: Vec::new(),
+            env: Default::default(),
+            trust: crate::mcp_config::Trust::Ask,
+        };
+        let cfg = AgentConfig {
+            mcp_servers: vec![server("zeta"), server("alpha")],
+            ..Default::default()
+        };
+        let segs = assemble(&cfg);
+        assert!(boundary_ok(&segs), "mcp must respect the frozen ORDER");
+        assert!(hygiene_lint(&segs).is_empty());
+        let mcp = segs
+            .iter()
+            .find(|s| s.name == "mcp")
+            .expect("configured servers must produce the segment");
+        assert!(mcp.cacheable, "the MCP line is a static section");
+        assert!(mcp.text.contains("op=search"), "{}", mcp.text);
+        assert!(
+            mcp.text.contains("alpha, zeta"),
+            "names sorted, not config order: {}",
+            mcp.text
+        );
+        // Position: after skills, before persona/computer.
+        let names: Vec<&str> = segs.iter().map(|s| s.name).collect();
+        let rank = |n: &str| names.iter().position(|x| *x == n);
+        assert!(
+            rank("mcp").unwrap() < rank("computer").unwrap(),
+            "{names:?}"
+        );
+        let order_rank = |n: &str| ORDER.iter().position(|x| *x == n).unwrap();
+        assert!(order_rank("skills") < order_rank("mcp"));
+        assert!(order_rank("mcp") < order_rank("persona"));
+
+        // An ablated `mcp` tool means no segment: the prompt must not
+        // advertise a tool the run cannot call.
+        let ablated = AgentConfig {
+            mcp_servers: vec![server("alpha")],
+            disabled_tools: vec!["mcp".to_string()],
+            ..Default::default()
+        };
+        assert!(assemble(&ablated).iter().all(|s| s.name != "mcp"));
+    }
 
     #[test]
     fn assemble_is_deterministic() {

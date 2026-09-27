@@ -18,6 +18,7 @@ pub mod ir;
 pub mod ledger;
 pub mod manifest;
 pub mod mcp;
+pub mod mcp_config;
 pub mod memory;
 pub mod microagent;
 pub mod modes;

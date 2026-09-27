@@ -55,8 +55,20 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   dependencies: the grammar/query registry a real binding registers
   against); sandboxes and grants (`backends.rs` — e2b trait, provider
   enum, runtime selection, toolhive grants, context-forge grants);
-  `mcp.rs` (minimal stdio JSON-RPC client). `bash` honours `--runtime
-  <native|seatbelt|bubblewrap|gvisor>`: a pinned runtime that is
+  `mcp.rs` (minimal stdio JSON-RPC client) plus `mcp_config.rs` (the
+  `~/.overseer/mcp.json` server list: `${VAR}` env expansion, per-server
+  `trust: read|ask`). The client is wired in as exactly **one** resident
+  op tool, `mcp` (`tools/mcp_tool.rs`): `op=search` finds a tool,
+  `op=call` runs a namespaced `mcp__<server>__<tool>` one. Servers spawn
+  lazily on first use and are dropped when a call fails (next use
+  respawns); a name that would shadow a resident tool is skipped, never
+  callable; children get an env allowlist (PATH/HOME + the pairs the
+  config declares — never the parent's keys); a `trust: read` server's
+  calls skip the approval ladder, everything else rides the
+  external-comms lane. Discovered definitions never enter
+  `ToolRegistry.specs` — the `mcp` spec appears only when a server is
+  configured, so the advertised array is byte-stable. `bash` honours
+  `--runtime <native|seatbelt|bubblewrap|gvisor>`: a pinned runtime that is
   unavailable FAILS the call with the requirement named (never a silent
   downgrade to unsandboxed exec); unset keeps the platform default.
   Deferred sites are marked `// DEFERRED(owner)` in each module header.

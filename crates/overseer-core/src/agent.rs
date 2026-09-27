@@ -135,6 +135,13 @@ pub struct AgentConfig {
     /// never end up executing unsandboxed just because `runsc` was missing.
     /// Parsed/validated with `crate::backends::SandboxRuntime::parse`.
     pub sandbox_runtime: Option<String>,
+    /// R7 MCP servers this session may drive (`~/.overseer/mcp.json`). Empty
+    /// (the default) means no MCP at all: the registry gets no `mcp` spec and
+    /// the prompt gets no MCP segment, so the session is byte-identical to
+    /// the pre-MCP engine. The registry installs one op tool (see
+    /// `ToolRegistry::with_mcp`) and the discovered tool definitions never
+    /// reach the advertised spec array.
+    pub mcp_servers: Vec<crate::mcp_config::McpServer>,
 }
 
 /// P7-1 computer-use containment flags. All default off except
@@ -223,6 +230,8 @@ impl Default for AgentConfig {
             persona_dir: None,
             // P8-C: unset = the platform default sandbox, exactly as before.
             sandbox_runtime: None,
+            // R7: no MCP unless the CLI's config loader found servers.
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -1279,15 +1288,25 @@ impl Agent {
 
     /// Registry for the configured preset — plan mode removes mutating
     /// tools from the spec list entirely (capability removal, P1.4).
+    /// R7: the configured MCP servers join the **core** registry only. Plan
+    /// mode is a read-only posture with its own spec set, and the subagent
+    /// registries are quarantined by design — neither gets the `mcp` op tool,
+    /// so neither can spawn a third-party program.
     fn registry(config: &AgentConfig) -> ToolRegistry {
         let policy = Self::policy(config);
-        let mut reg = if !config.full_access && config.policy_preset == crate::perm::Preset::Plan {
+        let plan_mode = !config.full_access && config.policy_preset == crate::perm::Preset::Plan;
+        let mut reg = if plan_mode {
             ToolRegistry::plan_mode(policy)
         } else {
             ToolRegistry::core(policy)
         };
         if !config.disabled_tools.is_empty() {
             reg.disable(&config.disabled_tools);
+        }
+        if !plan_mode {
+            // `--no-tools mcp` survives this: `with_mcp` rebuilds the
+            // advertised list from the resident set minus the disabled set.
+            reg = reg.with_mcp(config.mcp_servers.clone());
         }
         reg
     }

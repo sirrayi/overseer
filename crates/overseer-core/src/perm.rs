@@ -310,7 +310,18 @@ const IDENTITY_MARKERS: &[&str] = &[
 /// (InternalWrite); type/submit/send emit content outward
 /// (ExternalComms); any credential-field focus escalates to Identity.
 /// Unknown actions default up (InternalWrite), never down.
+/// R6 MCP arm: the `mcp` op tool declares its own class — `search` reads
+/// third-party tool *metadata* (Read); `call` runs a third-party tool, which
+/// is external communication until an operator says otherwise. The operator's
+/// `trust: "read"` allow lives in [`Policy::check`] (it needs the config);
+/// this pure function must not guess it, and an unknown op defaults up.
 pub fn classify(tool: &str, input: &Value) -> Irreversibility {
+    if tool == "mcp" {
+        return match input.get("op").and_then(Value::as_str) {
+            Some(op) if op.eq_ignore_ascii_case("search") => Irreversibility::Read,
+            _ => Irreversibility::ExternalComms,
+        };
+    }
     if tool == "computer" {
         let action = input
             .get("action")
@@ -548,6 +559,14 @@ pub struct Policy {
     /// persona dir to the file tools — a draft is unreadable, not merely
     /// absent from the prompt (`draft_deny`, R2-F8).
     pub persona_approved: bool,
+    /// R6: MCP servers the operator declared `trust: "read"` — **sanitized**
+    /// server ids (the segment `mcp::namespaced` builds into a tool name),
+    /// set once by `ToolRegistry::with_mcp`, empty by default. An `mcp` call
+    /// whose server segment is in here is a read and skips the ladder; every
+    /// other MCP call rides the normal path (WorkspaceWrite: external-comms
+    /// lane → Ask). This is a declaration in a file, not a discovery about
+    /// the server.
+    pub mcp_read_servers: Vec<String>,
 }
 
 impl Policy {
@@ -568,6 +587,7 @@ impl Policy {
             memory_dir: None,
             persona_dir: None,
             persona_approved: false,
+            mcp_read_servers: Vec::new(),
         }
     }
 
@@ -587,6 +607,7 @@ impl Policy {
             memory_dir: None,
             persona_dir: None,
             persona_approved: false,
+            mcp_read_servers: Vec::new(),
         }
     }
 
@@ -607,6 +628,7 @@ impl Policy {
             memory_dir: None,
             persona_dir: None,
             persona_approved: false,
+            mcp_read_servers: Vec::new(),
         }
     }
 
@@ -709,6 +731,11 @@ impl Policy {
         if !t.untrusted
             && (tool == "task"
                 || tool == "skill"
+                // R6: MCP output is third-party content by construction —
+                // a search result is descriptions the server authored, a
+                // call result is whatever the server returned — so every
+                // `mcp` result latches untrusted, marker or not.
+                || tool == "mcp"
                 || Self::is_screenshot_context(tool, input)
                 || INJECTION_MARKERS.iter().any(|m| lower.contains(m)))
         {
@@ -843,6 +870,22 @@ impl Policy {
         if READ_TOOLS.contains(&tool) {
             return Verdict::Allow;
         }
+        // R6 MCP early-allow, next to the read-tool rule: `search` reads
+        // third-party tool metadata (a read under every preset), and a `call`
+        // to a server the operator declared `trust: "read"` is a read too.
+        // Everything else about `mcp` falls through to the normal path below
+        // — ReadOnly/Plan deny it, WorkspaceWrite runs the external-comms
+        // ladder (Ask by default) and ends at the `"mcp"` arm of
+        // `check_workspace`, never the unknown-tool deny.
+        if tool == "mcp" {
+            let op = input.get("op").and_then(Value::as_str).unwrap_or("");
+            if op.eq_ignore_ascii_case("search") {
+                return Verdict::Allow;
+            }
+            if op.eq_ignore_ascii_case("call") && self.mcp_call_read_trusted(input) {
+                return Verdict::Allow;
+            }
+        }
         match self.preset {
             Preset::ReadOnly | Preset::Plan => Verdict::Deny {
                 reason: format!(
@@ -852,6 +895,24 @@ impl Policy {
             },
             Preset::WorkspaceWrite => self.check_workspace(tool, input),
         }
+    }
+
+    /// R6: does this `call` name a server the operator declared
+    /// `trust: "read"`? A full name is `mcp__<san(srv)>__<san(tool)>`, and
+    /// `mcp_read_servers` holds sanitized ids (what `with_mcp` stores), so
+    /// the prefix test is exact. `mcp_config::load` refuses a config where
+    /// one sanitized id extends another on a namespace boundary, so this
+    /// cannot land on the wrong server.
+    fn mcp_call_read_trusted(&self, input: &Value) -> bool {
+        let Some(full) = input.get("tool").and_then(Value::as_str) else {
+            return false;
+        };
+        if !full.starts_with("mcp__") {
+            return false;
+        }
+        self.mcp_read_servers
+            .iter()
+            .any(|server| full.starts_with(&format!("mcp__{server}__")))
     }
 
     /// Domain of an irreversibility class (the autonomy-map key).
@@ -1023,6 +1084,15 @@ impl Policy {
             // Ask/Deny already won for side-effecting actions. Explicit
             // autonomy keeps the default ActWithApproval Ask for acts.
             "computer" => Verdict::Allow,
+            // R6 `mcp` arm — reached only after the ladder floor above, and
+            // only for a `call`: `search` and read-trust calls returned Allow
+            // from `check`. So this is a call to a not-read-trusted server
+            // whose external-comms lane forced no Ask (an explicit
+            // `external=report|silent` autonomy, or the headless
+            // `ActSilently`-style floor). Allowing it here — exactly like
+            // `computer` — keeps an autonomy that earned silence from
+            // falling into the unknown-tool deny below.
+            "mcp" => Verdict::Allow,
             // Side-effecting file tools: containment already enforced by
             // hard_deny above (deny wins). Remaining: memory LAYER bar
             // (F5) → Rule-of-Two taint Ask, else Allow.
@@ -2295,6 +2365,88 @@ mod tests {
             forever.tick_turn();
         }
         assert_eq!(forever.check("bash", &cmd), Verdict::Allow);
+    }
+
+    #[test]
+    fn mcp_ops_classify_and_gate_on_the_declared_trust() {
+        use serde_json::json;
+        // R6: `classify` is pure — search is a read; call and every unknown
+        // op (including a missing one) default up to external communication.
+        assert_eq!(
+            classify("mcp", &json!({"op": "search", "query": "x"})),
+            Irreversibility::Read
+        );
+        assert_eq!(
+            classify("mcp", &json!({"op": "call", "tool": "mcp__fs__read"})),
+            Irreversibility::ExternalComms
+        );
+        assert_eq!(
+            classify("mcp", &json!({"op": "nonsense"})),
+            Irreversibility::ExternalComms
+        );
+        assert_eq!(classify("mcp", &json!({})), Irreversibility::ExternalComms);
+
+        let search = json!({"op": "search", "query": "read"});
+        let call_read = json!({"op": "call", "tool": "mcp__fs__read", "args": {}});
+        let call_other = json!({"op": "call", "tool": "mcp__db__sql", "args": {}});
+
+        // Search is allowed under every preset (it reads tool metadata).
+        for preset in [Preset::WorkspaceWrite, Preset::ReadOnly, Preset::Plan] {
+            let p = Policy::preset(preset, PathBuf::from("/tmp/ws"));
+            assert_eq!(
+                p.check("mcp", &search),
+                Verdict::Allow,
+                "{preset:?}: search is a read"
+            );
+        }
+
+        // A `trust: "read"` server's calls are reads; a default server's
+        // calls ride the external-comms ladder (ActWithApproval → Ask).
+        let mut p = Policy::preset(Preset::WorkspaceWrite, PathBuf::from("/tmp/ws"));
+        p.mcp_read_servers = vec!["fs".to_string()];
+        assert_eq!(p.check("mcp", &call_read), Verdict::Allow);
+        assert!(
+            matches!(p.check("mcp", &call_other), Verdict::Ask { .. }),
+            "an untrusted server needs approval, got {:?}",
+            p.check("mcp", &call_other)
+        );
+        // ... and an explicit silent-external autonomy reaches the `"mcp"`
+        // arm instead of the unknown-tool deny.
+        let mut silent = Policy::preset(Preset::WorkspaceWrite, PathBuf::from("/tmp/ws"));
+        silent
+            .autonomy
+            .insert("external".to_string(), Autonomy::ActSilently);
+        assert_eq!(silent.check("mcp", &call_other), Verdict::Allow);
+        // A read-trust id must not match a different server's name.
+        assert!(matches!(p.check("mcp", &call_other), Verdict::Ask { .. }));
+
+        // ReadOnly/Plan deny a call (both headless Ask and unknown fall
+        // through to the preset deny).
+        for preset in [Preset::ReadOnly, Preset::Plan] {
+            let p = Policy::preset(preset, PathBuf::from("/tmp/ws"));
+            assert!(
+                matches!(p.check("mcp", &call_other), Verdict::Deny { .. }),
+                "{preset:?}: a call is a side effect"
+            );
+        }
+
+        // Any mcp result latches untrusted (third-party content, including
+        // search descriptions) — proven by arming the triangle's other half.
+        let p = Policy::headless(PathBuf::from("/tmp/ws"));
+        assert!(
+            p.note_result("mcp", &search, "mcp__fs__read — Read a file")
+                .is_some(),
+            "the mcp result must latch"
+        );
+        assert!(!p.taint_armed(), "untrusted alone is not the triangle");
+        p.mark_sensitive("test");
+        assert!(p.taint_armed(), "note_result(mcp) set the untrusted latch");
+        let q = Policy::headless(PathBuf::from("/tmp/ws"));
+        q.mark_sensitive("test");
+        assert!(
+            !q.taint_armed(),
+            "a sensitive touch alone must not arm it (control)"
+        );
     }
 
     #[test]

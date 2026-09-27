@@ -19,6 +19,7 @@ pub mod diagnostics;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod mcp_tool;
 pub mod plan;
 pub mod read;
 pub mod repomap;
@@ -170,14 +171,16 @@ struct ReadRecord {
 /// All tool names the core registry can emit — the validation set for
 /// `--no-tools` ablations (typo'd names fail fast, not silently no-op).
 /// Sorted; `all_core_specs_deny_additional_properties` pins the count to
-/// the registry's spec list.
-pub const TOOL_NAMES: [&str; 14] = [
+/// the registry's spec list. `mcp` is the one name that is not always
+/// resident: the spec exists only when a server is configured (`with_mcp`).
+pub const TOOL_NAMES: [&str; 15] = [
     "bash",
     "computer",
     "diagnostics",
     "edit",
     "glob",
     "grep",
+    "mcp",
     "plan",
     "read",
     "repo_map",
@@ -212,6 +215,12 @@ pub struct ToolRegistry {
     /// P8-B session mode (roo pattern): the active posture's toolset and
     /// edit globs. `None` = default posture (every resident tool).
     pub mode: Option<&'static crate::modes::Mode>,
+    /// Configured MCP servers + the live ones (`with_mcp`). `None` = no MCP
+    /// in this registry, which is the shipped default. Discovered tool
+    /// definitions never enter `base_specs`/`specs` — they live in here,
+    /// behind the single resident `mcp` op tool (Invariant 2: the advertised
+    /// array must not change because a third-party server did).
+    mcp: Option<mcp_tool::McpState>,
 }
 
 impl ToolRegistry {
@@ -246,6 +255,7 @@ impl ToolRegistry {
             disabled: HashSet::new(),
             hooks,
             mode: None,
+            mcp: None,
         }
     }
 
@@ -265,6 +275,7 @@ impl ToolRegistry {
             disabled: HashSet::new(),
             hooks,
             mode: None,
+            mcp: None,
         }
     }
 
@@ -285,7 +296,34 @@ impl ToolRegistry {
             disabled: HashSet::new(),
             hooks,
             mode: None,
+            mcp: None,
         }
+    }
+
+    /// Install the configured MCP servers.
+    ///
+    /// Adds **exactly one** resident spec — `mcp`, whose input schema and
+    /// description are fixed text (see `mcp_tool`) — and moves every
+    /// discovered tool definition behind it. That is the cache-stability
+    /// contract (Invariant 2): a third-party server's names, count and
+    /// descriptions must never enter the advertised array, or a server that
+    /// reorders its list would invalidate the prompt prefix every turn.
+    ///
+    /// A no-op for an empty list, so a session with no configured server
+    /// keeps a byte-identical spec array; the decision is taken here, once,
+    /// and never revisited mid-session. The servers' declared `trust: read`
+    /// ids are handed to the policy here too, which is the only place that
+    /// sees the config.
+    pub fn with_mcp(mut self, servers: Vec<crate::mcp_config::McpServer>) -> Self {
+        if servers.is_empty() {
+            return self;
+        }
+        self.policy.mcp_read_servers = mcp_tool::read_server_ids(&servers);
+        self.base_specs.push(mcp_tool::spec());
+        self.base_specs.sort_by(|a, b| a.name.cmp(&b.name));
+        self.mcp = Some(mcp_tool::McpState::new(servers));
+        self.rebuild_specs();
+        self
     }
 
     /// Apply a session mode (roo pattern): every resident tool the mode
@@ -481,6 +519,17 @@ impl ToolRegistry {
             "computer" => computer::run(input, ctx),
             "diagnostics" => diagnostics::run(input, ctx),
             "struct_search" => struct_search::run(input, ctx),
+            // MCP (R1/R4): one op tool over the configured servers. The
+            // discovered tool definitions live in the state, never in
+            // `specs`; a server is spawned on first use and dropped if it
+            // dies. The result flows through the same post-hook, taint,
+            // sanitize and budget path as every other tool below.
+            "mcp" => match self.mcp.as_mut() {
+                Some(state) => state.run(input),
+                None => ToolOutput::err(
+                    "mcp: no MCP servers are configured — add them to ~/.overseer/mcp.json.",
+                ),
+            },
             other => ToolOutput::err(format!(
                 "Unknown tool '{other}'. Available tools: {}.",
                 TOOL_NAMES.join(", ")
@@ -916,7 +965,16 @@ mod tests {
                 spec.name
             );
         }
-        assert_eq!(reg.specs.len(), TOOL_NAMES.len());
+        // `mcp` is the one name that is only resident when a server is
+        // configured, so the count compares against TOOL_NAMES minus it —
+        // the intent (spec list ↔ validation set, one of each) is kept.
+        let resident: Vec<&str> = TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| *name != "mcp")
+            .collect();
+        assert_eq!(reg.specs.len(), resident.len());
+        assert!(!reg.specs.iter().any(|s| s.name == "mcp"));
     }
 
     #[test]
