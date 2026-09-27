@@ -50,16 +50,12 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   the shared restore implementation used by `overseer rewind` and the
   TUI's `/rewind`.
 - arsenal modules (P8-B/P8-C ports — pure patterns, no servers/runtimes):
-  memory/graph (`memory.rs`, `graph.rs`, `cognee.rs`, `press.rs`,
-  `rag.rs`), retrieval (`tools/struct_search.rs` — ast-grep + semgrep
+  `memory.rs`; retrieval (`tools/struct_search.rs` — ast-grep + semgrep
   shell-out; `tsitter.rs`, feature `tree-sitter`, default-off, zero
   dependencies: the grammar/query registry a real binding registers
-  against), search/scrape (`web.rs`, `extract.rs`, `crawl.rs`),
-  browser/agent surface (`browse.rs`, `webagent.rs`), sandboxes and
-  grants (`backends.rs` — e2b trait, provider enum, runtime selection,
-  toolhive grants, context-forge grants), `mcp.rs` (minimal stdio
-  JSON-RPC client), `refine.rs` (textgrad bounded loop),
-  `evalcfg.rs`/`observability.rs` (B2). `bash` honours `--runtime
+  against); sandboxes and grants (`backends.rs` — e2b trait, provider
+  enum, runtime selection, toolhive grants, context-forge grants);
+  `mcp.rs` (minimal stdio JSON-RPC client). `bash` honours `--runtime
   <native|seatbelt|bubblewrap|gvisor>`: a pinned runtime that is
   unavailable FAILS the call with the requirement named (never a silent
   downgrade to unsandboxed exec); unset keeps the platform default.

@@ -6,19 +6,12 @@
 
 pub mod agent;
 pub mod backends;
-pub mod browse;
-pub mod cache;
-pub mod cognee;
 pub mod compact;
 pub mod computer_obs;
 pub mod control;
-pub mod crawl;
 pub mod cred;
-pub mod evalcfg;
 pub mod event;
-pub mod extract;
 pub mod fuzzy;
-pub mod graph;
 pub mod harden;
 pub mod hooks;
 pub mod ir;
@@ -28,17 +21,12 @@ pub mod mcp;
 pub mod memory;
 pub mod microagent;
 pub mod modes;
-pub mod observability;
 pub mod onboard;
-pub mod orchestration;
 pub mod perm;
-pub mod press;
 pub mod profile;
 pub mod prompt;
 pub mod provider;
-pub mod rag;
 pub mod recipe;
-pub mod refine;
 pub mod repomap;
 pub mod rewind;
 pub mod session;
@@ -53,5 +41,3 @@ pub mod toon;
 /// linked (offline build + the zero-new-crate gate).
 #[cfg(feature = "tree-sitter")]
 pub mod tsitter;
-pub mod web;
-pub mod webagent;

@@ -12,7 +12,6 @@ pub mod gemini;
 pub mod local;
 pub mod openai;
 pub mod responses;
-pub mod router;
 
 /// Native-compaction seam, defined in [`crate::compact`]: adapters opt in
 /// via `NativeCompaction`; routing gates on `provider_compact_capability`.
