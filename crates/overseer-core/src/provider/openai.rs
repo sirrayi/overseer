@@ -1,6 +1,6 @@
 //! OpenAI-compatible Chat Completions adapter (playbook Ch.7 §1.2).
 //! Covers api.openai.com and OpenAI-compatible gateways (vLLM, Groq,
-//! Together, etc.) — verified against hosted vLLM fleets.
+//! Together, etc.) — verified against hosted vLLM gateways.
 //!
 //! Wire conventions handled here:
 //! - tool_calls are separate `tool` role messages per result (NOT merged
@@ -113,7 +113,7 @@ impl OpenAiCompatible {
                 super::Effort::High | super::Effort::Max => "high",
             });
         }
-        // Param filter (Ch.7 §2.2): the conservative hosted-fleet profile
+        // Param filter (Ch.7 §2.2): the conservative gateway profile
         // rejects reasoning_effort, so it is stripped there while
         // unknown/OpenAI models keep it. Core keys are never stripped.
         crate::profile::strip_optional_params(
@@ -578,8 +578,8 @@ mod tests {
     }
 
     #[test]
-    fn param_filter_strips_reasoning_effort_on_fleet() {
-        // The conservative fleet profile rejects reasoning_effort: effort
+    fn param_filter_strips_reasoning_effort_on_gateway() {
+        // The conservative gateway profile rejects reasoning_effort: effort
         // maps then strips, so vLLM never sees a gateway-specific knob.
         let system: Vec<SystemSegment> = vec![];
         let tools: Vec<ToolSpec> = vec![];
