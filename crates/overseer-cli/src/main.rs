@@ -80,8 +80,9 @@ fn usage() {
          USAGE:\n\
          \x20 overseer [tui] [FLAGS]          interactive TUI (bare `overseer`)\n\
          \x20 overseer tui --inline           live-strip surface (native scrollback)\n\
-         \x20 overseer web [FLAGS] [--port <n>]\n\
-         \x20                             browser surface on localhost (default 8641);\n\
+         \x20 overseer web [FLAGS] [--port <n>] [--no-open]\n\
+         \x20                             browser surface on localhost; opens a tab\n\
+         \x20                             (scans 8641+ unless --port pins one)\n\
          \x20                             alias: overseer tui --web [--web-port <n>]\n\
          \x20 overseer tui --no-tui           line mode (screen readers, plain REPL)\n\
          \x20 overseer exec [FLAGS] <prompt>  one prompt, headless ('-' reads stdin)\n\
@@ -166,7 +167,8 @@ fn usage() {
          \x20 --no-tui            Line mode (plain-text REPL)\n\
          \x20 --inline            Live-strip surface in native scrollback\n\
          \x20 --web               Browser surface on localhost\n\
-         \x20 --web-port <n>      Port for --web (default: 8641)\n\
+         \x20 --web-port <n>      Port for --web (absent: scan 8641-8660)\n\
+         \x20 --no-open           Print the URL instead of opening a tab\n\
          \n\
          ENV (provider keys; each provider reads only its own name, from env\n\
          \x20    first, then the same name in the credential payload):\n\

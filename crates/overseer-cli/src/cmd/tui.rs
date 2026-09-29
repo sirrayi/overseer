@@ -7,8 +7,6 @@ use crate::flags::{exec_from, ExecFlags, EXEC_FLAGS};
 use crate::provider::build_provider;
 use crate::session::{agent_config, apply_credentials, resolve_session};
 
-const DEFAULT_WEB_PORT: u16 = 8641;
-
 /// Surface selectors layered on top of the exec flag set.
 const TUI_FLAGS: &[Flag] = &[
     // --no-tui: line mode — same session plumbing, plain-text REPL
@@ -19,7 +17,10 @@ const TUI_FLAGS: &[Flag] = &[
     // --web: same session, rendered into a browser tab on localhost
     // (the fullscreen surface, drawn to a DOM grid).
     Flag::switch(&["--web"]),
+    // --web-port pins the port; absent → the server scans 8641..=8660.
     Flag::value(&["--web-port"]),
+    // --no-open: print the tokenized URL instead of opening a tab.
+    Flag::switch(&["--no-open"]),
 ];
 
 /// `overseer web` takes the tui set plus `--port`, a synonym for `--web-port`.
@@ -29,7 +30,9 @@ struct TuiFlags {
     line_mode: bool,
     inline: bool,
     web: bool,
-    web_port: u16,
+    /// `Some(n)` pins the port; `None` lets the server scan 8641..=8660.
+    web_port: Option<u16>,
+    no_open: bool,
     exec: ExecFlags,
 }
 
@@ -45,7 +48,8 @@ fn parse_tui(argv: &[String], web_cmd: bool) -> Result<TuiFlags, String> {
         line_mode: false,
         inline: false,
         web: web_cmd,
-        web_port: DEFAULT_WEB_PORT,
+        web_port: None,
+        no_open: false,
         exec: exec_from(Vec::new())?,
     };
     let mut rest = Vec::new();
@@ -59,13 +63,16 @@ fn parse_tui(argv: &[String], web_cmd: bool) -> Result<TuiFlags, String> {
             } => f.inline = true,
             Arg::Flag { name: "--web", .. } => f.web = true,
             Arg::Flag {
+                name: "--no-open", ..
+            } => f.no_open = true,
+            Arg::Flag {
                 name: "--web-port",
                 value: Some(v),
-            } => f.web_port = v.parse().map_err(|_| format!("bad --web-port '{v}'"))?,
+            } => f.web_port = Some(v.parse().map_err(|_| format!("bad --web-port '{v}'"))?),
             Arg::Flag {
                 name: "--port",
                 value: Some(v),
-            } => f.web_port = v.parse().map_err(|_| format!("bad --port '{v}'"))?,
+            } => f.web_port = Some(v.parse().map_err(|_| format!("bad --port '{v}'"))?),
             other => rest.push(other),
         }
     }
@@ -84,6 +91,16 @@ pub(crate) fn cmd_tui(argv: &[String]) -> i32 {
 /// [--web-port <n>]`: the same session rendered into a localhost browser tab.
 pub(crate) fn cmd_web(argv: &[String]) -> i32 {
     run(argv, "web")
+}
+
+/// TUI/web flags → WebOpts: `--web-port`/`--port` pins, absent scans
+/// 8641..=8660; the tab auto-opens unless `--no-open` (or the
+/// environment says it can't — SSH/headless is checked server-side).
+fn web_opts(f: &TuiFlags) -> overseer_tui::web::WebOpts {
+    overseer_tui::web::WebOpts {
+        port: f.web_port,
+        open: !f.no_open,
+    }
 }
 
 fn run(argv: &[String], cmd: &str) -> i32 {
@@ -122,7 +139,7 @@ fn run(argv: &[String], cmd: &str) -> i32 {
     match if f.line_mode {
         overseer_tui::run_line(cfg)
     } else if f.web {
-        overseer_tui::web::run_web(cfg, f.web_port)
+        overseer_tui::web::run_web_with(cfg, web_opts(&f))
     } else if f.inline {
         overseer_tui::run_inline(cfg)
     } else {
@@ -154,14 +171,15 @@ mod tests {
         let tui = tui_only(&argv(&["--web", "--web-port", "9001", "--model", "m"])).unwrap();
         for f in [&web, &tui] {
             assert!(f.web && !f.inline && !f.line_mode);
-            assert_eq!(f.web_port, 9001);
+            assert_eq!(f.web_port, Some(9001));
             assert_eq!(f.exec.model, "m");
         }
         // Same flags as tui: --web-port and a redundant --web still work.
         let f = parse_tui(&argv(&["--web", "--web-port=9002"]), true).unwrap();
         assert!(f.web);
-        assert_eq!(f.web_port, 9002);
-        assert_eq!(parse_tui(&[], true).unwrap().web_port, DEFAULT_WEB_PORT);
+        assert_eq!(f.web_port, Some(9002));
+        // No port flag → None → the server scans 8641..=8660.
+        assert_eq!(parse_tui(&[], true).unwrap().web_port, None);
         // --port belongs to `web` only.
         assert_eq!(
             tui_only(&argv(&["--port", "1"])).err().unwrap(),
@@ -174,14 +192,32 @@ mod tests {
     }
 
     #[test]
+    fn web_opts_mapping() {
+        // Default: scan ports, auto-open.
+        let f = parse_tui(&argv(&[]), true).unwrap();
+        let o = web_opts(&f);
+        assert_eq!(o.port, None);
+        assert!(o.open);
+        // Pinned port + --no-open, same on both spellings.
+        let f = parse_tui(&argv(&["--port", "9001", "--no-open"]), true).unwrap();
+        let o = web_opts(&f);
+        assert_eq!(o.port, Some(9001));
+        assert!(!o.open);
+        let f = tui_only(&argv(&["--web", "--web-port=8641", "--no-open"])).unwrap();
+        let o = web_opts(&f);
+        assert_eq!(o.port, Some(8641));
+        assert!(!o.open);
+    }
+
+    #[test]
     fn tui_surface_flags_mix_with_exec_flags() {
         let f = tui_only(&argv(&["--web", "--model", "m", "--web-port=9000"])).unwrap();
         assert!(f.web && !f.inline && !f.line_mode);
-        assert_eq!(f.web_port, 9000);
+        assert_eq!(f.web_port, Some(9000));
         assert_eq!(f.exec.model, "m");
         let f = tui_only(&argv(&["--no-tui", "--inline"])).unwrap();
         assert!(f.line_mode && f.inline);
-        assert_eq!(f.web_port, DEFAULT_WEB_PORT);
+        assert_eq!(f.web_port, None);
     }
 
     #[test]

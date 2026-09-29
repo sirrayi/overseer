@@ -91,19 +91,6 @@ pub struct WebOpts {
     pub open: bool,
 }
 
-/// CLI entry point: pinned port, never auto-opens (the caller prints
-/// the URL). All the hardening lives in the server below — this is
-/// just a narrower front door.
-pub fn run_web(cfg: TuiConfig, port: u16) -> std::io::Result<i32> {
-    run_web_with(
-        cfg,
-        WebOpts {
-            port: Some(port),
-            open: false,
-        },
-    )
-}
-
 /// Run the session on the web surface. Blocks until /quit (like `run`).
 /// `opts.port` pins the bind (busy = error); `None` scans 8641..=8660.
 /// `opts.open` opens the tokenized URL in the system browser unless the
