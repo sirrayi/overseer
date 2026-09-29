@@ -2,10 +2,30 @@
 // Layout math is server-side (same draw code as the terminal); this is
 // a dumb grid renderer + input forwarder.
 
+// ── auth ───────────────────────────────────────────────────────────
+// The token arrives in the URL fragment (`#t=`): fragments never ride
+// a request line or a Referer header. We lift it into localStorage
+// (a returning tab keeps working) and strip it from the address bar.
+let TOKEN = '';
+const hashT = location.hash.match(/[#&]t=([0-9a-f]+)/);
+if (hashT) {
+  TOKEN = hashT[1];
+  localStorage.setItem('overseer.token', TOKEN);
+  history.replaceState(null, '', location.pathname + location.search);
+} else {
+  TOKEN = localStorage.getItem('overseer.token') || '';
+}
+
 const screen = document.getElementById('screen');
 const cursor = document.createElement('div');
 cursor.id = 'cursor';
 screen.appendChild(cursor);
+
+function locked() {
+  // body.locked hides the whole window and shows the mark + one
+  // instruction line (see style.css).
+  document.body.classList.add('locked');
+}
 
 // ── cell metrics ──────────────────────────────────────────────────
 let CH = 8, LH = 18;
@@ -40,23 +60,21 @@ const col = c => c && c[0] === 'i' ? PAL[+c.slice(1)] : c;
 // ratatui Modifier bits
 const M_BOLD = 1, M_DIM = 2, M_ITALIC = 4, M_UNDER = 8, M_REV = 64, M_CROSS = 256;
 
-function spanCss(s) {
+// One span per styled run — DOM APIs + CSSOM writes only (never
+// innerHTML / setAttribute('style')), so `style-src 'self'` holds.
+function applySpan(el, s) {
   let f = col(s.f), b = col(s.b);
-  let css = '';
-  if (s.m & M_REV) [f, b] = [b || '#1e1f24', f || '#abb2bf'];
-  if (f) css += 'color:' + f + ';';
-  if (b) css += 'background:' + b + ';';
-  if (s.m & M_BOLD) css += 'font-weight:bold;';
-  if (s.m & M_DIM) css += 'opacity:.55;';
-  if (s.m & M_ITALIC) css += 'font-style:italic;';
-  let td = [];
+  if (s.m & M_REV) [f, b] = [b || '#1e1f24', f || '#d4d6db'];
+  if (f) el.style.color = f;
+  if (b) el.style.background = b;
+  if (s.m & M_BOLD) el.style.fontWeight = 'bold';
+  if (s.m & M_DIM) el.style.opacity = '.55';
+  if (s.m & M_ITALIC) el.style.fontStyle = 'italic';
+  const td = [];
   if (s.m & M_UNDER) td.push('underline');
   if (s.m & M_CROSS) td.push('line-through');
-  if (td.length) css += 'text-decoration:' + td.join(' ') + ';';
-  return css;
+  if (td.length) el.style.textDecoration = td.join(' ');
 }
-
-const esc = t => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 // Whole-grid vertical nudge inside the window (tuning pass).
 const TOP_OFF = 10.5;
@@ -85,25 +103,46 @@ function render(f) {
     screen.insertBefore(d, cursor);
     rowEls.push(d);
   }
+  // Rows past the frame height are ghosts from a taller grid — hide
+  // them and drop their cache keys so a shrink never leaves stale cells.
+  for (let y = f.h; y < rowEls.length; y++) {
+    rowEls[y].style.display = 'none';
+    rowCache[y] = null;
+  }
   // f.p = the prompt band's first grid row — the server reports it so
   // the dip+divider track the layout whether or not the panel band is
   // open below it.
   const pt = f.p ?? f.h - 3;
+  // §5: fresh session — the server leaves the glyph row blank and
+  // paints the wordmark; the client overlays ONLY the 40px mark,
+  // centred on that row (mid = (t_rows-1)/2, t_rows = pt).
+  const empty = document.getElementById('empty');
+  empty.classList.toggle('on', !!f.e);
+  if (f.e) {
+    const mid = Math.max(0, (pt - 1) >> 1);
+    empty.style.top = (mid * LH + TOP_OFF + LH / 2 - 20) + 'px';
+  }
+  const frag = document.createDocumentFragment();
   for (let y = 0; y < f.h; y++) {
     const row = f.rows[y];
     const el = rowEls[y];
     const inPrompt = y >= pt && y < pt + 2;
     // Always reposition — resize shifts which band a row belongs to
     // even when its content is identical.
+    el.style.display = '';
     el.style.top = (y * LH + TOP_OFF + (inPrompt ? PROMPT_OFF : 0)) + 'px';
     el.style.left = (inPrompt ? PROMPT_L : 0) + 'px';
     const key = JSON.stringify(row);
     if (rowCache[y] === key) continue;
     rowCache[y] = key;
     el.style.height = LH + 'px';
-    let html = '';
-    for (const s of row) html += '<span style="' + spanCss(s) + '">' + esc(s.t) + '</span>';
-    el.innerHTML = html;
+    for (const s of row) {
+      const sp = document.createElement('span');
+      sp.textContent = s.t;
+      applySpan(sp, s);
+      frag.appendChild(sp);
+    }
+    el.replaceChildren(frag);
   }
   // 1px separator 3px above the prompt arrow, inset 3px each side.
   divider.style.top = (pt * LH + TOP_OFF + PROMPT_OFF - 4) + 'px';
@@ -116,19 +155,51 @@ function render(f) {
 
 // ── server link ────────────────────────────────────────────────────
 let es;
-// GET with the payload in ?d= — some preview proxies forward POST
-// requests but drop their bodies; GET passes through untouched.
-const post = o => fetch('/input?d=' + encodeURIComponent(JSON.stringify(o)));
+// POST with the bearer header first; some preview proxies forward
+// POSTs but drop bodies, so a failed POST falls back to GET ?d=&t= —
+// the token in a URL is acceptable here (fetch, not navigation, and
+// Referrer-Policy: no-referrer keeps it out of Referer headers).
+const post = o => {
+  const body = JSON.stringify(o);
+  const get = () =>
+    fetch('/input?t=' + encodeURIComponent(TOKEN) + '&d=' + encodeURIComponent(body));
+  fetch('/input', {
+    method: 'POST',
+    headers: { 'X-Overseer-Token': TOKEN },
+    body,
+  })
+    .then(res => {
+      // fetch resolves on HTTP errors — a body-stripping proxy's 400
+      // is a RESOLVED 400, not a rejection. Retry over GET for
+      // anything that isn't a real auth verdict.
+      if (!res.ok && res.status !== 401 && res.status !== 403) get();
+    })
+    .catch(get);
+};
+
+// §6 installed PWA is full-bleed: no title bar, no page margin.
+const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 
 function fit() {
-  // Fill the viewport: 10px page margin either side, 30px title bar.
-  const cols = Math.max(40, Math.floor((innerWidth - 20) / CH));
-  const rows = Math.max(10, Math.floor((innerHeight - 30 - 20) / LH));
+  const cols = Math.max(40, Math.floor((innerWidth - (standalone ? 0 : 20)) / CH));
+  const rows = Math.max(10, Math.floor((innerHeight - (standalone ? 0 : 30 + 20)) / LH));
   post({ type: 'resize', cols, rows });
 }
 
-function connect() {
-  es = new EventSource('/events');
+async function connect() {
+  if (!TOKEN) { locked(); return; }
+  // EventSource can't set headers or report a 401 — probe the route
+  // with fetch first so a bad/expired token lands on the locked screen
+  // instead of an invisible reconnect loop.
+  try {
+    const probe = await fetch('/events?t=' + encodeURIComponent(TOKEN));
+    if (probe.status === 401 || probe.status === 403) { probe.body.cancel(); locked(); return; }
+    await probe.body.cancel();
+  } catch {
+    locked();
+    return;
+  }
+  es = new EventSource('/events?t=' + encodeURIComponent(TOKEN));
   es.onmessage = e => render(JSON.parse(e.data));
   fit();
   // Re-fit once layout/fonts settle — first measure can run before
@@ -146,18 +217,30 @@ const KEYS = {
 };
 
 // The bottom mark is the panel button — same as F1 / ↑ on empty input.
-document.getElementById('mark').addEventListener('click', e => {
+// §10 swap point: /mark.svg is the ONE geometry file; it's injected
+// inline (never innerHTML strings we build) into the button, the
+// empty-state mark and the locked-screen mark so CSS currentColor
+// controls each copy.
+const markBtn = document.getElementById('mark');
+fetch('/mark.svg')
+  .then(r => r.text())
+  .then(svg => {
+    markBtn.innerHTML = svg;
+    for (const id of ['emark', 'lockmark']) {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = svg;
+    }
+  })
+  .catch(() => {});
+markBtn.addEventListener('click', e => {
   post({ type: 'panel' });
   e.stopPropagation();
 });
 
-const titleEl = document.getElementById('title');
 addEventListener('keydown', e => {
-  // Echo the key in the title bar — proves keydown reached the page
-  // even if the POST round-trip dies elsewhere.
-  titleEl.textContent = 'overseer · ' + e.key;
-  clearTimeout(titleEl._t);
-  titleEl._t = setTimeout(() => (titleEl.textContent = 'overseer'), 900);
+  // Focused on the mark button? Enter/Space belongs to it — let the
+  // browser produce the click instead of forwarding a transcript key.
+  if (e.target === markBtn) return;
   if (e.metaKey) return; // leave cmd-* to the browser
   const mods = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey };
   if (e.key === 'Tab' && e.shiftKey) {

@@ -7,7 +7,7 @@ use overseer_core::perm::{AskRequest, Preset};
 
 use crate::theme;
 
-const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(crate) const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// One-row working indicator: spinner + phase + elapsed + token count +
 /// an *accurate* interrupt hint — it's only drawn while the engine is

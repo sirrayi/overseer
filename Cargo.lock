@@ -1187,7 +1187,6 @@ dependencies = [
  "insta",
  "libc",
  "overseer-core",
- "overseer-proto",
  "ratatui",
  "serde_json",
  "unicode-segmentation",

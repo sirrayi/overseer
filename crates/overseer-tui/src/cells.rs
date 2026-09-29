@@ -54,6 +54,15 @@ pub enum Cell {
     Meta {
         style: Style,
         text: String,
+        /// Target emitted as an OSC 8 link line on flush (subagent
+        /// traces) — the glyph row keeps just the word "trace".
+        link: Option<std::path::PathBuf>,
+    },
+    /// End-of-run summary: right-aligned faint `steps · elapsed · cost`;
+    /// `warn` prefixes the reason in warn colour on abnormal ends.
+    End {
+        text: String,
+        warn: Option<String>,
     },
 }
 
@@ -72,6 +81,10 @@ impl Cell {
             } => format!("{name} {summary} {}", output.as_deref().unwrap_or("")),
             Cell::Plan { markdown } => markdown.clone(),
             Cell::Meta { text, .. } => text.clone(),
+            Cell::End { text, warn } => match warn {
+                Some(w) => format!("{w} · {text}"),
+                None => text.clone(),
+            },
         }
     }
 
@@ -79,6 +92,7 @@ impl Cell {
     pub fn link_path(&self) -> Option<&std::path::Path> {
         match self {
             Cell::Tool { link, .. } => link.as_deref(),
+            Cell::Meta { link, .. } => link.as_deref(),
             _ => None,
         }
     }
@@ -86,11 +100,20 @@ impl Cell {
     /// Render at `width` columns. Cells are height-cacheable per width —
     /// the transcript only ever appends.
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.lines_at(width, None)
+    }
+
+    /// `tick` = Some((tick, reduce_motion)) only for the live region:
+    /// a running tool's glyph cycles the spinner (frozen ◌ under
+    /// REDUCE_MOTION). Scrollback cells always render the static arm.
+    pub(crate) fn lines_at(&self, width: u16, tick: Option<(usize, bool)>) -> Vec<Line<'static>> {
         let w = width.max(8) as usize;
         match self {
             Cell::User { text } => {
                 let bg = theme::user_bg();
-                let mut out = Vec::new();
+                // One unstyled row of turn separation above the band —
+                // renderers strip it when the cell tops the transcript.
+                let mut out = vec![Line::default()];
                 for (i, l) in text.lines().enumerate() {
                     let prefix = if i == 0 { "❯ " } else { "  " };
                     for line in wrap_styled(
@@ -110,10 +133,26 @@ impl Cell {
                 }
                 out
             }
-            Cell::Assistant { text } => markdown::render(text)
-                .into_iter()
-                .flat_map(|l| wrap_line(l, w))
-                .collect(),
+            Cell::Assistant { text } => {
+                let mut out: Vec<Line> = markdown::render(text)
+                    .into_iter()
+                    .flat_map(|l| wrap_line(l, w))
+                    .collect();
+                // Fence lines carry the code bg across the block width —
+                // only when the palette gives `code` a bg (graphite).
+                if let Some(bg) = theme::code().bg {
+                    for l in out.iter_mut() {
+                        if !l.spans.is_empty() && l.spans.iter().all(|s| s.style.bg == Some(bg)) {
+                            let pad = w.saturating_sub(l.width());
+                            if pad > 0 {
+                                l.spans
+                                    .push(Span::styled(" ".repeat(pad), Style::new().bg(bg)));
+                            }
+                        }
+                    }
+                }
+                out
+            }
             Cell::Reasoning { text } => {
                 let mut out = vec![Line::from(Span::styled("thinking", theme::dim()))];
                 for l in text.lines().take(6) {
@@ -141,18 +180,31 @@ impl Cell {
                 output,
                 ..
             } => {
-                let (glyph, st) = match status {
-                    ToolStatus::Running => ("◌", theme::tool()),
-                    ToolStatus::Ok => ("✓", theme::tool_ok()),
-                    ToolStatus::Err | ToolStatus::Skipped => ("✗", theme::tool_err()),
+                let (glyph, gst) = match status {
+                    // The live region cycles the spinner here; flushed
+                    // cells freeze on ◌ (and always under REDUCE_MOTION).
+                    ToolStatus::Running => match tick {
+                        Some((t, false)) => (
+                            crate::widgets::SPINNER[t % crate::widgets::SPINNER.len()],
+                            theme::spinner(),
+                        ),
+                        _ => ("◌", theme::tool()),
+                    },
+                    ToolStatus::Ok => ("●", theme::tool_ok()),
+                    ToolStatus::Err => ("●", theme::tool_err()),
                     ToolStatus::Denied => ("⊘", theme::tool_err()),
+                    ToolStatus::Skipped => ("○", theme::faint()),
                 };
+                // `  ● bash  ls -la` — the glyph marks state, the name
+                // is the tool colour, args dim, truncated at width-1.
+                let head_w = 2 + 1 + 1 + UnicodeWidthStr::width(name.as_str()) + 2;
+                let args = truncate(summary, w.saturating_sub(1 + head_w));
                 let head = vec![
-                    Span::styled(format!("{glyph} "), st),
+                    Span::styled(format!("  {glyph} "), gst),
                     Span::styled(name.clone(), theme::tool()),
-                    Span::styled(format!(" {summary}"), theme::dim()),
+                    Span::styled(format!("  {args}"), theme::dim()),
                 ];
-                let mut out = wrap_styled(head, w);
+                let mut out = vec![Line::from(head)];
                 // Errors stay legible in scrollback: a short tail of the
                 // output is part of the immutable cell.
                 if matches!(status, ToolStatus::Err | ToolStatus::Denied) {
@@ -167,10 +219,27 @@ impl Cell {
                 }
                 out
             }
-            Cell::Meta { style, text } => text
+            Cell::Meta { style, text, .. } => text
                 .lines()
                 .flat_map(|l| wrap_styled(vec![Span::styled(l.to_string(), *style)], w))
                 .collect(),
+            Cell::End { text, warn } => {
+                // Right-aligned run summary, one row, faint; an
+                // abnormal stop reason prefixes it in warn.
+                let warn_txt = warn.as_deref().unwrap_or("");
+                let warn_w = if warn_txt.is_empty() {
+                    0
+                } else {
+                    UnicodeWidthStr::width(warn_txt) + 3 // " · "
+                };
+                let pad = w.saturating_sub(warn_w + UnicodeWidthStr::width(text.as_str()) + 1);
+                let mut spans = vec![Span::styled(" ".repeat(pad), Style::new())];
+                if warn_w > 0 {
+                    spans.push(Span::styled(format!("{warn_txt} · "), theme::warn()));
+                }
+                spans.push(Span::styled(text.clone(), theme::faint()));
+                vec![Line::from(spans)]
+            }
         }
     }
 
@@ -212,7 +281,7 @@ impl Cell {
 pub fn tool_summary(name: &str, input: &serde_json::Value) -> String {
     let s = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or("");
     match name {
-        "bash" => truncate(&s("command").replace('\n', " ⏎ "), 80),
+        "bash" => s("command").replace('\n', " ⏎ "),
         "read" => {
             let mut p = s("path").to_string();
             if let Some(o) = input.get("offset").and_then(|v| v.as_u64()) {
@@ -231,24 +300,49 @@ pub fn tool_summary(name: &str, input: &serde_json::Value) -> String {
                 .map(|a| a.len())
                 .unwrap_or(0)
         ),
-        "task" => truncate(s("prompt"), 80),
-        _ => truncate(&serde_json::to_string(input).unwrap_or_default(), 80),
+        "task" => s("prompt").to_string(),
+        _ => serde_json::to_string(input).unwrap_or_default(),
     }
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    let mut g = s.graphemes(true);
-    let taken: String = g.by_ref().take(n).collect();
-    if g.next().is_some() {
-        format!("{taken}…")
-    } else {
-        taken
+/// §2: the sent-prompt band leads with one blank row of turn
+/// separation — renderers call this on the transcript's first cell so
+/// the session doesn't open on a gap.
+pub(crate) fn strip_top_gap(cell: &Cell, lines: &mut Vec<Line<'static>>) {
+    if matches!(cell, Cell::User { .. })
+        && lines.first().map(|l| l.spans.is_empty()).unwrap_or(false)
+    {
+        lines.remove(0);
     }
+}
+
+/// Truncate to `n` DISPLAY COLUMNS — the budget is visual width, so
+/// CJK and emoji (2 cols) count double; a grapheme count would let
+/// them overflow and wrap. A truncation always shows `…` and never
+/// exceeds the budget: a full-width tail gives up columns for it.
+fn truncate(s: &str, n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    let mut w = 0usize;
+    let mut taken = Vec::new();
+    for g in s.graphemes(true) {
+        let gw = UnicodeWidthStr::width(g);
+        if w + gw > n {
+            while w + 1 > n && !taken.is_empty() {
+                w -= UnicodeWidthStr::width(taken.pop().unwrap());
+            }
+            return format!("{}…", taken.concat());
+        }
+        w += gw;
+        taken.push(g);
+    }
+    taken.concat()
 }
 
 /// Reduce one engine event to zero or more cells. ToolCallStart/ToolResult
 /// merge into a single Tool cell — `feed` returns the cell to insert or a
-/// mutation of an existing one via `ToolUpdate`.
+/// mutation of an existing one via `Feed::ToolDone`.
 pub enum Feed {
     NewCells(Vec<Cell>),
     /// Finalize a running tool cell in place (matched by call id).
@@ -260,7 +354,9 @@ pub enum Feed {
     Ignore,
 }
 
-pub fn feed(ev: &Event) -> Feed {
+/// `run_elapsed` supplies the live run's wall-clock duration for the
+/// RunEnd summary; replays and the line-mode surface pass None.
+pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
     match &ev.kind {
         EventKind::SessionStart { .. } => Feed::Ignore,
         EventKind::UserInput { text } => Feed::NewCells(vec![Cell::User { text: text.clone() }]),
@@ -335,30 +431,37 @@ pub fn feed(ev: &Event) -> Feed {
             }
         }
         EventKind::Nudge { text } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::meta(),
-            text: format!("⟲ {text}"),
+            style: theme::faint(),
+            text: format!("  ⟲ {text}"),
+            link: None,
         }]),
         EventKind::SubagentDone { task_id: id, trace } => Feed::NewCells(vec![Cell::Meta {
             style: theme::meta(),
-            text: format!("⤷ subagent {id} finished — trace {}", trace),
+            // The trace dir goes into the OSC 8 link, not the text.
+            text: format!("  ↳ subagent {id} finished · trace"),
+            link: Some(std::path::PathBuf::from(trace)),
         }]),
         EventKind::Tainted { detail } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::error(),
-            text: format!("⛨ {detail} — side effects now need confirmation"),
+            style: theme::warn(),
+            text: format!("  ! {detail} — side effects now ask first"),
+            link: None,
         }]),
         // P7-3 audit-only computer-use record — no transcript cell.
         EventKind::ComputerAct { .. } => Feed::Ignore,
         EventKind::StuckDetected { pattern } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::error(),
-            text: format!("⚠ stuck: {pattern}"),
+            style: theme::warn(),
+            text: format!("  ! stuck: {pattern}"),
+            link: None,
         }]),
         EventKind::Compaction { tail_from, .. } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::dim(),
-            text: format!("⧉ context compacted — events before e{tail_from} summarized"),
+            style: theme::faint(),
+            text: format!("  ⋯ context compacted — events before e{tail_from} summarized"),
+            link: None,
         }]),
         EventKind::Error { message } => Feed::NewCells(vec![Cell::Meta {
             style: theme::error(),
-            text: format!("error: {message}"),
+            text: format!("  ● {message}"),
+            link: None,
         }]),
         // Audit-only engine events (P6-2 memory commits, P6-4 consent
         // grants, P8-B model switches) are provenance, not conversation —
@@ -377,18 +480,52 @@ pub fn feed(ev: &Event) -> Feed {
             stop_reason,
             steps,
             total_cost_usd,
-        } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::dim(),
-            text: format!("— {stop_reason} · {steps} step(s) · ${total_cost_usd:.4}"),
+        } => Feed::NewCells(vec![Cell::End {
+            text: run_summary(*steps, run_elapsed, *total_cost_usd),
+            warn: abnormal_stop(stop_reason),
         }]),
         EventKind::TurnEnd { .. } => Feed::Ignore,
+    }
+}
+
+/// `19 steps · 1m 12s · $0.042` — segments append only when known.
+/// DEFERRED(owner): `· NN% cached` once Agent::cache_stats() /
+/// CacheStats::hit_rate lands on the run path (per AGENTS.md).
+fn run_summary(steps: u32, elapsed: Option<std::time::Duration>, cost: f64) -> String {
+    let mut s = format!("{steps} step{}", if steps == 1 { "" } else { "s" });
+    if let Some(d) = elapsed {
+        let secs = d.as_secs();
+        let t = if secs >= 3600 {
+            format!("{}h {:02}m", secs / 3600, secs % 3600 / 60)
+        } else if secs >= 60 {
+            format!("{}m {:02}s", secs / 60, secs % 60)
+        } else {
+            format!("{secs}s")
+        };
+        s.push_str(" · ");
+        s.push_str(&t);
+    }
+    if cost >= 0.0005 {
+        s.push_str(&format!(" · ${cost:.3}"));
+    }
+    s
+}
+
+/// Normal ends are silent about the reason; anything else names itself
+/// (`max_tokens` → `max tokens`) so the summary explains the cutoff.
+fn abnormal_stop(stop_reason: &str) -> Option<String> {
+    match stop_reason {
+        "end_turn" | "stop_sequence" => None,
+        "max_tokens" => Some("max tokens".to_string()),
+        other => Some(other.replace('_', " ")),
     }
 }
 
 fn plan_marker() -> Cell {
     Cell::Meta {
         style: theme::meta(),
-        text: "plan".to_string(),
+        text: "  ↳ plan".to_string(),
+        link: None,
     }
 }
 
@@ -464,6 +601,18 @@ mod tests {
     }
 
     #[test]
+    fn truncate_counts_display_columns() {
+        // The budget is columns, not graphemes — CJK/emoji are 2 wide
+        // and must never overflow it.
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        assert_eq!(truncate("あいうえ", 5), "あい…");
+        assert_eq!(truncate("a🎉b🎉c", 5), "a🎉b…");
+        assert_eq!(truncate("hi", 5), "hi");
+        // A full-width tail gives up a column for the marker.
+        assert_eq!(truncate("あいう", 4), "あ…");
+    }
+
+    #[test]
     fn feed_merges_tool_lifecycle() {
         let ev = |kind| overseer_core::event::Event {
             id: 1,
@@ -473,23 +622,29 @@ mod tests {
             hash: 0,
             kind,
         };
-        match feed(&ev(EventKind::ToolCallStart {
-            call_id: "c1".into(),
-            name: "bash".into(),
-            input: serde_json::json!({"command": "ls"}),
-        })) {
+        match feed(
+            &ev(EventKind::ToolCallStart {
+                call_id: "c1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            }),
+            None,
+        ) {
             Feed::NewCells(c) => assert!(matches!(c[0], Cell::Tool { .. })),
             _ => panic!(),
         }
-        match feed(&ev(EventKind::ToolResult {
-            call_id: "c1".into(),
-            name: "bash".into(),
-            content: "ok".into(),
-            is_error: false,
-            raw_bytes: 2,
-            spilled_to: None,
-            denied: false,
-        })) {
+        match feed(
+            &ev(EventKind::ToolResult {
+                call_id: "c1".into(),
+                name: "bash".into(),
+                content: "ok".into(),
+                is_error: false,
+                raw_bytes: 2,
+                spilled_to: None,
+                denied: false,
+            }),
+            None,
+        ) {
             Feed::ToolDone {
                 call_id, status, ..
             } => {

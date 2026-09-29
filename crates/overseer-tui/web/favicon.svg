@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" color="#e8e8ea">
+  <!-- Same geometry as mark.svg (small cut). Light-mode browsers flip
+       the colour via the media rule — keep both in this one file. -->
+  <style>@media (prefers-color-scheme: light) { :root { color: #111214 } }</style>
+  <g fill="none" stroke="currentColor" stroke-width="5.5" stroke-linecap="round">
+    <path d="M10 45H54"/>
+    <path d="M15 45A17 17 0 0 1 49 45"/>
+  </g>
+  <circle cx="32" cy="18" r="3.25" fill="currentColor"/>
+</svg>

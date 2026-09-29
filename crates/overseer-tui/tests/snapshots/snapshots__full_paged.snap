@@ -1,25 +1,24 @@
 ---
 source: crates/overseer-tui/tests/snapshots.rs
-assertion_line: 768
 expression: s
 ---
-❯ prompt 0
-answer 0 line a
-answer 0 line b
-answer 0 line c
 ❯ prompt 1
 answer 1 line a
 answer 1 line b
 answer 1 line c
+
 ❯ prompt 2
 answer 2 line a
 answer 2 line b
 answer 2 line c
+
 ❯ prompt 3
 answer 3 line a
 answer 3 line b
 answer 3 line c
-❯ prompt 4
-❯
 
-                                                      ↑15
+❯ prompt 4
+answer 4 line a
+❯ ask anything  ·  ↑ panel  ·  ? keys
+
+                                                      ↑17

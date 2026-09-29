@@ -766,7 +766,11 @@ fn full_transcript_pages_up_with_footer_marker() {
     app.step(&mut term, &caps).unwrap();
     let s = screen(&term);
     insta::assert_snapshot!("full_paged", s);
-    assert!(s.contains('↑'), "footer scroll marker:\n{s}");
+    // The `↑N` marker lives on the footer row — the composer
+    // placeholder's `↑` mustn't count.
+    let footer =
+        |t: &Terminal<TestBackend>| screen(t).split('\n').nth(19).unwrap_or("").to_string();
+    assert!(footer(&term).contains('↑'), "footer scroll marker:\n{s}");
     assert!(
         !s.contains("answer 7"),
         "paged view should hide the tail:\n{s}"
@@ -775,7 +779,7 @@ fn full_transcript_pages_up_with_footer_marker() {
     // Submitting snaps back to the tail.
     app.submit_text("next task");
     app.step(&mut term, &caps).unwrap();
-    assert!(!screen(&term).contains('↑'), "submit resets scroll");
+    assert!(!footer(&term).contains('↑'), "submit resets scroll");
 }
 
 #[test]
@@ -813,7 +817,10 @@ fn full_dialog_pins_over_transcript() {
     let s = screen(&term);
     assert!(s.contains("permission"), "dialog visible:\n{s}");
     assert!(s.contains("rm -rf /tmp/x"), "typed preview:\n{s}");
-    assert!(!s.contains('↑'), "dialog force-follows the tail:\n{s}");
+    // The `↑N` marker lives on the footer row — the composer
+    // placeholder's `↑` mustn't count.
+    let footer = s.split('\n').nth(19).unwrap_or("");
+    assert!(!footer.contains('↑'), "dialog force-follows the tail:\n{s}");
 }
 
 #[test]
@@ -859,11 +866,9 @@ fn full_panel_click_switches_tabs() {
     ));
     app.step(&mut term, &caps).unwrap();
     let s = screen(&term);
-    // First help line proves the keys tab — the band shows 2 rows.
-    assert!(
-        s.contains("ctrl+j / alt+enter"),
-        "keys tab after click:\n{s}"
-    );
+    // §4 keys tab is the grouped list — the "edit" group proves it
+    // (the band truncates before the "modes" group at 20 rows).
+    assert!(s.contains("ctrl+w"), "keys tab after click:\n{s}");
 
     // Esc closes; the band gives the rows back to the transcript.
     app.key(crossterm::event::KeyEvent::from(
@@ -906,4 +911,104 @@ fn panel_open_composer_still_types() {
         s.contains("dashboard"),
         "arrows with text stay in the composer, panel stays:\n{s}"
     );
+}
+
+// ── L2 graphite redesign ───────────────────────────────────────────
+
+/// §5 empty state + §3 placeholder: a fresh session centres the mark
+/// over the wordmark and hints at the composer.
+#[test]
+fn full_empty_state_and_placeholder() {
+    let (mut app, _e, _w, mut term, caps) = full_harness();
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains('⌓'), "mark glyph centred:\n{s}");
+    assert!(s.contains("overseer"), "wordmark:\n{s}");
+    assert!(s.contains("ask anything"), "composer placeholder:\n{s}");
+    insta::assert_snapshot!("empty_state", s);
+}
+
+/// §2 tool-line indent + glyphs: `●` ok/err, spinner frame running;
+/// the end-of-run summary is right-aligned.
+#[test]
+fn full_tool_glyphs_and_run_summary() {
+    let (mut app, etx, _w, mut term, caps) = full_harness();
+    app.submit_text("run the checks");
+    let _ = _w.try_recv(); // drain the Submit
+    etx.send(EngineMsg::Event(ev(EventKind::UserInput {
+        text: "run the checks".into(),
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolCallStart {
+        call_id: "c1".into(),
+        name: "bash".into(),
+        input: serde_json::json!({"command": "cargo test"}),
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolResult {
+        call_id: "c1".into(),
+        name: "bash".into(),
+        content: "ok".into(),
+        is_error: false,
+        raw_bytes: 2,
+        spilled_to: None,
+        denied: false,
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolCallStart {
+        call_id: "c2".into(),
+        name: "read".into(),
+        input: serde_json::json!({"path": "src/app.rs"}),
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolResult {
+        call_id: "c2".into(),
+        name: "read".into(),
+        content: "permission denied".into(),
+        is_error: true,
+        raw_bytes: 17,
+        spilled_to: None,
+        denied: false,
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolCallStart {
+        call_id: "c3".into(),
+        name: "grep".into(),
+        input: serde_json::json!({"pattern": "todo", "path": "src"}),
+    })))
+    .unwrap();
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("● bash"), "ok glyph:\n{s}");
+    assert!(s.contains("● read"), "err glyph:\n{s}");
+    insta::assert_snapshot!("tool_lines", s);
+
+    etx.send(EngineMsg::Event(ev(EventKind::RunEnd {
+        stop_reason: "end_turn".into(),
+        steps: 2,
+        total_cost_usd: 0.042,
+    })))
+    .unwrap();
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("2 steps"), "run summary:\n{s}");
+    insta::assert_snapshot!("run_summary", s);
+}
+
+/// §4 keys tab: grouped two-column key list.
+#[test]
+fn full_panel_keys_tab() {
+    let (mut app, _e, _w, mut term, caps) = full_harness();
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Up,
+    ));
+    for _ in 0..3 {
+        app.key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Right,
+        ));
+    }
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("ctrl+w"), "grouped keys:\n{s}");
+    insta::assert_snapshot!("panel_keys", s);
 }
