@@ -7,7 +7,7 @@
 //!   overseer --version                   fast path, <10ms (no deps loaded)
 //!
 //! Headless and TUI share the same engine. Each subcommand lives in
-//! `cmd/<name>.rs`; every flag goes through the one parser in `args.rs`.
+//! `cmd/<name>.rs` (`web` is `tui --web`, in cmd/tui.rs); every flag goes through the one parser in `args.rs`.
 
 mod args;
 mod cmd;
@@ -54,6 +54,7 @@ fn real_main() -> i32 {
     let rest = &args[1..];
     match args[0].as_str() {
         "tui" => cmd::tui::cmd_tui(rest),
+        "web" => cmd::tui::cmd_web(rest),
         "exec" => cmd::exec::cmd_exec(rest),
         "onboard" => cmd::onboard::cmd_onboard(rest),
         "consolidate" => cmd::consolidate::cmd_consolidate(rest),
@@ -79,8 +80,9 @@ fn usage() {
          USAGE:\n\
          \x20 overseer [tui] [FLAGS]          interactive TUI (bare `overseer`)\n\
          \x20 overseer tui --inline           live-strip surface (native scrollback)\n\
-         \x20 overseer tui --web [--web-port <n>]\n\
-         \x20                             browser surface on localhost (default 8641)\n\
+         \x20 overseer web [FLAGS] [--port <n>]\n\
+         \x20                             browser surface on localhost (default 8641);\n\
+         \x20                             alias: overseer tui --web [--web-port <n>]\n\
          \x20 overseer tui --no-tui           line mode (screen readers, plain REPL)\n\
          \x20 overseer exec [FLAGS] <prompt>  one prompt, headless ('-' reads stdin)\n\
          \x20 overseer onboard [--dir <d>] [--approve]\n\

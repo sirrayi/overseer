@@ -22,6 +22,9 @@ const TUI_FLAGS: &[Flag] = &[
     Flag::value(&["--web-port"]),
 ];
 
+/// `overseer web` takes the tui set plus `--port`, a synonym for `--web-port`.
+const WEB_FLAGS: &[Flag] = &[Flag::value(&["--port"])];
+
 struct TuiFlags {
     line_mode: bool,
     inline: bool,
@@ -30,12 +33,18 @@ struct TuiFlags {
     exec: ExecFlags,
 }
 
-fn parse_tui(argv: &[String]) -> Result<TuiFlags, String> {
-    let table: Vec<Flag> = EXEC_FLAGS.iter().chain(TUI_FLAGS).copied().collect();
+fn parse_tui(argv: &[String], web_cmd: bool) -> Result<TuiFlags, String> {
+    let extra: &[Flag] = if web_cmd { WEB_FLAGS } else { &[] };
+    let table: Vec<Flag> = EXEC_FLAGS
+        .iter()
+        .chain(TUI_FLAGS)
+        .chain(extra)
+        .copied()
+        .collect();
     let mut f = TuiFlags {
         line_mode: false,
         inline: false,
-        web: false,
+        web: web_cmd,
         web_port: DEFAULT_WEB_PORT,
         exec: exec_from(Vec::new())?,
     };
@@ -53,6 +62,10 @@ fn parse_tui(argv: &[String]) -> Result<TuiFlags, String> {
                 name: "--web-port",
                 value: Some(v),
             } => f.web_port = v.parse().map_err(|_| format!("bad --web-port '{v}'"))?,
+            Arg::Flag {
+                name: "--port",
+                value: Some(v),
+            } => f.web_port = v.parse().map_err(|_| format!("bad --port '{v}'"))?,
             other => rest.push(other),
         }
     }
@@ -64,16 +77,26 @@ fn parse_tui(argv: &[String]) -> Result<TuiFlags, String> {
 /// terminal frontend. Same engine, same event stream, same flags as
 /// `exec` (minus --json and the positional prompt).
 pub(crate) fn cmd_tui(argv: &[String]) -> i32 {
-    let f = match parse_tui(argv) {
+    run(argv, "tui")
+}
+
+/// `overseer web [tui flags] [--port <n>]` — exactly `overseer tui --web
+/// [--web-port <n>]`: the same session rendered into a localhost browser tab.
+pub(crate) fn cmd_web(argv: &[String]) -> i32 {
+    run(argv, "web")
+}
+
+fn run(argv: &[String], cmd: &str) -> i32 {
+    let f = match parse_tui(argv, cmd == "web") {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("overseer tui: {e}");
+            eprintln!("overseer {cmd}: {e}");
             return 2;
         }
     };
     let flags = &f.exec;
     if flags.prompt.is_some() {
-        eprintln!("overseer tui: no positional prompt — type inside the session");
+        eprintln!("overseer {cmd}: no positional prompt — type inside the session");
         return 2;
     }
     if !f.line_mode && !f.web && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
@@ -107,7 +130,7 @@ pub(crate) fn cmd_tui(argv: &[String]) -> i32 {
     } {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("overseer tui: {e}");
+            eprintln!("overseer {cmd}: {e}");
             1
         }
     }
@@ -121,26 +144,55 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    fn tui_only(v: &[String]) -> Result<TuiFlags, String> {
+        parse_tui(v, false)
+    }
+
+    #[test]
+    fn web_is_tui_dash_dash_web() {
+        let web = parse_tui(&argv(&["--port", "9001", "--model", "m"]), true).unwrap();
+        let tui = tui_only(&argv(&["--web", "--web-port", "9001", "--model", "m"])).unwrap();
+        for f in [&web, &tui] {
+            assert!(f.web && !f.inline && !f.line_mode);
+            assert_eq!(f.web_port, 9001);
+            assert_eq!(f.exec.model, "m");
+        }
+        // Same flags as tui: --web-port and a redundant --web still work.
+        let f = parse_tui(&argv(&["--web", "--web-port=9002"]), true).unwrap();
+        assert!(f.web);
+        assert_eq!(f.web_port, 9002);
+        assert_eq!(parse_tui(&[], true).unwrap().web_port, DEFAULT_WEB_PORT);
+        // --port belongs to `web` only.
+        assert_eq!(
+            tui_only(&argv(&["--port", "1"])).err().unwrap(),
+            "unknown flag '--port'"
+        );
+        assert!(parse_tui(&argv(&["--port=x"]), true)
+            .err()
+            .unwrap()
+            .contains("bad --port"));
+    }
+
     #[test]
     fn tui_surface_flags_mix_with_exec_flags() {
-        let f = parse_tui(&argv(&["--web", "--model", "m", "--web-port=9000"])).unwrap();
+        let f = tui_only(&argv(&["--web", "--model", "m", "--web-port=9000"])).unwrap();
         assert!(f.web && !f.inline && !f.line_mode);
         assert_eq!(f.web_port, 9000);
         assert_eq!(f.exec.model, "m");
-        let f = parse_tui(&argv(&["--no-tui", "--inline"])).unwrap();
+        let f = tui_only(&argv(&["--no-tui", "--inline"])).unwrap();
         assert!(f.line_mode && f.inline);
         assert_eq!(f.web_port, DEFAULT_WEB_PORT);
     }
 
     #[test]
     fn tui_rejects_bad_port_and_unknown_flags() {
-        assert!(parse_tui(&argv(&["--web-port", "nope"]))
+        assert!(tui_only(&argv(&["--web-port", "nope"]))
             .err()
             .unwrap()
             .contains("bad --web-port"));
-        assert!(parse_tui(&argv(&["--web-port"])).is_err());
+        assert!(tui_only(&argv(&["--web-port"])).is_err());
         assert_eq!(
-            parse_tui(&argv(&["--bogus"])).err().unwrap(),
+            tui_only(&argv(&["--bogus"])).err().unwrap(),
             "unknown flag '--bogus'"
         );
     }
