@@ -12,6 +12,7 @@
 //! the event log is the source of truth, so every call carries full
 //! history (`store: false` keeps server-side state off).
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -77,9 +78,20 @@ impl ResponsesApi {
             .collect::<Vec<_>>()
             .join("\n\n");
 
+        // Computer results are typed by their originating call's name
+        // (call id → name), never by sniffing the result text.
+        let computer_calls: HashSet<&str> = req
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                Block::ToolCall { id, name, .. } if name == "computer" => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
         let mut input = Vec::with_capacity(req.messages.len() + 2);
         for m in req.messages {
-            ir_message_to_input(m, &mut input);
+            ir_message_to_input(m, &computer_calls, &mut input);
         }
 
         let tools: Vec<Value> = req
@@ -128,6 +140,7 @@ impl ResponsesApi {
     ) -> Result<Response, ProviderError> {
         let mut blocks = Vec::new();
         let mut saw_tool_call = false;
+        let response_id = parsed["id"].clone();
         for item in parsed["output"].as_array().cloned().unwrap_or_default() {
             match item["type"].as_str() {
                 Some("reasoning") => blocks.push(Block::Reasoning { raw: item }),
@@ -140,12 +153,40 @@ impl ResponsesApi {
                         }
                     }
                 }
+                // P7-2 CU: a `computer_call` item decodes to a `computer`
+                // ToolCall; the linkage (`previous_response_id` = this
+                // response's id, `pending_safety_checks`) rides in the input
+                // so the ack gate can hold the turn.
+                Some("computer_call") => {
+                    saw_tool_call = true;
+                    let mut input =
+                        super::object_input(item.get("action").cloned().unwrap_or(json!({})));
+                    if !response_id.is_null() {
+                        input["previous_response_id"] = response_id.clone();
+                    }
+                    if let Some(checks) = item.get("pending_safety_checks") {
+                        input["pending_safety_checks"] = checks.clone();
+                    }
+                    blocks.push(Block::ToolCall {
+                        id: item["call_id"]
+                            .as_str()
+                            .or_else(|| item["id"].as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        name: "computer".into(),
+                        input,
+                    });
+                }
                 Some("function_call") => {
                     saw_tool_call = true;
-                    let input = item["arguments"]
-                        .as_str()
-                        .and_then(|a| serde_json::from_str(a).ok())
-                        .unwrap_or(Value::Null);
+                    // Unparseable (or non-object) arguments are preserved
+                    // raw, mirroring the chat adapter.
+                    let input = match item["arguments"].as_str() {
+                        Some(a) => serde_json::from_str(a)
+                            .map(super::object_input)
+                            .unwrap_or_else(|_| json!({"_unparsed": a})),
+                        None => json!({}),
+                    };
                     blocks.push(Block::ToolCall {
                         // `call_id` is what function_call_output references;
                         // the item `id` (fc_…) is server bookkeeping.
@@ -172,17 +213,24 @@ impl ResponsesApi {
             .as_u64()
             .unwrap_or(0);
 
-        // status: "completed" | "incomplete" | "failed" | "in_progress".
-        // incomplete_details.reason tells us *why* (max_output_tokens,
-        // max_tool_calls, content_filter).
+        // status: "completed" | "incomplete" | "failed" | "cancelled" |
+        // "in_progress". incomplete_details.reason tells us *why*
+        // (max_output_tokens, content_filter, …). Anything unmapped
+        // survives raw in `Other` (invariant 7).
         let stop_reason = if saw_tool_call {
             StopReason::ToolUse
-        } else if parsed["status"].as_str() == Some("incomplete")
-            && parsed["incomplete_details"]["reason"].as_str() == Some("max_output_tokens")
-        {
-            StopReason::MaxTokens
         } else {
-            StopReason::EndTurn
+            match parsed["status"].as_str() {
+                Some("completed") => StopReason::EndTurn,
+                Some("incomplete") => match parsed["incomplete_details"]["reason"].as_str() {
+                    Some("max_output_tokens") => StopReason::MaxTokens,
+                    Some("content_filter") => StopReason::Refusal,
+                    Some(r) => StopReason::Other(r.to_string()),
+                    None => StopReason::Other("incomplete".to_string()),
+                },
+                Some(s) => StopReason::Other(s.to_string()),
+                None => StopReason::Other("missing".to_string()),
+            }
         };
 
         Ok(Response {
@@ -203,7 +251,9 @@ impl ResponsesApi {
 
 /// IR → Responses input items. Tool results and tool calls are top-level
 /// items (not nested in messages); reasoning items echo back verbatim.
-fn ir_message_to_input(m: &Message, out: &mut Vec<Value>) {
+/// `computer_calls` holds the ids of `computer` ToolCalls in the request,
+/// so their results go back as `computer_call_output`.
+fn ir_message_to_input(m: &Message, computer_calls: &HashSet<&str>, out: &mut Vec<Value>) {
     match m.role {
         Role::User => {
             let mut parts: Vec<Value> = Vec::new();
@@ -225,7 +275,11 @@ fn ir_message_to_input(m: &Message, out: &mut Vec<Value>) {
                         content,
                         ..
                     } => out.push(json!({
-                        "type": "function_call_output",
+                        "type": if computer_calls.contains(tool_use_id.as_str()) {
+                            "computer_call_output"
+                        } else {
+                            "function_call_output"
+                        },
                         "call_id": tool_use_id,
                         "output": content,
                     })),
@@ -248,6 +302,9 @@ fn ir_message_to_input(m: &Message, out: &mut Vec<Value>) {
                     Block::Text { text } => parts.push(json!({
                         "type": "output_text", "text": text,
                     })),
+                    Block::ToolCall { id, name, input } if name == "computer" => {
+                        out.push(computer_call_item(id, input))
+                    }
                     Block::ToolCall { id, name, input } => out.push(json!({
                         "type": "function_call",
                         "call_id": id,
@@ -264,6 +321,31 @@ fn ir_message_to_input(m: &Message, out: &mut Vec<Value>) {
             }
         }
     }
+}
+
+/// A `computer` ToolCall re-emitted as a Responses `computer_call` item:
+/// the harness-side linkage keys are lifted back out of the input.
+// DEFERRED(owner): full computer_call round-trip fidelity (server item `id`, `acknowledged_safety_checks`, the `computer_screenshot` output payload) — gate: a recorded live Responses CU fixture.
+fn computer_call_item(id: &str, input: &Value) -> Value {
+    let mut action = input.clone();
+    let mut checks = json!([]);
+    let mut raw = None;
+    if let Some(obj) = action.as_object_mut() {
+        obj.remove("previous_response_id");
+        obj.remove("safety_ack");
+        if let Some(c) = obj.remove("pending_safety_checks") {
+            checks = c;
+        }
+        if obj.len() == 1 {
+            raw = obj.get("_unparsed").cloned();
+        }
+    }
+    json!({
+        "type": "computer_call",
+        "call_id": id,
+        "action": raw.unwrap_or(action),
+        "pending_safety_checks": checks,
+    })
 }
 
 impl Provider for ResponsesApi {
@@ -348,7 +430,7 @@ mod tests {
             is_error: false,
         }]);
         let mut out = Vec::new();
-        ir_message_to_input(&m, &mut out);
+        ir_message_to_input(&m, &Default::default(), &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["type"], "function_call_output");
         assert_eq!(out[0]["call_id"], "call_1");
@@ -371,7 +453,7 @@ mod tests {
             ],
         };
         let mut out = Vec::new();
-        ir_message_to_input(&m, &mut out);
+        ir_message_to_input(&m, &Default::default(), &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["type"], "function_call");
         assert_eq!(out[0]["call_id"], "call_9");
@@ -397,7 +479,7 @@ mod tests {
             content: vec![Block::Reasoning { raw: item.clone() }],
         };
         let mut out = Vec::new();
-        ir_message_to_input(&m, &mut out);
+        ir_message_to_input(&m, &Default::default(), &mut out);
         assert_eq!(out, vec![item]);
     }
 
@@ -463,5 +545,129 @@ mod tests {
         req.effort = Some(Effort::Min);
         let body = ResponsesApi::build_body(&req);
         assert_eq!(body["reasoning"]["effort"], "high"); // budget wins
+    }
+
+    fn stop_of(body: Value) -> StopReason {
+        ResponsesApi::parse_response(&body, 1, 1)
+            .unwrap()
+            .stop_reason
+    }
+
+    /// C4 (invariant 7): every status/reason maps explicitly; unknown
+    /// values survive raw in `Other`.
+    #[test]
+    fn stop_reason_mapping_preserves_raw() {
+        let inc = |reason: &str| {
+            json!({"status": "incomplete",
+                   "incomplete_details": {"reason": reason}, "output": []})
+        };
+        assert_eq!(
+            stop_of(json!({"status": "completed", "output": []})),
+            StopReason::EndTurn
+        );
+        assert_eq!(stop_of(inc("max_output_tokens")), StopReason::MaxTokens);
+        assert_eq!(stop_of(inc("content_filter")), StopReason::Refusal);
+        assert_eq!(
+            stop_of(inc("max_tool_calls")),
+            StopReason::Other("max_tool_calls".into())
+        );
+        for s in ["failed", "cancelled", "in_progress"] {
+            assert_eq!(
+                stop_of(json!({"status": s, "output": []})),
+                StopReason::Other(s.into())
+            );
+        }
+        // A tool call wins over any status.
+        let mut with_call = inc("max_output_tokens");
+        with_call["output"] = json!([{"type": "function_call", "call_id": "c",
+                                      "name": "bash", "arguments": "{}"}]);
+        assert_eq!(stop_of(with_call), StopReason::ToolUse);
+    }
+
+    /// C4: unparseable `arguments` are preserved raw, not nulled.
+    #[test]
+    fn unparseable_arguments_preserved_raw() {
+        let body = json!({"status": "completed", "output": [
+            {"type": "function_call", "call_id": "c1", "name": "write",
+             "arguments": "{not json"}
+        ]});
+        let r = ResponsesApi::parse_response(&body, 1, 1).unwrap();
+        match &r.blocks[0] {
+            Block::ToolCall { input, .. } => {
+                assert_eq!(input, &json!({"_unparsed": "{not json"}))
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    /// C3/C12: computer_call linkage lives here — a non-object action
+    /// from the wire must not panic and survives under `_unparsed`.
+    #[test]
+    fn computer_call_parses_with_linkage_and_non_object_action() {
+        for action in [json!({"type": "click", "x": 1}), json!("click"), json!([1])] {
+            let body = json!({"id": "resp_7", "status": "completed", "output": [
+                {"type": "computer_call", "id": "cu_1", "call_id": "call_cu",
+                 "action": action.clone(),
+                 "pending_safety_checks": [{"id": "s9"}]}
+            ]});
+            let r = ResponsesApi::parse_response(&body, 1, 1).unwrap();
+            assert_eq!(r.stop_reason, StopReason::ToolUse);
+            match &r.blocks[0] {
+                Block::ToolCall { id, name, input } => {
+                    assert_eq!(id, "call_cu");
+                    assert_eq!(name, "computer");
+                    assert_eq!(input["previous_response_id"], "resp_7");
+                    assert_eq!(input["pending_safety_checks"][0]["id"], "s9");
+                    assert!(!crate::provider::openai::safety_ack_complete(input));
+                    if !action.is_object() {
+                        assert_eq!(input["_unparsed"], action);
+                    }
+                }
+                other => panic!("expected ToolCall, got {other:?}"),
+            }
+        }
+    }
+
+    /// C12: results are marked by the originating call's name, not by
+    /// sniffing content — a plain result starting with "[computer]" stays
+    /// a function_call_output.
+    #[test]
+    fn computer_result_keyed_by_call_name() {
+        let msgs = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    Block::ToolCall {
+                        id: "cu_1".into(),
+                        name: "computer".into(),
+                        input: json!({"type": "click"}),
+                    },
+                    Block::ToolCall {
+                        id: "b_1".into(),
+                        name: "bash".into(),
+                        input: json!({"command": "echo"}),
+                    },
+                ],
+            },
+            Message::tool_results(vec![
+                Block::ToolResult {
+                    tool_use_id: "cu_1".into(),
+                    content: "clicked".into(),
+                    is_error: false,
+                },
+                Block::ToolResult {
+                    tool_use_id: "b_1".into(),
+                    content: "[computer] not really".into(),
+                    is_error: false,
+                },
+            ]),
+        ];
+        let body = ResponsesApi::build_body(&bare_req(&[], &[], &msgs));
+        let items = body["input"].as_array().unwrap();
+        let find = |id: &str, ty: &str| items.iter().any(|i| i["call_id"] == id && i["type"] == ty);
+        assert!(find("cu_1", "computer_call"));
+        assert!(find("cu_1", "computer_call_output"));
+        assert!(find("b_1", "function_call"));
+        assert!(find("b_1", "function_call_output"));
     }
 }

@@ -77,10 +77,10 @@ impl OpenAiCompatible {
         for m in req.messages {
             ir_message_to_wire(m, &mut messages);
         }
-        // P7-2 CU: the Responses-API linkage (`previous_response_id` /
-        // `pending_safety_checks`) rides inside computer tool inputs at the
-        // message layer (see ir_message_to_wire); build_body section order
-        // system/messages/tools stays frozen — no new top-level section.
+        // Chat Completions only knows `type:"function"` tool calls: the
+        // computer tool is a plain function on this wire. Responses-API CU
+        // linkage (`previous_response_id`, safety checks) lives in
+        // responses.rs. Section order system/messages/tools stays frozen.
         let tools: Vec<Value> = req
             .tools
             .iter()
@@ -161,38 +161,16 @@ impl OpenAiCompatible {
         }
         if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
             for c in calls {
-                // P7-2 CU: `computer_call` items (Responses API) decode to a
-                // `computer` ToolCall; `pending_safety_checks` ride in the
-                // input so the ack gate can hold the turn.
-                if c.get("type").and_then(Value::as_str) == Some("computer_call") {
-                    let inner = c.get("computer_call").cloned().unwrap_or(json!({}));
-                    let mut input = inner.get("input").cloned().unwrap_or(json!({}));
-                    if let Some(prev) = inner.get("previous_response_id") {
-                        input["previous_response_id"] = prev.clone();
-                    }
-                    if let Some(checks) = inner.get("pending_safety_checks") {
-                        input["pending_safety_checks"] = checks.clone();
-                    }
-                    blocks.push(Block::ToolCall {
-                        id: c
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        name: "computer".into(),
-                        input,
-                    });
-                    continue;
-                }
                 let args = c
                     .pointer("/function/arguments")
                     .and_then(Value::as_str)
                     .unwrap_or("{}");
-                let input: Value = serde_json::from_str(args).unwrap_or_else(|_| {
-                    // Unparseable args are preserved raw so the tool sees a
-                    // schema error rather than silently losing the call.
-                    json!({"_unparsed": args})
-                });
+                // Unparseable (or non-object) args are preserved raw so the
+                // tool sees a schema error rather than silently losing the
+                // call.
+                let input: Value = serde_json::from_str(args)
+                    .map(super::object_input)
+                    .unwrap_or_else(|_| json!({"_unparsed": args}));
                 blocks.push(Block::ToolCall {
                     id: c
                         .get("id")
@@ -278,11 +256,8 @@ pub fn safety_ack_complete(input: &Value) -> bool {
 }
 
 /// One IR message → one or more wire messages (tool results fan out into
-/// individual `tool` role messages — OpenAI's pairing rule).
-/// P7-2 CU (Responses API): `computer_call` items arrive as ToolCalls whose
-/// input may carry `previous_response_id`; results go back as
-/// `computer_call_output` tool messages; `pending_safety_checks` without a
-/// matching ack blocks at the gate (see `safety_ack_complete`).
+/// individual `tool` role messages — OpenAI's pairing rule). Every tool
+/// call — `computer` included — is a `type:"function"` call here.
 fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
     match m.role {
         Role::User => {
@@ -292,22 +267,11 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
                         tool_use_id,
                         content,
                         ..
-                    } => {
-                        // P7-2 CU output: computer results carry the
-                        // `computer_call_output` type marker so the
-                        // Responses-API pairing survives the chat wire.
-                        let is_cu = tool_use_id.starts_with("computer")
-                            || content.starts_with("[computer]");
-                        let mut v = json!({
-                            "role": "tool",
-                            "tool_call_id": tool_use_id,
-                            "content": content,
-                        });
-                        if is_cu {
-                            v["type"] = json!("computer_call_output");
-                        }
-                        out.push(v);
-                    }
+                    } => out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": content,
+                    })),
                     // P7-1: screenshots ride as image_url blocks; other
                     // variants (Reasoning/ToolCall) never appear user-side.
                     Block::Text { text } => out.push(json!({
@@ -339,31 +303,14 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
                         }
                         text.push_str(t);
                     }
-                    // P7-2 CU: a `computer` ToolCall serializes as a
-                    // `computer_call` item (Responses-API type marker) with
-                    // the input passthrough (incl. previous_response_id).
-                    Block::ToolCall { id, name, input } => {
-                        if name == "computer" {
-                            calls.push(json!({
-                                "id": id,
-                                "type": "computer_call",
-                                "computer_call": {
-                                    "action": input.get("action").cloned().unwrap_or(json!(null)),
-                                    "input": input,
-                                    "previous_response_id": input.get("previous_response_id").cloned().unwrap_or(json!(null)),
-                                }
-                            }));
-                        } else {
-                            calls.push(json!({
-                                "id": id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": serde_json::to_string(input).unwrap_or_default(),
-                                }
-                            }));
+                    Block::ToolCall { id, name, input } => calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(input).unwrap_or_default(),
                         }
-                    }
+                    })),
                     // Reasoning is never echoed back on this API family.
                     Block::Reasoning { .. } => {}
                     Block::ToolResult { .. } => {}
@@ -678,57 +625,6 @@ mod tests {
     }
 
     #[test]
-    fn computer_call_serializes_with_previous_response_id() {
-        // P7-2: computer ToolCall → computer_call item + previous_response_id.
-        let m = Message {
-            role: Role::Assistant,
-            content: vec![Block::ToolCall {
-                id: "cu_1".into(),
-                name: "computer".into(),
-                input: json!({"action": "click", "previous_response_id": "resp-9"}),
-            }],
-        };
-        let mut out = Vec::new();
-        ir_message_to_wire(&m, &mut out);
-        let tc = &out[0]["tool_calls"][0];
-        assert_eq!(tc["type"], "computer_call");
-        assert_eq!(tc["computer_call"]["previous_response_id"], "resp-9");
-        // Non-computer calls keep the function shape.
-        let m2 = Message {
-            role: Role::Assistant,
-            content: vec![Block::ToolCall {
-                id: "tc1".into(),
-                name: "bash".into(),
-                input: json!({"command": "ls"}),
-            }],
-        };
-        let mut out2 = Vec::new();
-        ir_message_to_wire(&m2, &mut out2);
-        assert_eq!(out2[0]["tool_calls"][0]["type"], "function");
-    }
-
-    #[test]
-    fn computer_call_output_marker_on_results() {
-        // P7-2: computer results carry the computer_call_output marker.
-        let m = Message::tool_results(vec![Block::ToolResult {
-            tool_use_id: "computer-1".into(),
-            content: "[computer] clicked".into(),
-            is_error: false,
-        }]);
-        let mut out = Vec::new();
-        ir_message_to_wire(&m, &mut out);
-        assert_eq!(out[0]["type"], "computer_call_output");
-        let plain = Message::tool_results(vec![Block::ToolResult {
-            tool_use_id: "a".into(),
-            content: "r1".into(),
-            is_error: false,
-        }]);
-        let mut out2 = Vec::new();
-        ir_message_to_wire(&plain, &mut out2);
-        assert!(out2[0].get("type").is_none());
-    }
-
-    #[test]
     fn unacked_safety_check_blocks_ack_gate() {
         // P7-2 ack gate: pending checks without safety_ack → blocked.
         assert!(!safety_ack_complete(
@@ -740,32 +636,6 @@ mod tests {
         assert!(safety_ack_complete(&json!({"action": "click"})));
         assert!(safety_ack_complete(
             &json!({"action": "click", "pending_safety_checks": []})
-        ));
-    }
-
-    #[test]
-    fn computer_call_parses_with_safety_checks() {
-        // P7-2: wire computer_call → computer ToolCall with checks in input.
-        let body = json!({
-            "choices": [{"message": {
-                "role": "assistant", "content": "",
-                "tool_calls": [{"id": "cu_2", "type": "computer_call",
-                    "computer_call": {
-                        "action": "type",
-                        "input": {"action": "type", "text": "hi"},
-                        "previous_response_id": "resp-3",
-                        "pending_safety_checks": [{"id": "s9"}]
-                    }}]
-            }, "finish_reason": "tool_calls"}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 5}
-        });
-        let r = OpenAiCompatible::parse_response(&body, 10, 5).unwrap();
-        assert!(matches!(
-            &r.blocks[0],
-            Block::ToolCall { name, input, .. }
-            if name == "computer"
-                && input["previous_response_id"] == "resp-3"
-                && !safety_ack_complete(input)
         ));
     }
 
@@ -792,5 +662,89 @@ mod tests {
         };
         let err = p.complete(&req).unwrap_err();
         assert!(matches!(err, ProviderError::Transport(_)));
+    }
+
+    /// C12: a Chat Completions body only ever carries `type:"function"`
+    /// tool calls — the computer tool is a plain function here, and a
+    /// result is never re-typed by sniffing its content.
+    #[test]
+    fn chat_body_only_emits_function_tool_calls() {
+        let msgs = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    Block::ToolCall {
+                        id: "cu_1".into(),
+                        name: "computer".into(),
+                        input: json!({"action": "click", "previous_response_id": "r"}),
+                    },
+                    Block::ToolCall {
+                        id: "b_1".into(),
+                        name: "bash".into(),
+                        input: json!({"command": "ls"}),
+                    },
+                ],
+            },
+            Message::tool_results(vec![
+                Block::ToolResult {
+                    tool_use_id: "cu_1".into(),
+                    content: "clicked".into(),
+                    is_error: false,
+                },
+                Block::ToolResult {
+                    tool_use_id: "b_1".into(),
+                    content: "[computer] looks like CU".into(),
+                    is_error: false,
+                },
+            ]),
+        ];
+        let system: Vec<SystemSegment> = vec![];
+        let tools: Vec<ToolSpec> = vec![];
+        let req = Request {
+            model: "gpt-5.5",
+            system: &system,
+            tools: &tools,
+            messages: &msgs,
+            max_tokens: 100,
+            thinking_budget: None,
+            effort: None,
+            cache_breakpoints: false,
+        };
+        let body = OpenAiCompatible::build_body(&req);
+        let wire = body["messages"].as_array().unwrap();
+        let calls: Vec<&Value> = wire
+            .iter()
+            .filter_map(|m| m.get("tool_calls").and_then(Value::as_array))
+            .flatten()
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|c| c["type"] == "function"), "{calls:?}");
+        assert_eq!(calls[0]["function"]["name"], "computer");
+        assert!(
+            wire.iter().all(|m| m.get("type").is_none()),
+            "chat tool messages carry no type marker: {wire:?}"
+        );
+    }
+
+    /// C3: a chat tool call whose arguments are a non-object JSON value
+    /// is preserved raw and never panics.
+    #[test]
+    fn non_object_arguments_preserved() {
+        for args in ["\"a string\"", "[1,2]"] {
+            let body = json!({
+                "choices": [{"message": {"role": "assistant", "content": "",
+                    "tool_calls": [{"id": "c", "type": "function",
+                        "function": {"name": "write", "arguments": args}}]},
+                    "finish_reason": "tool_calls"}]
+            });
+            let r = OpenAiCompatible::parse_response(&body, 1, 1).unwrap();
+            match &r.blocks[0] {
+                Block::ToolCall { input, .. } => {
+                    let raw: Value = serde_json::from_str(args).unwrap();
+                    assert_eq!(input["_unparsed"], raw);
+                }
+                other => panic!("expected ToolCall, got {other:?}"),
+            }
+        }
     }
 }
