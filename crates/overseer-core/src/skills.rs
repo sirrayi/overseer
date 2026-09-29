@@ -32,11 +32,32 @@ pub struct SkillMeta {
     pub triggers: Vec<String>,
 }
 
+/// Split `---`-delimited frontmatter from the body: `(front, body)`. A
+/// delimiter is a line that is exactly `---` (trailing whitespace allowed),
+/// so a `---` inside a value never ends the block. `None` when the text
+/// does not open with a delimiter or the block is unterminated. Shared by
+/// skills and microagents.
+pub(crate) fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
+    let mut lines = text.split_inclusive('\n');
+    let first = lines.next()?;
+    if first.trim_end() != "---" {
+        return None;
+    }
+    let start = first.len();
+    let mut pos = start;
+    for line in lines {
+        if line.trim_end() == "---" {
+            return Some((&text[start..pos], &text[pos + line.len()..]));
+        }
+        pos += line.len();
+    }
+    None
+}
+
 /// `---`-delimited frontmatter → (name, description, triggers).
 /// Deliberately minimal — `key: value` lines only, no YAML dep.
 fn parse_frontmatter(text: &str) -> Option<(String, String, Vec<String>)> {
-    let t = text.strip_prefix("---")?;
-    let fm = t.split("\n---").next()?;
+    let (fm, _) = split_frontmatter(text)?;
     let mut name = None;
     let mut desc = None;
     let mut triggers: Vec<String> = Vec::new();
@@ -65,9 +86,8 @@ fn parse_frontmatter(text: &str) -> Option<(String, String, Vec<String>)> {
 
 /// The body after the frontmatter block (what `skill` loads on demand).
 pub fn body_of(text: &str) -> String {
-    text.splitn(3, "---")
-        .nth(2)
-        .unwrap_or(text)
+    split_frontmatter(text)
+        .map_or(text, |(_, body)| body)
         .trim()
         .to_string()
 }
@@ -293,6 +313,26 @@ mod tests {
         let d = root.join(dir);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("SKILL.md"), format!("---\n{fm}---\n{body}")).unwrap();
+    }
+
+    #[test]
+    fn frontmatter_delimiters_are_whole_lines() {
+        let text = "---\nname: dash\ndescription: a---b\n---  \nbody line\n\n---\nafter rule\n";
+        let (name, desc, _) = parse_frontmatter(text).unwrap();
+        assert_eq!(name, "dash");
+        assert_eq!(desc, "a---b");
+        assert_eq!(body_of(text), "body line\n\n---\nafter rule");
+        assert_eq!(
+            split_frontmatter(text),
+            Some((
+                "name: dash\ndescription: a---b\n",
+                "body line\n\n---\nafter rule\n"
+            ))
+        );
+        // `----` is not a delimiter; an unterminated block is no frontmatter.
+        assert!(split_frontmatter("----\nname: x\n---\nb").is_none());
+        assert!(split_frontmatter("---\nname: x\n").is_none());
+        assert_eq!(body_of("# plain\ntext"), "# plain\ntext");
     }
 
     #[test]
