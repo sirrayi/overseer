@@ -7,7 +7,7 @@
 //!
 //! v1 extractor is regex-based for rs/py/js/ts/tsx/go — deterministic,
 //! dependency-free, and honest about its limits (no tree-sitter dep yet;
-//! the index is rebuilt per call so invalidation can't go stale).
+//! the index is rebuilt per tool call so invalidation can't go stale).
 //!
 //! Tools backed by this index:
 //! - `repo_map`  → ranked `name — file:line (refs:N)` lines ≤4KB
@@ -418,9 +418,9 @@ pub fn window(root: &Path, path: &Path, line: usize, ctx_lines: usize) -> Option
     Some(out)
 }
 
-/// go_to_definition + reference listing for one symbol.
-pub fn lookup(root: &Path, name: &str) -> String {
-    let idx = build(root);
+/// go_to_definition + reference listing for one symbol in a built `idx`
+/// of `root` (callers build once and reuse the index).
+pub fn lookup(idx: &Index, root: &Path, name: &str) -> String {
     match idx.symbols.get(name) {
         None => format!("no symbol '{name}' in {} indexed files", idx.files_indexed),
         Some(s) => {
@@ -565,10 +565,11 @@ mod tests {
         let dir = tmpdir();
         std::fs::write(dir.join("a.rs"), "fn thing() {}\n").unwrap();
         std::fs::write(dir.join("b.rs"), "// uses thing\n").unwrap();
-        let out = lookup(&dir, "thing");
+        let idx = build(&dir);
+        let out = lookup(&idx, &dir, "thing");
         assert!(out.contains("a.rs:1"));
         assert!(out.contains("b.rs"));
-        assert!(lookup(&dir, "nope").contains("no symbol"));
+        assert!(lookup(&idx, &dir, "nope").contains("no symbol"));
     }
 
     #[test]
