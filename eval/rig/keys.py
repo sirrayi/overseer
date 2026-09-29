@@ -2,8 +2,9 @@
 
 The harness has no key of its own: every provider reads its own
 provider-specific variable, chosen by OVERSEER_PROVIDER (default
-"opencode"). The same name is what `overseer exec` resolves, so the
-binary inherits it unchanged.
+"opencode"). The same names, in the same order, are what `overseer exec`
+resolves (crates/overseer-cli/src/provider.rs `key_names`), so the binary
+inherits them unchanged.
 """
 
 from __future__ import annotations
@@ -17,6 +18,11 @@ KEY_ENV = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
     "gemini": "GOOGLE_API_KEY",
+}
+
+# Names the binary also accepts, after the KEY_ENV one.
+KEY_FALLBACKS = {
+    "gemini": ("GEMINI_API_KEY",),
 }
 
 
@@ -35,13 +41,26 @@ def key_env(name: str | None = None) -> str:
         ) from None
 
 
+def key_names(name: str | None = None) -> tuple[str, ...]:
+    """Every env var that holds the key for `name`, in lookup order."""
+    p = name or provider()
+    return (key_env(p), *KEY_FALLBACKS.get(p, ()))
+
+
+def key_label(name: str | None = None) -> str:
+    """The key names for messages: "A" or "A or B"."""
+    return " or ".join(key_names(name))
+
+
 def api_key(name: str | None = None) -> str | None:
-    """The provider's key, or None when unset or empty."""
-    return os.environ.get(key_env(name)) or None
+    """The provider's key, or None when every name is unset or empty."""
+    return next(
+        (v for n in key_names(name) if (v := os.environ.get(n))), None
+    )
 
 
 def require(name: str | None = None) -> str:
     key = api_key(name)
     if key is None:
-        raise RuntimeError(f"{key_env(name)} is not set")
+        raise RuntimeError(f"{key_label(name)} is not set")
     return key

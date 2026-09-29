@@ -484,7 +484,7 @@ def run_cli(
     model_id = args.model or os.environ.get("OVERSEER_MODEL", "deepseek-v4.1-flash")
     if preds_arg is None and not keys.api_key():
         print(
-            f"{keys.key_env()} required for swe_bench rollouts "
+            f"{keys.key_label()} required for swe_bench rollouts "
             "(or pass --predictions-path for eval-only)",
             file=sys.stderr,
         )

@@ -258,7 +258,7 @@ def main() -> int:
         if a == "mini" or a == "overseer" or a.startswith("overseer@")
     ]
     if needs_key and not keys.api_key():
-        sys.exit(f"{keys.key_env()} required for " + ",".join(needs_key))
+        sys.exit(f"{keys.key_label()} required for " + ",".join(needs_key))
 
     print(f"matrix: {len(tasks)} tasks × {agent_names} × {args.seeds} seeds")
     records = scheduler.run_matrix(

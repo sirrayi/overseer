@@ -306,7 +306,7 @@ def run_cli(
     )
     if model_arg and not keys.api_key():
         print(
-            f"{keys.key_env()} required for {adapter.name} agent {agent!r}",
+            f"{keys.key_label()} required for {adapter.name} agent {agent!r}",
             file=sys.stderr,
         )
         return 2
