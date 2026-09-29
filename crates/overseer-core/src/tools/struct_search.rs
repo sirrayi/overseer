@@ -5,9 +5,12 @@
 //!   regex: `$A` / `$$$ARGS` metavariables match any node, so whitespace,
 //!   comments and formatting are irrelevant. Matches come back sorted by
 //!   (file, line, column) so the same probe answers identically twice.
-//! - **semgrep `--json`** — the audit lane. Rules from `--config` (default
-//!   `auto`) run against `path`; every finding carries severity, check id and
-//!   message, sorted by (file, line, check).
+//! - **semgrep `--json`** — the audit lane. Rules from a LOCAL `--config`
+//!   file or directory run against `path`; every finding carries severity,
+//!   check id and message, sorted by (file, line, check). The lane is
+//!   classified Read, so it must not egress: `--metrics=off` is always
+//!   passed, and `auto`, registry ids (`p/…`, `r/…`, `s/…`) and URLs are
+//!   refused before anything spawns.
 //!
 //! Backends are opt-in helper binaries — never linked, never bundled:
 //!
@@ -26,8 +29,9 @@
 //! exit, an unparseable stream — each is a plain *note* naming the lane, what
 //! happened and the variable that configures the binary. Never a tool error,
 //! never a panic: a probe must not be the reason a turn dies. The only hard
-//! errors are the caller's own mistakes (missing/empty `pattern`, unknown
-//! `lane`). A non-zero exit *with* parseable rows is a normal result —
+//! errors are the caller's own mistakes (missing/empty `pattern` on the
+//! ast-grep lane, a missing or non-local `config` on the semgrep lane, an
+//! unknown `lane`). A non-zero exit *with* parseable rows is a normal result —
 //! semgrep exits non-zero when it found something — so the exit code is
 //! evidence, not a verdict.
 //!
@@ -39,8 +43,8 @@
 //! `crate::tsitter` module is its registry — this port deliberately does not
 //! import it, so the tool builds without the optional parser stack);
 //! incremental re-indexing (every probe re-walks `path` from scratch);
-//! semgrep's own rule registry (rules arrive via `--config` only, no registry
-//! fetch or cache) — all P8-C+ material.`
+//! semgrep's own rule registry (rules arrive via a local `--config` only, no
+//! registry fetch or cache) — all P8-C+ material.`
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -63,9 +67,6 @@ const AST_GREP_NAMES: [&str; 2] = ["ast-grep", "sg"];
 
 /// Binary name looked up on `PATH` for the audit lane.
 const SEMGREP_NAMES: [&str; 1] = ["semgrep"];
-
-/// Rules semgrep runs when the caller names no `config`.
-const DEFAULT_SEMGREP_CONFIG: &str = "auto";
 
 /// Wall-clock cap for one probe; a runaway scan never blocks a turn.
 const PROBE_TIMEOUT_S: u64 = 120;
@@ -368,11 +369,13 @@ pub fn render_audits(audits: &[Audit]) -> String {
 }
 
 /// The argv for one probe: `(program, args)`, or `None` while the lane has no
-/// binary. Pure by construction — the tool's only spawn policy, so it is
-/// asserted without spawning anything.
+/// binary (or, for semgrep, no `config` — it never falls back to `auto`).
+/// Pure by construction — the tool's only spawn policy, so it is asserted
+/// without spawning anything. `config` must already have passed
+/// [`check_semgrep_config`]; `pattern` is ignored by the semgrep lane.
 ///
 /// - ast-grep: `run --pattern <pattern> --json [--lang <lang>] <path>`
-/// - semgrep: `--json --quiet --config <config|auto> <path>`
+/// - semgrep: `--json --quiet --metrics=off --config <config> <path>`
 pub fn command_for(
     lane: Lane,
     bins: &Bins,
@@ -400,12 +403,37 @@ pub fn command_for(
         Lane::Semgrep => vec![
             "--json".into(),
             "--quiet".into(),
+            "--metrics=off".into(),
             "--config".into(),
-            config.unwrap_or(DEFAULT_SEMGREP_CONFIG).into(),
+            config?.into(),
             path.into(),
         ],
     };
     Some((program, args))
+}
+
+/// A semgrep `--config` is accepted only when it names a local rules file or
+/// directory under `cwd`. `auto`, registry ids and URLs make semgrep fetch
+/// rules over the network, which a Read-classified probe must never do.
+pub fn check_semgrep_config(config: &str, cwd: &Path) -> Result<(), String> {
+    let c = config.trim();
+    let lower = c.to_ascii_lowercase();
+    let remote = lower == "auto"
+        || lower.contains("://")
+        || ["p/", "r/", "s/"].iter().any(|p| lower.starts_with(p));
+    if remote {
+        return Err(format!(
+            "struct_search: semgrep `config` `{c}` would fetch rules over the network — \
+             pass a local rules file or directory (e.g. `.semgrep.yml`)."
+        ));
+    }
+    if !cwd.join(c).exists() {
+        return Err(format!(
+            "struct_search: semgrep `config` `{c}` is not a local rules file or directory \
+             under the working directory."
+        ));
+    }
+    Ok(())
 }
 
 /// Tool entry: detect the operator's backends, then run the lane.
@@ -416,17 +444,6 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
 /// Backend-injecting entry (tests, future config plumbing). Argument errors
 /// are tool errors; every backend problem is a fail-open note.
 pub fn run_with(input: &Value, ctx: &mut ToolCtx, bins: &Bins) -> ToolOutput {
-    let pattern = match need_str(input, "pattern") {
-        Ok(p) => p.trim(),
-        Err(e) => return e,
-    };
-    if pattern.is_empty() {
-        return ToolOutput::err(
-            "struct_search: `pattern` is empty — pass real code to match, e.g. `foo($A)` \
-             (`$A` is a metavariable, not a regex group)."
-                .to_string(),
-        );
-    }
     let lane = match input.get("lane").and_then(Value::as_str) {
         None => Lane::AstGrep,
         Some(s) => match Lane::parse(s) {
@@ -447,13 +464,55 @@ pub fn run_with(input: &Value, ctx: &mut ToolCtx, bins: &Bins) -> ToolOutput {
     let path = nonblank("path").unwrap_or(".");
     let limit = opt_u64(input, "limit");
 
-    let Some((program, args)) = command_for(lane, bins, pattern, lang, config, path) else {
+    let pattern = match lane {
+        Lane::AstGrep => {
+            let pattern = match need_str(input, "pattern") {
+                Ok(p) => p.trim(),
+                Err(_) => {
+                    return ToolOutput::err(
+                        "struct_search: the ast-grep lane needs `pattern` — real code to \
+                         match, e.g. `foo($A)`."
+                            .to_string(),
+                    )
+                }
+            };
+            if pattern.is_empty() {
+                return ToolOutput::err(
+                    "struct_search: `pattern` is empty — pass real code to match, e.g. `foo($A)` \
+                     (`$A` is a metavariable, not a regex group)."
+                        .to_string(),
+                );
+            }
+            pattern
+        }
+        Lane::Semgrep => {
+            let Some(c) = config else {
+                return ToolOutput::err(
+                    "struct_search: the semgrep lane needs `config` — a local rules file or \
+                     directory (e.g. `.semgrep.yml`)."
+                        .to_string(),
+                );
+            };
+            if let Err(e) = check_semgrep_config(c, &ctx.cwd) {
+                return ToolOutput::err(e);
+            }
+            ""
+        }
+    };
+
+    if bins.binary(lane).is_none() {
         return ToolOutput::ok(format!(
             "struct_search: the {} lane has no binary — none run (fail-open). Set {} to its path, \
              or leave it unset and keep {} on PATH.",
             lane.as_str(),
             lane.env(),
             lane.path_names().join(" / ")
+        ));
+    }
+    let Some((program, args)) = command_for(lane, bins, pattern, lang, config, path) else {
+        return ToolOutput::err(format!(
+            "struct_search: no {} command could be built.",
+            lane.as_str()
         ));
     };
 
@@ -480,7 +539,9 @@ fn probe(
         .args(args)
         .current_dir(&ctx.cwd)
         .env_clear()
-        .envs(std::env::vars().filter(|(k, _)| ENV_ALLOW.contains(&k.as_str())))
+        .envs(super::filter_env(std::env::vars_os(), |k| {
+            ENV_ALLOW.contains(&k)
+        }))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -567,7 +628,7 @@ fn probe(
     let code = status.as_ref().and_then(|s| s.code());
     let scope = match lane {
         Lane::AstGrep => format!("for pattern `{pattern}`"),
-        Lane::Semgrep => format!("for config `{}`", config.unwrap_or(DEFAULT_SEMGREP_CONFIG)),
+        Lane::Semgrep => format!("for config `{}`", config.unwrap_or_default()),
     };
     let label = match lane {
         Lane::AstGrep => "matches",
@@ -817,7 +878,7 @@ pub fn spec() -> crate::provider::ToolSpec {
             json!({
                 "pattern": {
                     "type": "string",
-                    "description": "Structural pattern — real code with `$A` metavariables, e.g. `foo($A)`. Required by the shared argument contract; the semgrep lane scans by its rules and does not use it."
+                    "description": "Structural pattern — real code with `$A` metavariables, e.g. `foo($A)`. Required by the ast-grep lane; the semgrep lane ignores it."
                 },
                 "lang": {
                     "type": "string",
@@ -834,14 +895,14 @@ pub fn spec() -> crate::provider::ToolSpec {
                 },
                 "config": {
                     "type": "string",
-                    "description": "Semgrep lane only: rules to run (`--config`), e.g. `p/security-audit` or a path. Defaults to `auto`."
+                    "description": "Semgrep lane only (required there): a local rules file or directory (`--config`). Registry ids and URLs are refused."
                 },
                 "limit": {
                     "type": "integer",
                     "description": "Maximum rows to return; the cap is 50 and `limit` can only narrow it."
                 }
             }),
-            &["pattern"],
+            &[],
         ),
     }
 }
@@ -1141,11 +1202,12 @@ mod tests {
     #[test]
     fn unconfigured_lane_fails_open_with_a_note_naming_the_env_var() {
         let dir = tmpdir("unconfigured");
+        std::fs::write(dir.join("rules.yml"), "rules: []\n").unwrap();
         let mut c = ctx(&dir);
         for lane in Lane::ALL {
             let bins = Bins::default();
             let out = run_with(
-                &json!({"pattern": "foo($A)", "lane": lane.as_str()}),
+                &json!({"pattern": "foo($A)", "lane": lane.as_str(), "config": "rules.yml"}),
                 &mut c,
                 &bins,
             );
@@ -1164,9 +1226,11 @@ mod tests {
             ast_grep: Some(dir.join("no-such-ast-grep")),
             semgrep: Some(dir.join("no-such-semgrep")),
         };
+        std::fs::write(dir.join("rules.yml"), "rules: []\n").unwrap();
         for lane in Lane::ALL {
             let out = run_with(
-                &json!({"pattern": "foo($A)", "lane": lane.as_str(), "path": "src"}),
+                &json!({"pattern": "foo($A)", "lane": lane.as_str(), "path": "src",
+                        "config": "rules.yml"}),
                 &mut c,
                 &bins,
             );
@@ -1217,29 +1281,132 @@ mod tests {
     }
 
     #[test]
-    fn command_for_builds_the_exact_semgrep_argv_and_defaults_the_config_to_auto() {
+    fn command_for_builds_the_exact_semgrep_argv_with_metrics_off() {
         let bins = Bins {
             ast_grep: None,
             semgrep: Some(PathBuf::from("/opt/semgrep")),
         };
         let (program, args) =
-            command_for(Lane::Semgrep, &bins, "unused($A)", None, None, "src").unwrap();
+            command_for(Lane::Semgrep, &bins, "", None, Some("rules.yml"), "src").unwrap();
         assert_eq!(program, PathBuf::from("/opt/semgrep"));
-        assert_eq!(args, vec!["--json", "--quiet", "--config", "auto", "src"]);
-        let (_, args) = command_for(
-            Lane::Semgrep,
-            &bins,
-            "unused($A)",
-            None,
-            Some("p/security-audit"),
-            "svc",
-        )
-        .unwrap();
         assert_eq!(
             args,
-            vec!["--json", "--quiet", "--config", "p/security-audit", "svc"]
+            vec![
+                "--json",
+                "--quiet",
+                "--metrics=off",
+                "--config",
+                "rules.yml",
+                "src"
+            ]
+        );
+        assert!(
+            command_for(Lane::Semgrep, &bins, "", None, None, "src").is_none(),
+            "no config, no command — semgrep never falls back to `auto`"
         );
         assert!(command_for(Lane::AstGrep, &bins, "x", None, None, ".").is_none());
+    }
+
+    /// A stand-in backend: records its argv to `argv.txt` in the cwd and
+    /// prints `stdout`.
+    #[cfg(unix)]
+    fn fake_bin(dir: &Path, name: &str, stdout: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join(name);
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\necho \"$@\" > argv.txt\nprintf '%s' '{stdout}'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semgrep_refuses_network_configs_before_spawning() {
+        let dir = tmpdir("semgrep-net");
+        let bins = Bins {
+            ast_grep: None,
+            semgrep: Some(fake_bin(&dir, "semgrep", r#"{"results":[]}"#)),
+        };
+        let mut c = ctx(&dir);
+        for config in [
+            "auto",
+            " AUTO ",
+            "p/security-audit",
+            "r/python.lang.security.audit.exec-use",
+            "s/someone:ruleset",
+            "https://example.com/rules.yml",
+            "http://example.com/rules.yml",
+        ] {
+            let out = run_with(&json!({"lane": "semgrep", "config": config}), &mut c, &bins);
+            assert!(out.is_error, "{config}: {}", out.text);
+            assert!(out.text.contains("local"), "{config}: {}", out.text);
+            assert!(!dir.join("argv.txt").exists(), "{config} spawned semgrep");
+        }
+        let out = run_with(&json!({"lane": "semgrep"}), &mut c, &bins);
+        assert!(out.is_error, "a missing config is refused: {}", out.text);
+        assert!(out.text.contains("config"), "{}", out.text);
+        let out = run_with(
+            &json!({"lane": "semgrep", "config": "no-such-rules.yml"}),
+            &mut c,
+            &bins,
+        );
+        assert!(out.is_error, "a config that is not on disk: {}", out.text);
+        assert!(!dir.join("argv.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semgrep_runs_a_local_config_with_metrics_off_and_no_pattern() {
+        let dir = tmpdir("semgrep-local");
+        std::fs::write(dir.join("rules.yml"), "rules: []\n").unwrap();
+        let bins = Bins {
+            ast_grep: None,
+            semgrep: Some(fake_bin(&dir, "semgrep", r#"{"results":[]}"#)),
+        };
+        let mut c = ctx(&dir);
+        let out = run_with(
+            &json!({"lane": "semgrep", "config": "rules.yml"}),
+            &mut c,
+            &bins,
+        );
+        assert!(!out.is_error, "{}", out.text);
+        let argv = std::fs::read_to_string(dir.join("argv.txt")).unwrap();
+        assert!(argv.contains("--metrics=off"), "{argv}");
+        assert!(argv.contains("--config rules.yml"), "{argv}");
+    }
+
+    /// Child-process probe with a non-UTF-8 env value (see bash's twin).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_env_value_does_not_kill_the_probe() {
+        use std::os::unix::ffi::OsStringExt;
+        const MARK: &str = "LC_OVERSEER_T12_PROBE";
+        if std::env::var_os(MARK).is_some() {
+            let dir = tmpdir("nonutf8");
+            let bins = Bins {
+                ast_grep: Some(fake_bin(&dir, "sg", "[]")),
+                semgrep: None,
+            };
+            let out = run_with(&json!({"pattern": "foo($A)"}), &mut ctx(&dir), &bins);
+            assert!(!out.is_error, "{}", out.text);
+            assert!(dir.join("argv.txt").exists(), "the probe really ran");
+            return;
+        }
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::struct_search::tests::a_non_utf8_env_value_does_not_kill_the_probe",
+                "--test-threads=1",
+            ])
+            .env(MARK, std::ffi::OsString::from_vec(vec![b'f', 0xff]))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
     }
 
     #[test]
@@ -1259,20 +1426,20 @@ mod tests {
     }
 
     #[test]
-    fn spec_declares_the_two_lanes_and_requires_a_pattern() {
+    fn spec_declares_the_two_lanes_and_leaves_pattern_optional() {
         let s = spec();
         assert_eq!(s.name, "struct_search");
         assert!(s.description.contains("structurally"), "{}", s.description);
         assert!(s.description.contains("metavariable"), "{}", s.description);
         assert!(s.description.contains(ENV_AST_GREP), "{}", s.description);
         assert!(s.description.contains(ENV_SEMGREP), "{}", s.description);
-        assert_eq!(s.input_schema["required"], json!(["pattern"]));
+        assert_eq!(s.input_schema["required"], json!([]));
         assert_eq!(
             s.input_schema["properties"]["lane"]["enum"],
             json!(["ast-grep", "semgrep"])
         );
         assert_eq!(s.input_schema["additionalProperties"], json!(false));
-        assert!(s.input_schema["properties"]["config"]["description"]
+        assert!(!s.input_schema["properties"]["config"]["description"]
             .as_str()
             .unwrap()
             .contains("auto"));
