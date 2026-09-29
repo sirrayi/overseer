@@ -9,7 +9,7 @@
 //! - max_tokens is always required
 //! - temperature is never sent (reasoning models reject it)
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 
@@ -32,12 +32,8 @@ pub struct Anthropic {
 
 impl Anthropic {
     pub fn new(api_key: impl Into<String>) -> Self {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(600)))
-            .build();
         Anthropic {
-            agent: ureq::Agent::new_with_config(config),
+            agent: super::http_agent(),
             api_key: api_key.into(),
             base_url: API_URL.to_string(),
         }
@@ -327,36 +323,7 @@ impl Provider for Anthropic {
         if wants_cu {
             call = call.header("anthropic-beta", COMPUTER_TOOLSET_BETA);
         }
-        let mut resp = call
-            .send_json(&body)
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-        let latency_ms = started.elapsed().as_millis() as u64;
-
-        let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-
-        if status == 429 || status == 529 || status == 503 {
-            let retry_after_ms = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5)
-                * 1000;
-            return Err(ProviderError::RateLimit {
-                status,
-                retry_after_ms,
-            });
-        }
-        if !(200..300).contains(&status) {
-            return Err(ProviderError::Http { status, body: text });
-        }
-
-        let parsed: Value =
-            serde_json::from_str(&text).map_err(|e| ProviderError::Malformed(e.to_string()))?;
+        let (parsed, latency_ms) = super::send_json(call, &body, started, super::RATE_LIMITED)?;
         Self::parse_response(&parsed, request_bytes, latency_ms)
     }
 

@@ -175,6 +175,79 @@ impl std::fmt::Display for ProviderError {
     }
 }
 
+/// The HTTP agent every adapter shares: non-2xx statuses come back as
+/// values (mapped by [`send_json`]), with a 600s global timeout.
+pub(crate) fn http_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(600)))
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+/// `POST url` with bearer auth and a JSON content type, then the adapter's
+/// extra headers (OpenAI Chat Completions and Responses).
+pub(crate) fn bearer_post(
+    agent: &ureq::Agent,
+    url: &str,
+    api_key: &str,
+    extra_headers: &[(String, String)],
+) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+    let mut call = agent
+        .post(url)
+        .header("authorization", &format!("Bearer {api_key}"))
+        .header("content-type", "application/json");
+    for (name, value) in extra_headers {
+        call = call.header(name, value);
+    }
+    call
+}
+
+/// Statuses that mean "back off and retry" (529 is Anthropic's overload).
+pub(crate) const RATE_LIMITED: &[u16] = &[429, 529, 503];
+
+/// Send `body` and map the reply: a `rate_limited` status becomes
+/// `RateLimit` (the `retry-after` seconds, default 5), any other non-2xx
+/// becomes `Http` (rendered by `http_plain`), and a 2xx body is parsed as
+/// JSON. Returns `(json, latency_ms)`, latency measured from `started`.
+pub(crate) fn send_json(
+    call: ureq::RequestBuilder<ureq::typestate::WithBody>,
+    body: &Value,
+    started: std::time::Instant,
+    rate_limited: &[u16],
+) -> Result<(Value, u64), ProviderError> {
+    let mut resp = call
+        .send_json(body)
+        .map_err(|e| ProviderError::Transport(e.to_string()))?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    let status = resp.status().as_u16();
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+    if rate_limited.contains(&status) {
+        let retry_after_ms = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5)
+            * 1000;
+        return Err(ProviderError::RateLimit {
+            status,
+            retry_after_ms,
+        });
+    }
+    if !(200..300).contains(&status) {
+        return Err(ProviderError::Http { status, body: text });
+    }
+    let parsed =
+        serde_json::from_str(&text).map_err(|e| ProviderError::Malformed(e.to_string()))?;
+    Ok((parsed, latency_ms))
+}
+
 /// Render an HTTP failure as one plain-English line: a status gloss
 /// plus the provider's own `error.message` when the body is the usual
 /// `{"error":{…}}` envelope (Anthropic, OpenAI, and Gemini all use it);

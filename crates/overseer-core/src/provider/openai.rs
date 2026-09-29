@@ -13,7 +13,7 @@
 //!   in details objects (shape varies by vendor — both spellings read)
 //! - finish_reason: stop|length|tool_calls|content_filter (+ raw preserved)
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 
@@ -35,12 +35,8 @@ pub struct OpenAiCompatible {
 impl OpenAiCompatible {
     /// `base_url` is the versioned root (…/v1); the path is appended.
     pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(600)))
-            .build();
         OpenAiCompatible {
-            agent: ureq::Agent::new_with_config(config),
+            agent: super::http_agent(),
             api_key: api_key.into(),
             base_url: base_url.into(),
             extra_headers: Vec::new(),
@@ -357,44 +353,8 @@ impl Provider for OpenAiCompatible {
         }
 
         let started = Instant::now();
-        let mut call = self
-            .agent
-            .post(&self.url())
-            .header("authorization", &format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json");
-        for (name, value) in &self.extra_headers {
-            call = call.header(name, value);
-        }
-        let mut resp = call
-            .send_json(&body)
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-        let latency_ms = started.elapsed().as_millis() as u64;
-
-        let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-
-        if status == 429 || status == 529 || status == 503 {
-            let retry_after_ms = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5)
-                * 1000;
-            return Err(ProviderError::RateLimit {
-                status,
-                retry_after_ms,
-            });
-        }
-        if !(200..300).contains(&status) {
-            return Err(ProviderError::Http { status, body: text });
-        }
-
-        let parsed: Value =
-            serde_json::from_str(&text).map_err(|e| ProviderError::Malformed(e.to_string()))?;
+        let call = super::bearer_post(&self.agent, &self.url(), &self.api_key, &self.extra_headers);
+        let (parsed, latency_ms) = super::send_json(call, &body, started, super::RATE_LIMITED)?;
         Self::parse_response(&parsed, request_bytes, latency_ms)
     }
 

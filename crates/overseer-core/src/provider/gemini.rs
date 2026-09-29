@@ -17,7 +17,7 @@
 //! - usageMetadata: promptTokenCount (includes cached), cachedContent-
 //!   TokenCount, candidatesTokenCount, thoughtsTokenCount.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 
@@ -36,12 +36,8 @@ impl Gemini {
     /// `base_url` is the API root (…/v1beta); `/models/{m}:generateContent`
     /// is appended per request.
     pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(600)))
-            .build();
         Gemini {
-            agent: ureq::Agent::new_with_config(config),
+            agent: super::http_agent(),
             api_key: api_key.into(),
             base_url: base_url.into(),
         }
@@ -356,40 +352,12 @@ impl Provider for Gemini {
             ));
         }
         let started = Instant::now();
-        let mut resp = self
+        let call = self
             .agent
             .post(&self.url(req.model))
             .header("x-goog-api-key", &self.api_key)
-            .header("content-type", "application/json")
-            .send_json(&body)
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-        let latency_ms = started.elapsed().as_millis() as u64;
-
-        let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-
-        if status == 429 || status == 503 {
-            let retry_after_ms = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5)
-                * 1000;
-            return Err(ProviderError::RateLimit {
-                status,
-                retry_after_ms,
-            });
-        }
-        if !(200..300).contains(&status) {
-            return Err(ProviderError::Http { status, body: text });
-        }
-
-        let parsed: Value =
-            serde_json::from_str(&text).map_err(|e| ProviderError::Malformed(e.to_string()))?;
+            .header("content-type", "application/json");
+        let (parsed, latency_ms) = super::send_json(call, &body, started, &[429, 503])?;
         Self::parse_response(&parsed, request_bytes, latency_ms)
     }
 
