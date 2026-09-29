@@ -104,16 +104,10 @@ pub fn filtered_memory_dir(
     std::fs::create_dir_all(dest).ok()?;
     let mut kept_lines = Vec::new();
     for line in text.lines() {
-        // Preserve non-pointer lines (headers, blanks) verbatim.
-        let mut named: Option<String> = None;
-        for tok in line.split_whitespace() {
-            let t = tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';');
-            if t.ends_with(".md") && !t.contains('/') && !t.contains('\\') {
-                named = Some(t.to_string());
-                break;
-            }
-        }
-        let Some(name) = named else {
+        // Pointer recognition is memory's own rule: bare names AND
+        // layer-qualified ones (`semantic/x.md`); anything else is a
+        // non-pointer line preserved verbatim.
+        let Some(name) = crate::memory::topic_name(line).map(str::to_string) else {
             kept_lines.push(line.to_string());
             continue;
         };
@@ -615,6 +609,40 @@ mod tests {
         ] {
             assert!(!out.join(dropped).exists(), "{dropped} must not be copied");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filtered_view_keeps_layer_qualified_pointers() {
+        // `semantic/x.md` in the INDEX is a pointer too — the file must
+        // be materialized and the line kept; a qualified REGULATED
+        // topic still drops out entirely.
+        let dir = std::env::temp_dir().join(format!("overseer-submemq-{}", uuid::Uuid::now_v7()));
+        let mem = dir.join("memory");
+        std::fs::create_dir_all(mem.join("semantic")).unwrap();
+        std::fs::write(mem.join("semantic/prefs.md"), "prefers tabs\n").unwrap();
+        std::fs::write(
+            mem.join("semantic/secret.md"),
+            "---\nsensitivity: secret\n---\nhush\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem.join("INDEX.md"),
+            "# Memory Index\n\nsemantic/prefs.md — tabs\nsemantic/secret.md — hush\n",
+        )
+        .unwrap();
+
+        let dest = dir.join("filtered");
+        let out = filtered_memory_dir(&mem, crate::memory::Sensitivity::Personal, &dest)
+            .expect("filtered dir");
+        let index = std::fs::read_to_string(out.join("INDEX.md")).unwrap();
+        assert!(index.contains("semantic/prefs.md"), "{index}");
+        assert!(!index.contains("semantic/secret.md"), "{index}");
+        assert_eq!(
+            std::fs::read_to_string(out.join("semantic/prefs.md")).unwrap(),
+            "prefers tabs\n"
+        );
+        assert!(!out.join("semantic/secret.md").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

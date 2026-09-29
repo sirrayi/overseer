@@ -738,8 +738,9 @@ fn rank(s: Sensitivity) -> u8 {
 }
 
 /// First `*.md` token on an index line, if it is a valid pointer (see
-/// `valid_pointer`).
-fn topic_name(line: &str) -> Option<&str> {
+/// `valid_pointer`). Shared with tools/task.rs so the subagent view
+/// reads INDEX lines under the same pointer rules.
+pub(crate) fn topic_name(line: &str) -> Option<&str> {
     line.split_whitespace()
         .find(|tok| tok.ends_with(".md"))
         .map(trim_pointer)
