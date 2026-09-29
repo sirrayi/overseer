@@ -43,12 +43,8 @@ pub fn spec() -> ToolSpec {
         name: "task".into(),
         description: concat!(
             "Spawn a subagent for a self-contained subtask in an isolated ",
-            "context. It returns a compact digest (~2K tokens) plus the path ",
-            "to its full trace. mode=read (default) has read/grep/glob only ",
-            "and cannot modify files. mode=write gets full tools inside an ",
-            "isolated git worktree (its changes land on a scratch branch, ",
-            "never your checkout). background=true returns immediately and ",
-            "the digest arrives as a notice when done (max 4 in flight)."
+            "context. Returns a compact digest (~2K tokens) plus the path to ",
+            "its full trace."
         )
         .into(),
         input_schema: schema(
@@ -60,15 +56,15 @@ pub fn spec() -> ToolSpec {
                 "mode": {
                     "type": "string",
                     "enum": ["read", "write"],
-                    "description": "read (default): read-only quarantine. write: full tools in an isolated git worktree."
+                    "description": "read (default): read/grep/glob only, cannot modify files. write: full tools in an isolated git worktree; changes land on a scratch branch, never your checkout."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "true: run on a thread and notify when done (max 4 concurrent). default: false (block for the digest)."
+                    "description": "Return immediately; the digest arrives as a notice when done (max 4 in flight). Default false."
                 },
                 "max_steps": {
                     "type": "integer",
-                    "description": "Step budget for the subagent (default 10, max 20)."
+                    "description": "Default 10, max 20."
                 }
             }),
             &["prompt"],

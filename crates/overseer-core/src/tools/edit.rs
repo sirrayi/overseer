@@ -10,22 +10,19 @@ pub fn spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
         name: "edit".into(),
         description: concat!(
-            "Replace an exact string in a file. `old_string` must match the file ",
-            "content verbatim (including indentation) and be unique unless ",
-            "replace_all is set. The file must have been read with `read` or ",
-            "created with `write` earlier in this session. On failure, read the ",
-            "relevant lines again and retry with more surrounding context. ",
-            "Alternatively pass `patch`: a unified diff (`@@ -a,b +c,d @@` hunks) ",
-            "for this file alone."
+            "Replace an exact string in a file (verbatim, including indentation; ",
+            "unique unless replace_all), or apply `patch`, a unified diff for ",
+            "this file alone. The file must have been read or written earlier ",
+            "this session. On failure, re-read the lines and retry with more context."
         )
         .into(),
         input_schema: schema(
             json!({
-                "path": {"type": "string", "description": "File path to edit."},
-                "old_string": {"type": "string", "description": "Exact text to find; must occur exactly once unless replace_all. Omit when sending `patch`."},
-                "new_string": {"type": "string", "description": "Replacement text. Omit when sending `patch`."},
+                "path": {"type": "string", "description": "File to edit."},
+                "old_string": {"type": "string", "description": "Exact text to replace. Omit with `patch`."},
+                "new_string": {"type": "string", "description": "Replacement text. Omit with `patch`."},
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)."},
-                "patch": {"type": "string", "description": "Unified diff to apply instead of old_string/new_string: one or more `@@ -a,b +c,d @@` hunks with context, '-' and '+' lines."}
+                "patch": {"type": "string", "description": "`@@ -a,b +c,d @@` hunks with context, '-' and '+' lines."}
             }),
             // Only `path` is structurally required: the edit *variant*
             // (anchor pair vs patch) is validated in `run`, so the error

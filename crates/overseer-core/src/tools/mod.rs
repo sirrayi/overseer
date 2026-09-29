@@ -6,6 +6,13 @@
 //! budget: ~30K chars inline, middle-truncate, beyond that spill-to-file with
 //! {path, preview, size} so the model can re-read on demand.
 //! Error messages are prompts: name the invariant violated, suggest the repair.
+//!
+//! Optional tools (`computer`, `struct_search`, `diagnostics`) are
+//! advertised only when this host can serve them. [`Optional::detect`] runs
+//! once, when [`ToolRegistry::core`] builds the registry — env/PATH lookups
+//! and file-existence checks only, no process spawns — so the spec array is
+//! fixed and byte-stable for the session (Invariant 2). An absent optional
+//! tool is also refused at dispatch with the reason and how to enable it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -190,6 +197,62 @@ pub const TOOL_NAMES: [&str; 15] = [
     "write",
 ];
 
+/// Which optional tools this host can serve, decided once per registry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Optional {
+    /// At least one computer-use tier has a configured helper.
+    pub computer: bool,
+    /// `ast-grep`/`sg` or `semgrep` is configured or on PATH.
+    pub struct_search: bool,
+    /// A supported checker (`cargo`) is on PATH.
+    pub diagnostics: bool,
+}
+
+impl Optional {
+    /// Every optional tool on (fixed-environment tests).
+    pub const ALL: Optional = Optional {
+        computer: true,
+        struct_search: true,
+        diagnostics: true,
+    };
+
+    /// Probe the host: env vars, PATH lookups and `is_file` checks only.
+    pub fn detect() -> Self {
+        let backends = computer::Backends::detect();
+        let bins = struct_search::Bins::detect();
+        Optional {
+            computer: computer::Tier::ORDER
+                .iter()
+                .any(|t| backends.configured(*t)),
+            struct_search: bins.ast_grep.is_some() || bins.semgrep.is_some(),
+            diagnostics: struct_search::find_on_path(&["cargo"]).is_some(),
+        }
+    }
+
+    /// `(tool, why it is absent and how to enable it)` for each tool off.
+    fn absent(self) -> Vec<(&'static str, &'static str)> {
+        let mut out = Vec::new();
+        if !self.computer {
+            out.push((
+                "computer",
+                "no computer-use helper is configured (set OVERSEER_COMPUTER_STRUCTURED, \
+                 OVERSEER_COMPUTER_A11Y or OVERSEER_COMPUTER_PIXEL to a helper path)",
+            ));
+        }
+        if !self.diagnostics {
+            out.push(("diagnostics", "no supported checker (`cargo`) is on PATH"));
+        }
+        if !self.struct_search {
+            out.push((
+                "struct_search",
+                "neither ast-grep/sg nor semgrep is on PATH (or set OVERSEER_AST_GREP / \
+                 OVERSEER_SEMGREP)",
+            ));
+        }
+        out
+    }
+}
+
 pub struct ToolRegistry {
     /// Every spec resident in this registry — the set a mode or an
     /// ablation filters down from. `specs` is the advertised view.
@@ -220,12 +283,22 @@ pub struct ToolRegistry {
     /// behind the single resident `mcp` op tool (Invariant 2: the advertised
     /// array must not change because a third-party server did).
     mcp: Option<mcp_tool::McpState>,
+    /// Optional tools this host cannot serve (see [`Optional`]): absent
+    /// from the specs and refused at dispatch with the reason.
+    unavailable: Vec<(&'static str, &'static str)>,
 }
 
 impl ToolRegistry {
+    /// The full resident registry; optional tools per [`Optional::detect`].
     pub fn core(policy: crate::perm::Policy) -> Self {
+        Self::core_with(policy, Optional::detect())
+    }
+
+    /// [`core`](Self::core) with the optional-tool availability given.
+    pub fn core_with(policy: crate::perm::Policy, optional: Optional) -> Self {
         // Sorted by name — the tool list serializes deterministically
         // regardless of registration order (Invariant 2: stable prefix).
+        let unavailable = optional.absent();
         let mut specs = vec![
             bash::spec(),
             read::spec(),
@@ -242,6 +315,7 @@ impl ToolRegistry {
             diagnostics::spec(),
             struct_search::spec(),
         ];
+        specs.retain(|s| !unavailable.iter().any(|(n, _)| *n == s.name));
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         let hooks = crate::hooks::load(&policy.root);
         ToolRegistry {
@@ -255,6 +329,7 @@ impl ToolRegistry {
             hooks,
             mode: None,
             mcp: None,
+            unavailable,
         }
     }
 
@@ -275,6 +350,7 @@ impl ToolRegistry {
             hooks,
             mode: None,
             mcp: None,
+            unavailable: Vec::new(),
         }
     }
 
@@ -296,6 +372,7 @@ impl ToolRegistry {
             hooks,
             mode: None,
             mcp: None,
+            unavailable: Vec::new(),
         }
     }
 
@@ -444,6 +521,12 @@ impl ToolRegistry {
         if self.disabled.contains(name) {
             return ToolOutput::err(format!(
                 "Tool '{name}' is disabled for this run (--no-tools)."
+            ));
+        }
+        if let Some((_, why)) = self.unavailable.iter().find(|(n, _)| *n == name) {
+            return ToolOutput::err(format!(
+                "Tool '{name}' is not available in this session: {why}. Availability is \
+                 detected once at startup — configure it, then start a new session."
             ));
         }
         // P8-B hooks (ECC pattern): a pre_tool_use rule blocks the call
@@ -1168,9 +1251,89 @@ mod tests {
     }
 
     #[test]
+    fn unconfigured_optional_tools_are_absent_and_refused() {
+        let dir = tmpdir();
+        let mut reg =
+            ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::default());
+        let names: Vec<&str> = reg.specs.iter().map(|s| s.name.as_str()).collect();
+        for t in ["computer", "struct_search", "diagnostics"] {
+            assert!(!names.contains(&t), "{t} must not be advertised");
+        }
+        assert!(names.contains(&"read") && names.contains(&"bash"));
+        let mut c = ctx(&dir);
+        let out = reg.call("struct_search", &json!({"pattern": "foo($A)"}), &mut c);
+        assert!(out.is_error);
+        assert!(
+            out.text.contains("not available in this session"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("semgrep"), "{}", out.text);
+        let full = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
+        for t in ["computer", "struct_search", "diagnostics"] {
+            assert!(full.specs.iter().any(|s| s.name == t), "{t} forced on");
+        }
+    }
+
+    #[test]
+    fn spec_array_is_byte_stable_and_name_sorted_across_builds() {
+        let ser = |r: &ToolRegistry| serde_json::to_string(&spec_json(&r.specs)).unwrap();
+        let a = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let b = ToolRegistry::core(crate::perm::Policy::allow_all());
+        assert_eq!(ser(&a), ser(&b), "same environment, same bytes");
+        for reg in [
+            &a,
+            &ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL),
+        ] {
+            let names: Vec<&str> = reg.specs.iter().map(|s| s.name.as_str()).collect();
+            let mut sorted = names.clone();
+            sorted.sort_unstable();
+            assert_eq!(names, sorted);
+        }
+    }
+
+    fn spec_json(specs: &[crate::provider::ToolSpec]) -> Vec<Value> {
+        specs
+            .iter()
+            .map(|s| json!({"name": s.name, "description": s.description, "input_schema": s.input_schema}))
+            .collect()
+    }
+
+    /// Serialized `name + description + input_schema` chars of one spec —
+    /// the three fields every provider sends.
+    fn spec_chars(s: &crate::provider::ToolSpec) -> usize {
+        s.name.chars().count()
+            + s.description.chars().count()
+            + serde_json::to_string(&s.input_schema)
+                .unwrap()
+                .chars()
+                .count()
+    }
+
+    /// Startup-token guard: every resident spec with every optional tool
+    /// forced on (plus the `mcp` op tool). Post-trim measurement: 9,160
+    /// chars (~2,290 tokens at ~4 chars/token), down from 10,650 at base;
+    /// +5% headroom.
+    #[test]
+    fn resident_tool_specs_stay_within_the_startup_budget() {
+        const POST_TRIM_CHARS: usize = 9_160;
+        let mut reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
+        reg.specs.push(mcp_tool::spec());
+        for s in &reg.specs {
+            println!("spec {:<14} {:>5} chars", s.name, spec_chars(s));
+        }
+        let total: usize = reg.specs.iter().map(spec_chars).sum();
+        println!("spec TOTAL {total} chars (~{} tokens)", total / 4);
+        assert!(
+            total <= POST_TRIM_CHARS + POST_TRIM_CHARS / 20,
+            "resident tool specs grew to {total} chars (budget {POST_TRIM_CHARS} + 5%)"
+        );
+    }
+
+    #[test]
     fn all_core_specs_deny_additional_properties() {
         // B1-2 FastMCP audit: every advertised spec must be strict.
-        let reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
         for spec in &reg.specs {
             assert_eq!(
                 spec.input_schema.get("additionalProperties"),
@@ -1274,7 +1437,7 @@ mod tests {
     #[test]
     fn diagnostics_is_resident_and_arg_checked() {
         let dir = tmpdir();
-        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
         assert!(
             reg.specs.iter().any(|s| s.name == "diagnostics"),
             "the diagnostics tool is advertised"

@@ -786,7 +786,7 @@ fn from_env_value(raw: Option<&str>) -> Option<PathBuf> {
 }
 
 /// First of `names` that exists as a file on `PATH`, in the given order.
-fn find_on_path(names: &[&str]) -> Option<PathBuf> {
+pub(crate) fn find_on_path(names: &[&str]) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for name in names {
         for dir in std::env::split_paths(&path) {
@@ -865,40 +865,39 @@ pub fn spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
         name: "struct_search".into(),
         description: concat!(
-            "Search code *structurally*: `pattern` is real code with `$A` metavariables ",
-            "(e.g. `foo($A, $B)`), not a regex — matches ignore formatting and comments. ",
-            "The `semgrep` lane instead runs a rules-based audit scan (security and ",
-            "anti-pattern findings, each with severity and check id). Backends are opt-in: ",
-            "ast-grep via OVERSEER_AST_GREP (`ast-grep`/`sg` on PATH), semgrep via ",
-            "OVERSEER_SEMGREP. Fails open with a note when the backend is missing."
+            "Search code structurally: `pattern` is code with `$A` metavariables ",
+            "(e.g. `foo($A, $B)`), not a regex; formatting and comments are ignored. ",
+            "The `semgrep` lane instead runs a local-rules audit scan (findings with ",
+            "severity and check id). Backends: OVERSEER_AST_GREP or `ast-grep`/`sg`, ",
+            "OVERSEER_SEMGREP or `semgrep`; a missing one fails open with a note."
         )
         .into(),
         input_schema: schema(
             json!({
                 "pattern": {
                     "type": "string",
-                    "description": "Structural pattern — real code with `$A` metavariables, e.g. `foo($A)`. Required by the ast-grep lane; the semgrep lane ignores it."
+                    "description": "Required by ast-grep; semgrep ignores it."
                 },
                 "lang": {
                     "type": "string",
-                    "description": "Language the pattern is written in (ast-grep `--lang`), e.g. rust, python, ts. Inferred from the file extension when omitted."
+                    "description": "ast-grep `--lang` (rust, python, ts, …); inferred from the extension when omitted."
                 },
                 "path": {
                     "type": "string",
-                    "description": "File or directory to search, relative to the working directory (default `.`)."
+                    "description": "File or directory (default `.`)."
                 },
                 "lane": {
                     "type": "string",
                     "enum": ["ast-grep", "semgrep"],
-                    "description": "Which backend answers: `ast-grep` structural search (default) or `semgrep` audit scan."
+                    "description": "Default `ast-grep`."
                 },
                 "config": {
                     "type": "string",
-                    "description": "Semgrep lane only (required there): a local rules file or directory (`--config`). Registry ids and URLs are refused."
+                    "description": "Semgrep only (required): local rules file or directory; registry ids and URLs are refused."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum rows to return; the cap is 50 and `limit` can only narrow it."
+                    "description": "Max rows (cap 50; can only narrow)."
                 }
             }),
             &[],

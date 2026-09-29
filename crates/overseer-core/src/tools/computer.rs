@@ -804,12 +804,11 @@ pub fn spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
         name: "computer".into(),
         description: concat!(
-            "Drive the user's screen in tiers: a structured API call (`api`), then an element ",
-            "lookup by `name`/`role`, then a pixel act at `x`/`y`. `screenshot`/`observe` capture ",
-            "the screen and return the sent and native frame sizes; give coordinates in the sent ",
-            "frame — they are scaled to native pixels for you. A suppressed capture (credential ",
-            "field, watch mode) returns metadata only. `batch` runs up to 32 actions in order. ",
-            "Backends are opt-in: an unconfigured tier errors instead of guessing."
+            "Drive the user's screen in tiers: structured API (`api`), element lookup ",
+            "(`name`/`role`), then pixel act (`x`/`y`). Captures return sent and native frame ",
+            "sizes; give coordinates in the sent frame (scaled for you). A suppressed capture ",
+            "(credential field, watch mode) returns metadata only. `batch` runs up to 32 ",
+            "actions in order. An unconfigured tier errors."
         )
         .into(),
         input_schema: schema(
@@ -818,15 +817,15 @@ pub fn spec() -> crate::provider::ToolSpec {
                     "type": "string",
                     "description": "screenshot | observe | click | move | scroll | drag | type | key | paste | submit | send | invoke | batch"
                 },
-                "api": {"type": "string", "description": "Structured-API handle to invoke (structured tier)"},
-                "name": {"type": "string", "description": "Element name to resolve (a11y tier)"},
-                "role": {"type": "string", "description": "Element role to resolve (a11y tier)"},
-                "x": {"type": "number", "description": "X in the frame you were sent"},
-                "y": {"type": "number", "description": "Y in the frame you were sent"},
-                "dy": {"type": "integer", "description": "Scroll delta (positive = down)"},
+                "api": {"type": "string", "description": "Structured-API handle"},
+                "name": {"type": "string", "description": "Element name"},
+                "role": {"type": "string", "description": "Element role"},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "dy": {"type": "integer", "description": "Scroll delta (+ = down)"},
                 "text": {"type": "string", "description": "Text to type, or key name"},
-                "cred_field": {"type": "boolean", "description": "Target is a credential field (suppresses capture; escalates to identity)"},
-                "actions": {"type": "array", "items": {"type": "object"}, "description": "batch: actions to run in order"},
+                "cred_field": {"type": "boolean", "description": "Target is a credential field"},
+                "actions": {"type": "array", "items": {"type": "object"}, "description": "batch members"},
             }),
             &["action"],
         ),
@@ -993,13 +992,17 @@ mod tests {
         assert!(err.contains(ENV_PIXEL), "names the pixel backend: {err}");
         let err = run_with(&json!({"action": "screenshot"}), &mut c, &none).unwrap_err();
         assert!(err.contains(ENV_PIXEL), "got: {err}");
-        // Through the registry: the tool is advertised and dispatched, and
-        // an unconfigured backend is an honest error, not a fake success.
+        // Through the registry: with no helper the tool is not advertised,
+        // and a call is an honest error naming how to configure it.
         assert!(super::super::TOOL_NAMES.contains(&"computer"));
-        let mut reg = super::super::ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut reg = super::super::ToolRegistry::core_with(
+            crate::perm::Policy::allow_all(),
+            super::super::Optional::default(),
+        );
+        assert!(!reg.specs.iter().any(|s| s.name == "computer"));
         let out = reg.call("computer", &json!({"action": "screenshot"}), &mut c);
         assert!(out.is_error);
-        assert!(out.text.contains("unconfigured"), "got: {}", out.text);
+        assert!(out.text.contains(ENV_PIXEL), "got: {}", out.text);
         // Unknown actions are refused with the action list.
         let bad = run_with(&json!({"action": "frobnicate"}), &mut c, &none).unwrap_err();
         assert!(bad.contains("unknown action"), "got: {bad}");

@@ -553,7 +553,11 @@ mod tests {
                 r#"{"content":[{"type":"text","text":"hello from echo"}]}"#,
             ),
         );
-        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all()).with_mcp(vec![server]);
+        let mut reg = ToolRegistry::core_with(
+            crate::perm::Policy::allow_all(),
+            crate::tools::Optional::ALL,
+        )
+        .with_mcp(vec![server]);
         let mut c = ctx(&dir);
 
         // Exactly one spec was added, with the fixed envelope schema.
