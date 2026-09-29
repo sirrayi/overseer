@@ -28,10 +28,9 @@ pub mod struct_search;
 pub mod task;
 pub mod write;
 
-/// Hard cap on inline tool results (proven default: Claude Code's ~30K).
+/// Hard cap on inline tool results, in bytes (`text.len()`) — results over
+/// it spill to a file (proven default: Claude Code's ~30K).
 pub const INLINE_CAP: usize = 30_000;
-/// Spill threshold: results over this go to a file instead of context.
-pub const SPILL_THRESHOLD: usize = 30_000;
 
 /// Per-invocation context passed to tools.
 pub struct ToolCtx<'a> {
@@ -568,7 +567,8 @@ impl ToolRegistry {
 }
 
 /// Enforce the tool-result byte budget (playbook Ch.6 §2.2):
-/// ≤30K chars inline; larger results spill to a file and return a pointer.
+/// ≤[`INLINE_CAP`] bytes inline; larger results spill to a file and return a
+/// pointer.
 pub fn enforce_budget(out: ToolOutput, ctx: &mut ToolCtx) -> ToolOutput {
     if out.text.len() <= INLINE_CAP {
         return out;
