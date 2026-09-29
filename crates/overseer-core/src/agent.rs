@@ -1410,12 +1410,6 @@ fn count_tool_calls(blocks: &[Block]) -> usize {
         .count()
 }
 
-/// P1.10 verification gate runner: execute the definition-of-done command
-/// in the session cwd via `sh -c`. Output goes to a temp file (not a pipe)
-/// so a verbose suite can't deadlock on a full buffer; a 120s watchdog
-/// kills runaway checks. `Ok(())` = exit 0; `Err(tail)` = nonzero exit,
-/// spawn failure, or timeout — the tail keeps the last ~6K chars of output
-/// so the failure stays reviewable when injected back into context.
 /// Text of the last assistant message — what a stop hook observes as the
 /// session's "final result" (the `tool` side of the rule never matches a
 /// real dispatch, so payload = the text the model ended on).
@@ -1435,6 +1429,13 @@ fn last_text(messages: &[Message]) -> String {
         .unwrap_or_default()
 }
 
+/// P1.10 verification gate runner: execute the definition-of-done command
+/// in the session cwd via `sh -c`. Output goes to a temp file (not a pipe)
+/// so a verbose suite can't deadlock on a full buffer; a 120s watchdog
+/// kills runaway checks. `Ok(())` = exit 0; `Err(tail)` = nonzero exit,
+/// spawn failure, or timeout — the tail keeps the last ~6K chars of output
+/// so the failure stays reviewable when injected back into context.
+// DEFERRED(owner): route verify_cmd through the bash sandbox wrapper (tools/bash.rs) — needs a shared pub(crate) sandbox API
 fn run_verify(cmd: &str, cwd: &std::path::Path) -> Result<(), String> {
     use std::process::{Command, Stdio};
 
