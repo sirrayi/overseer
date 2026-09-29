@@ -31,6 +31,9 @@ html, body {
 }
 
 .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+.dot.r { background: #ff5f57; }
+.dot.y { background: #febc2e; }
+.dot.g { background: #28c840; }
 
 #title {
   flex: 1;
@@ -96,7 +99,7 @@ html, body {
   background: rgba(255,255,255,.18);
 }
 
-#bye {
+#bye, #lock {
   position: fixed;
   inset: 0;
   display: none;
@@ -106,7 +109,7 @@ html, body {
   color: #e5c07b;
   background: rgba(23,24,28,.7);
 }
-#bye.on { display: flex; }
+#bye.on, #lock.on { display: flex; }
 
 /* Unfocused = dimmed; one click inside returns input. */
 #win { transition: opacity .12s; }

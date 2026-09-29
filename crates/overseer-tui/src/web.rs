@@ -5,9 +5,26 @@
 //! `App`, one state machine, zero second engine. Dev tool: assets are
 //! served from `web/` on disk when present so CSS/JS edits are a
 //! browser refresh, not a rebuild.
+//!
+//! Security model: the server can drive a shell-capable agent, so
+//! `GET /input` needs more than the loopback address. A per-install
+//! bearer token (`~/.overseer/web/token`, 0600 in a 0700 dir) rides the
+//! URL *fragment* — `#t=` never leaves the browser in a request line or
+//! a Referer — and `app.js` hands it to `/events` as `?t=` (EventSource
+//! can't set headers) and to `POST /input` as `X-Overseer-Token`. Every
+//! request must carry a loopback `Host:` (DNS-rebinding defence) and
+//! `/events` + `/input` reject cross-site fetch metadata.
+//!
+//! Limits: ≤32 concurrent connections (long-lived SSE clients count
+//! toward the cap — a writer thread drops the guard only when its
+//! socket dies, so a closed tab frees the slot), request head ≤16 KiB
+//! in 10 s, body ≤64 KiB checked against Content-Length BEFORE the
+//! allocation, and every SSE write carries a 5 s timeout so a stalled
+//! tab can never wedge the drive loop.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +32,7 @@ use crossterm::event::{
     Event as CtEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::backend::{Backend, TestBackend};
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -25,35 +43,87 @@ use crate::TuiConfig;
 /// Shared input channel — every HTTP connection thread can inject
 /// events into the drive loop.
 type InputTx = mpsc::Sender<CtEvent>;
-/// Connected SSE clients — the drive loop writes each changed frame to
-/// all of them and drops the ones whose sockets closed.
-type Clients = Arc<Mutex<Vec<TcpStream>>>;
+/// Connected SSE clients — one `sync_channel(1)` sender per client,
+/// fed by a per-client writer thread. Broadcast is `try_send`: a full
+/// channel drops the stale frame (frames are full snapshots), so a
+/// stalled reader never blocks the UI loop.
+type Clients = Arc<Mutex<Vec<mpsc::SyncSender<String>>>>;
 /// Latest frame, replayed to each SSE client on connect — otherwise a
 /// tab that attaches between frames stares at a blank screen.
 type LastFrame = Arc<Mutex<Option<String>>>;
 
-/// Run the session on the web surface. Blocks until /quit (like `run`).
-pub fn run_web(cfg: TuiConfig, port: u16) -> std::io::Result<i32> {
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
-    let (input_tx, input_rx) = mpsc::channel::<CtEvent>();
-    let clients: Clients = Arc::new(Mutex::new(Vec::new()));
-    let last: LastFrame = Arc::new(Mutex::new(None));
+/// Auto-pick scans upward from the default; `--web-port` pins instead.
+const PORT_RANGE: std::ops::RangeInclusive<u16> = 8641..=8660;
+const MAX_CONNS: usize = 32;
+const HEAD_CAP: usize = 16 * 1024;
+const BODY_CAP: usize = 64 * 1024;
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
 
-    let (accept_input, accept_clients, accept_last) =
-        (input_tx.clone(), clients.clone(), last.clone());
-    std::thread::spawn(move || loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let (itx, cls, lf) = (
-                    accept_input.clone(),
-                    accept_clients.clone(),
-                    accept_last.clone(),
-                );
-                std::thread::spawn(move || handle_conn(stream, itx, cls, lf));
-            }
-            Err(_) => return,
-        }
+/// Security headers on the page + assets. `style-src 'self'` works
+/// because `app.js` styles spans via CSSOM (`el.style.*`) — parser-level
+/// inline style is the only thing the CSP needs to forbid.
+const SEC_HEADERS: &str = concat!(
+    "Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'self'; ",
+    "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; ",
+    "form-action 'none'\r\n",
+    "X-Content-Type-Options: nosniff\r\n",
+    "Referrer-Policy: no-referrer\r\n"
+);
+
+/// Web-surface options: the port (None → scan [`PORT_RANGE`]) and
+/// whether to auto-open a browser.
+pub struct WebOpts {
+    pub port: Option<u16>,
+    pub open: bool,
+}
+
+/// CLI entry point: pinned port, never auto-opens (the caller prints
+/// the URL). All the hardening lives in the server below — this is
+/// just a narrower front door.
+pub fn run_web(cfg: TuiConfig, port: u16) -> std::io::Result<i32> {
+    run_web_with(
+        cfg,
+        WebOpts {
+            port: Some(port),
+            open: false,
+        },
+    )
+}
+
+/// Run the session on the web surface. Blocks until /quit (like `run`).
+/// `opts.port` pins the bind (busy = error); `None` scans 8641..=8660.
+/// `opts.open` opens the tokenized URL in the system browser unless the
+/// environment says it can't (SSH / headless).
+pub fn run_web_with(cfg: TuiConfig, opts: WebOpts) -> std::io::Result<i32> {
+    let listener = bind_port(opts.port)?;
+    let port = listener.local_addr()?.port();
+    let token = web_token()?;
+    let url = format!("http://127.0.0.1:{port}/#t={token}");
+
+    let (input_tx, input_rx) = mpsc::channel::<CtEvent>();
+    let ctx = Arc::new(Ctx {
+        token,
+        port,
+        input: input_tx,
+        clients: Clients::new(Mutex::new(Vec::new())),
+        last: LastFrame::new(Mutex::new(None)),
+        conns: Arc::new(AtomicUsize::new(0)),
     });
+
+    {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || handle_conn(stream, ctx));
+                }
+                Err(_) => return,
+            }
+        });
+    }
 
     let (mut app, worker) = crate::launch(cfg);
     app.mode = crate::app::UiMode::Full;
@@ -74,9 +144,14 @@ pub fn run_web(cfg: TuiConfig, port: u16) -> std::io::Result<i32> {
     )
     .unwrap_or_else(|e| match e {}); // TestBackend::Error = Infallible
 
-    eprintln!("overseer web: http://localhost:{port}");
+    eprintln!("overseer web: {url}");
+    if auto_open_ok(opts.open) {
+        open_url(&url);
+    }
 
-    let mut last_hash = 0u64;
+    // Frame diffing happens on the buffer + cursor + prompt_top BEFORE
+    // serialization — an idle tick costs a PartialEq, not a JSON write.
+    let mut prev: Option<(Buffer, (u16, u16), u16)> = None;
     while !app.quit {
         match input_rx.recv_timeout(std::time::Duration::from_millis(80)) {
             Ok(CtEvent::Resize(c, r)) => {
@@ -90,32 +165,192 @@ pub fn run_web(cfg: TuiConfig, port: u16) -> std::io::Result<i32> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         app.step(&mut term, &caps)?;
-        let frame = frame_json(&mut term, app.prompt_top);
-        let h = fnv(frame.as_bytes());
-        if h != last_hash {
-            last_hash = h;
-            *last.lock().unwrap() = Some(frame.clone());
-            broadcast(&clients, &format!("data: {frame}\n\n"));
+        let changed = {
+            let backend = term.backend_mut();
+            let pos = backend
+                .get_cursor_position()
+                .map(|p| (p.x, p.y))
+                .unwrap_or((0, 0));
+            let cur = (backend.buffer().clone(), pos, app.prompt_top);
+            match &prev {
+                Some(p) if *p == cur => false,
+                _ => {
+                    prev = Some(cur);
+                    true
+                }
+            }
+        };
+        if changed {
+            let frame = frame_json(&mut term, app.prompt_top);
+            *ctx.last.lock().unwrap() = Some(frame.clone());
+            broadcast(&ctx.clients, &format!("data: {frame}\n\n"));
         }
     }
     app.shutdown();
-    broadcast(&clients, "data: {\"bye\":true}\n\n");
+    broadcast(&ctx.clients, "data: {\"bye\":true}\n\n");
     let _ = worker.join();
     Ok(0)
 }
 
-fn broadcast(clients: &Clients, msg: &str) {
-    let mut list = clients.lock().unwrap();
-    list.retain_mut(|s| s.write_all(msg.as_bytes()).is_ok());
+fn bind_port(port: Option<u16>) -> std::io::Result<TcpListener> {
+    match port {
+        Some(p) => TcpListener::bind(("127.0.0.1", p)),
+        None => {
+            let mut last = std::io::Error::new(std::io::ErrorKind::AddrInUse, "no ports tried");
+            for p in PORT_RANGE {
+                match TcpListener::bind(("127.0.0.1", p)) {
+                    Ok(l) => return Ok(l),
+                    Err(e) => last = e,
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("no free web port in {PORT_RANGE:?} (last: {last})"),
+            ))
+        }
+    }
 }
 
-/// 64-bit FNV-1a — cheap frame-equality check without cloning cells.
-fn fnv(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for b in bytes {
-        h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
+/// Auto-open policy: `open` opt-in minus SSH sessions and headless
+/// Linux. Kept env-pure so tests can drive every arm.
+fn auto_open_ok_env(open: bool, ssh: bool, display: bool, os: &str) -> bool {
+    if !open || ssh {
+        return false;
     }
-    h
+    match os {
+        "macos" => true,
+        // A Linux box with no display server has nothing to open into.
+        "linux" => display,
+        _ => false,
+    }
+}
+
+fn auto_open_ok(open: bool) -> bool {
+    auto_open_ok_env(
+        open,
+        std::env::var_os("SSH_CONNECTION").is_some(),
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::consts::OS,
+    )
+}
+
+/// `open` (macOS) / `xdg-open` (Linux), detached — the child's stdio is
+/// nulled and spawn errors are ignored (a missing opener is a warning's
+/// worth of trouble, not a failed launch).
+fn open_url(url: &str) {
+    let browser = match std::env::consts::OS {
+        "macos" => "open",
+        "linux" => "xdg-open",
+        _ => return,
+    };
+    let _ = std::process::Command::new(browser)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Per-install bearer token for `/events` and `/input`: 32 bytes of
+/// `/dev/urandom`, hex, persisted at `~/.overseer/web/token` (dir 0700,
+/// file 0600) and reused across launches so an installed PWA's origin
+/// keeps working.
+fn web_token() -> std::io::Result<String> {
+    let dir = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".overseer")
+        .join("web");
+    overseer_core::harden::ensure_private_dir(&dir)?;
+    let path = dir.join("token");
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        let t = t.trim();
+        if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(t.to_string());
+        }
+    }
+    let mut raw = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
+    let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    write_private(&path, token.as_bytes())?;
+    Ok(token)
+}
+
+/// Create-or-replace `path` owner-only (0600), never following a
+/// preexisting symlink's target perms — `OpenOptions::mode` applies at
+/// creation, and the file is ours to rewrite either way.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Length-agnostic byte compare — the token check must not leak a
+/// prefix via early exit.
+fn token_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let n = a.len().max(b.len()).max(1);
+    for i in 0..n {
+        let x = a.get(i % a.len().max(1)).copied().unwrap_or(0);
+        let y = b.get(i % b.len().max(1)).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
+}
+
+/// Connection-slot lease. Long-lived SSE connections hold their slot
+/// in the writer thread (see `handle_conn`) — the slot frees exactly
+/// when the socket dies, not when the handler returns.
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl ConnGuard {
+    fn claim(n: &Arc<AtomicUsize>) -> Option<ConnGuard> {
+        n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+            (c < MAX_CONNS).then_some(c + 1)
+        })
+        .ok()?;
+        Some(ConnGuard(n.clone()))
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Per-request context: everything `handle_conn` needs that isn't the
+/// socket itself.
+struct Ctx {
+    token: String,
+    port: u16,
+    input: InputTx,
+    clients: Clients,
+    last: LastFrame,
+    conns: Arc<AtomicUsize>,
+}
+
+fn broadcast(clients: &Clients, msg: &str) {
+    let mut list = clients.lock().unwrap();
+    list.retain(|tx| match tx.try_send(msg.to_string()) {
+        Ok(()) => true,
+        // Full = a slow reader drops a stale snapshot; it still gets
+        // the next frame. Disconnected = writer is gone, drop the slot.
+        Err(mpsc::TrySendError::Full(_)) => true,
+        Err(mpsc::TrySendError::Disconnected(_)) => false,
+    });
 }
 
 /// Serialize the terminal buffer as `{w,h,p,cur,rows:[ [span] ]}` where
@@ -141,10 +376,22 @@ fn frame_json(term: &mut Terminal<TestBackend>, prompt_top: u16) -> String {
             out.push(',');
         }
         out.push('[');
+        // The client pads rows to full width — trailing blank cells in
+        // the default style carry nothing.
+        let end = row
+            .iter()
+            .rposition(|c| {
+                !c.symbol().trim().is_empty()
+                    || c.fg != Color::Reset
+                    || c.bg != Color::Reset
+                    || !c.modifier.is_empty()
+            })
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let mut first = true;
         let mut run: Option<(Color, Color, Modifier)> = None;
         let mut text = String::new();
-        for cell in row {
+        for cell in &row[..end] {
             let sty = (cell.fg, cell.bg, cell.modifier);
             if run != Some(sty) && !text.is_empty() {
                 span_json(&mut out, &text, run.unwrap(), &mut first);
@@ -229,61 +476,189 @@ fn color_css(c: Color) -> String {
 
 // ── HTTP ────────────────────────────────────────────────────────────
 
-fn handle_conn(mut stream: TcpStream, input: InputTx, clients: Clients, last: LastFrame) {
-    let _ = stream.set_nodelay(true);
-    let mut head = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-    // Read the request head; stop at the header/body boundary.
-    while !head.ends_with(b"\r\n\r\n") && head.len() < 16 * 1024 {
-        if stream.read(&mut byte).unwrap_or(0) == 0 {
-            return;
+struct Request {
+    method: String,
+    /// Raw path+query — routing splits on `?` later.
+    path: String,
+    /// Header names lowercased; last value wins on duplicates.
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Request {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// One query value — `?a=x&b=y` order-agnostic.
+    fn query(&self, key: &str) -> Option<String> {
+        let q = self.path.split_once('?')?.1;
+        q.split('&').find_map(|kv| {
+            kv.split_once('=').and_then(|(k, v)| {
+                (k == key).then(|| String::from_utf8_lossy(&url_decode(v)).into_owned())
+            })
+        })
+    }
+
+    fn route(&self) -> &str {
+        self.path.split('?').next().unwrap_or("")
+    }
+}
+
+/// Head-read failure: `Silent` (EOF/timeout/malformed — hang up) or
+/// `Status` (report a code, then hang up).
+enum HeadErr {
+    Silent,
+    Status(u16),
+}
+
+/// Request head through a BufReader (no byte-at-a-time): 10 s overall
+/// read timeout, ≤16 KiB head, Content-Length capped at 64 KiB BEFORE
+/// the body allocation — a lying header gets 413, never a giant `vec!`.
+fn read_request(stream: &TcpStream) -> Result<Request, HeadErr> {
+    let mut reader = BufReader::new(stream.try_clone().map_err(|_| HeadErr::Silent)?);
+    let mut head = Vec::with_capacity(1024);
+    loop {
+        let mut line = Vec::new();
+        let n = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|_| HeadErr::Silent)?;
+        if n == 0 {
+            return Err(HeadErr::Silent);
         }
-        head.push(byte[0]);
+        head.extend_from_slice(&line);
+        if head.len() > HEAD_CAP {
+            return Err(HeadErr::Status(431));
+        }
+        if line == b"\r\n" || line == b"\n" {
+            break;
+        }
     }
     let head = String::from_utf8_lossy(&head);
-    let mut parts = head.split_whitespace();
-    let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or("/"));
+    let mut lines = head.lines();
+    let mut parts = lines.next().unwrap_or("").split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+    if method.is_empty() {
+        return Err(HeadErr::Silent);
+    }
+    let headers = lines
+        .filter_map(|l| {
+            l.split_once(':')
+                .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
+        })
+        .collect();
     let body_len = head
         .lines()
+        .skip(1)
         .find_map(|l| {
-            l.strip_prefix("Content-Length:")
-                .map(|v| v.trim().parse::<usize>())
+            l.split_once(':')
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, v)| v.trim().parse::<usize>().ok())
         })
-        .and_then(|r| r.ok())
         .unwrap_or(0);
+    if body_len > BODY_CAP {
+        return Err(HeadErr::Status(413));
+    }
     let mut body = vec![0u8; body_len];
-    let _ = stream.read_exact(&mut body);
+    // Short body = the sender lied about its length — that's a 400,
+    // not a silent trunc.
+    if reader.read_exact(&mut body).is_err() {
+        return Err(HeadErr::Status(400));
+    }
+    Ok(Request {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
 
-    let (route, query) = path.split_once('?').unwrap_or((path, ""));
-    match (method, route) {
+/// One accepted connection. Rejections in order: over-cap 503 → bad
+/// Host 421 → bad head → cross-site metadata 403 → bad token 401 →
+/// route.
+fn handle_conn(mut stream: TcpStream, ctx: Arc<Ctx>) {
+    let Some(guard) = ConnGuard::claim(&ctx.conns) else {
+        let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length:0\r\n\r\n");
+        return;
+    };
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    let req = match read_request(&stream) {
+        Ok(r) => r,
+        Err(HeadErr::Silent) => return,
+        Err(HeadErr::Status(code)) => {
+            let _ = respond(&mut stream, code, "");
+            return;
+        }
+    };
+    if !host_ok(req.header("host"), ctx.port) {
+        // DNS rebinding: a victim's browser re-pointed at our port
+        // still arrives under THEIR Host — refuse to speak to it.
+        let _ = respond(&mut stream, 421, "");
+        return;
+    }
+    let route = req.route();
+    if matches!(route, "/events" | "/input") {
+        if !fetch_metadata_ok(&req, ctx.port) {
+            let _ = respond(&mut stream, 403, "");
+            return;
+        }
+        if !token_ok(&req, &ctx.token) {
+            let _ = respond(&mut stream, 401, "");
+            return;
+        }
+    }
+    match (req.method.as_str(), route) {
         ("GET", "/events") => {
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n",
-            );
-            if let Some(f) = last.lock().unwrap().as_ref() {
-                let _ = stream.write_all(format!("data: {f}\n\n").as_bytes());
+            // The writer thread now owns the socket AND the connection
+            // slot — `guard` moves with it, so the cap frees only when
+            // the client actually goes away.
+            let (tx, rx) = mpsc::sync_channel::<String>(1);
+            if stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n",
+                )
+                .is_err()
+            {
+                return;
             }
-            if stream.flush().is_ok() {
-                clients.lock().unwrap().push(stream);
+            if let Some(f) = ctx.last.lock().unwrap().as_ref() {
+                if stream
+                    .write_all(format!("data: {f}\n\n").as_bytes())
+                    .is_err()
+                {
+                    return;
+                }
             }
+            let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+            ctx.clients.lock().unwrap().push(tx);
+            std::thread::spawn(move || sse_writer(stream, rx, guard));
         }
         // Some preview proxies forward POSTs but drop the body — the
         // page also speaks `GET /input?d=<json>`, which survives.
+        // NOTE: that fallback puts `?t=` in a URL. Acceptable here:
+        // the request is `fetch`, not navigation, and
+        // `Referrer-Policy: no-referrer` keeps it out of Referer
+        // headers — the token still never crosses a third party.
         ("POST", "/input") | ("GET", "/input") => {
-            let decoded = query.strip_prefix("d=").map(url_decode);
-            let payload: &[u8] = if method == "GET" {
-                decoded.as_deref().unwrap_or(&[])
+            let decoded = req.query("d");
+            let payload: &[u8] = if req.method == "GET" {
+                decoded.as_ref().map(|s| s.as_bytes()).unwrap_or(&[])
             } else {
-                &body
+                &req.body
             };
             match parse_input(payload) {
                 Some(ev) => {
-                    let _ = input.send(ev);
-                    let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+                    let _ = ctx.input.send(ev);
+                    let _ = respond(&mut stream, 204, "");
                 }
                 None => {
-                    let _ =
-                        stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length:0\r\n\r\n");
+                    let _ = respond(&mut stream, 400, "");
                 }
             }
         }
@@ -292,16 +667,109 @@ fn handle_conn(mut stream: TcpStream, input: InputTx, clients: Clients, last: La
                 "/" | "/index.html" => ("index.html", "text/html; charset=utf-8"),
                 "/app.js" => ("app.js", "text/javascript; charset=utf-8"),
                 "/style.css" => ("style.css", "text/css; charset=utf-8"),
+                // Reserved names for the PWA pass — absent files 404,
+                // which is the correct static-file answer.
+                "/favicon.svg" => ("favicon.svg", "image/svg+xml"),
+                "/manifest.webmanifest" => ("manifest.webmanifest", "application/manifest+json"),
+                p if p.starts_with("/icon-") && p.ends_with(".png") && !p.contains("..") => {
+                    (&p[1..], "image/png")
+                }
                 _ => {
-                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length:0\r\n\r\n");
+                    let _ = respond(&mut stream, 404, "");
                     return;
                 }
             };
             serve_file(&mut stream, file, ctype);
         }
         _ => {
-            let _ = stream.write_all(b"HTTP/1.1 405\r\nContent-Length:0\r\n\r\n");
+            let _ = respond(&mut stream, 405, "");
         }
+    }
+}
+
+/// SSE writer loop: channel → socket under a write timeout. Exits on
+/// send error (client gone → the guard frees its cap slot) or when
+/// `clients` drops the sender.
+fn sse_writer(mut stream: TcpStream, rx: mpsc::Receiver<String>, guard: ConnGuard) {
+    let _guard = guard;
+    loop {
+        match rx.recv_timeout(KEEPALIVE) {
+            Ok(msg) => {
+                if stream.write_all(msg.as_bytes()).is_err() {
+                    return;
+                }
+            }
+            // ":" is an SSE comment — a no-op heartbeat that flushes
+            // dead sockets via the write timeout.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if stream.write_all(b":\n\n").is_err() {
+                    return;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn respond(stream: &mut TcpStream, code: u16, reason: &str) -> std::io::Result<()> {
+    let reason = if reason.is_empty() {
+        match code {
+            204 => "No Content",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            413 => "Content Too Large",
+            421 => "Misdirected Request",
+            431 => "Request Header Fields Too Large",
+            503 => "Service Unavailable",
+            _ => "",
+        }
+    } else {
+        reason
+    };
+    stream.write_all(format!("HTTP/1.1 {code} {reason}\r\nContent-Length:0\r\n\r\n").as_bytes())
+}
+
+/// Loopback-only Host check (rebinding defence): the listener binds
+/// 127.0.0.1, so a valid request names one of the loopback spellings.
+fn host_ok(host: Option<&str>, port: u16) -> bool {
+    let Some(host) = host else { return false };
+    let host = host.trim().to_lowercase();
+    host == format!("127.0.0.1:{port}")
+        || host == format!("localhost:{port}")
+        || host == format!("[::1]:{port}")
+}
+
+/// `/events` + `/input` cross-site defence: a present `Sec-Fetch-Site`
+/// must be `same-origin`/`none` (never `cross-site`/`same-site` — a
+/// same-site evil subdomain still isn't our origin), and a present
+/// `Origin` must be our own.
+fn fetch_metadata_ok(req: &Request, port: u16) -> bool {
+    if let Some(s) = req.header("sec-fetch-site") {
+        if !matches!(s.trim().to_lowercase().as_str(), "same-origin" | "none") {
+            return false;
+        }
+    }
+    if let Some(o) = req.header("origin") {
+        let o = o.trim().to_lowercase();
+        if o != format!("http://127.0.0.1:{port}") && o != format!("http://localhost:{port}") {
+            return false;
+        }
+    }
+    true
+}
+
+/// Bearer check: `X-Overseer-Token` header (POST path) or the `t=`
+/// query param (EventSource can't set headers). Constant-time.
+fn token_ok(req: &Request, token: &str) -> bool {
+    if let Some(h) = req.header("x-overseer-token") {
+        return token_eq(h.trim().as_bytes(), token.as_bytes());
+    }
+    match req.query("t") {
+        Some(t) => token_eq(t.as_bytes(), token.as_bytes()),
+        None => false,
     }
 }
 
@@ -317,16 +785,20 @@ fn serve_file(stream: &mut TcpStream, name: &str, ctype: &str) {
         "style.css" => include_str!("../web/style.css").as_bytes().to_vec(),
         _ => Vec::new(),
     });
+    if content.is_empty() && !disk.exists() {
+        let _ = respond(stream, 404, "");
+        return;
+    }
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{SEC_HEADERS}\r\n",
         content.len()
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&content);
 }
 
-/// Minimal percent-decoder for the `?d=` payload — `%XX` and `+`
-/// are all the page emits via `encodeURIComponent` (which actually
+/// Minimal percent-decoder for the `?d=`/`?t=` payloads — `%XX` and
+/// `+` are all the page emits via `encodeURIComponent` (which actually
 /// uses `%20`, but `+` is harmless to support).
 fn url_decode(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
@@ -429,5 +901,322 @@ fn parse_input(body: &[u8]) -> Option<CtEvent> {
             CtEvent::FocusLost
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn test_ctx(port: u16) -> (Arc<Ctx>, mpsc::Receiver<CtEvent>) {
+        let (input_tx, input_rx) = mpsc::channel();
+        (
+            Arc::new(Ctx {
+                token: TOKEN.into(),
+                port,
+                input: input_tx,
+                clients: Clients::new(Mutex::new(Vec::new())),
+                last: LastFrame::new(Mutex::new(None)),
+                conns: Arc::new(AtomicUsize::new(0)),
+            }),
+            input_rx,
+        )
+    }
+
+    /// A real listener on port 0 feeding `handle_conn` — the same
+    /// dispatch shape `run_web_with` uses.
+    fn server() -> (u16, mpsc::Receiver<CtEvent>, Arc<Ctx>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (ctx, rx) = test_ctx(port);
+        let accept_ctx = ctx.clone();
+        std::thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((s, _)) => {
+                    let c = accept_ctx.clone();
+                    std::thread::spawn(move || handle_conn(s, c));
+                }
+                Err(_) => return,
+            }
+        });
+        (port, rx, ctx)
+    }
+
+    /// Send one raw request, return the status line.
+    fn exchange(port: u16, raw: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(raw.as_bytes()).unwrap();
+        s.shutdown(std::net::Shutdown::Write).ok();
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        line.trim().to_string()
+    }
+
+    fn host(port: u16) -> String {
+        format!("Host: 127.0.0.1:{port}\r\n")
+    }
+
+    #[test]
+    fn token_gates_events_and_input() {
+        let (port, _rx, _ctx) = server();
+        assert_eq!(
+            exchange(port, &format!("GET /events HTTP/1.1\r\n{}\r\n", host(port))),
+            "HTTP/1.1 401 Unauthorized"
+        );
+        assert_eq!(
+            exchange(
+                port,
+                &format!("GET /events?t=wrong HTTP/1.1\r\n{}\r\n", host(port))
+            ),
+            "HTTP/1.1 401 Unauthorized"
+        );
+        let body = "{\"type\":\"x\"}";
+        assert_eq!(
+            exchange(
+                port,
+                &format!(
+                    "POST /input HTTP/1.1\r\n{}Content-Length: {}\r\n\r\n{body}",
+                    host(port),
+                    body.len()
+                )
+            ),
+            "HTTP/1.1 401 Unauthorized"
+        );
+        // Static assets need no token.
+        assert_eq!(
+            exchange(port, &format!("GET / HTTP/1.1\r\n{}\r\n", host(port))),
+            "HTTP/1.1 200 OK"
+        );
+    }
+
+    #[test]
+    fn input_accepts_header_and_query_tokens() {
+        let (port, rx, _ctx) = server();
+        let body = "{\"type\":\"key\",\"code\":\"esc\"}";
+        assert_eq!(
+            exchange(
+                port,
+                &format!(
+                    "POST /input HTTP/1.1\r\n{}X-Overseer-Token: {TOKEN}\r\nContent-Length: {}\r\n\r\n{body}",
+                    host(port),
+                    body.len()
+                )
+            ),
+            "HTTP/1.1 204 No Content"
+        );
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(CtEvent::Key(_))
+        ));
+        // The proxy-safe GET fallback carries t= in the URL.
+        assert_eq!(
+            exchange(
+                port,
+                &format!(
+                    "GET /input?t={TOKEN}&d=%7B%22type%22%3A%22key%22%2C%22code%22%3A%22esc%22%7D HTTP/1.1\r\n{}\r\n",
+                    host(port)
+                )
+            ),
+            "HTTP/1.1 204 No Content"
+        );
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(CtEvent::Key(_))
+        ));
+    }
+
+    #[test]
+    fn bad_host_is_rejected() {
+        let (port, _rx, _ctx) = server();
+        assert_eq!(
+            exchange(port, "GET / HTTP/1.1\r\nHost: evil.example.com\r\n\r\n"),
+            "HTTP/1.1 421 Misdirected Request"
+        );
+        assert_eq!(
+            exchange(port, "GET / HTTP/1.1\r\n\r\n"),
+            "HTTP/1.1 421 Misdirected Request"
+        );
+        assert_eq!(
+            exchange(
+                port,
+                &format!("GET / HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+            ),
+            "HTTP/1.1 200 OK"
+        );
+    }
+
+    #[test]
+    fn cross_site_metadata_is_rejected() {
+        let (port, _rx, _ctx) = server();
+        assert_eq!(
+            exchange(
+                port,
+                &format!(
+                    "GET /input?t={TOKEN}&d=%7B%22type%22%3A%22esc%22%7D HTTP/1.1\r\n{}Sec-Fetch-Site: cross-site\r\n\r\n",
+                    host(port)
+                )
+            ),
+            "HTTP/1.1 403 Forbidden"
+        );
+        assert_eq!(
+            exchange(
+                port,
+                &format!(
+                    "GET /events?t={TOKEN} HTTP/1.1\r\n{}Origin: http://evil.example.com\r\n\r\n",
+                    host(port)
+                )
+            ),
+            "HTTP/1.1 403 Forbidden"
+        );
+        // same-origin metadata passes the metadata gate (token still applies).
+        assert_eq!(
+            exchange(
+                port,
+                &format!(
+                    "GET /events?t={TOKEN} HTTP/1.1\r\n{}Sec-Fetch-Site: same-origin\r\nOrigin: http://127.0.0.1:{port}\r\n\r\n",
+                    host(port)
+                )
+            ),
+            "HTTP/1.1 200 OK"
+        );
+    }
+
+    #[test]
+    fn oversize_body_is_413() {
+        let (port, _rx, _ctx) = server();
+        assert_eq!(
+            exchange(
+                port,
+                &format!(
+                    "POST /input HTTP/1.1\r\n{}X-Overseer-Token: {TOKEN}\r\nContent-Length: {}\r\n\r\n",
+                    host(port),
+                    BODY_CAP + 1
+                )
+            ),
+            "HTTP/1.1 413 Content Too Large"
+        );
+    }
+
+    #[test]
+    fn connection_cap_returns_503() {
+        let (port, _rx, _ctx) = server();
+        // Fill every slot with a live authed SSE connection — the
+        // writer thread holds the slot while the socket is open.
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNS {
+            let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            held.push(s);
+            // No request needed: the slot is claimed at accept time.
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            exchange(port, &format!("GET / HTTP/1.1\r\n{}\r\n", host(port))),
+            "HTTP/1.1 503 Service Unavailable"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn stalled_sse_client_never_stalls_input() {
+        let (port, rx, _ctx) = server();
+        // A client that never drains its socket: its channel fills,
+        // frames drop — and nobody else's request waits on it.
+        let _stalled = {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(format!("GET /events?t={TOKEN} HTTP/1.1\r\n{}\r\n", host(port)).as_bytes())
+                .unwrap();
+            s
+        };
+        let body = "{\"type\":\"key\",\"code\":\"esc\"}";
+        assert_eq!(
+            exchange(
+                port,
+                &format!(
+                    "POST /input HTTP/1.1\r\n{}X-Overseer-Token: {TOKEN}\r\nContent-Length: {}\r\n\r\n{body}",
+                    host(port),
+                    body.len()
+                )
+            ),
+            "HTTP/1.1 204 No Content"
+        );
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
+    }
+
+    #[test]
+    fn short_body_is_400() {
+        let (port, _rx, _ctx) = server();
+        assert_eq!(
+            exchange(
+                port,
+                &format!(
+                    "POST /input HTTP/1.1\r\n{}X-Overseer-Token: {TOKEN}\r\nContent-Length: 100\r\n\r\n{{}}",
+                    host(port)
+                )
+            ),
+            "HTTP/1.1 400 Bad Request"
+        );
+    }
+
+    #[test]
+    fn port_fallback_scans_and_pin_fails() {
+        // Pin: binding a port someone already holds must fail.
+        let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let p = held.local_addr().unwrap().port();
+        assert!(bind_port(Some(p)).is_err());
+        // Auto: lands inside the range; if the default is free to hold
+        // here, the pick must skip it.
+        let hold_default = TcpListener::bind(("127.0.0.1", *PORT_RANGE.start())).ok();
+        let l = bind_port(None).unwrap();
+        let p = l.local_addr().unwrap().port();
+        assert!(PORT_RANGE.contains(&p));
+        if hold_default.is_some() {
+            assert!(p > *PORT_RANGE.start());
+        }
+    }
+
+    #[test]
+    fn auto_open_policy() {
+        // never opens when asked not to, or over SSH
+        assert!(!auto_open_ok_env(false, false, true, "macos"));
+        assert!(!auto_open_ok_env(true, true, true, "macos"));
+        // headless Linux: no display → no opener
+        assert!(!auto_open_ok_env(true, false, false, "linux"));
+        assert!(auto_open_ok_env(true, false, true, "linux"));
+        assert!(auto_open_ok_env(true, false, false, "macos"));
+        // other platforms: no opener defined
+        assert!(!auto_open_ok_env(true, false, true, "windows"));
+    }
+
+    #[test]
+    fn token_compare_is_exact() {
+        assert!(token_eq(b"abc", b"abc"));
+        assert!(!token_eq(b"abc", b"abd"));
+        assert!(!token_eq(b"abc", b"ab"));
+        assert!(!token_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn frame_json_trims_trailing_blanks() {
+        use ratatui::widgets::Paragraph;
+        let backend = TestBackend::new(10, 3);
+        let mut term = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fullscreen,
+            },
+        )
+        .unwrap();
+        term.draw(|f| f.render_widget(Paragraph::new("hi"), f.area()))
+            .unwrap();
+        let f = frame_json(&mut term, 2);
+        let v: serde_json::Value = serde_json::from_str(&f).unwrap();
+        assert_eq!(v["w"], 10);
+        assert_eq!(v["h"], 3);
+        assert_eq!(v["p"], 2);
+        // "hi" then padding trimmed — the row ends at the glyph.
+        assert_eq!(v["rows"][0], serde_json::json!([{ "t": "hi" }]));
+        assert_eq!(v["rows"][1], serde_json::json!([]));
     }
 }
