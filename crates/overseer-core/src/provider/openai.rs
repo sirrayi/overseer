@@ -201,10 +201,24 @@ impl OpenAiCompatible {
 
         let u = body.get("usage").cloned().unwrap_or(json!({}));
         let prompt = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-        let cached = u
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        // OpenAI: prompt_tokens_details.cached_tokens. DeepSeek:
+        // prompt_cache_hit_tokens / prompt_cache_miss_tokens (the miss
+        // count falls back to prompt − hit). OpenAI's field wins.
+        let hit = u.get("prompt_cache_hit_tokens").and_then(Value::as_u64);
+        let (fresh, cached) = match (
+            u.pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64),
+            hit,
+        ) {
+            (Some(c), _) => (prompt.saturating_sub(c), c),
+            (None, Some(h)) => (
+                u.get("prompt_cache_miss_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| prompt.saturating_sub(h)),
+                h,
+            ),
+            (None, None) => (prompt, 0),
+        };
         let created = u
             .pointer("/prompt_tokens_details/created_cache_tokens")
             .and_then(Value::as_u64)
@@ -219,7 +233,7 @@ impl OpenAiCompatible {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let usage = Usage {
-            fresh_input: prompt.saturating_sub(cached),
+            fresh_input: fresh,
             cache_write: created,
             cache_read: cached,
             // completion includes reasoning; split so cost stays honest.
@@ -746,5 +760,45 @@ mod tests {
                 other => panic!("expected ToolCall, got {other:?}"),
             }
         }
+    }
+
+    /// K2: DeepSeek reports cache hits as `prompt_cache_hit_tokens` /
+    /// `prompt_cache_miss_tokens` (no prompt_tokens_details).
+    #[test]
+    fn deepseek_usage_shape() {
+        let body = |usage: Value| {
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"}], "usage": usage})
+        };
+        let r = OpenAiCompatible::parse_response(
+            &body(json!({"prompt_tokens": 100, "completion_tokens": 7,
+                "prompt_cache_hit_tokens": 64, "prompt_cache_miss_tokens": 36})),
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(r.usage.cache_read, 64);
+        assert_eq!(r.usage.fresh_input, 36);
+        // Miss count absent → prompt − hit.
+        let r = OpenAiCompatible::parse_response(
+            &body(json!({"prompt_tokens": 100, "completion_tokens": 7,
+                "prompt_cache_hit_tokens": 60})),
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(r.usage.cache_read, 60);
+        assert_eq!(r.usage.fresh_input, 40);
+        // OpenAI's own field wins when both are present.
+        let r = OpenAiCompatible::parse_response(
+            &body(json!({"prompt_tokens": 100, "completion_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 10},
+                "prompt_cache_hit_tokens": 60})),
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(r.usage.cache_read, 10);
+        assert_eq!(r.usage.fresh_input, 90);
     }
 }
