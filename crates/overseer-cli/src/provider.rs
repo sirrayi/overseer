@@ -10,35 +10,46 @@ use crate::flags::ExecFlags;
 /// Requires the `x-opencode-session` routing header on every call.
 const OPENCODE_URL: &str = "https://opencode.ai/zen/go/v1";
 
-/// Build the provider from flags + env. Key resolution order:
-/// OVERSEER_API_KEY → provider-specific env, then the same names inside
-/// the resolved credential payload (`apply_credentials` runs first — env
-/// stays authoritative; the keychain/env payload only fills names env
-/// never set).
+type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// The env/credential names that hold `provider`'s key, in lookup order.
+fn key_names(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "gemini" => &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+        "opencode" => &["OPENCODE_API_KEY"],
+        _ => &["OPENAI_API_KEY"],
+    }
+}
+
+/// The provider-specific names from env, then the same names in the
+/// credential payload. The harness has no key of its own.
+fn resolve_key(provider: &str, env: Lookup, cred: Lookup) -> Option<String> {
+    let names = key_names(provider);
+    names
+        .iter()
+        .find_map(|n| env(n))
+        .or_else(|| names.iter().find_map(|n| cred(n)))
+}
+
+/// Build the provider from flags + env. The key comes from
+/// [`resolve_key`]: `apply_credentials` runs first, env stays
+/// authoritative, and the keychain/env payload only fills names env never
+/// set.
 pub(crate) fn build_provider(
     flags: &ExecFlags,
     broker: &overseer_core::cred::Broker,
 ) -> Result<Box<dyn Provider>, String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let cred = |k: &str| broker.real_for(k).map(str::to_string);
-    let provider_key = |get: &dyn Fn(&str) -> Option<String>| match flags.provider.as_str() {
-        "anthropic" => get("ANTHROPIC_API_KEY"),
-        "gemini" => get("GOOGLE_API_KEY").or_else(|| get("GEMINI_API_KEY")),
-        "opencode" => get("OPENCODE_API_KEY"),
-        _ => get("OPENAI_API_KEY"),
-    };
-    let key = env("OVERSEER_API_KEY")
-        .or_else(|| provider_key(&env))
-        .or_else(|| cred("OVERSEER_API_KEY"))
-        .or_else(|| provider_key(&cred))
-        .ok_or_else(|| {
-            format!(
-                "no API key for provider '{}' — set OVERSEER_API_KEY \
-                 (or ANTHROPIC_API_KEY / OPENAI_API_KEY), or store one in \
-                 the credential payload (--credential-store)",
-                flags.provider
-            )
-        })?;
+    let key = resolve_key(&flags.provider, &env, &cred).ok_or_else(|| {
+        format!(
+            "no API key for provider '{}' — set {}, or store it in the \
+             credential payload (--credential-store)",
+            flags.provider,
+            key_names(&flags.provider).join(" or ")
+        )
+    })?;
     Ok(match flags.provider.as_str() {
         "anthropic" => Box::new(Anthropic::new(key)),
         "openai" => Box::new(OpenAiCompatible::new(
@@ -102,4 +113,55 @@ pub(crate) fn build_provider(
             ))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| owned.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn keys_resolve_by_provider_specific_name_env_first() {
+        let none = table(&[]);
+        for (provider, name) in [
+            ("anthropic", "ANTHROPIC_API_KEY"),
+            ("openai", "OPENAI_API_KEY"),
+            ("gemini", "GOOGLE_API_KEY"),
+            ("gemini", "GEMINI_API_KEY"),
+            ("opencode", "OPENCODE_API_KEY"),
+        ] {
+            let hit = table(&[(name, "k")]);
+            assert_eq!(resolve_key(provider, &hit, &none).as_deref(), Some("k"));
+            assert_eq!(resolve_key(provider, &none, &hit).as_deref(), Some("k"));
+        }
+        let env = table(&[("ANTHROPIC_API_KEY", "from-env")]);
+        let cred = table(&[("ANTHROPIC_API_KEY", "from-cred")]);
+        assert_eq!(
+            resolve_key("anthropic", &env, &cred).as_deref(),
+            Some("from-env")
+        );
+        let both = table(&[("GOOGLE_API_KEY", "g"), ("GEMINI_API_KEY", "m")]);
+        assert_eq!(resolve_key("gemini", &both, &none).as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn a_project_level_key_is_not_a_provider_key() {
+        for p in ["anthropic", "openai", "gemini", "opencode", "other"] {
+            assert!(key_names(p).iter().all(|n| !n.starts_with("OVERSEER")));
+        }
+        let generic = table(&[("HARNESS_API_KEY", "harness-key")]);
+        let none = table(&[]);
+        assert_eq!(resolve_key("anthropic", &generic, &none), None);
+        assert_eq!(resolve_key("opencode", &none, &generic), None);
+        // Nor does it shadow the real one.
+        let env = table(&[("HARNESS_API_KEY", "x"), ("OPENAI_API_KEY", "real")]);
+        assert_eq!(resolve_key("openai", &env, &none).as_deref(), Some("real"));
+    }
 }

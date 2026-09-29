@@ -168,8 +168,8 @@ fn usage() {
          \x20 --web               Browser surface on localhost\n\
          \x20 --web-port <n>      Port for --web (default: 8641)\n\
          \n\
-         ENV:\n\
-         \x20 OVERSEER_API_KEY    Provider key (preferred, any provider)\n\
+         ENV (provider keys; each provider reads only its own name, from env\n\
+         \x20    first, then the same name in the credential payload):\n\
          \x20 ANTHROPIC_API_KEY   Anthropic key\n\
          \x20 OPENAI_API_KEY      OpenAI-compatible key\n\
          \x20 GOOGLE_API_KEY      Gemini key (GEMINI_API_KEY also works)\n\
