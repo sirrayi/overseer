@@ -326,12 +326,12 @@ impl Notifier for LogNotifier {
     }
 }
 
-/// The per-OS CLI backend: macOS `osascript`, Linux `notify-send`, Windows
-/// PowerShell toast. Chosen by `cfg!` at build time and probed at runtime —
+/// The per-OS CLI backend: macOS `osascript`, Linux `notify-send`. Chosen
+/// by `cfg!` at build time and probed at runtime —
 /// when the helper is missing the caller falls back to [`LogNotifier`].
 ///
 /// The native *framework* shells (UNUserNotificationCenter, libnotify
-/// bindings, WinRT toasts) are deferred: they need a platform dependency
+/// bindings) are deferred: they need a platform dependency
 /// this phase does not take, and the CLI path already produces a real
 /// notification with real Approve/Reject/Snooze targets.
 pub struct CliNotifier {
@@ -346,8 +346,6 @@ impl CliNotifier {
             &["/usr/bin/osascript"]
         } else if cfg!(target_os = "linux") {
             &["/usr/bin/notify-send", "/bin/notify-send"]
-        } else if cfg!(target_os = "windows") {
-            &["powershell.exe"]
         } else {
             &[]
         };
@@ -374,18 +372,11 @@ impl Notifier for CliNotifier {
                 "display notification {:?} with title {:?}",
                 text, action_hint
             )
-        } else if cfg!(target_os = "windows") {
-            // A toast via the shell's own notification API.
-            format!(
-                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] > $null; $t='<toast><visual><binding template=\"ToastGeneric\"><text>{text}</text><text>{action_hint}</text></binding></visual></toast>'; $x=[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType=WindowsRuntime]::new(); $x.LoadXml($t); [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Overseer').Show($x)"
-            )
         } else {
             format!("{action_hint}\n{text}")
         };
         let args: Vec<String> = if cfg!(target_os = "macos") {
             vec!["-e".into(), script]
-        } else if cfg!(target_os = "windows") {
-            vec!["-NoProfile".into(), "-Command".into(), script]
         } else {
             vec![action_hint, text]
         };
@@ -410,8 +401,6 @@ impl Notifier for CliNotifier {
     fn backend(&self) -> &'static str {
         if cfg!(target_os = "macos") {
             "osascript"
-        } else if cfg!(target_os = "windows") {
-            "powershell-toast"
         } else {
             "notify-send"
         }

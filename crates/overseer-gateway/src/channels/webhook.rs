@@ -16,11 +16,8 @@
 //! gateway's frozen dependency edge for P7 is `ureq` only (R1-F1), so the
 //! MAC is hand-rolled and pinned by RFC 4231 vectors in the tests below.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
-use super::sentinel;
 use crate::config::WebhookSpec;
 use crate::event::TriggerEvent;
 
@@ -298,13 +295,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Local helper for the spool: `{signature, body}` records.
 pub fn parse_request(text: &str) -> Result<WebhookRequest, String> {
     serde_json::from_str(text).map_err(|e| format!("webhook: spool record is not JSON: {e}"))
-}
-
-/// Convenience for tests and the CLI: a `HashMap` of secrets redacted in
-/// one pass (kept here so callers never hand-roll `<secret>` masking).
-pub fn redact_all(text: &str, secrets: &HashMap<String, String>) -> String {
-    let list: Vec<String> = secrets.values().cloned().collect();
-    sentinel::redact(text, &list)
 }
 
 #[cfg(test)]

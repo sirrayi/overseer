@@ -48,10 +48,8 @@ extern "C" fn on_sig(_sig: i32) {
     SIG_RECEIVED.store(true, Ordering::SeqCst);
 }
 
-/// Install SIGTERM/SIGINT → flag (libc-free: raw signal(2) via std is
-/// not exposed; we register with `signal` through libc only on unix —
-/// overseer-tui already carries the libc dep pattern).
-#[cfg(unix)]
+/// Install SIGTERM/SIGINT → flag via raw signal(2) (std does not expose
+/// it; overseer-tui already carries the libc dep pattern).
 fn install_signal_flag() {
     unsafe {
         libc::signal(
@@ -64,8 +62,6 @@ fn install_signal_flag() {
         );
     }
 }
-#[cfg(not(unix))]
-fn install_signal_flag() {}
 
 pub struct Daemon {
     /// P7-4: thread → session routing for messaging channels.
