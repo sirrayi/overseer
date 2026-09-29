@@ -194,12 +194,15 @@ pub struct Event {
     pub kind: EventKind,
 }
 
-/// Tamper-evident chain hash for one event (FNV-1a, 64-bit).
+/// Structural chain hash for one event (FNV-1a, 64-bit, not
+/// cryptographic).
 ///
 /// Feeds `id` (LE bytes), `parent_id` (`u64::MAX` for `None` — distinct
-/// from any real id), the serde `type` tag of `kind` (stable across
-/// payload edits — payload bytes are NOT hashed), and `prev` (0 for the
-/// chain head). Deterministic, std-only, no new deps.
+/// from any real id), the serde `type` tag of `kind`, and `prev` (0 for the
+/// chain head). It detects structural tampering (reordered, inserted,
+/// dropped or re-typed events, broken parent links); it does NOT detect a
+/// payload edit — payload bytes are not hashed. Deterministic, std-only.
+// DEFERRED(owner): payload hashing — needs a versioned hash format so existing logs still verify.
 pub fn event_hash(id: u64, parent_id: Option<u64>, type_str: &str, prev: u64) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -289,6 +292,7 @@ pub fn verify_chain(events: &[Event]) -> bool {
 /// - Usage fresh/cache/output/reasoning → `gen_ai.usage.*`
 /// - latency_ms → `gen_ai.latency_ms`, cost_usd → `gen_ai.cost_usd`
 /// - ToolCallStart/ToolResult → span `gen_ai.span.kind="tool"`
+#[cfg(test)]
 pub fn otel_spans(events: &[Event]) -> Vec<serde_json::Value> {
     let trace_id = events
         .iter()
