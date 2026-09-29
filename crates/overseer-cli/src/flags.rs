@@ -159,7 +159,10 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
             "--session" => f.session = Some(PathBuf::from(&v)),
             "--cwd" => f.cwd = PathBuf::from(&v),
             "--model" => f.model = v.clone(),
-            "--provider" => f.provider = v.clone(),
+            "--provider" => {
+                crate::provider::check_provider(&v)?;
+                f.provider = v.clone();
+            }
             "--base-url" => f.base_url = Some(v.clone()),
             "--max-steps" => f.max_steps = v.parse().map_err(|_| "bad --max-steps")?,
             "--max-cost" => f.max_cost = v.parse().map_err(|_| "bad --max-cost")?,
@@ -326,6 +329,38 @@ mod syntax_tests {
         assert_eq!(e, "bad --max-steps");
         let e = parse_exec(&argv(&["--nope", "x"])).err().unwrap();
         assert_eq!(e, "unknown flag '--nope'");
+    }
+}
+
+#[cfg(test)]
+mod provider_flag_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_provider_is_rejected_at_parse_time() {
+        let e = parse_exec(&["--provider".into(), "bogus".into(), "x".into()])
+            .err()
+            .expect("an unknown --provider must not parse");
+        assert_eq!(
+            e,
+            "unknown provider 'bogus' — expected one of: anthropic, openai, opencode, gemini"
+        );
+        assert!(!e.contains("OPENAI_API_KEY"), "{e}");
+    }
+
+    #[test]
+    fn unknown_provider_exits_2_before_any_key_lookup() {
+        let code = crate::cmd::exec::cmd_exec(&["--provider".into(), "bogus".into(), "x".into()]);
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn every_supported_provider_parses() {
+        for p in ["anthropic", "openai", "opencode", "gemini"] {
+            let f = parse_exec(&["--provider".into(), p.into(), "x".into()]).unwrap();
+            assert_eq!(f.provider, p);
+        }
+        assert_eq!(parse_exec(&["x".into()]).unwrap().provider, "anthropic");
     }
 }
 

@@ -12,13 +12,30 @@ const OPENCODE_URL: &str = "https://opencode.ai/zen/go/v1";
 
 type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
+/// Every `--provider` value [`build_provider`] can construct.
+pub(crate) const PROVIDERS: &[&str] = &["anthropic", "openai", "opencode", "gemini"];
+
+/// `Ok` for a name in [`PROVIDERS`], else the user-facing error.
+pub(crate) fn check_provider(name: &str) -> Result<(), String> {
+    if PROVIDERS.contains(&name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown provider '{name}' — expected one of: {}",
+            PROVIDERS.join(", ")
+        ))
+    }
+}
+
 /// The env/credential names that hold `provider`'s key, in lookup order.
+/// An unknown provider has none.
 fn key_names(provider: &str) -> &'static [&'static str] {
     match provider {
         "anthropic" => &["ANTHROPIC_API_KEY"],
+        "openai" => &["OPENAI_API_KEY"],
         "gemini" => &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
         "opencode" => &["OPENCODE_API_KEY"],
-        _ => &["OPENAI_API_KEY"],
+        _ => &[],
     }
 }
 
@@ -42,6 +59,7 @@ pub(crate) fn build_provider(
 ) -> Result<Box<dyn Provider>, String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let cred = |k: &str| broker.real_for(k).map(str::to_string);
+    check_provider(&flags.provider)?;
     let key = resolve_key(&flags.provider, &env, &cred).ok_or_else(|| {
         format!(
             "no API key for provider '{}' — set {}, or store it in the \
@@ -107,11 +125,7 @@ pub(crate) fn build_provider(
                 Box::new(OpenAiCompatible::new(key, base).with_header("x-opencode-session", tag))
             }
         }
-        other => {
-            return Err(format!(
-                "unknown provider '{other}' (anthropic|openai|opencode|gemini)"
-            ))
-        }
+        other => return Err(check_provider(other).unwrap_err()),
     })
 }
 
@@ -149,6 +163,34 @@ mod tests {
         );
         let both = table(&[("GOOGLE_API_KEY", "g"), ("GEMINI_API_KEY", "m")]);
         assert_eq!(resolve_key("gemini", &both, &none).as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn every_supported_provider_has_its_own_key_names() {
+        for (p, want) in [
+            ("anthropic", &["ANTHROPIC_API_KEY"][..]),
+            ("openai", &["OPENAI_API_KEY"][..]),
+            ("opencode", &["OPENCODE_API_KEY"][..]),
+            ("gemini", &["GOOGLE_API_KEY", "GEMINI_API_KEY"][..]),
+        ] {
+            assert!(PROVIDERS.contains(&p));
+            assert_eq!(key_names(p), want, "{p}");
+        }
+        assert_eq!(PROVIDERS.len(), 4);
+    }
+
+    #[test]
+    fn an_unknown_provider_borrows_no_other_providers_key() {
+        assert!(key_names("bogus").is_empty());
+        let openai = table(&[("OPENAI_API_KEY", "k")]);
+        assert_eq!(resolve_key("bogus", &openai, &openai), None);
+        assert_eq!(
+            check_provider("bogus").unwrap_err(),
+            "unknown provider 'bogus' — expected one of: anthropic, openai, opencode, gemini"
+        );
+        for p in PROVIDERS {
+            assert!(check_provider(p).is_ok(), "{p}");
+        }
     }
 
     #[test]
