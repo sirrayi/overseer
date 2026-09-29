@@ -794,24 +794,9 @@ pub fn overseer_binary() -> PathBuf {
 #[cfg(test)]
 mod daemon_pipeline_tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use crate::config::{GateConfig, SpawnConfig, TriageRule};
-
-    static N: AtomicU64 = AtomicU64::new(0);
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "overseer-gw-{}-{}-{}-{}",
-            tag,
-            std::process::id(),
-            now_ms(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).expect("tmpdir");
-        dir
-    }
+    use crate::test_util::tmpdir;
+    use std::path::PathBuf;
 
     fn journal_records(dir: &std::path::Path) -> Vec<serde_json::Value> {
         std::fs::read_to_string(dir.join("daemon.jsonl"))

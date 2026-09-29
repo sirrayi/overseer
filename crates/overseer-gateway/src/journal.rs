@@ -72,17 +72,8 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::tmpdir;
     use std::io::Write;
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "overseer-gateway-journal-{}-{}",
-            tag,
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create tmpdir");
-        dir
-    }
 
     fn read_kinds(dir: &std::path::Path) -> Vec<serde_json::Value> {
         let text = std::fs::read_to_string(dir.join("daemon.jsonl")).expect("read journal");

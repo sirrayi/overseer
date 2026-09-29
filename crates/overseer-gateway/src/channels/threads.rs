@@ -133,19 +133,7 @@ fn slug(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "overseer-channels-{tag}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::test_util::tmpdir;
 
     #[test]
     fn two_threads_route_to_two_session_dirs() {

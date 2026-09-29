@@ -430,13 +430,7 @@ pub fn platform_notifier(notify_log: PathBuf) -> Box<dyn Notifier> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("overseer-gateway-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::test_util::tmpdir;
 
     fn item(id: &str, class: &str, created: u64, body: &str) -> InboxItem {
         InboxItem {

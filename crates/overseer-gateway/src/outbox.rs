@@ -337,17 +337,8 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::tmpdir;
     use std::sync::Mutex;
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "overseer-outbox-{tag}-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     fn journal(dir: &std::path::Path) -> Journal {
         Journal::new(dir.join("daemon.jsonl"))

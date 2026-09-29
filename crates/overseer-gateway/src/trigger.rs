@@ -645,13 +645,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("overseer-gateway-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::test_util::tmpdir;
 
     fn interval_spec(id: &str, every_s: u64) -> TriggerSpec {
         TriggerSpec::Interval {

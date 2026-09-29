@@ -165,13 +165,7 @@ pub fn reap(sp: &mut Spawned) -> Option<SpawnOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("overseer-gateway-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::test_util::tmpdir;
 
     fn live_child(
         program: &str,
