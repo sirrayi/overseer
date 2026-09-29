@@ -201,7 +201,7 @@ pub fn is_sentinel(s: &str) -> bool {
     if b.len() != SENTINEL_PREFIX.len() + SENTINEL_HEX_LEN {
         return false;
     }
-    if &s[..SENTINEL_PREFIX.len()] != SENTINEL_PREFIX {
+    if !b.starts_with(SENTINEL_PREFIX.as_bytes()) {
         return false;
     }
     b[SENTINEL_PREFIX.len()..]
@@ -1171,6 +1171,15 @@ mod tests {
         assert!(!is_sentinel("ovsent_abc123"));
         assert!(!is_sentinel("bearer_abcdef1234567890abcdef1234567890"));
         assert!(!is_sentinel(&format!("{s}X")));
+    }
+
+    #[test]
+    fn is_sentinel_rejects_multibyte_prefix_without_panicking() {
+        // Right byte length, but byte 7 falls inside `€`.
+        let s = format!("é€€{}", "a".repeat(31));
+        assert_eq!(s.len(), SENTINEL_PREFIX.len() + SENTINEL_HEX_LEN);
+        assert!(!s.is_char_boundary(SENTINEL_PREFIX.len()));
+        assert!(!is_sentinel(&s));
     }
 
     #[test]
