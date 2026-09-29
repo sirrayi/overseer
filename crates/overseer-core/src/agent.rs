@@ -424,6 +424,15 @@ impl Agent {
     ) -> std::io::Result<Self> {
         let events = EventLog::replay(session_dir.join("events.jsonl"))?;
         let messages = rehydrate_messages(&events);
+        // Background tasks already noticed before the resume must not be
+        // re-injected (their SubagentDone rehydrated above).
+        let bg_noticed = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::SubagentDone { task_id, .. } => Some(task_id.clone()),
+                _ => None,
+            })
+            .collect();
         let log = EventLog::open(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::open(session_dir.join("ledger.jsonl"))?;
         let tools = Self::registry(&config);
@@ -444,7 +453,7 @@ impl Agent {
             stuck_nudged: false,
             empty_responses: 0,
             effort_boost: 0,
-            bg_noticed: std::collections::HashSet::new(),
+            bg_noticed,
             pending_compact: false,
             ctx_wall_stop: false,
             spill_seq,
@@ -1007,9 +1016,11 @@ impl Agent {
             // history/diff/rollback). Engine-made commit, best-effort.
             // P6-2 audit: a dirty worktree at the boundary emits a
             // log-only MemoryUpdated event (never injected into context).
+            // The dirty set is captured BEFORE the commit — afterwards the
+            // worktree is clean by construction.
             if let Some(dir) = &self.config.memory_dir.clone() {
-                crate::memory::commit(dir, &format!("turn {steps}"));
                 let files = crate::memory::dirty_files(dir);
+                crate::memory::commit(dir, &format!("turn {steps}"));
                 if !files.is_empty() {
                     self.emit(EventKind::MemoryUpdated { files }, on_event)?;
                 }
@@ -1370,7 +1381,10 @@ fn prompt_text_for_estimate(messages: &[Message]) -> String {
             match b {
                 Block::Text { text } => out.push_str(text),
                 Block::ToolResult { content, .. } => out.push_str(content),
-                Block::ToolCall { name, .. } => out.push_str(name),
+                Block::ToolCall { name, input, .. } => {
+                    out.push_str(name);
+                    out.push_str(&input.to_string());
+                }
                 // Screenshots are pixels, not tokens of text — the estimate
                 // counts nothing for them (image cost lands in P7-2 usage).
                 Block::Image { .. } => {}
@@ -2972,5 +2986,88 @@ mod tests {
             ),
             crate::perm::Verdict::Ask { .. }
         ));
+    }
+
+    /// C1: a resumed session must not re-notice background tasks whose
+    /// SubagentDone is already in the replayed log.
+    #[test]
+    fn resume_does_not_renotice_finished_bg_tasks() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        {
+            let provider = Arc::new(Mock::new(vec![tool_turn(1), done()]));
+            let mut agent = Agent::start(provider, cfg.clone(), dir.clone(), "s".into()).unwrap();
+            let bg = dir.join("subagents/bg-1");
+            std::fs::create_dir_all(&bg).unwrap();
+            std::fs::write(bg.join("done.txt"), "bg-1 digest").unwrap();
+            let mut sink = |_: &Event| {};
+            agent.run_turn("go", &mut sink).unwrap();
+        }
+        let provider = Arc::new(Mock::new(vec![tool_turn(2), done()]));
+        let mut agent = Agent::resume(provider, cfg, dir.clone()).unwrap();
+        let mut events = Vec::new();
+        let mut sink = |e: &Event| events.push(e.kind.clone());
+        agent.run_turn("again", &mut sink).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|k| matches!(k, EventKind::SubagentDone { .. })),
+            "resume re-emitted a SubagentDone: {events:?}"
+        );
+        let copies = agent
+            .messages()
+            .iter()
+            .filter(|m| m.text().contains("bg-1 digest"))
+            .count();
+        assert_eq!(copies, 1, "the notice appears exactly once in the view");
+    }
+
+    /// C2: a dirty memory dir at the turn boundary emits MemoryUpdated
+    /// naming the dirty files (captured BEFORE the commit cleans them).
+    #[test]
+    fn dirty_memory_emits_memory_updated() {
+        let dir = tmpdir();
+        let memdir = dir.join("memory");
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            memory_dir: Some(memdir.clone()),
+            ..AgentConfig::default()
+        };
+        let provider = Arc::new(Mock::new(vec![tool_turn(1), done()]));
+        let mut agent = Agent::start(provider, cfg, dir.join("s"), "s".into()).unwrap();
+        crate::memory::commit(&memdir, "seed");
+        std::fs::write(memdir.join("episodic").join("note.md"), "hi\n").unwrap();
+        let mut events = Vec::new();
+        let mut sink = |e: &Event| events.push(e.kind.clone());
+        agent.run_turn("go", &mut sink).unwrap();
+        assert!(
+            events.iter().any(|k| matches!(
+                k,
+                EventKind::MemoryUpdated { files } if files.iter().any(|f| f.contains("note.md"))
+            )),
+            "no MemoryUpdated for the dirty file: {events:?}"
+        );
+    }
+
+    /// C8: the token estimate counts tool-call inputs — a 100 KB `write`
+    /// body is not "5 chars".
+    #[test]
+    fn estimate_counts_tool_call_input() {
+        let body = "x".repeat(100_000);
+        let msgs = vec![Message {
+            role: crate::ir::Role::Assistant,
+            content: vec![Block::ToolCall {
+                id: "c1".into(),
+                name: "write".into(),
+                input: serde_json::json!({"path": "a.txt", "content": body}),
+            }],
+        }];
+        let text = prompt_text_for_estimate(&msgs);
+        assert!(text.len() >= 100_000, "estimate saw {} chars", text.len());
     }
 }
