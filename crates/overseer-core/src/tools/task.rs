@@ -226,6 +226,16 @@ fn worktree_diffstat(wt: &Path) -> String {
     }
 }
 
+/// The branch + diffstat block a writer subagent's result carries, so its
+/// worktree changes are visible to the parent (foreground and background).
+fn worktree_note(branch: &str, wt: &Path) -> String {
+    format!(
+        "\n\n[worktree branch `{branch}` at {} — changes:\n{}]",
+        wt.display(),
+        worktree_diffstat(wt)
+    )
+}
+
 pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     let prompt = match need_str(input, "prompt") {
         Ok(p) => p,
@@ -331,8 +341,14 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         let dir2 = dir.clone();
         let prompt = prompt.to_string();
         let id2 = id.clone();
+        let worktree = worktree_branch
+            .clone()
+            .map(|b| (b, subagents_dir.join(format!("wt-{seq}/wt"))));
         std::thread::spawn(move || {
-            let (digest, outcome) = run_subagent(provider, cfg, registry, &dir2, &id2, &prompt);
+            let (mut digest, outcome) = run_subagent(provider, cfg, registry, &dir2, &id2, &prompt);
+            if let Some((branch, wt)) = &worktree {
+                digest.push_str(&worktree_note(branch, wt));
+            }
             // Marker last: done.txt is the parent loop's notification.
             let _ = std::fs::write(
                 dir2.join("done.txt"),
@@ -349,11 +365,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     let (mut digest, outcome) = run_subagent(provider, cfg, registry, &dir, &id, prompt);
     if let Some(branch) = &worktree_branch {
         let wt = subagents_dir.join(format!("wt-{seq}/wt"));
-        digest.push_str(&format!(
-            "\n\n[worktree branch `{branch}` at {} — changes:\n{}]",
-            wt.display(),
-            worktree_diffstat(&wt)
-        ));
+        digest.push_str(&worktree_note(branch, &wt));
     }
     ToolOutput::ok(format!(
         "{digest}\n\n[subagent {outcome} — full trace: {}]",
@@ -506,6 +518,48 @@ mod tests {
         assert!(!out.is_error, "{}", out.text);
         assert!(out.text.contains("overseer-task-1"));
         assert!(dir.join("session/subagents/wt-1/wt").exists());
+    }
+
+    #[test]
+    fn background_write_mode_reports_its_worktree_in_done_txt() {
+        let dir = tmpdir();
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "x",
+                "--allow-empty",
+            ],
+        ] {
+            let st = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(&args)
+                .output()
+                .unwrap()
+                .status;
+            assert!(st.success());
+        }
+        let mut c = ctx(&dir);
+        let out = run(
+            &json!({"prompt": "write stuff", "mode": "write", "background": true}),
+            &mut c,
+        );
+        assert!(!out.is_error, "{}", out.text);
+        let marker = dir.join("session/subagents/bg-1/done.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let done = std::fs::read_to_string(&marker).expect("done.txt");
+        assert!(done.contains("digest body"), "{done}");
+        assert!(done.contains("worktree branch `overseer-task-1`"), "{done}");
+        assert!(done.contains("changes:"), "{done}");
     }
 
     #[test]
