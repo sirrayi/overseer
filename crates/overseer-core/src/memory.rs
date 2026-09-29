@@ -453,48 +453,20 @@ pub fn ensure(dir: &Path) -> std::io::Result<PathBuf> {
 /// True when an INDEX pointer line names a quarantine proposal: unreviewed
 /// untrusted text (RT-3). Proposals stay on disk for human review but are
 /// never injected into the trusted memory segment.
-/// Lexicographic RFC-3339 expiry check (UTC `now`): valid_to past → expired.
-/// No chrono dep — RFC-3339 UTC strings compare lexicographically.
+/// `valid_to` expiry: the stored instant is strictly before now. Compared
+/// as epoch seconds so `Z` and `±HH:MM` stamps order by the instant they
+/// name, not by their spelling. An unparseable stamp reads as not expired
+/// — `parse_meta` already refuses one, so only a directly constructed
+/// `EntryMeta` can carry it.
 fn meta_expired(meta: &EntryMeta) -> bool {
-    let Some(to) = &meta.valid_to else {
+    let Some(to) = meta.valid_to.as_deref().and_then(rfc3339_epoch) else {
         return false;
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Format now as RFC-3339-ish UTC for string comparison via the same
-    // lexicographic property: compare against the stored string's prefix.
-    // Simplest sound rule: a valid_to strictly earlier than the current
-    // year-month-day prefix chain — compare full strings against a
-    // now-formatted stamp built without chrono.
-    let stamp = format_utc_stamp(now);
-    to.as_str() < stamp.as_str()
-}
-
-fn format_utc_stamp(secs: u64) -> String {
-    // Days since epoch → civil date (Howard Hinnant's algorithm), UTC.
-    let days = (secs / 86_400) as i64;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    let sod = secs % 86_400;
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y,
-        m,
-        d,
-        sod / 3600,
-        (sod % 3600) / 60,
-        sod % 60
-    )
+    to < now
 }
 
 /// True when the topic body carries a `superseded_by` trailer pointing at
@@ -1098,8 +1070,8 @@ pub fn promote_candidates(dir: &Path) -> Vec<String> {
 
 /// Parse an RFC3339 timestamp to Unix epoch seconds (`None` on any
 /// malformed input — callers treat unparseable as "not settled", never
-/// as settled). Zero-dep companion to `format_utc_stamp`: days-from-civil
-/// in reverse (Howard Hinnant's algorithm), with the numeric zone offset
+/// as settled). Zero-dep days-from-civil (Howard Hinnant's algorithm),
+/// with the numeric zone offset
 /// applied. A leap second (`:60`) reads as `:59` — a one-second slop far
 /// below the 30-day promotion bar. Inputs here already passed
 /// `valid_rfc3339` via `parse_meta`, so this re-checks ranges lightly.
@@ -1950,6 +1922,31 @@ pub fn fingerprint(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn format_utc_stamp(secs: u64) -> String {
+        // Days since epoch → civil date (Howard Hinnant's algorithm), UTC.
+        let days = (secs / 86_400) as i64;
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        let sod = secs % 86_400;
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            y,
+            m,
+            d,
+            sod / 3600,
+            (sod % 3600) / 60,
+            sod % 60
+        )
+    }
 
     fn tmpdir() -> PathBuf {
         let d = std::env::temp_dir().join(format!("overseer-mem-{}", uuid::Uuid::now_v7()));
@@ -3195,6 +3192,48 @@ mod tests {
         assert_eq!(fingerprint("Hello, World!"), fingerprint("hello world"));
         assert_ne!(fingerprint("hello world"), fingerprint("hello worlds"));
         assert_eq!(fingerprint("abc").len(), 64);
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// RFC3339 stamp for instant `epoch` written in the zone `off_mins`
+    /// east of UTC (0 → `Z`).
+    fn stamp_at(epoch: u64, off_mins: i64) -> String {
+        let wall = format_utc_stamp((epoch as i64 + off_mins * 60) as u64);
+        if off_mins == 0 {
+            return wall;
+        }
+        let sign = if off_mins < 0 { '-' } else { '+' };
+        let a = off_mins.abs();
+        format!("{}{sign}{:02}:{:02}", &wall[..19], a / 60, a % 60)
+    }
+
+    #[test]
+    fn valid_to_expiry_compares_instants_across_offsets() {
+        let now = now_secs();
+        let meta = |to: String| EntryMeta {
+            valid_to: Some(to),
+            ..EntryMeta::default()
+        };
+        for off in [300, -180, 0] {
+            let past = stamp_at(now - 3_600, off);
+            let future = stamp_at(now + 3_600, off);
+            assert!(parse_meta(&format!("---\nvalid_to: {past}\n---\n")).is_ok());
+            assert!(meta_expired(&meta(past.clone())), "{past} is an hour ago");
+            assert!(
+                !meta_expired(&meta(future.clone())),
+                "{future} is an hour ahead"
+            );
+        }
+        assert!(
+            !meta_expired(&meta("not-a-date".into())),
+            "unparseable reads as not expired"
+        );
     }
 
     #[test]
