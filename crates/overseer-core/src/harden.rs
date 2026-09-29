@@ -3,7 +3,7 @@
 //! Fail-closed and std-only (no new deps): umask + proxy-env scrub +
 //! owner-only session dirs. Non-goals (per slice brief): no network
 //! changes, no keychain writes, no proxy runtime — the loopback egress
-//! proxy itself is still Phase-C (`backends.rs`).
+//! proxy itself is still Phase-C (not yet implemented).
 
 use std::path::Path;
 

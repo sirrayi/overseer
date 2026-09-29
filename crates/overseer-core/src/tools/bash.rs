@@ -59,43 +59,21 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     // unavailable runtime fails the call with the requirement spelled out —
     // a run that asked for gVisor must never execute unsandboxed because
     // `runsc` was missing.
-    let (prog, args, note) = match ctx
-        .agent_config
-        .as_ref()
-        .and_then(|c| c.sandbox_runtime.as_deref())
-    {
-        Some(requested) => match pinned_wrap(requested, command, ctx) {
-            Ok(v) => v,
-            Err(e) => return ToolOutput::err(e),
-        },
-        None => wrap_command(command, ctx),
+    let Invocation {
+        program: prog,
+        args,
+        note,
+        ..
+    } = match sandboxed(&sh_argv(command), ctx) {
+        Ok(v) => v,
+        Err(e) => return ToolOutput::err(e),
     };
 
     let mut child = match Command::new(&prog)
         .args(&args)
         .current_dir(&ctx.cwd)
         .env_clear()
-        .envs(std::env::vars().filter(|(k, _)| {
-            // Minimal allowlisted env — secrets stay out of child scope
-            // unless deliberately inherited (playbook Ch.10 §4).
-            matches!(
-                k.as_str(),
-                "PATH"
-                    | "HOME"
-                    | "USER"
-                    | "SHELL"
-                    | "TERM"
-                    | "LANG"
-                    | "LC_ALL"
-                    | "TMPDIR"
-                    | "SSH_AUTH_SOCK"
-                    | "GIT_AUTHOR_NAME"
-                    | "GIT_AUTHOR_EMAIL"
-                    | "GIT_COMMITTER_NAME"
-                    | "GIT_COMMITTER_EMAIL"
-                    | "CI"
-            ) || k.starts_with("LC_")
-        }))
+        .envs(child_env())
         // P6-3 broker injection: declared secrets enter the child's env
         // (selector → real). The model never sees these values — tool
         // results sanitize back to sentinels in `call()`.
@@ -170,67 +148,6 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     o
 }
 
-/// Split a shell command into pipeline stages on `|`, respecting single
-/// quotes, double quotes and backticks (a `|` inside any of the three
-/// never splits). A `\` quotes the next character outside single quotes.
-/// Stages are trimmed and empties dropped. This is a shape helper for
-/// pipeline analysis, not a shell parser: it knows nothing of `||`,
-/// `|&`, redirections or nesting. Pure function of `cmd`; `run` and
-/// `wrap_command` are untouched by it.
-pub fn split_pipeline(cmd: &str) -> Vec<String> {
-    let mut stages = Vec::new();
-    let mut cur = String::new();
-    let mut single = false;
-    let mut double = false;
-    let mut backtick = false;
-    let mut chars = cmd.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' && !single {
-            cur.push(c);
-            if let Some(n) = chars.next() {
-                cur.push(n);
-            }
-            continue;
-        }
-        match c {
-            '\'' if !double && !backtick => single = !single,
-            '"' if !single && !backtick => double = !double,
-            '`' if !single && !double => backtick = !backtick,
-            '|' if !single && !double && !backtick => {
-                let stage = cur.trim().to_string();
-                if !stage.is_empty() {
-                    stages.push(stage);
-                }
-                cur.clear();
-                continue;
-            }
-            _ => {}
-        }
-        cur.push(c);
-    }
-    let tail = cur.trim().to_string();
-    if !tail.is_empty() {
-        stages.push(tail);
-    }
-    stages
-}
-
-/// Middle-truncate tool output to `cap` chars (char-safe, never bytes),
-/// keeping head and tail around an explicit `…[trimmed N chars]…` marker
-/// (`N` is always `chars − cap`). Within `cap` returns whole. A twin of
-/// `super::middle_truncate` with a marker that names the dropped count;
-/// pure function of its inputs.
-pub fn shape_trim(output: &str, cap: usize) -> String {
-    let n = output.chars().count();
-    if n <= cap {
-        return output.to_string();
-    }
-    let half = cap / 2;
-    let head: String = output.chars().take(half).collect();
-    let tail: String = output.chars().skip(n - half).collect();
-    format!("{head}\n…[trimmed {} chars]…\n{tail}", n - cap)
-}
-
 /// Declared broker secrets as (selector, real) env pairs for the child.
 /// Empty without a broker — the allowlisted env above is untouched.
 fn broker_env(ctx: &ToolCtx) -> Vec<(String, String)> {
@@ -240,49 +157,131 @@ fn broker_env(ctx: &ToolCtx) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Parent-env keys a sandboxed child inherits — secrets stay out of child
+/// scope unless deliberately inherited (playbook Ch.10 §4).
+fn env_key_allowed(k: &str) -> bool {
+    matches!(
+        k,
+        "PATH"
+            | "HOME"
+            | "USER"
+            | "SHELL"
+            | "TERM"
+            | "LANG"
+            | "LC_ALL"
+            | "TMPDIR"
+            | "SSH_AUTH_SOCK"
+            | "GIT_AUTHOR_NAME"
+            | "GIT_AUTHOR_EMAIL"
+            | "GIT_COMMITTER_NAME"
+            | "GIT_COMMITTER_EMAIL"
+            | "CI"
+            // Rust toolchain paths — sandboxed `diagnostics` runs
+            // `cargo check`, which breaks on rustup-managed setups
+            // without them. Config, not secrets.
+            | "CARGO_HOME"
+            | "RUSTUP_HOME"
+            | "RUSTUP_TOOLCHAIN"
+            | "CARGO_TARGET_DIR"
+    ) || k.starts_with("LC_")
+}
+
+/// The allowlisted parent env for a sandboxed child (bash, diagnostics).
+/// Pair with `env_clear()`.
+pub(crate) fn child_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    super::filter_env(std::env::vars_os(), env_key_allowed)
+}
+
+/// A child invocation wrapped in the session's sandbox.
+pub(crate) struct Invocation {
+    pub program: String,
+    pub args: Vec<String>,
+    /// Model-visible note when the run is NOT sandboxed.
+    pub note: Option<String>,
+    /// Whether the child runs with network denied (a sandbox backend
+    /// wrapped it; both seatbelt and bwrap deny all egress).
+    pub network_denied: bool,
+}
+
+/// Wrap `argv` in the sandbox bash uses: the pinned `--runtime` when set
+/// (an unavailable runtime is an error, never a silent downgrade), else
+/// the platform default. `argv` must be non-empty.
+pub(crate) fn sandboxed(argv: &[String], ctx: &ToolCtx) -> Result<Invocation, String> {
+    let (program, args, note) = match ctx
+        .agent_config
+        .as_ref()
+        .and_then(|c| c.sandbox_runtime.as_deref())
+    {
+        Some(requested) => pinned_argv(requested, argv, ctx)?,
+        None => wrap_argv(argv, ctx)?,
+    };
+    let network_denied = argv.first() != Some(&program);
+    Ok(Invocation {
+        program,
+        args,
+        note,
+        network_denied,
+    })
+}
+
+/// Whether a child wrapped by [`sandboxed`] would run with network denied.
+pub(crate) fn denies_network(ctx: &ToolCtx) -> bool {
+    sandboxed(&["true".to_string()], ctx).is_ok_and(|i| i.network_denied)
+}
+
+fn sh_argv(command: &str) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), command.into()]
+}
+
+fn unwrapped(argv: &[String], note: Option<String>) -> (String, Vec<String>, Option<String>) {
+    (argv[0].clone(), argv[1..].to_vec(), note)
+}
+
 /// Pick the exec backend for a bash call. Returns (program, argv, warning):
 /// sandbox-exec on macOS, bwrap on Linux, plain `sh` when sandboxing is off
 /// or no backend exists (with an honest note so the model/user can see it).
+#[cfg(test)]
 fn wrap_command(command: &str, ctx: &ToolCtx) -> (String, Vec<String>, Option<String>) {
+    wrap_argv(&sh_argv(command), ctx).expect("the platform sandbox wraps")
+}
+
+/// [`wrap_command`] for an arbitrary argv. Errors only when a present
+/// backend cannot build a safe profile (fail closed, never unsandboxed).
+fn wrap_argv(
+    argv: &[String],
+    ctx: &ToolCtx,
+) -> Result<(String, Vec<String>, Option<String>), String> {
     if !ctx.sandbox {
-        return ("sh".into(), vec!["-c".into(), command.into()], None);
+        return Ok(unwrapped(argv, None));
     }
     #[cfg(target_os = "macos")]
-    if let Some(inv) = seatbelt_invocation(command, ctx) {
+    if let Some(inv) = seatbelt_invocation(argv, ctx) {
         return inv;
     }
     #[cfg(target_os = "linux")]
-    if let Some(inv) = bubblewrap_invocation(command, ctx) {
-        return inv;
+    if let Some(inv) = bubblewrap_invocation(argv, ctx) {
+        return Ok(inv);
     }
-    (
-        "sh".into(),
-        vec!["-c".into(), command.into()],
+    Ok(unwrapped(
+        argv,
         Some("no sandbox backend (sandbox-exec/bwrap) — ran unsandboxed".into()),
-    )
+    ))
 }
 
-/// The macOS seatbelt invocation, or `None` when sandbox-exec is absent.
-/// One builder for both the platform default path and the pinned
-/// `--runtime seatbelt` path, so the two can never drift.
+/// The macOS seatbelt invocation, or `None` when sandbox-exec is absent
+/// (`Some(Err)` when the profile cannot be built safely). One builder for
+/// both the platform default path and the pinned `--runtime seatbelt`
+/// path, so the two can never drift.
 #[cfg(target_os = "macos")]
 fn seatbelt_invocation(
-    command: &str,
+    argv: &[String],
     ctx: &ToolCtx,
-) -> Option<(String, Vec<String>, Option<String>)> {
+) -> Option<Result<(String, Vec<String>, Option<String>), String>> {
     let exe = "/usr/bin/sandbox-exec";
     std::path::Path::new(exe).exists().then(|| {
-        (
-            exe.into(),
-            vec![
-                "-p".into(),
-                macos_profile(&ctx.cwd),
-                "sh".into(),
-                "-c".into(),
-                command.into(),
-            ],
-            None,
-        )
+        let mut args = vec!["-p".to_string(), macos_profile(&ctx.cwd)?];
+        args.extend(argv.iter().cloned());
+        Ok((exe.into(), args, None))
     })
 }
 
@@ -290,50 +289,98 @@ fn seatbelt_invocation(
 /// as `seatbelt_invocation`: one builder, two callers.
 #[cfg(target_os = "linux")]
 fn bubblewrap_invocation(
-    command: &str,
+    argv: &[String],
     ctx: &ToolCtx,
 ) -> Option<(String, Vec<String>, Option<String>)> {
     if !bwrap_available() {
         return None;
     }
     let root = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
-    Some((
-        "bwrap".into(),
-        vec![
-            "--ro-bind".into(),
-            "/".into(),
-            "/".into(),
-            "--bind".into(),
-            root.display().to_string(),
-            root.display().to_string(),
-            "--tmpfs".into(),
-            "/tmp".into(),
-            "--dev".into(),
-            "/dev".into(),
-            "--proc".into(),
-            "/proc".into(),
-            "--unshare-net".into(),
-            "--die-with-parent".into(),
-            "sh".into(),
-            "-c".into(),
-            command.into(),
-        ],
-        None,
-    ))
+    let mut args: Vec<String> = vec![
+        "--ro-bind".into(),
+        "/".into(),
+        "/".into(),
+        // Mount order matters: a later mount shadows an earlier one, so
+        // the scratch /tmp goes first and a workspace under /tmp stays
+        // writable on top of it.
+        "--tmpfs".into(),
+        "/tmp".into(),
+        "--bind".into(),
+        root.display().to_string(),
+        root.display().to_string(),
+        "--dev".into(),
+        "/dev".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--unshare-net".into(),
+        "--die-with-parent".into(),
+    ];
+    args.extend(argv.iter().cloned());
+    Some(("bwrap".into(), args, None))
 }
 
-/// macOS Seatbelt profile for `sandbox-exec -p` (P1.5): deny-by-default,
-/// exec/read freely, writes only to the workspace + temp dirs, network
-/// fully denied (deny overrides allow regardless of order). Secret dirs
-/// are read-denied on top of the broad read allow. Egress stays deny-all:
-/// the Phase-C gate (`backends::allowlist_match` + `is_public_ip_literal`)
-/// decides *which* domains a future loopback CONNECT/SOCKS5 proxy may dial.
-// DEFERRED(owner): loopback CONNECT+SOCKS5 proxy + per-session token — matcher lands now, proxy needs runtime.
+/// macOS Seatbelt profile for `sandbox-exec -p` (P1.5) for `cwd`, the
+/// session HOME and the canonical per-user temp dir — see
+/// [`seatbelt_profile`].
 #[cfg(target_os = "macos")]
-fn macos_profile(cwd: &std::path::Path) -> String {
+fn macos_profile(cwd: &std::path::Path) -> Result<String, String> {
     let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!(
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let tmp = std::env::temp_dir();
+    let tmp = tmp.canonicalize().unwrap_or(tmp);
+    seatbelt_profile(&home, &root, &tmp)
+}
+
+/// The SBPL profile (pure, built on every platform so its tests run
+/// anywhere): deny-by-default, exec/read freely, writes only to the
+/// workspace `root`, `/private/tmp`, the per-user temp dir `tmp` (under
+/// `/private/var/folders/…` on macOS — never all of `/private/var`) and
+/// `/dev/null`/`/dev/tty`; network fully denied (deny overrides allow
+/// regardless of order). Secret dirs under `home` are read-denied on top
+/// of the broad read allow.
+///
+/// Paths are SBPL string literals: `\` and `"` are escaped, and a path
+/// that is not UTF-8 or carries a control character is refused, as is a
+/// `tmp` so broad it would reopen `/private/var`.
+// DEFERRED(owner): loopback CONNECT+SOCKS5 proxy + per-session token — egress stays deny-all until a proxy runtime exists.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn seatbelt_profile(
+    home: &std::path::Path,
+    root: &std::path::Path,
+    tmp: &std::path::Path,
+) -> Result<String, String> {
+    let lit = |p: &std::path::Path, what: &str| -> Result<String, String> {
+        let s = p.to_str().ok_or_else(|| {
+            format!(
+                "bash: seatbelt profile — the {what} path {} is not UTF-8",
+                p.display()
+            )
+        })?;
+        if s.chars().any(char::is_control) {
+            return Err(format!(
+                "bash: seatbelt profile — the {what} path {s:?} contains a control character"
+            ));
+        }
+        Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
+    };
+    let tmp_str = tmp.to_str().unwrap_or("");
+    if matches!(
+        tmp_str.trim_end_matches('/'),
+        "" | "/private" | "/private/var" | "/var"
+    ) {
+        return Err(format!(
+            "bash: seatbelt profile — the temp dir {} is too broad to be writable",
+            tmp.display()
+        ));
+    }
+    let (home, root, tmp) = (
+        lit(home, "HOME")?,
+        lit(root, "workspace")?,
+        lit(tmp, "temp")?,
+    );
+    Ok(format!(
         "(version 1)\n\
          (deny default)\n\
          (allow process-exec process-fork)\n\
@@ -342,13 +389,11 @@ fn macos_profile(cwd: &std::path::Path) -> String {
          (allow sysctl-read mach-lookup ipc-posix-shm)\n\
          (allow file-read*)\n\
          (allow file-write* (subpath \"{root}\") (subpath \"/private/tmp\") \
-         (subpath \"/private/var\") (literal \"/dev/null\") (literal \"/dev/tty\"))\n\
+         (subpath \"{tmp}\") (literal \"/dev/null\") (literal \"/dev/tty\"))\n\
          (deny file-read* (subpath \"{home}/.ssh\") (subpath \"{home}/.aws\") \
          (subpath \"{home}/.gnupg\") (subpath \"{home}/.kube\") (subpath \"{home}/.docker\"))\n\
-         (deny network*)\n",
-        root = root.display(),
-        home = home
-    )
+         (deny network*)\n"
+    ))
 }
 
 /// The pinned-runtime path (P8-C `--runtime`): build the invocation for the
@@ -360,17 +405,26 @@ fn macos_profile(cwd: &std::path::Path) -> String {
 /// (or to unsandboxed exec) would make `--runtime` a lie — and a sandbox that
 /// quietly is not there is worse than no sandbox at all, because the operator
 /// stops checking.
+#[cfg(test)]
 fn pinned_wrap(
     requested: &str,
     command: &str,
     ctx: &ToolCtx,
 ) -> Result<(String, Vec<String>, Option<String>), String> {
+    pinned_argv(requested, &sh_argv(command), ctx)
+}
+
+/// [`pinned_wrap`] for an arbitrary argv.
+fn pinned_argv(
+    requested: &str,
+    argv: &[String],
+    ctx: &ToolCtx,
+) -> Result<(String, Vec<String>, Option<String>), String> {
     let runtime = crate::backends::SandboxRuntime::parse(requested)
         .map_err(|e| format!("bash: {e} — drop --runtime to use the platform default"))?;
     match runtime {
-        crate::backends::SandboxRuntime::Native => Ok((
-            "sh".into(),
-            vec!["-c".into(), command.into()],
+        crate::backends::SandboxRuntime::Native => Ok(unwrapped(
+            argv,
             Some(
                 "runtime=native — running unsandboxed because --runtime native was requested"
                     .into(),
@@ -379,10 +433,12 @@ fn pinned_wrap(
         crate::backends::SandboxRuntime::Seatbelt => {
             #[cfg(target_os = "macos")]
             {
-                seatbelt_invocation(command, ctx).ok_or_else(|| {
-                    "bash: --runtime seatbelt needs /usr/bin/sandbox-exec, which is not present \
-                     on this host — drop --runtime or pass --runtime native"
-                        .to_string()
+                seatbelt_invocation(argv, ctx).unwrap_or_else(|| {
+                    Err(
+                        "bash: --runtime seatbelt needs /usr/bin/sandbox-exec, which is not \
+                         present on this host — drop --runtime or pass --runtime native"
+                            .to_string(),
+                    )
                 })
             }
             #[cfg(not(target_os = "macos"))]
@@ -397,7 +453,7 @@ fn pinned_wrap(
         crate::backends::SandboxRuntime::Bubblewrap => {
             #[cfg(target_os = "linux")]
             {
-                bubblewrap_invocation(command, ctx).ok_or_else(|| {
+                bubblewrap_invocation(argv, ctx).ok_or_else(|| {
                     "bash: --runtime bubblewrap needs `bwrap` on PATH (and a user namespace \
                      it can create) — drop --runtime or pass --runtime native"
                         .to_string()
@@ -458,6 +514,7 @@ mod tests {
     use super::*;
     use crate::perm::Policy;
     use crate::tools::{ToolCtx, ToolRegistry};
+    use std::path::Path;
 
     fn ctx(dir: &std::path::Path, sandbox: bool) -> ToolCtx<'_> {
         ToolCtx {
@@ -471,6 +528,43 @@ mod tests {
             sandbox,
             broker: None,
         }
+    }
+
+    /// Re-runs this test in a child test process whose env carries a
+    /// non-UTF-8 `LC_*` value — mutating this process's env would race
+    /// every other test that spawns a child.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_env_value_does_not_kill_bash() {
+        use std::os::unix::ffi::OsStringExt;
+        const MARK: &str = "LC_OVERSEER_T12_PROBE";
+        if std::env::var_os(MARK).is_some() {
+            let dir = std::env::temp_dir();
+            let out = run(
+                &serde_json::json!({"command": "echo alive-$LC_OVERSEER_T12_PROBE"}),
+                &mut ctx(&dir, false),
+            );
+            assert!(out.text.contains("alive-f"), "{}", out.text);
+            return;
+        }
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::bash::tests::a_non_utf8_env_value_does_not_kill_bash",
+                "--test-threads=1",
+            ])
+            .env(MARK, std::ffi::OsString::from_vec(vec![b'f', 0xff, 0xfe]))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "the child really ran the probe"
+        );
     }
 
     #[test]
@@ -639,34 +733,81 @@ mod tests {
     }
 
     #[test]
-    fn split_pipeline_splits_bare_pipes_trims_and_drops_empties() {
-        assert_eq!(split_pipeline("a | b | c"), vec!["a", "b", "c"]);
-        assert_eq!(split_pipeline("  a||b |  "), vec!["a", "b"]);
-        assert_eq!(split_pipeline("single"), vec!["single"]);
-        assert!(split_pipeline("  |  ").is_empty());
+    fn seatbelt_profile_writes_only_workspace_and_per_user_temp() {
+        let p = seatbelt_profile(
+            Path::new("/Users/me"),
+            Path::new("/Users/me/ws"),
+            Path::new("/private/var/folders/ab/cd/T"),
+        )
+        .unwrap();
+        assert!(p.contains(r#"(subpath "/Users/me/ws")"#), "{p}");
+        assert!(
+            p.contains(r#"(subpath "/private/var/folders/ab/cd/T")"#),
+            "{p}"
+        );
+        assert!(p.contains(r#"(subpath "/private/tmp")"#), "{p}");
+        assert!(!p.contains(r#"(subpath "/private/var")"#), "{p}");
+        assert!(p.contains(r#"(subpath "/Users/me/.ssh")"#), "{p}");
+        assert!(p.contains("(deny network*)"));
     }
 
     #[test]
-    fn split_pipeline_respects_quotes_backticks_and_escapes() {
-        assert_eq!(
-            split_pipeline(r#"echo 'a|b' | grep "x|y""#),
-            vec!["echo 'a|b'", r#"grep "x|y""#]
+    fn seatbelt_profile_escapes_quotes_and_backslashes() {
+        let p = seatbelt_profile(
+            Path::new(r"/Users/a\b"),
+            Path::new(r#"/ws/x") (allow file-write* (subpath "/"#),
+            Path::new("/private/var/folders/ab/cd/T"),
+        )
+        .unwrap();
+        assert!(p.contains(r#"(subpath "/Users/a\\b/.ssh")"#), "{p}");
+        assert!(
+            p.contains(r#"(subpath "/ws/x\") (allow file-write* (subpath \"/")"#),
+            "{p}"
         );
-        assert_eq!(
-            split_pipeline("echo `a|b` | wc -l"),
-            vec!["echo `a|b`", "wc -l"]
+        assert!(
+            !p.contains(r#"(subpath "/")"#),
+            "injected rule survived: {p}"
         );
-        // A backslash quotes the pipe outside single quotes.
-        assert_eq!(split_pipeline(r"echo a\|b | c"), vec![r"echo a\|b", "c"]);
     }
 
     #[test]
-    fn shape_trim_keeps_head_and_tail_around_a_counted_marker() {
-        assert_eq!(shape_trim("abc", 10), "abc");
-        let out = shape_trim("abcdefghij", 4);
-        assert_eq!(out, "ab\n…[trimmed 6 chars]…\nij");
-        // The dropped count is chars, not bytes: six `é` minus cap 2.
-        let out = shape_trim("éééééé", 2);
-        assert_eq!(out, "é\n…[trimmed 4 chars]…\né");
+    fn seatbelt_profile_refuses_control_chars_and_broad_temp_dirs() {
+        let home = Path::new("/Users/me");
+        let tmp = Path::new("/private/var/folders/ab/cd/T");
+        assert!(seatbelt_profile(home, Path::new("/ws/a\nb"), tmp).is_err());
+        for broad in ["/", "/private", "/private/var", "/var"] {
+            let err = seatbelt_profile(home, Path::new("/ws"), Path::new(broad)).unwrap_err();
+            assert!(err.contains("temp"), "{broad}: {err}");
+        }
+    }
+
+    #[test]
+    fn child_env_allowlist_passes_the_rust_toolchain_and_still_strips_secrets() {
+        // Sandboxed `diagnostics` runs `cargo check`: rustup-managed
+        // toolchains resolve through these variables. Config, not secrets.
+        for k in [
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "CARGO_TARGET_DIR",
+        ] {
+            assert!(env_key_allowed(k), "{k} must reach the child");
+        }
+        // The same wall still strips secret-looking keys end-to-end.
+        let kept = crate::tools::filter_env(
+            [
+                (
+                    std::ffi::OsString::from("CARGO_TARGET_DIR"),
+                    std::ffi::OsString::from("target/x"),
+                ),
+                (
+                    std::ffi::OsString::from("FOO_API_KEY"),
+                    std::ffi::OsString::from("sk-1"),
+                ),
+            ],
+            env_key_allowed,
+        );
+        assert!(kept.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"));
+        assert!(!kept.iter().any(|(k, _)| k == "FOO_API_KEY"));
     }
 }

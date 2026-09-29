@@ -10,22 +10,19 @@ pub fn spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
         name: "edit".into(),
         description: concat!(
-            "Replace an exact string in a file. `old_string` must match the file ",
-            "content verbatim (including indentation) and be unique unless ",
-            "replace_all is set. The file must have been read with `read` or ",
-            "created with `write` earlier in this session. On failure, read the ",
-            "relevant lines again and retry with more surrounding context. ",
-            "Alternatively pass `patch`: a unified diff (`@@ -a,b +c,d @@` hunks) ",
-            "for this file alone."
+            "Replace an exact string in a file (verbatim, including indentation; ",
+            "unique unless replace_all), or apply `patch`, a unified diff for ",
+            "this file alone. The file must have been read or written earlier ",
+            "this session. On failure, re-read the lines and retry with more context."
         )
         .into(),
         input_schema: schema(
             json!({
-                "path": {"type": "string", "description": "File path to edit."},
-                "old_string": {"type": "string", "description": "Exact text to find; must occur exactly once unless replace_all. Omit when sending `patch`."},
-                "new_string": {"type": "string", "description": "Replacement text. Omit when sending `patch`."},
+                "path": {"type": "string", "description": "File to edit."},
+                "old_string": {"type": "string", "description": "Exact text to replace. Omit with `patch`."},
+                "new_string": {"type": "string", "description": "Replacement text. Omit with `patch`."},
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)."},
-                "patch": {"type": "string", "description": "Unified diff to apply instead of old_string/new_string: one or more `@@ -a,b +c,d @@` hunks with context, '-' and '+' lines."}
+                "patch": {"type": "string", "description": "`@@ -a,b +c,d @@` hunks with context, '-' and '+' lines."}
             }),
             // Only `path` is structurally required: the edit *variant*
             // (anchor pair vs patch) is validated in `run`, so the error
@@ -113,6 +110,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
             first_change,
             added.max(0) as usize + 1,
             ctx,
+            &reg.policy.root,
             &format!("applied patch ({added:+} lines)"),
         );
     }
@@ -168,6 +166,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
                     line_no,
                     new_lines,
                     ctx,
+                    &reg.policy.root,
                     "whitespace-tolerant match (diff format)",
                 );
             }
@@ -220,7 +219,16 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
         new.matches('\n').count() + 1
     };
     let line_no = replaced[..upto.min(replaced.len())].matches('\n').count() + 1;
-    commit_edit(&path, replaced, count, line_no, new_lines, ctx, "")
+    commit_edit(
+        &path,
+        replaced,
+        count,
+        line_no,
+        new_lines,
+        ctx,
+        &reg.policy.root,
+        "",
+    )
 }
 
 /// Validate, snapshot, write, and report one applied edit. The lint gate
@@ -235,6 +243,7 @@ fn commit_edit(
     line_no: usize,
     new_lines: usize,
     ctx: &mut ToolCtx,
+    root: &std::path::Path,
     note: &str,
 ) -> ToolOutput {
     if let Some(diag) = edit_lint_gate(path, &replaced) {
@@ -245,9 +254,13 @@ fn commit_edit(
             path.display()
         ));
     }
-    super::snapshot(ctx, path);
-    if let Err(e) = std::fs::write(path, &replaced) {
-        return ToolOutput::err(format!("Cannot write {}: {e}", path.display()));
+    let target = match super::contained_target(path, root) {
+        Ok(t) => t,
+        Err(e) => return ToolOutput::err(e),
+    };
+    super::snapshot(ctx, &target);
+    if let Err(e) = super::write_no_follow(&target, replaced.as_bytes()) {
+        return ToolOutput::err(e);
     }
     // Return the applied hunk (±3 lines context) — never the whole file.
     let suffix = if note.is_empty() {
@@ -332,8 +345,9 @@ fn find_ws_tolerant(content: &str, needle: &str) -> Option<(usize, usize)> {
 /// Pre-verify a unified diff against `content` without writing: parse every
 /// `@@` hunk, check its old line numbers sit in range, and check its old
 /// block (context plus `-` lines) matches the file where
-/// `apply_unified_diff` would locate it (declared position first, then a
-/// forward scan). Returns the affected 1-based old-file line numbers,
+/// `apply_unified_diff` would locate it (`locate_hunk`: declared position
+/// first, then a forward scan that never reaches back before the previous
+/// hunk). Returns the affected 1-based old-file line numbers,
 /// sorted and deduplicated; a pure-insertion (zero-length) hunk covers no
 /// old lines and contributes none. Any failure names the hunk in its
 /// message — fail-closed: `run` refuses the patch on `Err` before
@@ -345,6 +359,7 @@ pub fn preverify_patch(content: &str, patch: &str) -> Result<Vec<usize>, String>
     let patch_lines: Vec<&str> = patch.lines().collect();
     let mut idx = 0usize;
     let mut hunks = 0usize;
+    let mut floor = 0usize;
     let mut affected: Vec<usize> = Vec::new();
     while idx < patch_lines.len() {
         let header = patch_lines[idx];
@@ -383,27 +398,17 @@ pub fn preverify_patch(content: &str, patch: &str) -> Result<Vec<usize>, String>
             ));
         }
         // Context must match where `apply_unified_diff` would put the
-        // hunk: the declared position first, then a forward scan over the
-        // original content (hunk headers name old-file lines, so every
-        // hunk is checked against the original, never a half-patched
-        // buffer).
-        let found = if old_block.is_empty() {
-            Some(old_start.min(n))
-        } else {
-            let declared = old_start.saturating_sub(1);
-            (declared..n.saturating_sub(old_block.len()) + 1).find(|&s| {
-                lines[s..s + old_block.len()]
-                    .iter()
-                    .zip(old_block.iter())
-                    .all(|(a, b)| *a == b.as_str())
-            })
-        };
-        let Some(start) = found else {
+        // hunk: the same `locate_hunk` over the original content (hunk
+        // headers name old-file lines, so every hunk is checked against
+        // the original, never a half-patched buffer).
+        let Some(start) = locate_hunk(&lines, old_start, &old_block, floor) else {
             return Err(format!(
-                "hunk {hunks} (declared at line {old_start}) does not match the file"
+                "hunk {hunks} (declared at line {old_start}) does not match the file \
+                 after the previous hunk"
             ));
         };
         affected.extend(start..start + old_block.len());
+        floor = start + old_block.len();
         hunks += 1;
     }
     if hunks == 0 {
@@ -429,6 +434,8 @@ pub fn apply_unified_diff(content: &str, patch: &str) -> Result<String, String> 
     let patch_lines: Vec<&str> = patch.lines().collect();
     let mut idx = 0usize;
     let mut hunks = 0usize;
+    let mut floor = 0usize;
+    let mut splices: Vec<(usize, usize, Vec<String>)> = Vec::new();
     while idx < patch_lines.len() {
         let header = patch_lines[idx];
         if !header.starts_with("@@") {
@@ -449,26 +456,62 @@ pub fn apply_unified_diff(content: &str, patch: &str) -> Result<String, String> 
                 old_block.len()
             ));
         }
-        // Locate by content: prefer the declared position, then scan.
-        let declared = old_start.saturating_sub(1);
-        let found = (declared..lines.len().saturating_sub(old_block.len()) + 1)
-            .find(|&s| lines[s..s + old_block.len()] == old_block[..]);
-        let Some(start) = found else {
+        let Some(start) = locate_hunk(&lines, old_start, &old_block, floor) else {
             return Err(format!(
-                "hunk {hunks} (declared at line {old_start}) does not match the file"
+                "hunk {hunks} (declared at line {old_start}) does not match the file \
+                 after the previous hunk"
             ));
         };
-        lines.splice(start..start + old_block.len(), new_block);
+        floor = start + old_block.len();
+        splices.push((start, old_block.len(), new_block));
         hunks += 1;
     }
     if hunks == 0 {
         return Err("no `@@` hunk headers found".to_string());
     }
-    let mut out = lines.join("\n");
+    // Splices are ordered and disjoint in old-file coordinates.
+    let mut patched: Vec<String> = Vec::with_capacity(lines.len());
+    let mut cursor = 0usize;
+    for (start, len, new_block) in splices {
+        patched.extend(lines[cursor..start].iter().cloned());
+        patched.extend(new_block);
+        cursor = start + len;
+    }
+    patched.extend(lines[cursor..].iter().cloned());
+    let mut out = patched.join("\n");
     if ends_nl {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// Where a hunk lands in the original lines (0-based splice index), shared
+/// by `preverify_patch` and `apply_unified_diff` so the two never disagree.
+/// A pure insertion (`@@ -a,0 …`) splices at index `a` — after old line
+/// `a`, `0` = top of file. Any other hunk matches its old block by content:
+/// the declared position first, then a forward scan. Hunks are ordered, so
+/// no hunk may land before `floor` (the previous hunk's old end) — two
+/// hunks with identical context edit two regions, never one twice.
+fn locate_hunk<S: AsRef<str>>(
+    lines: &[S],
+    old_start: usize,
+    old_block: &[String],
+    floor: usize,
+) -> Option<usize> {
+    let n = lines.len();
+    if old_block.is_empty() {
+        return (floor <= old_start && old_start <= n).then_some(old_start);
+    }
+    let from = old_start.saturating_sub(1).max(floor);
+    if from + old_block.len() > n {
+        return None;
+    }
+    (from..=n - old_block.len()).find(|&s| {
+        lines[s..s + old_block.len()]
+            .iter()
+            .zip(old_block)
+            .all(|(a, b)| a.as_ref() == b.as_str())
+    })
 }
 
 /// `@@ -a[,b] +c[,d] @@` → (old start, old length). Length defaults to 1.
@@ -855,6 +898,138 @@ mod tests {
         assert!(preverify_patch(content, "--- a\n+++ b\n")
             .unwrap_err()
             .contains("no `@@`"));
+    }
+
+    #[test]
+    fn pure_insertion_hunk_inserts_after_the_anchor_line() {
+        let content = "a\nb\nc\n";
+        // `-0,0`: insert before line 1 (top of file).
+        let top = "@@ -0,0 +1,1 @@\n+TOP\n";
+        assert!(preverify_patch(content, top).is_ok());
+        assert_eq!(apply_unified_diff(content, top).unwrap(), "TOP\na\nb\nc\n");
+        // `-2,0`: insert AFTER old line 2.
+        let mid = "@@ -2,0 +3,1 @@\n+MID\n";
+        assert!(preverify_patch(content, mid).is_ok());
+        assert_eq!(apply_unified_diff(content, mid).unwrap(), "a\nb\nMID\nc\n");
+        // `-3,0`: insert after the last line (EOF).
+        let eof = "@@ -3,0 +4,1 @@\n+END\n";
+        assert!(preverify_patch(content, eof).is_ok());
+        assert_eq!(apply_unified_diff(content, eof).unwrap(), "a\nb\nc\nEND\n");
+        // Past EOF is out of range in both halves.
+        let past = "@@ -4,0 +5,1 @@\n+X\n";
+        assert!(preverify_patch(content, past).is_err());
+        assert!(apply_unified_diff(content, past).is_err());
+    }
+
+    #[test]
+    fn identical_context_hunks_edit_two_different_regions() {
+        let content = "x\nkeep\ny\nmid\nx\nkeep\ny\n";
+        // Both hunks carry the same old block and a loose declared line:
+        // hunks are ordered, so the second must land after the first.
+        let patch = "\
+@@ -1,3 +1,3 @@
+ x
+-keep
++ONE
+ y
+@@ -1,3 +1,3 @@
+ x
+-keep
++TWO
+ y
+";
+        let affected = preverify_patch(content, patch).unwrap();
+        assert_eq!(affected, vec![1, 2, 3, 5, 6, 7]);
+        assert_eq!(
+            apply_unified_diff(content, patch).unwrap(),
+            "x\nONE\ny\nmid\nx\nTWO\ny\n"
+        );
+        // A hunk whose context only exists before the previous hunk's end
+        // is refused, never re-applied to the earlier region.
+        let twice = "\
+@@ -5,3 +5,3 @@
+ x
+-keep
++TWO
+ y
+@@ -1,3 +1,3 @@
+ x
+-keep
++ONE
+ y
+";
+        assert!(preverify_patch(content, twice).is_err());
+        assert!(apply_unified_diff(content, twice).is_err());
+        // Hunks that grow the buffer still locate later hunks correctly.
+        let grow = "\
+@@ -1,2 +1,3 @@
+ x
++NEW
+ keep
+@@ -5,2 +6,2 @@
+ x
+-keep
++KEPT
+";
+        assert!(preverify_patch(content, grow).is_ok());
+        assert_eq!(
+            apply_unified_diff(content, grow).unwrap(),
+            "x\nNEW\nkeep\ny\nmid\nx\nKEPT\ny\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_through_a_symlink_to_an_outside_file_is_refused() {
+        use crate::tools::ToolCtx;
+        let dir = std::env::temp_dir().join(format!("overseer-editlink-{}", uuid::Uuid::now_v7()));
+        let outside = dir.with_extension("outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        std::fs::write(outside.join("v.txt"), "alpha\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("v.txt"), dir.join("l.txt")).unwrap();
+        let mut reg = crate::tools::ToolRegistry::core(crate::perm::Policy::headless(dir.clone()));
+        reg.mark_read(&dir.join("l.txt"));
+        let mut c = ToolCtx {
+            cwd: dir.clone(),
+            session_dir: dir.join("session"),
+            spill_seq: 0,
+            provider: None,
+            agent_config: None,
+            subagent_seq: 0,
+            checkpoint: None,
+            sandbox: false,
+            broker: None,
+        };
+        let out = run(
+            &json!({"path": "l.txt", "old_string": "alpha", "new_string": "pwned"}),
+            &mut c,
+            &mut reg,
+        );
+        assert!(out.is_error, "{}", out.text);
+        assert!(
+            out.text.contains("outside the working directory"),
+            "{}",
+            out.text
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("v.txt")).unwrap(),
+            "alpha\n"
+        );
+        // A normal in-workspace edit is unchanged.
+        std::fs::write(dir.join("n.txt"), "alpha\n").unwrap();
+        reg.mark_read(&dir.join("n.txt"));
+        let out = run(
+            &json!({"path": "n.txt", "old_string": "alpha", "new_string": "beta"}),
+            &mut c,
+            &mut reg,
+        );
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("n.txt")).unwrap(),
+            "beta\n"
+        );
     }
 
     #[test]

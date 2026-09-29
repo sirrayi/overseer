@@ -72,23 +72,21 @@ pub fn spec() -> crate::provider::ToolSpec {
         name: "glob".into(),
         description: concat!(
             "Find files by glob pattern (e.g. '**/*.rs'). Returns paths only, ",
-            "capped at 500. Skips .gitignore'd files. `file_type` selects ",
-            "file/dir/symlink (default file); `extension` filters by extension ",
-            "('rs,py' or '.rs')."
+            "capped at 500; skips .gitignore'd files."
         )
         .into(),
         input_schema: schema(
             json!({
-                "pattern": {"type": "string", "description": "Glob pattern matched against paths relative to `path`."},
+                "pattern": {"type": "string", "description": "Matched against paths relative to `path`."},
                 "path": {"type": "string", "description": "Directory to search (default: working directory)."},
                 "file_type": {
                     "type": "string",
                     "enum": ["file", "dir", "symlink"],
-                    "description": "Entry kind to return (default: file)."
+                    "description": "Default: file."
                 },
                 "extension": {
                     "type": "string",
-                    "description": "Comma-separated extensions to keep, e.g. 'rs,py' (a leading dot is accepted)."
+                    "description": "Comma-separated, e.g. 'rs,py' or '.rs'."
                 }
             }),
             &["pattern"],

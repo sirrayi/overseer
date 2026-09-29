@@ -80,7 +80,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
             if out.len() >= MAX_MATCHES {
                 break;
             }
-            out.push(truncate_line(&l));
+            out.push(l);
         }
         if out.is_empty() {
             return ToolOutput::ok(format!("No matches for '{pattern}'."));
@@ -110,16 +110,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
             if re.is_match(line) {
                 // FAIL-1: byte-slicing panics on multibyte lines (byte 500
                 // inside a char boundary). Char-safe truncation instead.
-                let l: &str = if line.len() > MAX_LINE {
-                    line.char_indices()
-                        .take_while(|(b, _)| *b < MAX_LINE)
-                        .last()
-                        .map(|(b, c)| &line[..b + c.len_utf8()])
-                        .unwrap_or("")
-                } else {
-                    line
-                };
-                matches.push(format!("{}:{}:{}", path.display(), i + 1, l.trim_end()));
+                matches.push(format!("{}:{}:{}", path.display(), i + 1, cap_line(line)));
                 if matches.len() >= MAX_MATCHES {
                     return;
                 }
@@ -211,12 +202,11 @@ fn rg_json(
             .pointer("/data/line_number")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let content = ev
-            .pointer("/data/lines/text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim_end()
-            .to_string();
+        let content = cap_line(
+            ev.pointer("/data/lines/text")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        );
         lines.push(format!("{path}:{no}:{content}"));
         if lines.len() >= MAX_MATCHES {
             break;
@@ -255,14 +245,15 @@ fn which_rg() -> Option<std::path::PathBuf> {
     None
 }
 
-fn truncate_line(l: &str) -> String {
-    // Cap the overlong line at MAX_LINE bytes (char-boundary safe).
-    if l.len() > MAX_LINE + 64 {
-        let head: String = l.chars().take(MAX_LINE + 64).collect();
-        format!("{head}…")
-    } else {
-        l.to_string()
+/// A matched line as shown: at most [`MAX_LINE`] bytes (cut on a char
+/// boundary), trailing whitespace trimmed. Shared by the rg fast path and
+/// the embedded scanner so both render a hit identically.
+fn cap_line(line: &str) -> &str {
+    let mut end = line.len().min(MAX_LINE);
+    while !line.is_char_boundary(end) {
+        end -= 1;
     }
+    line[..end].trim_end()
 }
 
 #[cfg(test)]
@@ -351,6 +342,27 @@ mod tests {
             "honest regex error, got: {}",
             out.text
         );
+    }
+
+    #[test]
+    fn rg_path_and_fallback_truncate_long_lines_identically() {
+        let dir = tmpdir();
+        std::fs::write(
+            dir.join("long.txt"),
+            format!("needle {}\nneedle {}\n", "x".repeat(2_000), "é".repeat(700)),
+        )
+        .unwrap();
+        let mut c = ctx(&dir);
+        let fast = run(&serde_json::json!({"pattern": "needle"}), &mut c);
+        let guard = scrub_path();
+        let slow = run(&serde_json::json!({"pattern": "needle"}), &mut c);
+        drop(guard);
+        assert!(!fast.is_error && !slow.is_error);
+        assert_eq!(fast.text, slow.text, "both paths share one line cap");
+        for line in slow.text.lines() {
+            let content = line.splitn(3, ':').nth(2).unwrap();
+            assert!(content.len() <= MAX_LINE, "{} bytes", content.len());
+        }
     }
 
     #[test]

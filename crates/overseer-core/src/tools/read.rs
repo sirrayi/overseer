@@ -37,8 +37,9 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
     let offset = opt_u64(input, "offset").unwrap_or(1).max(1) as usize;
     let limit = opt_u64(input, "limit").unwrap_or(DEFAULT_LIMIT) as usize;
 
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
+    let start = offset - 1;
+    let Window { lines, total } = match scan(&path, start, limit) {
+        Ok(w) => w,
         Err(e) => {
             // P8-B (fzf lookup-miss hints): a missing path is usually a
             // typo — rank the sibling names so the repair is one call away
@@ -53,16 +54,13 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
         }
     };
 
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
-    let start = offset - 1;
     if start >= total && total > 0 {
         return ToolOutput::err(format!(
             "offset {offset} is past end of file ({} has {total} lines).",
             path.display()
         ));
     }
-    let end = (start + limit).min(total);
+    let end = start.saturating_add(limit).min(total);
 
     // P1.3 read dedup (path + mtime + range): an unchanged re-read whose
     // range is already covered returns a stub instead of the same bytes.
@@ -81,7 +79,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
     if reg.mtime_changed(&path, mtime) {
         out.push_str("[file modified since your previous read]\n");
     }
-    for (i, line) in lines[start..end].iter().enumerate() {
+    for (i, line) in lines.iter().enumerate() {
         let n = start + i + 1;
         if line.len() > MAX_LINE {
             // FAIL-2: same char-boundary class as FAIL-1 — truncate safely.
@@ -105,6 +103,42 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
     }
     reg.record_read(&path, mtime, start, end);
     ToolOutput::ok(out)
+}
+
+/// The requested line window plus the file's total line count.
+struct Window {
+    lines: Vec<String>,
+    total: usize,
+}
+
+/// Stream `path` line by line, keeping only lines `start..start+limit`.
+/// Memory is bounded by the window; the rest is only counted (the footer
+/// needs the total). Line splitting matches `str::lines` (`\n` or `\r\n`)
+/// and invalid UTF-8 anywhere fails like `read_to_string` does.
+fn scan(path: &std::path::Path, start: usize, limit: usize) -> std::io::Result<Window> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let stop = start.saturating_add(limit);
+    let mut buf = Vec::new();
+    let mut lines = Vec::new();
+    let mut total = 0usize;
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let text = std::str::from_utf8(&buf).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })?;
+        if (start..stop).contains(&total) {
+            lines.push(text.lines().next().unwrap_or("").to_string());
+        }
+        total += 1;
+    }
+    Ok(Window { lines, total })
 }
 
 /// Bounded sibling-name hint for a failed read: at most `SIBLING_SCAN`
@@ -178,6 +212,92 @@ mod tests {
         );
         // The hint is bounded and never turns into an error of its own.
         assert!(sibling_hint(std::path::Path::new("/")).is_none());
+    }
+
+    /// The whole-file slicing the streaming reader replaced, kept as the
+    /// byte-for-byte oracle for the rendered window and footer.
+    fn oracle(content: &str, offset: usize, limit: usize) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        let start = offset - 1;
+        let end = (start + limit).min(total);
+        let mut out = String::new();
+        for (i, line) in lines[start..end].iter().enumerate() {
+            let n = start + i + 1;
+            if line.len() > MAX_LINE {
+                let head: String = line.chars().take(MAX_LINE).collect();
+                out.push_str(&format!("{n:>6}\t{head} [line truncated]\n"));
+            } else {
+                out.push_str(&format!("{n:>6}\t{line}\n"));
+            }
+        }
+        if end < total {
+            out.push_str(&format!(
+                "[showing lines {}-{} of {}; use offset={} to continue]\n",
+                start + 1,
+                end,
+                total,
+                end + 1
+            ));
+        }
+        if out.is_empty() {
+            out.push_str("(empty file)");
+        }
+        out
+    }
+
+    #[test]
+    fn large_file_windows_are_byte_identical_to_whole_file_slicing() {
+        let dir = tmpdir();
+        let mut content = String::new();
+        for i in 0..200_000 {
+            match i % 7 {
+                0 => content.push_str("\r\n"),
+                1 => content.push_str(&format!("crlf {i}\r\n")),
+                2 => content.push_str(&format!("{}é{i}\n", "x".repeat(2_100))),
+                _ => content.push_str(&format!("line {i}\n")),
+            }
+        }
+        content.push_str("no trailing newline\r");
+        std::fs::write(dir.join("big.txt"), &content).unwrap();
+        for (offset, limit) in [(1, 2_000), (99_990, 25), (199_995, 2_000), (200_001, 5)] {
+            let mut reg = crate::tools::ToolRegistry::core(crate::perm::Policy::allow_all());
+            let mut c = ctx(&dir);
+            let out = run(
+                &serde_json::json!({"path": "big.txt", "offset": offset, "limit": limit}),
+                &mut c,
+                &mut reg,
+            );
+            assert!(!out.is_error, "{}", out.text);
+            assert_eq!(
+                out.text,
+                oracle(&content, offset, limit),
+                "{offset}/{limit}"
+            );
+        }
+        let mut reg = crate::tools::ToolRegistry::core(crate::perm::Policy::allow_all());
+        let past = run(
+            &serde_json::json!({"path": "big.txt", "offset": 200_002}),
+            &mut ctx(&dir),
+            &mut reg,
+        );
+        assert!(past.is_error);
+        assert!(past.text.contains("has 200001 lines"), "{}", past.text);
+        std::fs::write(dir.join("empty.txt"), "").unwrap();
+        let empty = run(
+            &serde_json::json!({"path": "empty.txt"}),
+            &mut ctx(&dir),
+            &mut reg,
+        );
+        assert_eq!(empty.text, "(empty file)");
+        std::fs::write(dir.join("bad.txt"), b"ok\n\xff\n").unwrap();
+        let bad = run(
+            &serde_json::json!({"path": "bad.txt"}),
+            &mut ctx(&dir),
+            &mut reg,
+        );
+        assert!(bad.is_error);
+        assert!(bad.text.contains("valid UTF-8"), "{}", bad.text);
     }
 
     #[test]
