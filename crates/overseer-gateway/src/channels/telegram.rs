@@ -7,6 +7,8 @@
 //! string this module produces is passed through the sentinel redactor
 //! first, because Telegram's API embeds the token in the URL.
 
+use std::time::Duration;
+
 use serde_json::Value;
 
 use super::sentinel;
@@ -21,12 +23,21 @@ pub struct Polled {
     pub next_offset: Option<i64>,
 }
 
+/// Whole-request bound for every Bot API call: one hung connection must
+/// not wedge the single-threaded daemon loop.
+pub const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `getUpdates` server hold time. Must stay below [`HTTP_TIMEOUT`], or a
+/// healthy long-poll would be cut off as a timeout.
+pub const LONG_POLL_S: u64 = 0;
+
 /// The HTTP surface of one bot. `base` is overridable so tests can point
 /// at a closed local port instead of the network.
 #[derive(Debug, Clone)]
 pub struct Telegram {
     token: String,
     base: String,
+    timeout: Duration,
 }
 
 impl Telegram {
@@ -35,6 +46,7 @@ impl Telegram {
         Telegram {
             token: token.into(),
             base: "https://api.telegram.org".to_string(),
+            timeout: HTTP_TIMEOUT,
         }
     }
 
@@ -51,6 +63,19 @@ impl Telegram {
     pub fn with_base(mut self, base: impl Into<String>) -> Self {
         self.base = base.into();
         self
+    }
+
+    /// Override the whole-request timeout (tests use a short bound).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    fn agent(&self) -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(self.timeout))
+            .build()
+            .into()
     }
 
     fn url(&self, method: &str) -> String {
@@ -76,8 +101,10 @@ impl Telegram {
     /// One non-blocking poll. A transport or API failure is an error naming
     /// the method, with the token redacted out of the message.
     pub fn poll(&self, offset: Option<i64>) -> Result<Polled, String> {
-        let url = self.get_updates_url(offset, 0);
-        let body = ureq::get(&url)
+        let url = self.get_updates_url(offset, LONG_POLL_S);
+        let body = self
+            .agent()
+            .get(&url)
             .call()
             .map_err(|e| self.scrub(format!("telegram: getUpdates failed: {e}")))?
             .body_mut()
@@ -108,7 +135,9 @@ impl Telegram {
             "text": text,
             "disable_web_page_preview": true,
         });
-        let resp = ureq::post(&self.url("sendMessage"))
+        let resp = self
+            .agent()
+            .post(&self.url("sendMessage"))
             .send_json(&payload)
             .map_err(|e| self.scrub(format!("telegram: sendMessage failed: {e}")))?
             .body_mut()
@@ -269,6 +298,48 @@ mod tests {
         assert_eq!(got[1].thread.as_deref(), Some("77"));
         // A body with no `result` yields nothing (never an error).
         assert!(parse_updates(&serde_json::json!({"ok": true})).is_empty());
+    }
+
+    #[test]
+    fn poll_against_a_silent_server_errors_within_the_bound() {
+        // A peer that accepts and never answers must not wedge the
+        // single-threaded daemon loop.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming().flatten() {
+                held.push(conn);
+            }
+        });
+        let bound = std::time::Duration::from_millis(500);
+        let tg = Telegram::new("SUPER-SECRET-TOKEN")
+            .with_base(format!("http://{addr}"))
+            .with_timeout(bound);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let res = tg.poll(None);
+            let _ = tx.send((res, started.elapsed()));
+        });
+        let (res, took) = rx
+            .recv_timeout(bound * 10)
+            .expect("telegram poll hung on a silent server");
+        let err = res.expect_err("a silent server is a transport error");
+        assert!(err.contains("getUpdates"), "{err}");
+        assert!(!err.contains("SUPER-SECRET-TOKEN"), "token leaked: {err}");
+        assert!(took < bound * 4, "poll took {took:?}, bound {bound:?}");
+    }
+
+    #[test]
+    fn default_timeout_outlasts_the_long_poll_hold() {
+        let tg = Telegram::new("T");
+        assert_eq!(tg.timeout, HTTP_TIMEOUT);
+        assert_eq!(HTTP_TIMEOUT, std::time::Duration::from_secs(15));
+        assert!(std::time::Duration::from_secs(LONG_POLL_S) < tg.timeout);
+        assert!(tg
+            .get_updates_url(None, LONG_POLL_S)
+            .ends_with(&format!("timeout={LONG_POLL_S}")));
     }
 
     #[test]
