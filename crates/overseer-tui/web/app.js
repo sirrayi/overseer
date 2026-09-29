@@ -62,7 +62,7 @@ const M_BOLD = 1, M_DIM = 2, M_ITALIC = 4, M_UNDER = 8, M_REV = 64, M_CROSS = 25
 // innerHTML / setAttribute('style')), so `style-src 'self'` holds.
 function applySpan(el, s) {
   let f = col(s.f), b = col(s.b);
-  if (s.m & M_REV) [f, b] = [b || '#1e1f24', f || '#abb2bf'];
+  if (s.m & M_REV) [f, b] = [b || '#1e1f24', f || '#d4d6db'];
   if (f) el.style.color = f;
   if (b) el.style.background = b;
   if (s.m & M_BOLD) el.style.fontWeight = 'bold';
@@ -93,6 +93,8 @@ const rowCache = [];
 
 function render(f) {
   if (f.bye) { document.getElementById('bye').classList.add('on'); es.close(); return; }
+  // §5: the server flags a fresh session — overlay the real mark.
+  document.getElementById('empty').classList.toggle('on', !!f.e);
   screen.style.width = (f.w * CH) + 'px';
   screen.style.height = (f.h * LH) + 'px';
   while (rowEls.length < f.h) {
@@ -159,10 +161,12 @@ const post = o => {
   );
 };
 
+// §6 installed PWA is full-bleed: no title bar, no page margin.
+const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+
 function fit() {
-  // Fill the viewport: 10px page margin either side, 30px title bar.
-  const cols = Math.max(40, Math.floor((innerWidth - 20) / CH));
-  const rows = Math.max(10, Math.floor((innerHeight - 30 - 20) / LH));
+  const cols = Math.max(40, Math.floor((innerWidth - (standalone ? 0 : 20)) / CH));
+  const rows = Math.max(10, Math.floor((innerHeight - (standalone ? 0 : 30 + 20)) / LH));
   post({ type: 'resize', cols, rows });
 }
 
@@ -197,12 +201,27 @@ const KEYS = {
 };
 
 // The bottom mark is the panel button — same as F1 / ↑ on empty input.
-document.getElementById('mark').addEventListener('click', e => {
+// §10 swap point: /mark.svg is the ONE geometry file; it's injected
+// inline (never innerHTML strings we build) into the button and the
+// empty-state mark so CSS currentColor controls each copy.
+const markBtn = document.getElementById('mark');
+fetch('/mark.svg')
+  .then(r => r.text())
+  .then(svg => {
+    markBtn.innerHTML = svg;
+    const em = document.getElementById('emark');
+    if (em) em.innerHTML = svg;
+  })
+  .catch(() => {});
+markBtn.addEventListener('click', e => {
   post({ type: 'panel' });
   e.stopPropagation();
 });
 
 addEventListener('keydown', e => {
+  // Focused on the mark button? Enter/Space belongs to it — let the
+  // browser produce the click instead of forwarding a transcript key.
+  if (e.target === markBtn) return;
   if (e.metaKey) return; // leave cmd-* to the browser
   const mods = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey };
   if (e.key === 'Tab' && e.shiftKey) {

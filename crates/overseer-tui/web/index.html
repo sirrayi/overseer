@@ -2,8 +2,15 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>overseer</title>
 <link rel="stylesheet" href="/style.css">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<meta name="theme-color" content="#1e1f24">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 </head>
 <body>
 <div id="win">
@@ -14,7 +21,8 @@
     <span id="title">overseer</span>
   </div>
   <div id="screen" tabindex="0"></div>
-  <div id="mark"><i></i><i></i><i></i></div>
+  <div id="empty"><span id="emark"></span><span id="eword">overseer</span></div>
+  <button id="mark" type="button" aria-label="open panel"></button>
 </div>
 <div id="bye">session ended</div>
 <div id="lock">Run <code>overseer web</code> — it opens this page with your key.</div>

@@ -22,7 +22,7 @@
 //! allocation, and every SSE write carries a 5 s timeout so a stalled
 //! tab can never wedge the drive loop.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -181,7 +181,7 @@ pub fn run_web_with(cfg: TuiConfig, opts: WebOpts) -> std::io::Result<i32> {
             }
         };
         if changed {
-            let frame = frame_json(&mut term, app.prompt_top);
+            let frame = frame_json(&mut term, app.prompt_top, app.transcript_empty());
             *ctx.last.lock().unwrap() = Some(frame.clone());
             broadcast(&ctx.clients, &format!("data: {frame}\n\n"));
         }
@@ -256,17 +256,39 @@ fn open_url(url: &str) {
 /// file 0600) and reused across launches so an installed PWA's origin
 /// keeps working.
 fn web_token() -> std::io::Result<String> {
-    let dir = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(".overseer")
-        .join("web");
+    // No HOME → no per-install token. Refuse outright: falling back to
+    // `./.overseer` would drop a bearer secret in whatever directory
+    // the caller happened to sit in.
+    let home = std::env::var("HOME")
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
+    let dir = std::path::PathBuf::from(home).join(".overseer").join("web");
     overseer_core::harden::ensure_private_dir(&dir)?;
     let path = dir.join("token");
-    if let Ok(t) = std::fs::read_to_string(&path) {
-        let t = t.trim();
-        if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Ok(t.to_string());
+    // symlink_metadata, not metadata: a planted symlink or a file owned
+    // by a different uid is regenerated, never trusted.
+    let reusable = match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                !m.file_type().is_symlink() && m.uid() == unsafe { libc::getuid() }
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+        _ => false,
+    };
+    if reusable {
+        if let Ok(t) = std::fs::read_to_string(&path) {
+            let t = t.trim();
+            if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+                // Re-assert 0600 — an older build or a manual copy may
+                // have left the file lax.
+                write_private(&path, t.as_bytes())?;
+                return Ok(t.to_string());
+            }
         }
     }
     let mut raw = [0u8; 32];
@@ -276,10 +298,16 @@ fn web_token() -> std::io::Result<String> {
     Ok(token)
 }
 
-/// Create-or-replace `path` owner-only (0600), never following a
-/// preexisting symlink's target perms — `OpenOptions::mode` applies at
-/// creation, and the file is ours to rewrite either way.
+/// Create-or-replace `path` owner-only (0600). A preexisting symlink
+/// is removed first — `OpenOptions` would otherwise follow it and
+/// write the secret into the target's file.
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        std::fs::remove_file(path)?;
+    }
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -353,11 +381,13 @@ fn broadcast(clients: &Clients, msg: &str) {
     });
 }
 
-/// Serialize the terminal buffer as `{w,h,p,cur,rows:[ [span] ]}` where
-/// a span is `{t,f,b,m}` — text, css fg, css bg, modifier bits. `p` is
-/// the prompt band's first row (the client shifts it for its dip).
-/// Blank trailing cells are trimmed per row; the browser pads.
-fn frame_json(term: &mut Terminal<TestBackend>, prompt_top: u16) -> String {
+/// Serialize the terminal buffer as `{w,h,p,e,cur,rows:[ [span] ]}`
+/// where a span is `{t,f,b,m}` — text, css fg, css bg, modifier bits.
+/// `p` is the prompt band's first row (the client shifts it for its
+/// dip); `e` marks the empty state (client overlays the mark +
+/// wordmark). Blank trailing cells are trimmed per row; the browser
+/// pads.
+fn frame_json(term: &mut Terminal<TestBackend>, prompt_top: u16, transcript_empty: bool) -> String {
     let backend = term.backend_mut();
     let pos = backend
         .get_cursor_position()
@@ -370,6 +400,9 @@ fn frame_json(term: &mut Terminal<TestBackend>, prompt_top: u16) -> String {
         ..
     } = buf.area;
     let mut out = format!("{{\"w\":{w},\"h\":{h},\"p\":{prompt_top},");
+    if transcript_empty {
+        out.push_str("\"e\":true,");
+    }
     out.push_str(&format!("\"cur\":[{},{}],\"rows\":[", pos.0, pos.1));
     for (y, row) in buf.content.chunks(w as usize).enumerate() {
         if y > 0 {
@@ -450,25 +483,27 @@ fn json_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// ratatui Color → CSS. Indexed colors go out as `iNNN` and the client
-/// resolves them against the standard xterm palette.
+/// ratatui Color → CSS. §1: named ANSI colors map to muted,
+/// graphite-adjacent equivalents — nothing saturated reaches the web
+/// surface. Indexed colors go out as `iNNN` and the client resolves
+/// them against the standard xterm palette.
 fn color_css(c: Color) -> String {
     match c {
-        Color::Reset | Color::Black => "black".into(),
-        Color::Red => "#e86671".into(),
-        Color::Green => "#98c379".into(),
-        Color::Yellow => "#e5c07b".into(),
-        Color::Blue => "#61afef".into(),
-        Color::Magenta => "#c678dd".into(),
-        Color::Cyan => "#56b6c2".into(),
-        Color::Gray | Color::White => "#abb2bf".into(),
-        Color::DarkGray => "#5c6370".into(),
-        Color::LightRed => "#f78c8c".into(),
-        Color::LightGreen => "#b5e890".into(),
-        Color::LightYellow => "#f2d99c".into(),
-        Color::LightBlue => "#82cfff".into(),
-        Color::LightMagenta => "#d8a2e8".into(),
-        Color::LightCyan => "#7bdde0".into(),
+        Color::Reset | Color::Gray | Color::White => "#d4d6db".into(),
+        Color::Black => "#0d0e10".into(),
+        Color::Red => "#d77b7b".into(),
+        Color::Green => "#7fb58a".into(),
+        Color::Yellow => "#d4b26a".into(),
+        Color::Blue => "#8ea4c8".into(),
+        Color::Magenta => "#b79bd8".into(),
+        Color::Cyan => "#7fb8c4".into(),
+        Color::DarkGray => "#858a94".into(),
+        Color::LightRed => "#e3a1a1".into(),
+        Color::LightGreen => "#a0cba9".into(),
+        Color::LightYellow => "#e5cf9b".into(),
+        Color::LightBlue => "#a9c1e8".into(),
+        Color::LightMagenta => "#c9b3e2".into(),
+        Color::LightCyan => "#a0d3dc".into(),
         Color::Indexed(i) => format!("i{i}"),
         Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
     }
@@ -516,30 +551,43 @@ enum HeadErr {
     Status(u16),
 }
 
-/// Request head through a BufReader (no byte-at-a-time): 10 s overall
-/// read timeout, ≤16 KiB head, Content-Length capped at 64 KiB BEFORE
-/// the body allocation — a lying header gets 413, never a giant `vec!`.
+/// Request head: chunked raw reads — never a per-line `read_until`,
+/// so a newline-less line can't allocate past the 16 KiB cap before
+/// the 431 check sees it, and `deadline` is a wall-clock total from
+/// accept (not per-read): a 1-byte-per-9 s dribbler can't pin one of
+/// the 32 connection slots forever. Content-Length is capped at
+/// 64 KiB BEFORE the body allocation — a lying header gets 413, never
+/// a giant `vec!`. Head reads never wait on the body beyond the
+/// socket's own read timeout.
 fn read_request(stream: &TcpStream) -> Result<Request, HeadErr> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(|_| HeadErr::Silent)?);
+    read_request_within(stream, std::time::Instant::now() + READ_TIMEOUT)
+}
+
+fn read_request_within(
+    stream: &TcpStream,
+    deadline: std::time::Instant,
+) -> Result<Request, HeadErr> {
+    let mut s = stream.try_clone().map_err(|_| HeadErr::Silent)?;
     let mut head = Vec::with_capacity(1024);
-    loop {
-        let mut line = Vec::new();
-        let n = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|_| HeadErr::Silent)?;
+    let mut buf = [0u8; 4096];
+    let split = loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(HeadErr::Silent);
+        }
+        let n = s.read(&mut buf).map_err(|_| HeadErr::Silent)?;
         if n == 0 {
             return Err(HeadErr::Silent);
         }
-        head.extend_from_slice(&line);
+        head.extend_from_slice(&buf[..n]);
         if head.len() > HEAD_CAP {
             return Err(HeadErr::Status(431));
         }
-        if line == b"\r\n" || line == b"\n" {
-            break;
+        if let Some(i) = head_end(&head) {
+            break i;
         }
-    }
-    let head = String::from_utf8_lossy(&head);
-    let mut lines = head.lines();
+    };
+    let head_text = String::from_utf8_lossy(&head[..split]);
+    let mut lines = head_text.lines();
     let mut parts = lines.next().unwrap_or("").split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("/").to_string();
@@ -547,14 +595,13 @@ fn read_request(stream: &TcpStream) -> Result<Request, HeadErr> {
         return Err(HeadErr::Silent);
     }
     let headers = lines
+        .clone()
         .filter_map(|l| {
             l.split_once(':')
                 .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
         })
         .collect();
-    let body_len = head
-        .lines()
-        .skip(1)
+    let body_len = lines
         .find_map(|l| {
             l.split_once(':')
                 .filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
@@ -564,11 +611,17 @@ fn read_request(stream: &TcpStream) -> Result<Request, HeadErr> {
     if body_len > BODY_CAP {
         return Err(HeadErr::Status(413));
     }
-    let mut body = vec![0u8; body_len];
-    // Short body = the sender lied about its length — that's a 400,
-    // not a silent trunc.
-    if reader.read_exact(&mut body).is_err() {
-        return Err(HeadErr::Status(400));
+    // Chunked reads may have already swallowed part of the body.
+    let mut body = head[split..].to_vec();
+    body.truncate(body_len);
+    if body.len() < body_len {
+        let mut rest = vec![0u8; body_len - body.len()];
+        // Short body = the sender lied about its length — that's a 400,
+        // not a silent trunc.
+        if s.read_exact(&mut rest).is_err() {
+            return Err(HeadErr::Status(400));
+        }
+        body.extend_from_slice(&rest);
     }
     Ok(Request {
         method,
@@ -576,6 +629,15 @@ fn read_request(stream: &TcpStream) -> Result<Request, HeadErr> {
         headers,
         body,
     })
+}
+
+/// Index just past the blank line that ends the head — `\r\n\r\n`, or
+/// a bare `\n\n` for clients that skip CR.
+fn head_end(b: &[u8]) -> Option<usize> {
+    if let Some(i) = b.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some(i + 4);
+    }
+    b.windows(2).position(|w| w == b"\n\n").map(|i| i + 2)
 }
 
 /// One accepted connection. Rejections in order: over-cap 503 → bad
@@ -667,8 +729,8 @@ fn handle_conn(mut stream: TcpStream, ctx: Arc<Ctx>) {
                 "/" | "/index.html" => ("index.html", "text/html; charset=utf-8"),
                 "/app.js" => ("app.js", "text/javascript; charset=utf-8"),
                 "/style.css" => ("style.css", "text/css; charset=utf-8"),
-                // Reserved names for the PWA pass — absent files 404,
-                // which is the correct static-file answer.
+                // PWA assets — all embedded, all unauthenticated.
+                "/mark.svg" => ("mark.svg", "image/svg+xml"),
                 "/favicon.svg" => ("favicon.svg", "image/svg+xml"),
                 "/manifest.webmanifest" => ("manifest.webmanifest", "application/manifest+json"),
                 p if p.starts_with("/icon-") && p.ends_with(".png") && !p.contains("..") => {
@@ -773,19 +835,20 @@ fn token_ok(req: &Request, token: &str) -> bool {
     }
 }
 
-/// Dev loop wants disk-fresh assets: serve from `web/` next to the
-/// source when it exists, else the copies baked into the binary.
+/// Dev loop wants disk-fresh assets: DEBUG builds serve from `web/`
+/// next to the source when it exists. Release builds serve only the
+/// embedded copies — `CARGO_MANIFEST_DIR` is a build-time path that
+/// would let a deployed binary read whatever lives at that source path.
 fn serve_file(stream: &mut TcpStream, name: &str, ctype: &str) {
-    let disk = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("web")
-        .join(name);
-    let content = std::fs::read(&disk).unwrap_or_else(|_| match name {
-        "index.html" => include_str!("../web/index.html").as_bytes().to_vec(),
-        "app.js" => include_str!("../web/app.js").as_bytes().to_vec(),
-        "style.css" => include_str!("../web/style.css").as_bytes().to_vec(),
-        _ => Vec::new(),
-    });
-    if content.is_empty() && !disk.exists() {
+    let disk = cfg!(debug_assertions)
+        .then(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("web")
+                .join(name)
+        })
+        .and_then(|p| std::fs::read(p).ok());
+    let content = disk.unwrap_or_else(|| embedded_asset(name).to_vec());
+    if content.is_empty() {
         let _ = respond(stream, 404, "");
         return;
     }
@@ -795,6 +858,22 @@ fn serve_file(stream: &mut TcpStream, name: &str, ctype: &str) {
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&content);
+}
+
+/// Compile-time copies of every served asset — release builds serve
+/// these and nothing else (see `serve_file`).
+fn embedded_asset(name: &str) -> &'static [u8] {
+    match name {
+        "index.html" => include_bytes!("../web/index.html"),
+        "app.js" => include_bytes!("../web/app.js"),
+        "style.css" => include_bytes!("../web/style.css"),
+        "mark.svg" => include_bytes!("../web/mark.svg"),
+        "favicon.svg" => include_bytes!("../web/favicon.svg"),
+        "manifest.webmanifest" => include_bytes!("../web/manifest.webmanifest"),
+        "icon-192.png" => include_bytes!("../web/icon-192.png"),
+        "icon-512.png" => include_bytes!("../web/icon-512.png"),
+        _ => &[],
+    }
 }
 
 /// Minimal percent-decoder for the `?d=`/`?t=` payloads — `%XX` and
@@ -946,6 +1025,7 @@ mod tests {
 
     /// Send one raw request, return the status line.
     fn exchange(port: u16, raw: &str) -> String {
+        use std::io::{BufRead, BufReader};
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.write_all(raw.as_bytes()).unwrap();
         s.shutdown(std::net::Shutdown::Write).ok();
@@ -1160,6 +1240,97 @@ mod tests {
     }
 
     #[test]
+    fn newline_less_line_is_bounded_to_431() {
+        let (port, _rx, _ctx) = server();
+        // One 20 KiB header line with no '\n' — must hit the 431 cap
+        // before any over-cap allocation.
+        let big = "A".repeat(HEAD_CAP + 4096);
+        assert_eq!(
+            exchange(port, &format!("GET /{big} HTTP/1.1\r\n{}\r\n", host(port))),
+            "HTTP/1.1 431 Request Header Fields Too Large"
+        );
+        // And the server still answers afterwards (head read released).
+        assert_eq!(
+            exchange(port, &format!("GET / HTTP/1.1\r\n{}\r\n", host(port))),
+            "HTTP/1.1 200 OK"
+        );
+    }
+
+    #[test]
+    fn head_deadline_kills_dribblers() {
+        // A dribbler that keeps reads succeeding (a byte every 30 ms)
+        // never trips the per-read socket timeout — only the
+        // wall-clock head deadline hangs it up. `read_request_within`
+        // takes the deadline so the test uses a short clock while the
+        // client is still mid-stream.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (srv, _) = listener.accept().unwrap();
+            // Per-read timeout far past the deadline: only the
+            // deadline can end this.
+            let _ = srv.set_read_timeout(Some(std::time::Duration::from_secs(60)));
+            let r = read_request_within(
+                &srv,
+                std::time::Instant::now() + std::time::Duration::from_millis(100),
+            );
+            done_tx.send(matches!(r, Err(HeadErr::Silent))).unwrap();
+        });
+        let dribble = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            for _ in 0..20 {
+                // ~600 ms of trickle — well past the 100 ms deadline.
+                if c.write_all(b"x").is_err() {
+                    break; // server already hung up
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        });
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(400))
+            .unwrap());
+        dribble.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn web_token_reasserts_perms_and_rejects_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!("ovw-home-{}", std::process::id()));
+        std::env::set_var("HOME", &home);
+        let dir = home.join(".overseer").join("web");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+
+        // Lax perms on an existing token → re-asserted to 0600, reused.
+        std::fs::write(&path, TOKEN).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let t = web_token().unwrap();
+        assert_eq!(t, TOKEN);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // A planted symlink is never trusted — regenerated in place.
+        std::fs::remove_file(&path).unwrap();
+        let target = home.join("target.txt");
+        std::fs::write(&target, TOKEN).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let t2 = web_token().unwrap();
+        assert_ne!(t2, TOKEN);
+        assert_eq!(t2.len(), 64);
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        std::env::remove_var("HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn port_fallback_scans_and_pin_fails() {
         // Pin: binding a port someone already holds must fail.
         let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1210,7 +1381,7 @@ mod tests {
         .unwrap();
         term.draw(|f| f.render_widget(Paragraph::new("hi"), f.area()))
             .unwrap();
-        let f = frame_json(&mut term, 2);
+        let f = frame_json(&mut term, 2, false);
         let v: serde_json::Value = serde_json::from_str(&f).unwrap();
         assert_eq!(v["w"], 10);
         assert_eq!(v["h"], 3);
