@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Overseer CLI: headless exec/JSONL mode first, TUI later"
 repository = "https://github.com/sirrayi/overseer"
+homepage = "https://github.com/sirrayi/overseer"
 
 [[bin]]
 name = "overseer"
