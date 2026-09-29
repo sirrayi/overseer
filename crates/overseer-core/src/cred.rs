@@ -12,15 +12,13 @@
 //! Reals are never serialized: `Credential::real` has no Serialize path,
 //! `Broker` has a redacting Debug, and scans redact spills before write.
 //!
-//! P6-4 adds the OAuth *shape* (no redirect server): consent `Grant`s with
-//! a window/scope/rate gate, a vault kind per credential, opaque 16-byte
-//! session handles for frontends, and the credential store — the OS
+//! P6-4 adds the OAuth *shape* (no redirect server): consent `Grant`s
+//! recorded for audit, a vault kind per credential, and the credential
+//! store — the OS
 //! keychain through a subprocess (one entry, prefetched) with an honest
 //! env fallback that also clears a stale entry.
 
-use std::collections::{HashMap, HashSet};
-
-use crate::perm::{Autonomy, Irreversibility};
+use std::collections::HashMap;
 
 /// Sentinel prefix — frozen contract (both branches, R2-F6).
 pub const SENTINEL_PREFIX: &str = "ovsent_";
@@ -65,45 +63,6 @@ impl VaultKind {
                 "cred: bad vault kind `{other}` — want password|oauth_token|session_handle"
             )),
         }
-    }
-}
-
-/// Opaque 16-byte handle to a vault entry (P6-4): what a frontend or GUI
-/// keychain bridge holds instead of the secret. Minted from a fresh
-/// nonce, so it cannot be recomputed from the secret and carries none of
-/// its bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionHandle([u8; 16]);
-
-impl SessionHandle {
-    /// Handle width — frozen at 16 bytes.
-    pub const BYTES: usize = 16;
-
-    /// Mint from a fresh uuid-v7 nonce plus the credential's public parts
-    /// (id + sentinel — never the real).
-    pub fn mint(id: &str, sentinel: &str) -> Self {
-        use sha2::{Digest, Sha256};
-        let nonce = uuid::Uuid::now_v7();
-        let mut h = Sha256::new();
-        h.update(b"overseer-session-handle-v1:");
-        h.update(nonce.as_bytes());
-        h.update(b":");
-        h.update(id.as_bytes());
-        h.update(b":");
-        h.update(sentinel.as_bytes());
-        let d = h.finalize();
-        let mut b = [0u8; 16];
-        b.copy_from_slice(&d[..16]);
-        SessionHandle(b)
-    }
-
-    pub fn bytes(&self) -> &[u8; 16] {
-        &self.0
-    }
-
-    /// Printable form: 32 lowercase hex chars.
-    pub fn as_hex(&self) -> String {
-        self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
@@ -167,13 +126,6 @@ impl Credential {
     pub fn with_kind(mut self, kind: VaultKind) -> Self {
         self.kind = kind;
         self
-    }
-
-    /// P6-4: an opaque handle for this credential — 16 bytes, no secret
-    /// material. A fresh nonce per call, so two mints never collide and
-    /// nothing about the real can be recovered from the handle.
-    pub fn session_handle(&self) -> SessionHandle {
-        SessionHandle::mint(&self.id, &self.sentinel)
     }
 
     /// Server-side only: the real secret. Marker-named so call sites
@@ -261,7 +213,7 @@ pub fn is_sentinel(s: &str) -> bool {
 #[derive(Default, Clone)]
 pub struct Broker {
     map: HashMap<String, Credential>,
-    /// Consent grants + rate state — the OAuth shape's bookkeeping.
+    /// Issued consent grants — the OAuth shape's audit record.
     grants: GrantBook,
 }
 
@@ -356,7 +308,7 @@ impl Broker {
         self.grants.grants()
     }
 
-    /// The grant gate's book (window/scope/rate state).
+    /// The issued-grant book (audit record; no enforcement state).
     pub fn grant_book(&self) -> &GrantBook {
         &self.grants
     }
@@ -388,10 +340,6 @@ impl Broker {
             let s = c.selector.as_str();
             !s.is_empty() && (cmd.contains(s) || cmd.contains(&format!("${s}")))
         })
-    }
-
-    pub fn sentinel_for_id(&self, id: &str) -> Option<&str> {
-        self.map.get(id).map(|c| c.sentinel.as_str())
     }
 
     pub fn get(&self, id: &str) -> Option<&Credential> {
@@ -431,75 +379,12 @@ pub struct Grant {
     pub approved_by: String,
 }
 
-impl Grant {
-    /// Window check: true while `now_ms` is inside the grant.
-    pub fn in_window(&self, now_ms: u64) -> bool {
-        self.expires_ms == 0 || now_ms < self.expires_ms
-    }
-
-    /// Scope check: exact membership. A grant means what it says — no
-    /// wildcards, no prefix matching.
-    pub fn covers(&self, scope: &str) -> bool {
-        self.scopes.iter().any(|s| s == scope)
-    }
-
-    /// The three checks `check_grant` runs, as one predicate.
-    pub fn valid_for(&self, client: &str, scope: &str, now_ms: u64) -> bool {
-        self.client == client && self.in_window(now_ms) && self.covers(scope)
-    }
-}
-
-/// What the grant gate decided.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GrantVerdict {
-    /// A valid grant covers this (client, scope) with rate budget left.
-    Allow,
-    /// Nothing granted and the class needs a human (Money/Identity) — the
-    /// caller asks. At most one Ask per grant key per session.
-    Ask { reason: String },
-    /// Refused: rate exceeded, autonomy=observe, or a Money/Identity call
-    /// whose single Ask already went unanswered.
-    Deny { reason: String },
-    /// No grant in play and no floor for this class — the caller's own
-    /// rules decide.
-    NotApplicable,
-}
-
-impl GrantVerdict {
-    /// True unless the verdict is an outright refusal.
-    pub fn proceeds(&self) -> bool {
-        matches!(self, GrantVerdict::Allow | GrantVerdict::NotApplicable)
-    }
-}
-
-/// Issued grants + the per-(client, scope) call-rate window. `check_grant`
-/// is the single entry point: window → scope → rate → the Money/Identity
-/// autonomy floor.
-#[derive(Debug, Clone)]
+/// Issued consent grants: recorded into manifest.json and emitted as
+/// `ConsentGranted` at session start.
+// DEFERRED(owner): grants are recorded for audit (manifest + ConsentGranted) but rate/window enforcement is unwired — restore from git history and wire into perm::Policy::gate when needed
+#[derive(Debug, Clone, Default)]
 pub struct GrantBook {
     grants: Vec<Grant>,
-    /// `client:scope` → call timestamps inside the window.
-    calls: HashMap<String, Vec<u64>>,
-    /// Grant keys already asked this session (one Ask per grant).
-    asked: HashSet<String>,
-    /// Max calls per window per key; 0 = unlimited.
-    pub rate_limit: usize,
-    /// Rate window length in ms.
-    pub rate_window_ms: u64,
-}
-
-impl Default for GrantBook {
-    fn default() -> Self {
-        // A grant is a narrow authority, not a blank cheque: 60 calls a
-        // minute per (client, scope) before the gate refuses.
-        GrantBook {
-            grants: Vec::new(),
-            calls: HashMap::new(),
-            asked: HashSet::new(),
-            rate_limit: 60,
-            rate_window_ms: 60_000,
-        }
-    }
 }
 
 impl GrantBook {
@@ -521,90 +406,6 @@ impl GrantBook {
 
     pub fn add(&mut self, grant: Grant) {
         self.grants.push(grant);
-    }
-
-    /// Drop expired grants. Housekeeping only — `check_grant` never needs
-    /// it (an expired grant simply doesn't match).
-    pub fn prune(&mut self, now_ms: u64) -> usize {
-        let before = self.grants.len();
-        self.grants.retain(|g| g.in_window(now_ms));
-        before - self.grants.len()
-    }
-
-    fn key(client: &str, scope: &str) -> String {
-        format!("{client}:{scope}")
-    }
-
-    /// Calls for `key` inside the window, pruning the ones that aged out.
-    fn rate_count(&mut self, key: &str, now_ms: u64) -> usize {
-        let window = self.rate_window_ms.max(1);
-        let v = self.calls.entry(key.to_string()).or_default();
-        v.retain(|t| now_ms.saturating_sub(*t) < window);
-        v.len()
-    }
-
-    fn record_call(&mut self, key: &str, now_ms: u64) {
-        self.calls.entry(key.to_string()).or_default().push(now_ms);
-    }
-
-    /// The one grant gate (P6-4). A valid grant in window with scope cover
-    /// allows and consumes rate budget; the window bounds repeats; a
-    /// Money/Identity call with no grant needs a human — asked at most
-    /// once per grant key, then refused rather than re-asked (fail-closed).
-    pub fn check_grant(
-        &mut self,
-        class: Irreversibility,
-        autonomy: Autonomy,
-        client: &str,
-        scope: &str,
-        now_ms: u64,
-    ) -> GrantVerdict {
-        let key = Self::key(client, scope);
-        let count = self.rate_count(&key, now_ms);
-        if self.rate_limit > 0 && count >= self.rate_limit {
-            return GrantVerdict::Deny {
-                reason: format!(
-                    "cred: rate limit — {count} calls for {key} inside {}ms (limit {})",
-                    self.rate_window_ms, self.rate_limit
-                ),
-            };
-        }
-        if self
-            .grants
-            .iter()
-            .any(|g| g.valid_for(client, scope, now_ms))
-        {
-            self.record_call(&key, now_ms);
-            return GrantVerdict::Allow;
-        }
-        // No usable grant (absent, expired, or out of scope). Only the
-        // Money/Identity classes have an autonomy floor here; every other
-        // class leaves the decision to the caller's own rules.
-        if !matches!(class, Irreversibility::Money | Irreversibility::Identity) {
-            return GrantVerdict::NotApplicable;
-        }
-        match autonomy {
-            Autonomy::Observe => GrantVerdict::Deny {
-                reason: format!("cred: autonomy=observe — {key} denied (class {class:?})"),
-            },
-            Autonomy::Suggest | Autonomy::ActWithApproval => {
-                if self.asked.contains(&key) {
-                    return GrantVerdict::Deny {
-                        reason: format!(
-                            "cred: {key} already asked once this session with no grant — denied"
-                        ),
-                    };
-                }
-                self.asked.insert(key.clone());
-                GrantVerdict::Ask {
-                    reason: format!(
-                        "cred: no consent grant for {key} (class {class:?}) — needs approval"
-                    ),
-                }
-            }
-            // The domain's own level already permits acting (P5-B ladder).
-            Autonomy::ActAndReport | Autonomy::ActSilently => GrantVerdict::NotApplicable,
-        }
     }
 }
 
@@ -884,18 +685,10 @@ pub struct StoreResolution {
     pub note: String,
 }
 
-/// Resolve the effective store, reading the env payload itself.
-/// `outcome` is the (possibly prefetched) keychain answer.
-pub fn resolve_store(
-    store: CredentialStore,
-    kc: &Keychain,
-    outcome: KeychainOutcome,
-) -> StoreResolution {
-    resolve_store_with(store, kc, outcome, env_payload())
-}
-
-/// Same, with the env payload supplied by the caller (it is read during
-/// the prefetch overlap, and tests pin it without touching process env).
+/// Resolve the effective store. `outcome` is the (possibly prefetched)
+/// keychain answer; the env payload is supplied by the caller (it is read
+/// during the prefetch overlap, and tests pin it without touching process
+/// env).
 ///
 /// `Env` never touches the keychain. `Keychain`/`Auto` without a usable
 /// entry fall back to the env — and a *stale* entry (corrupt, or holding
@@ -1395,178 +1188,10 @@ mod tests {
         assert_eq!(sanitize(&br, &clean), clean);
     }
 
-    // ---------- P6-4: grants, vault kinds, handles, store ----------
-
-    fn grant(client: &str, scopes: &[&str], expires_ms: u64) -> Grant {
-        Grant {
-            client: client.into(),
-            scopes: scopes.iter().map(|s| s.to_string()).collect(),
-            expires_ms,
-            actor: "user".into(),
-            approved_by: "user".into(),
-        }
-    }
+    // ---------- P6-4: grants, vault kinds, store ----------
 
     #[test]
-    fn grant_window_and_scope_are_enforced() {
-        let now = 1_000_000u64;
-        let mut book = GrantBook::new();
-        book.add(grant("gh", &["repo", "read"], now + 60_000));
-
-        // In window, in scope → allow.
-        assert_eq!(
-            book.check_grant(
-                Irreversibility::Identity,
-                Autonomy::ActWithApproval,
-                "gh",
-                "repo",
-                now
-            ),
-            GrantVerdict::Allow
-        );
-        // Out of scope → the Money/Identity floor asks (never an allow).
-        assert!(matches!(
-            book.check_grant(
-                Irreversibility::Identity,
-                Autonomy::ActWithApproval,
-                "gh",
-                "delete",
-                now
-            ),
-            GrantVerdict::Ask { .. }
-        ));
-        // Expired window → not usable either.
-        let mut expired = GrantBook::new();
-        expired.add(grant("gh", &["repo"], now - 1));
-        assert!(matches!(
-            expired.check_grant(
-                Irreversibility::Identity,
-                Autonomy::ActWithApproval,
-                "gh",
-                "repo",
-                now
-            ),
-            GrantVerdict::Ask { .. }
-        ));
-        // 0 = no expiry.
-        let mut forever = GrantBook::new();
-        forever.add(grant("gh", &["repo"], 0));
-        assert_eq!(
-            forever.check_grant(
-                Irreversibility::ExternalComms,
-                Autonomy::ActAndReport,
-                "gh",
-                "repo",
-                u64::MAX
-            ),
-            GrantVerdict::Allow
-        );
-        // Other client → no grant.
-        assert!(!grant("gh", &["repo"], 0).valid_for("other", "repo", now));
-    }
-
-    #[test]
-    fn grant_rate_limit_refuses_beyond_window_budget() {
-        let mut book = GrantBook::new();
-        book.rate_limit = 2;
-        book.rate_window_ms = 1_000;
-        book.add(grant("stripe", &["charge"], 0));
-        let t = 5_000u64;
-        for _ in 0..2 {
-            assert_eq!(
-                book.check_grant(
-                    Irreversibility::Money,
-                    Autonomy::ActWithApproval,
-                    "stripe",
-                    "charge",
-                    t
-                ),
-                GrantVerdict::Allow
-            );
-        }
-        let third = book.check_grant(
-            Irreversibility::Money,
-            Autonomy::ActWithApproval,
-            "stripe",
-            "charge",
-            t,
-        );
-        assert!(matches!(third, GrantVerdict::Deny { .. }), "{third:?}");
-        assert!(!third.proceeds());
-        // The window sliding forward frees budget again.
-        assert_eq!(
-            book.check_grant(
-                Irreversibility::Money,
-                Autonomy::ActWithApproval,
-                "stripe",
-                "charge",
-                t + 1_000
-            ),
-            GrantVerdict::Allow
-        );
-    }
-
-    #[test]
-    fn money_identity_ask_once_per_grant_then_refuse() {
-        let mut book = GrantBook::new();
-        let now = 42u64;
-        // First call: one Ask.
-        assert!(matches!(
-            book.check_grant(
-                Irreversibility::Money,
-                Autonomy::ActWithApproval,
-                "bank",
-                "transfer",
-                now
-            ),
-            GrantVerdict::Ask { .. }
-        ));
-        // Same grant key again: refused, not re-asked.
-        let second = book.check_grant(
-            Irreversibility::Money,
-            Autonomy::ActWithApproval,
-            "bank",
-            "transfer",
-            now,
-        );
-        assert!(matches!(second, GrantVerdict::Deny { .. }), "{second:?}");
-        // A different key still gets its own single Ask.
-        assert!(matches!(
-            book.check_grant(
-                Irreversibility::Identity,
-                Autonomy::Suggest,
-                "bank",
-                "publish",
-                now
-            ),
-            GrantVerdict::Ask { .. }
-        ));
-        // Observe refuses outright — no asking at all.
-        assert!(matches!(
-            book.check_grant(
-                Irreversibility::Identity,
-                Autonomy::Observe,
-                "bank",
-                "sign",
-                now
-            ),
-            GrantVerdict::Deny { .. }
-        ));
-        // Classes without a grant in play leave the decision to the ladder.
-        assert_eq!(
-            book.check_grant(
-                Irreversibility::ExternalComms,
-                Autonomy::ActWithApproval,
-                "net",
-                "get",
-                now
-            ),
-            GrantVerdict::NotApplicable
-        );
-    }
-
-    #[test]
-    fn vault_kind_round_trips_and_handle_is_opaque() {
+    fn vault_kind_round_trips() {
         assert_eq!(VaultKind::parse("oauth_token"), Ok(VaultKind::OAuthToken));
         assert_eq!(VaultKind::parse("Session"), Ok(VaultKind::SessionHandle));
         assert_eq!(VaultKind::parse("password"), Ok(VaultKind::Password));
@@ -1585,21 +1210,6 @@ mod tests {
         );
         let cred = br.get("gh").unwrap();
         assert_eq!(cred.kind, VaultKind::OAuthToken);
-
-        let h = cred.session_handle();
-        assert_eq!(h.bytes().len(), SessionHandle::BYTES);
-        assert_eq!(h.as_hex().len(), 32);
-        assert!(h.as_hex().chars().all(|c| c.is_ascii_hexdigit()));
-        // No secret bytes: neither the raw bytes nor any 8-byte window of
-        // the real appears in the handle.
-        let real = cred.real_secret().as_bytes();
-        let hb = h.bytes();
-        assert!(
-            !hb.windows(8).any(|w| real.windows(8).any(|r| r == w)),
-            "handle shares bytes with the secret"
-        );
-        // Fresh nonce per mint.
-        assert_ne!(h, cred.session_handle());
     }
 
     #[test]
