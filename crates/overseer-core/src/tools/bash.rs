@@ -148,67 +148,6 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     o
 }
 
-/// Split a shell command into pipeline stages on `|`, respecting single
-/// quotes, double quotes and backticks (a `|` inside any of the three
-/// never splits). A `\` quotes the next character outside single quotes.
-/// Stages are trimmed and empties dropped. This is a shape helper for
-/// pipeline analysis, not a shell parser: it knows nothing of `||`,
-/// `|&`, redirections or nesting. Pure function of `cmd`; `run` and
-/// `wrap_command` are untouched by it.
-pub fn split_pipeline(cmd: &str) -> Vec<String> {
-    let mut stages = Vec::new();
-    let mut cur = String::new();
-    let mut single = false;
-    let mut double = false;
-    let mut backtick = false;
-    let mut chars = cmd.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' && !single {
-            cur.push(c);
-            if let Some(n) = chars.next() {
-                cur.push(n);
-            }
-            continue;
-        }
-        match c {
-            '\'' if !double && !backtick => single = !single,
-            '"' if !single && !backtick => double = !double,
-            '`' if !single && !double => backtick = !backtick,
-            '|' if !single && !double && !backtick => {
-                let stage = cur.trim().to_string();
-                if !stage.is_empty() {
-                    stages.push(stage);
-                }
-                cur.clear();
-                continue;
-            }
-            _ => {}
-        }
-        cur.push(c);
-    }
-    let tail = cur.trim().to_string();
-    if !tail.is_empty() {
-        stages.push(tail);
-    }
-    stages
-}
-
-/// Middle-truncate tool output to `cap` chars (char-safe, never bytes),
-/// keeping head and tail around an explicit `…[trimmed N chars]…` marker
-/// (`N` is always `chars − cap`). Within `cap` returns whole. A twin of
-/// `super::middle_truncate` with a marker that names the dropped count;
-/// pure function of its inputs.
-pub fn shape_trim(output: &str, cap: usize) -> String {
-    let n = output.chars().count();
-    if n <= cap {
-        return output.to_string();
-    }
-    let half = cap / 2;
-    let head: String = output.chars().take(half).collect();
-    let tail: String = output.chars().skip(n - half).collect();
-    format!("{head}\n…[trimmed {} chars]…\n{tail}", n - cap)
-}
-
 /// Declared broker secrets as (selector, real) env pairs for the child.
 /// Empty without a broker — the allowlisted env above is untouched.
 fn broker_env(ctx: &ToolCtx) -> Vec<(String, String)> {
@@ -267,7 +206,7 @@ pub(crate) fn sandboxed(argv: &[String], ctx: &ToolCtx) -> Result<Invocation, St
         .and_then(|c| c.sandbox_runtime.as_deref())
     {
         Some(requested) => pinned_argv(requested, argv, ctx)?,
-        None => wrap_argv(argv, ctx),
+        None => wrap_argv(argv, ctx)?,
     };
     let network_denied = argv.first() != Some(&program);
     Ok(Invocation {
@@ -296,13 +235,17 @@ fn unwrapped(argv: &[String], note: Option<String>) -> (String, Vec<String>, Opt
 /// or no backend exists (with an honest note so the model/user can see it).
 #[cfg(test)]
 fn wrap_command(command: &str, ctx: &ToolCtx) -> (String, Vec<String>, Option<String>) {
-    wrap_argv(&sh_argv(command), ctx)
+    wrap_argv(&sh_argv(command), ctx).expect("the platform sandbox wraps")
 }
 
-/// [`wrap_command`] for an arbitrary argv.
-fn wrap_argv(argv: &[String], ctx: &ToolCtx) -> (String, Vec<String>, Option<String>) {
+/// [`wrap_command`] for an arbitrary argv. Errors only when a present
+/// backend cannot build a safe profile (fail closed, never unsandboxed).
+fn wrap_argv(
+    argv: &[String],
+    ctx: &ToolCtx,
+) -> Result<(String, Vec<String>, Option<String>), String> {
     if !ctx.sandbox {
-        return unwrapped(argv, None);
+        return Ok(unwrapped(argv, None));
     }
     #[cfg(target_os = "macos")]
     if let Some(inv) = seatbelt_invocation(argv, ctx) {
@@ -310,27 +253,28 @@ fn wrap_argv(argv: &[String], ctx: &ToolCtx) -> (String, Vec<String>, Option<Str
     }
     #[cfg(target_os = "linux")]
     if let Some(inv) = bubblewrap_invocation(argv, ctx) {
-        return inv;
+        return Ok(inv);
     }
-    unwrapped(
+    Ok(unwrapped(
         argv,
         Some("no sandbox backend (sandbox-exec/bwrap) — ran unsandboxed".into()),
-    )
+    ))
 }
 
-/// The macOS seatbelt invocation, or `None` when sandbox-exec is absent.
-/// One builder for both the platform default path and the pinned
-/// `--runtime seatbelt` path, so the two can never drift.
+/// The macOS seatbelt invocation, or `None` when sandbox-exec is absent
+/// (`Some(Err)` when the profile cannot be built safely). One builder for
+/// both the platform default path and the pinned `--runtime seatbelt`
+/// path, so the two can never drift.
 #[cfg(target_os = "macos")]
 fn seatbelt_invocation(
     argv: &[String],
     ctx: &ToolCtx,
-) -> Option<(String, Vec<String>, Option<String>)> {
+) -> Option<Result<(String, Vec<String>, Option<String>), String>> {
     let exe = "/usr/bin/sandbox-exec";
     std::path::Path::new(exe).exists().then(|| {
-        let mut args = vec!["-p".to_string(), macos_profile(&ctx.cwd)];
+        let mut args = vec!["-p".to_string(), macos_profile(&ctx.cwd)?];
         args.extend(argv.iter().cloned());
-        (exe.into(), args, None)
+        Ok((exe.into(), args, None))
     })
 }
 
@@ -368,18 +312,68 @@ fn bubblewrap_invocation(
     Some(("bwrap".into(), args, None))
 }
 
-/// macOS Seatbelt profile for `sandbox-exec -p` (P1.5): deny-by-default,
-/// exec/read freely, writes only to the workspace + temp dirs, network
-/// fully denied (deny overrides allow regardless of order). Secret dirs
-/// are read-denied on top of the broad read allow. Egress stays deny-all:
-/// the Phase-C gate (`backends::allowlist_match` + `is_public_ip_literal`)
-/// decides *which* domains a future loopback CONNECT/SOCKS5 proxy may dial.
-// DEFERRED(owner): loopback CONNECT+SOCKS5 proxy + per-session token — matcher lands now, proxy needs runtime.
+/// macOS Seatbelt profile for `sandbox-exec -p` (P1.5) for `cwd`, the
+/// session HOME and the canonical per-user temp dir — see
+/// [`seatbelt_profile`].
 #[cfg(target_os = "macos")]
-fn macos_profile(cwd: &std::path::Path) -> String {
+fn macos_profile(cwd: &std::path::Path) -> Result<String, String> {
     let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!(
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let tmp = std::env::temp_dir();
+    let tmp = tmp.canonicalize().unwrap_or(tmp);
+    seatbelt_profile(&home, &root, &tmp)
+}
+
+/// The SBPL profile (pure, built on every platform so its tests run
+/// anywhere): deny-by-default, exec/read freely, writes only to the
+/// workspace `root`, `/private/tmp`, the per-user temp dir `tmp` (under
+/// `/private/var/folders/…` on macOS — never all of `/private/var`) and
+/// `/dev/null`/`/dev/tty`; network fully denied (deny overrides allow
+/// regardless of order). Secret dirs under `home` are read-denied on top
+/// of the broad read allow.
+///
+/// Paths are SBPL string literals: `\` and `"` are escaped, and a path
+/// that is not UTF-8 or carries a control character is refused, as is a
+/// `tmp` so broad it would reopen `/private/var`.
+// DEFERRED(owner): loopback CONNECT+SOCKS5 proxy + per-session token — egress stays deny-all until a proxy runtime exists.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn seatbelt_profile(
+    home: &std::path::Path,
+    root: &std::path::Path,
+    tmp: &std::path::Path,
+) -> Result<String, String> {
+    let lit = |p: &std::path::Path, what: &str| -> Result<String, String> {
+        let s = p.to_str().ok_or_else(|| {
+            format!(
+                "bash: seatbelt profile — the {what} path {} is not UTF-8",
+                p.display()
+            )
+        })?;
+        if s.chars().any(char::is_control) {
+            return Err(format!(
+                "bash: seatbelt profile — the {what} path {s:?} contains a control character"
+            ));
+        }
+        Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
+    };
+    let tmp_str = tmp.to_str().unwrap_or("");
+    if matches!(
+        tmp_str.trim_end_matches('/'),
+        "" | "/private" | "/private/var" | "/var"
+    ) {
+        return Err(format!(
+            "bash: seatbelt profile — the temp dir {} is too broad to be writable",
+            tmp.display()
+        ));
+    }
+    let (home, root, tmp) = (
+        lit(home, "HOME")?,
+        lit(root, "workspace")?,
+        lit(tmp, "temp")?,
+    );
+    Ok(format!(
         "(version 1)\n\
          (deny default)\n\
          (allow process-exec process-fork)\n\
@@ -388,13 +382,11 @@ fn macos_profile(cwd: &std::path::Path) -> String {
          (allow sysctl-read mach-lookup ipc-posix-shm)\n\
          (allow file-read*)\n\
          (allow file-write* (subpath \"{root}\") (subpath \"/private/tmp\") \
-         (subpath \"/private/var\") (literal \"/dev/null\") (literal \"/dev/tty\"))\n\
+         (subpath \"{tmp}\") (literal \"/dev/null\") (literal \"/dev/tty\"))\n\
          (deny file-read* (subpath \"{home}/.ssh\") (subpath \"{home}/.aws\") \
          (subpath \"{home}/.gnupg\") (subpath \"{home}/.kube\") (subpath \"{home}/.docker\"))\n\
-         (deny network*)\n",
-        root = root.display(),
-        home = home
-    )
+         (deny network*)\n"
+    ))
 }
 
 /// The pinned-runtime path (P8-C `--runtime`): build the invocation for the
@@ -434,10 +426,12 @@ fn pinned_argv(
         crate::backends::SandboxRuntime::Seatbelt => {
             #[cfg(target_os = "macos")]
             {
-                seatbelt_invocation(argv, ctx).ok_or_else(|| {
-                    "bash: --runtime seatbelt needs /usr/bin/sandbox-exec, which is not present \
-                     on this host — drop --runtime or pass --runtime native"
-                        .to_string()
+                seatbelt_invocation(argv, ctx).unwrap_or_else(|| {
+                    Err(
+                        "bash: --runtime seatbelt needs /usr/bin/sandbox-exec, which is not \
+                         present on this host — drop --runtime or pass --runtime native"
+                            .to_string(),
+                    )
                 })
             }
             #[cfg(not(target_os = "macos"))]
@@ -513,6 +507,7 @@ mod tests {
     use super::*;
     use crate::perm::Policy;
     use crate::tools::{ToolCtx, ToolRegistry};
+    use std::path::Path;
 
     fn ctx(dir: &std::path::Path, sandbox: bool) -> ToolCtx<'_> {
         ToolCtx {
@@ -731,34 +726,51 @@ mod tests {
     }
 
     #[test]
-    fn split_pipeline_splits_bare_pipes_trims_and_drops_empties() {
-        assert_eq!(split_pipeline("a | b | c"), vec!["a", "b", "c"]);
-        assert_eq!(split_pipeline("  a||b |  "), vec!["a", "b"]);
-        assert_eq!(split_pipeline("single"), vec!["single"]);
-        assert!(split_pipeline("  |  ").is_empty());
+    fn seatbelt_profile_writes_only_workspace_and_per_user_temp() {
+        let p = seatbelt_profile(
+            Path::new("/Users/me"),
+            Path::new("/Users/me/ws"),
+            Path::new("/private/var/folders/ab/cd/T"),
+        )
+        .unwrap();
+        assert!(p.contains(r#"(subpath "/Users/me/ws")"#), "{p}");
+        assert!(
+            p.contains(r#"(subpath "/private/var/folders/ab/cd/T")"#),
+            "{p}"
+        );
+        assert!(p.contains(r#"(subpath "/private/tmp")"#), "{p}");
+        assert!(!p.contains(r#"(subpath "/private/var")"#), "{p}");
+        assert!(p.contains(r#"(subpath "/Users/me/.ssh")"#), "{p}");
+        assert!(p.contains("(deny network*)"));
     }
 
     #[test]
-    fn split_pipeline_respects_quotes_backticks_and_escapes() {
-        assert_eq!(
-            split_pipeline(r#"echo 'a|b' | grep "x|y""#),
-            vec!["echo 'a|b'", r#"grep "x|y""#]
+    fn seatbelt_profile_escapes_quotes_and_backslashes() {
+        let p = seatbelt_profile(
+            Path::new(r"/Users/a\b"),
+            Path::new(r#"/ws/x") (allow file-write* (subpath "/"#),
+            Path::new("/private/var/folders/ab/cd/T"),
+        )
+        .unwrap();
+        assert!(p.contains(r#"(subpath "/Users/a\\b/.ssh")"#), "{p}");
+        assert!(
+            p.contains(r#"(subpath "/ws/x\") (allow file-write* (subpath \"/")"#),
+            "{p}"
         );
-        assert_eq!(
-            split_pipeline("echo `a|b` | wc -l"),
-            vec!["echo `a|b`", "wc -l"]
+        assert!(
+            !p.contains(r#"(subpath "/")"#),
+            "injected rule survived: {p}"
         );
-        // A backslash quotes the pipe outside single quotes.
-        assert_eq!(split_pipeline(r"echo a\|b | c"), vec![r"echo a\|b", "c"]);
     }
 
     #[test]
-    fn shape_trim_keeps_head_and_tail_around_a_counted_marker() {
-        assert_eq!(shape_trim("abc", 10), "abc");
-        let out = shape_trim("abcdefghij", 4);
-        assert_eq!(out, "ab\n…[trimmed 6 chars]…\nij");
-        // The dropped count is chars, not bytes: six `é` minus cap 2.
-        let out = shape_trim("éééééé", 2);
-        assert_eq!(out, "é\n…[trimmed 4 chars]…\né");
+    fn seatbelt_profile_refuses_control_chars_and_broad_temp_dirs() {
+        let home = Path::new("/Users/me");
+        let tmp = Path::new("/private/var/folders/ab/cd/T");
+        assert!(seatbelt_profile(home, Path::new("/ws/a\nb"), tmp).is_err());
+        for broad in ["/", "/private", "/private/var", "/var"] {
+            let err = seatbelt_profile(home, Path::new("/ws"), Path::new(broad)).unwrap_err();
+            assert!(err.contains("temp"), "{broad}: {err}");
+        }
     }
 }
