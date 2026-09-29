@@ -218,6 +218,7 @@ pub fn run_line(mut cfg: TuiConfig) -> std::io::Result<i32> {
         rrx.recv().unwrap_or(AskDecision::Deny)
     })));
 
+    let cwd = cfg.agent.cwd.display().to_string();
     let worker = spawn_worker(cfg, engine_tx, cmd_rx);
     std::thread::spawn(move || {
         for line in std::io::stdin().lines() {
@@ -287,7 +288,7 @@ pub fn run_line(mut cfg: TuiConfig) -> std::io::Result<i32> {
                 } else if line == "/quit" || line == "/exit" {
                     break;
                 } else if let Some(cmd) = line.strip_prefix('!') {
-                    let (code, out) = app::line_shell(cmd.trim());
+                    let (code, out) = app::line_shell(cmd.trim(), &cwd);
                     println!("{out}(exit {code})");
                 } else if !line.is_empty() {
                     if let Some(c) = &control {
@@ -416,8 +417,18 @@ fn drive(
 /// Suspend the TUI, run $VISUAL/$EDITOR (fallback `vi`) on a temp file
 /// seeded with `draft`, reinstall the result as the composer buffer.
 fn edit_in_editor(draft: String, app: &mut App) -> std::io::Result<()> {
-    let file = std::env::temp_dir().join(format!("overseer-draft-{}.md", std::process::id()));
-    std::fs::write(&file, &draft)?;
+    // Unpredictable name + create_new + 0600 — a predictable
+    // `overseer-draft-{pid}.md` in the shared temp dir is a symlink/
+    // squat target.
+    let file = std::env::temp_dir().join(format!("overseer-draft-{}.md", draft_suffix()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(&file)?.write_all(draft.as_bytes())?;
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
@@ -467,4 +478,21 @@ fn edit_in_editor(draft: String, app: &mut App) -> std::io::Result<()> {
     }
     let _ = std::fs::remove_file(&file);
     Ok(())
+}
+
+/// `/dev/urandom` when it exists, nanos otherwise — enough entropy to
+/// keep the draft filename unguessable.
+fn draft_suffix() -> String {
+    let mut raw = [0u8; 8];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut raw))
+        .is_ok()
+    {
+        return raw.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}")
 }

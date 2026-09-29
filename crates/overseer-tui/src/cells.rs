@@ -248,7 +248,7 @@ fn truncate(s: &str, n: usize) -> String {
 
 /// Reduce one engine event to zero or more cells. ToolCallStart/ToolResult
 /// merge into a single Tool cell — `feed` returns the cell to insert or a
-/// mutation of an existing one via `ToolUpdate`.
+/// mutation of an existing one via `Feed::ToolDone`.
 pub enum Feed {
     NewCells(Vec<Cell>),
     /// Finalize a running tool cell in place (matched by call id).

@@ -1,18 +1,20 @@
 //! Semantic style tokens (P2.8): one palette, no raw ANSI scattered
 //! through widgets. The active palette is chosen once at startup —
 //! `Theme::detect` maps capabilities + env to a variant — and read via
-//! the accessor functions below. 4-bit-ANSI-safe hues in the default
-//! palette: user-remappable terminal colors are an a11y feature.
+//! the accessor functions below. Most hues are 4-bit-ANSI-safe —
+//! user-remappable terminal colors are an a11y feature; the three
+//! truecolor accents (`user`/`prompt`/`user_bg`) fall back to ANSI-16
+//! via `Theme::ansi` on terminals without truecolor/256 support.
 //!
 //! Selection: `OVERSEER_THEME=mono|default|high-contrast` wins, then
-//! `caps.color == Mono` (NO_COLOR / TERM=dumb) forces `mono`.
+//! `caps.color` — `Mono` (NO_COLOR / TERM=dumb) forces `mono`,
+//! `Ansi16` gets `ansi`, 256/truecolor get `default`.
 
 use ratatui::style::{Color, Modifier, Style};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     pub user: Style,
-    pub assistant: Style,
     pub dim: Style,
     pub reasoning: Style,
     pub tool: Style,
@@ -37,11 +39,12 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// The shipped palette — ANSI-16 hues only.
+    /// The shipped palette. `user`/`prompt`/`user_bg` are truecolor
+    /// accents — detect() only picks this for truecolor/256 terminals;
+    /// `ansi` substitutes the nearest ANSI-16 colors below that.
     pub const fn default() -> Self {
         Theme {
             user: Style::new().fg(Color::Rgb(255, 255, 255)),
-            assistant: Style::new(),
             dim: Style::new().fg(Color::DarkGray),
             reasoning: Style::new().fg(Color::DarkGray),
             tool: Style::new().fg(Color::Yellow),
@@ -79,11 +82,20 @@ impl Theme {
         }
     }
 
+    /// 16-colour terminals: the default palette with the truecolor
+    /// accents swapped for their nearest ANSI-16 colors.
+    pub const fn ansi() -> Self {
+        let mut t = Theme::default();
+        t.user = Style::new().fg(Color::White);
+        t.prompt = Style::new().fg(Color::White);
+        t.user_bg = Style::new().bg(Color::DarkGray);
+        t
+    }
+
     /// NO_COLOR / screen readers: every token is plain default style.
     pub const fn mono() -> Self {
         Theme {
             user: Style::new(),
-            assistant: Style::new(),
             dim: Style::new(),
             reasoning: Style::new(),
             tool: Style::new(),
@@ -135,10 +147,10 @@ impl Theme {
             Ok("default") => return Theme::default(),
             _ => {}
         }
-        if caps.color == crate::probe::ColorDepth::Mono {
-            Theme::mono()
-        } else {
-            Theme::default()
+        match caps.color {
+            crate::probe::ColorDepth::Mono => Theme::mono(),
+            crate::probe::ColorDepth::Ansi16 => Theme::ansi(),
+            _ => Theme::default(),
         }
     }
 }
@@ -162,7 +174,46 @@ macro_rules! accessors {
 }
 
 accessors! {
-    user, assistant, dim, reasoning, tool, tool_ok, tool_err, meta, error,
+    user, dim, reasoning, tool, tool_ok, tool_err, meta, error,
     badge, badge_plan, badge_ro, status, spinner, queue, dialog, dialog_key,
     dialog_sel, code, prompt, link, user_bg,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe::{Caps, ColorDepth};
+
+    #[test]
+    fn ansi_falls_back_from_rgb_accents() {
+        let ansi = Theme::ansi();
+        assert_eq!(ansi.user.fg, Some(Color::White));
+        assert_eq!(ansi.prompt.fg, Some(Color::White));
+        assert_eq!(ansi.user_bg.bg, Some(Color::DarkGray));
+
+        let tc = Theme::default();
+        assert_eq!(tc.user.fg, Some(Color::Rgb(255, 255, 255)));
+        assert_eq!(tc.user_bg.bg, Some(Color::Rgb(38, 42, 54)));
+
+        let mono = Theme::mono();
+        assert_eq!(mono.user.fg, None);
+        assert_eq!(mono.user_bg.bg, None);
+    }
+
+    #[test]
+    fn detect_maps_depth_to_palette() {
+        let caps = |color| Caps {
+            color,
+            ..Caps::default()
+        };
+        // Only when OVERSEER_THEME isn't overriding — env wins above.
+        std::env::remove_var("OVERSEER_THEME");
+        assert_eq!(Theme::detect(&caps(ColorDepth::Mono)), Theme::mono());
+        assert_eq!(Theme::detect(&caps(ColorDepth::Ansi16)), Theme::ansi());
+        assert_eq!(Theme::detect(&caps(ColorDepth::Ansi256)), Theme::default());
+        assert_eq!(
+            Theme::detect(&caps(ColorDepth::TrueColor)),
+            Theme::default()
+        );
+    }
 }
