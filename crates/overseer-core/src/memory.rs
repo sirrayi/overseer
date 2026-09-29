@@ -3,8 +3,9 @@
 //! `/memory/` is a directory of topic files the agent edits with ordinary
 //! file tools — no special memory tool (the playbook's minimal option).
 //! `INDEX.md` is a ≤25KB file of one-line pointers, injected at the *end of
-//! the static prompt region* every turn: the index is always in context,
-//! the topic files are read on demand (progressive disclosure).
+//! the static prompt region* (assembled once per session): the index is
+//! always in context, the topic files are read on demand (progressive
+//! disclosure).
 //!
 //! The dir is git-versioned (Letta MemFS): free history, diffs, rollback.
 //! Commits are engine-made at turn boundaries, not model actions.
@@ -445,14 +446,6 @@ pub fn ensure(dir: &Path) -> std::io::Result<PathBuf> {
     Ok(idx)
 }
 
-/// The system-prompt segment carrying the index — sits at the end of the
-/// static region (Invariant 2): stable bytes when the index is unchanged,
-/// and an edit only invalidates cache from this segment onward.
-/// Re-read every turn because the model may have just edited it. An index
-/// over the cap is truncated *with a repair note* — never silently.
-/// True when an INDEX pointer line names a quarantine proposal: unreviewed
-/// untrusted text (RT-3). Proposals stay on disk for human review but are
-/// never injected into the trusted memory segment.
 /// `valid_to` expiry: the stored instant is strictly before now. Compared
 /// as epoch seconds so `Z` and `±HH:MM` stamps order by the instant they
 /// name, not by their spelling. An unparseable stamp reads as not expired
@@ -654,11 +647,22 @@ fn pointer_live(dir: &Path, line: &str) -> bool {
     true
 }
 
+/// True when an INDEX pointer line names a quarantine proposal: unreviewed
+/// untrusted text (RT-3). Proposals stay on disk for human review but are
+/// never injected into the trusted memory segment.
 fn is_proposal_pointer(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with("proposals/") || t.contains("proposals/")
 }
 
+/// The system-prompt segment carrying the index — sits at the end of the
+/// static region (Invariant 2): stable bytes when the index is unchanged,
+/// and an edit only invalidates cache from this segment onward. Proposal
+/// pointers and expired/superseded pointers are filtered out. Assembled
+/// once per session; mid-session edits apply from the next session/resume.
+/// An index over the cap is truncated *with a repair note* — never
+/// silently. The dir is named relative to the workspace (see
+/// `prompt_path`) so the cached prefix carries no machine-specific path.
 pub fn index_segment(dir: &Path) -> String {
     let idx = dir.join(INDEX_NAME);
     let text = std::fs::read_to_string(&idx).unwrap_or_default();
@@ -689,9 +693,43 @@ pub fn index_segment(dir: &Path) -> String {
          `{}/` is your persistent memory — read and update it with ordinary \
          file tools. {INDEX_NAME} holds one-line pointers (≤25KB); details \
          live in topic files you create there.\n\n{ROUTING_HINT}\n\n{body}{note}\n\n{MEMORY_LEGEND}{core}",
-        dir.display(),
+        prompt_path(dir),
         core = core_block(dir)
     )
+}
+
+/// `dir` as the prompt names it: relative to the workspace (the process
+/// cwd) when inside it, else `~`-relative when under `$HOME`, else as-is.
+fn prompt_path(dir: &Path) -> String {
+    let cwd = std::env::current_dir().ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    relative_display(dir, cwd.as_deref(), home.as_deref())
+}
+
+fn relative_display(dir: &Path, cwd: Option<&Path>, home: Option<&Path>) -> String {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let under = |base: &Path| -> Option<PathBuf> {
+        dir.strip_prefix(base)
+            .map(Path::to_path_buf)
+            .or_else(|_| canon(dir).strip_prefix(canon(base)).map(Path::to_path_buf))
+            .ok()
+    };
+    if let Some(rel) = cwd.and_then(under) {
+        return if rel.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            rel.display().to_string()
+        };
+    }
+    let home = home.filter(|h| h.is_absolute() && h.parent().is_some());
+    if let Some(rel) = home.and_then(under) {
+        return if rel.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rel.display())
+        };
+    }
+    dir.display().to_string()
 }
 
 /// The resident core block (Letta `CORE.md`): the always-in-context handful
@@ -2009,6 +2047,38 @@ mod tests {
         let seg = index_segment(&dir);
         assert!(seg.contains("exceeds 25KB"));
         assert!(seg.len() < INDEX_CAP + 1_000);
+    }
+
+    #[test]
+    fn segment_names_the_dir_without_absolute_machine_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = cwd.join(format!(".overseer-mem-test-{}", uuid::Uuid::now_v7()));
+        ensure(&dir).unwrap();
+        let seg = index_segment(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let rel = dir.file_name().unwrap().to_string_lossy().to_string();
+        assert!(seg.contains(&format!("`{rel}/`")), "{seg}");
+        assert!(!seg.contains(&cwd.display().to_string()), "{seg}");
+        if let Some(home) = std::env::var_os("HOME").filter(|h| h.len() > 1) {
+            let home = PathBuf::from(home).display().to_string();
+            assert!(!seg.contains(&home), "absolute home path leaked: {seg}");
+        }
+    }
+
+    #[test]
+    fn relative_display_prefers_workspace_then_home() {
+        let cwd = Path::new("/w/proj");
+        let home = Path::new("/h/me");
+        let show = |d: &str| relative_display(Path::new(d), Some(cwd), Some(home));
+        assert_eq!(show("/w/proj/memory"), "memory");
+        assert_eq!(show("/w/proj"), ".");
+        assert_eq!(show("/h/me/.overseer/memory"), "~/.overseer/memory");
+        assert_eq!(show("/srv/mem"), "/srv/mem");
+        assert_eq!(
+            relative_display(Path::new("/x"), None, Some(Path::new("/"))),
+            "/x",
+            "a root HOME is no prefix"
+        );
     }
 
     #[test]
