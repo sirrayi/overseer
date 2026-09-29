@@ -101,7 +101,7 @@ pub fn assemble(config: &AgentConfig) -> Vec<SystemSegment> {
     // configured AND the tool is resident (an ablated arm must not advertise
     // a tool the model cannot call — same rule as `task`/`computer`). Sorted
     // names: the config's own order must not move a byte of the prefix.
-    // `// DEFERRED(owner): a TUI `/mcp` panel (browse connected servers, toggle trust per server, see spawn failures live) — needs the frontend state machine to own MCP session state — gate: TUI panel work.`
+    // DEFERRED(owner): a TUI `/mcp` panel (browse connected servers, toggle trust per server, see spawn failures live) — needs the frontend state machine to own MCP session state — gate: TUI panel work.
     if !config.mcp_servers.is_empty() && !config.disabled_tools.iter().any(|t| t == "mcp") {
         let mut names: Vec<&str> = config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
         names.sort_unstable();
@@ -161,6 +161,7 @@ fn seg(name: &'static str, text: &str) -> SystemSegment {
 /// (one per problem, naming the segment) — `assemble` never mutates on the
 /// strength of one, because a lint that silently rewrites the prompt is a
 /// worse failure mode than the leak it prevents.
+#[cfg(test)]
 pub fn hygiene_lint(segments: &[SystemSegment]) -> Vec<String> {
     let mut findings = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -197,6 +198,7 @@ pub fn hygiene_lint(segments: &[SystemSegment]) -> Vec<String> {
 }
 
 /// `YYYY-MM-DD` anywhere (the shape every "today is …" leak takes).
+#[cfg(test)]
 fn has_date(text: &str) -> bool {
     let b = text.as_bytes();
     let mut i = 0usize;
@@ -217,6 +219,7 @@ fn has_date(text: &str) -> bool {
 
 /// `/Users/<name>`, `/home/<name>`, or `C:\Users\<name>` — a machine-specific
 /// path, as opposed to the deliberate `<cwd>/memory` style placeholder.
+#[cfg(test)]
 fn has_user_path(text: &str) -> bool {
     for (marker, sep) in [("/Users/", '/'), ("/home/", '/'), (r"C:\Users\", '\\')] {
         if let Some(idx) = text.find(marker) {
@@ -239,8 +242,9 @@ fn has_user_path(text: &str) -> bool {
 pub const ORDER: &[&str] = &[
     "identity", "contract", "safety", "memory", "skills", "mcp", "persona", "computer",
 ];
-/// Boundary lint used by tests and future assemblers: every cacheable
-/// segment must precede every non-cacheable one.
+/// Boundary lint used by tests: every cacheable segment must precede
+/// every non-cacheable one.
+#[cfg(test)]
 pub fn boundary_ok(segments: &[SystemSegment]) -> bool {
     // Cacheable-before-dynamic boundary.
     let mut dynamic_seen = false;
@@ -571,7 +575,10 @@ mod tests {
             .join("\n\n");
         let chars = text.chars().count();
         let tokens = crate::tokens::count_tokens(&text, &cfg.model);
-        eprintln!("K7 static prompt: {chars} chars, ~{tokens} tokens ({})", cfg.model);
+        eprintln!(
+            "K7 static prompt: {chars} chars, ~{tokens} tokens ({})",
+            cfg.model
+        );
         assert!(
             chars * 100 <= BASELINE_CHARS * 105,
             "static prompt grew to {chars} chars (baseline {BASELINE_CHARS} + 5%)"

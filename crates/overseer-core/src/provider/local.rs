@@ -13,19 +13,12 @@
 //! backend that only *accepts* `response_format` would return free text).
 //!
 //! The ollama probe is the lifecycle half: before routing to a local model,
-//! ask whether the daemon is up and which models it holds. It fails open
-//! (`Unavailable`) — a probe must never be the reason a turn dies — and its
-//! parser is pure, so the "is it up?" decision is testable without a server.
-//! `// DEFERRED(owner): managed server lifecycle (start/stop/health-watch for
-//! llama-server, mlx_lm.server and outlines serve) — this batch points at an
-//! already-running server; process supervision belongs with the ops surface,
-//! not the engine. CLI/provider-selection wiring for the local backends
-//! (`--backend outlines`, port flags) is likewise still open — the naming,
-//! ports, routing facts and probe land here; the flag rides the CLI work.
-//! CUDA-only stacks (TabbyAPI/EXL2, TensorRT-LLM) stay PARKed: no weights,
-//! no servers, docs-only discipline.`
+//! ask whether the daemon is up and which models it holds. Its parser
+//! (`parse_tags`) is pure and fails open (`Unavailable`) — a probe must
+//! never be the reason a turn dies — so the "is it up?" decision is
+//! testable without a server.
 
-use std::time::Duration;
+// DEFERRED(owner): managed server lifecycle (start/stop/health-watch for llama-server, mlx_lm.server and outlines serve) — this batch points at an already-running server; process supervision belongs with the ops surface, not the engine. CLI/provider-selection wiring for the local backends (`--backend outlines`, port flags) and the live ollama HTTP probe (removed as dead code; `parse_tags` is its pure half) are likewise still open — gate: the CLI work. CUDA-only stacks (TabbyAPI/EXL2, TensorRT-LLM) stay PARKed: no weights, no servers, docs-only discipline.
 
 use serde_json::Value;
 
@@ -257,26 +250,6 @@ pub fn parse_tags(tags_body: &str, version_body: Option<&str>) -> OllamaProbe {
     }
 }
 
-/// Ask a live daemon. Every failure mode (connection refused, timeout,
-/// garbage) is `Unavailable` — the probe reports, it never propagates.
-pub fn probe_ollama(port: u16) -> OllamaProbe {
-    let get = |path: &str| -> Option<String> {
-        let url = format!("{}{path}", ollama_base_url(port));
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_millis(1_500)))
-            .build();
-        let agent = ureq::Agent::new_with_config(agent);
-        match agent.get(&url).call() {
-            Ok(mut resp) => resp.body_mut().read_to_string().ok(),
-            Err(_) => None,
-        }
-    };
-    match get("/api/tags") {
-        Some(tags) => parse_tags(&tags, get("/api/version").as_deref()),
-        None => OllamaProbe::unavailable(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,12 +362,5 @@ mod tests {
             assert!(!p.is_running());
         }
         assert_eq!(ollama_base_url(OLLAMA_PORT), "http://127.0.0.1:11434");
-    }
-
-    #[test]
-    fn probing_a_closed_port_reports_unavailable() {
-        // Port 1 has nothing on it: the probe must report, not panic.
-        let p = probe_ollama(1);
-        assert_eq!(p.state, ProbeState::Unavailable);
     }
 }

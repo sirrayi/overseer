@@ -346,7 +346,8 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Rehydrate-check used by tests and the worker's post-fork resume.
+/// Rehydrate-check used by tests.
+#[cfg(test)]
 pub fn event_count(session_dir: &Path) -> usize {
     EventLog::replay(session_dir.join("events.jsonl"))
         .map(|e| e.len())

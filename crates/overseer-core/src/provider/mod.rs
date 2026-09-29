@@ -13,11 +13,6 @@ pub mod local;
 pub mod openai;
 pub mod responses;
 
-/// Native-compaction seam, defined in [`crate::compact`]: adapters opt in
-/// via `NativeCompaction`; routing gates on `provider_compact_capability`.
-/// Re-export only — no existing item touched.
-pub use crate::compact::{provider_compact_capability, NativeCompaction};
-
 /// Coerce a wire tool-call input into a JSON object. A non-object value
 /// (string/array/number from the wire) is preserved under `_unparsed`, so
 /// adapters can attach linkage fields without `IndexMut` panicking and the
