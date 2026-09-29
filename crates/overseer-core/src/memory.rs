@@ -794,6 +794,15 @@ fn topic_name(line: &str) -> Option<&str> {
         .filter(|tok| !tok.is_empty() && !tok.contains('/') && !tok.contains('\\'))
 }
 
+/// True when some line of `index` names topic `name` as a whole token.
+fn index_names(index: &str, name: &str) -> bool {
+    index.lines().any(|l| {
+        l.split_whitespace().any(|tok| {
+            tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';') == name
+        })
+    })
+}
+
 /// Quarantine a memory entry without overwriting it (P6-2 ADD-only):
 /// appends a `superseded_by <name>` trailer line to `path`. The old
 /// content stays on disk and in git — consolidation never rewrites a
@@ -1313,17 +1322,39 @@ pub fn consolidate(
             .collect();
         capped = kept.join("\n");
     }
+    // ADD-only enforcement: every live pointer in the old index survives.
+    // A pointer the reply no longer names is re-appended with its original
+    // line; one the reply rewrote or merged (still naming the topic, e.g.
+    // behind a `superseded_by` trailer) counts as kept.
+    let mut restored = 0usize;
+    for line in old_index.lines() {
+        if is_proposal_pointer(line) {
+            continue;
+        }
+        let Some(name) = topic_name(line) else {
+            continue;
+        };
+        if plan.drop.iter().any(|d| d == name) || index_names(&capped, name) {
+            continue;
+        }
+        if !capped.is_empty() && !capped.ends_with('\n') {
+            capped.push('\n');
+        }
+        capped.push_str(line);
+        restored += 1;
+    }
     std::fs::write(&idx, format!("{capped}\n")).map_err(|e| e.to_string())?;
     commit(dir, "consolidate");
 
     let dropped = old_index
         .lines()
         .filter(|l| l.contains(".md"))
-        .filter(|l| !new_index.contains(l.trim()))
+        .filter(|l| !capped.contains(l.trim()))
         .count();
     Ok(format!(
         "consolidated: {} → {} index lines, {dropped} pointers dropped \
-         (reconcile: {} stale, {} untracked, {dropped_stale} stale reclaimed)",
+         (reconcile: {} stale, {} untracked, {dropped_stale} stale reclaimed, \
+         {restored} live restored)",
         old_index.lines().count(),
         capped.lines().count(),
         plan.drop.len(),
@@ -2079,6 +2110,37 @@ mod tests {
         assert!(new.contains("facts.md — user facts"));
         assert!(!new.contains("dupe.md"), "stale pointer dropped");
         assert!(dir.join(".git").exists(), "consolidate commits");
+    }
+
+    #[test]
+    fn consolidate_restores_live_pointers_the_model_omitted() {
+        // ADD-only: the model may add and merge, never drop a live pointer.
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(
+            &idx,
+            "# Memory Index\n\nfacts.md — user facts\nprefs.md — `tabs` over spaces\ngone.md — missing\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("facts.md"), "data").unwrap();
+        std::fs::write(dir.join("semantic/prefs.md"), "tabs").unwrap();
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\nfacts.md — facts, tightened\nnew.md — added\n---INDEX---",
+        );
+        let msg = consolidate(&p, "tiny", &dir).unwrap();
+        let new = std::fs::read_to_string(&idx).unwrap();
+        assert!(
+            new.contains("prefs.md — `tabs` over spaces"),
+            "omitted live pointer restored verbatim: {new}"
+        );
+        assert!(new.contains("facts.md — facts, tightened"), "{new}");
+        assert!(
+            !new.contains("user facts"),
+            "a rewritten pointer is not duplicated: {new}"
+        );
+        assert!(new.contains("new.md — added"), "additions stay: {new}");
+        assert!(!new.contains("gone.md"), "stale pointer still drops: {new}");
+        assert!(msg.contains("1 live restored"), "{msg}");
     }
 
     #[test]
