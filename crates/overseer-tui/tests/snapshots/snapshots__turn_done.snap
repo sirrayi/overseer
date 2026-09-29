@@ -14,7 +14,7 @@ expression: screen(&term)
 I'll look at the test file first.
 
   ls tests/
-✓ bash cargo test flaky
-— end_turn · 1 step(s) · $0.0010
-❯
+  ● bash  cargo test flaky
+                                            1 step · $0.001
+❯ ask anything  ·  ↑ panel  ·  ? keys
  workspace  /repo                       test-model · $0.0010

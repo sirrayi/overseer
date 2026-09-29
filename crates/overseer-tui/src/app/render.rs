@@ -1,6 +1,8 @@
 //! Frame rendering: cell flushing, live stack, draw_full — split
 //! out of `app.rs` (W3).
 
+use unicode_width::UnicodeWidthStr;
+
 use super::*;
 
 /// Wrap a draw/insert in synchronized-update markers when probed —
@@ -44,7 +46,13 @@ impl App {
         if self.full() {
             self.tbuf_at(width);
             for cell in std::mem::take(&mut self.pending) {
-                self.tbuf.extend(cell.lines(width));
+                let mut lines = cell.lines(width);
+                // §2: the prompt band's blank separator row is dropped
+                // when the cell tops the transcript.
+                if self.history.is_empty() && self.tbuf.is_empty() {
+                    crate::cells::strip_top_gap(&cell, &mut lines);
+                }
+                self.tbuf.extend(lines);
                 self.history.push(cell);
             }
             // DEFERRED(tui): OSC 8 link lines + OSC 133 prompt/output
@@ -55,7 +63,10 @@ impl App {
         }
         for cell in std::mem::take(&mut self.pending) {
             self.history.push(cell.clone());
-            let lines = cell.lines(width);
+            let mut lines = cell.lines(width);
+            if self.history.len() == 1 {
+                crate::cells::strip_top_gap(&cell, &mut lines);
+            }
             let h = lines.len() as u16;
             if h == 0 {
                 continue;
@@ -117,6 +128,27 @@ impl App {
         }
     }
 
+    /// §3 composer placeholder: the empty, idle composer shows the
+    /// faint hint after `❯`. Typing or a live run drops it.
+    fn composer_frame(&self, width: u16) -> (Vec<Line<'static>>, (u16, u16)) {
+        let (mut lines, cur) = self.composer.render(width);
+        if self.composer.is_empty() && matches!(self.run, RunState::Idle) {
+            if let Some(first) = lines.first_mut() {
+                first.spans.push(Span::styled(
+                    "ask anything  ·  ↑ panel  ·  ? keys",
+                    crate::theme::faint(),
+                ));
+            }
+        }
+        (lines, cur)
+    }
+
+    /// True for a fresh session — nothing committed or in flight.
+    /// Drives the §5 empty state (terminal block + web `e` flag).
+    pub(crate) fn transcript_empty(&self) -> bool {
+        self.history.is_empty() && self.live.is_empty() && self.pending.is_empty()
+    }
+
     pub(crate) fn live_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         // A modal overlay owns the whole live region — nothing else
@@ -138,9 +170,10 @@ impl App {
                 return out;
             }
         }
-        // Running tools (cap: newest few stay visible).
+        // Running tools (cap: newest few stay visible) — the live
+        // pass animates their glyph with the spinner tick.
         for c in self.live.iter().rev().take(4).rev() {
-            out.extend(c.lines(width));
+            out.extend(c.lines_at(width, Some((self.tick, self.reduce_motion))));
         }
         if let Some((dlg, _)) = &self.dialog {
             out.extend(dlg.lines(width));
@@ -205,7 +238,7 @@ impl App {
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .width
             .max(1);
-        let (composer_lines, (cx, cy)) = self.composer.render(width);
+        let (composer_lines, (cx, cy)) = self.composer_frame(width);
         let live = self.live_lines(width);
         let status = widgets::status_line(self.preset, &self.cwd, &self.model, self.cost, width);
 
@@ -263,7 +296,7 @@ impl App {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let width = size.width.max(1);
         self.tbuf_at(width);
-        let (composer_lines, (cx, cy)) = self.composer.render(width);
+        let (composer_lines, (cx, cy)) = self.composer_frame(width);
         let live = self.live_lines(width);
 
         // 2 prompt rows + 1 footer row are pinned at the bottom; the
@@ -313,6 +346,25 @@ impl App {
             vec![Line::default(); tbuf_visible.saturating_sub(end - start)];
         region.extend(self.tbuf[start..end].iter().cloned());
         region.extend(live[live.len() - live_shown..].iter().cloned());
+
+        // §5 empty state: a fresh session greets with the centred mark
+        // over the wordmark, gone the moment the first cell lands.
+        if self.transcript_empty() && self.overlay.is_none() && self.dialog.is_none() {
+            let mid = t_rows.saturating_sub(1) / 2;
+            let center = |txt: &str, st| {
+                let pad = (width as usize).saturating_sub(UnicodeWidthStr::width(txt)) / 2;
+                Line::from(vec![
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(txt.to_string(), st),
+                ])
+            };
+            if let Some(l) = region.get_mut(mid) {
+                *l = center(crate::MARK_GLYPH, crate::theme::faint());
+            }
+            if let Some(l) = region.get_mut(mid + 1) {
+                *l = center("overseer", crate::theme::dim());
+            }
+        }
 
         // Composer clipped to 2 rows with the cursor kept visible.
         let c_rows = composer_lines.len().clamp(1, 2);

@@ -20,12 +20,14 @@ impl App {
         let mut strip = Vec::new();
         let mut used = 0usize;
         for (i, name) in PANEL_TABS.iter().enumerate() {
+            // §4: active tab = white + underline (dialog_sel), inactive
+            // fade to faint — no colour blocks.
             strip.push(Span::styled(
                 format!(" {name} "),
                 if i == tab {
                     theme::dialog_sel()
                 } else {
-                    theme::dim()
+                    theme::faint()
                 },
             ));
             used += name.len() + 2;
@@ -35,7 +37,7 @@ impl App {
         // window border, same reason the divider insets 3px.
         let pad = (width as usize).saturating_sub(used + hint.chars().count() + 1);
         strip.push(Span::raw(" ".repeat(pad)));
-        strip.push(Span::styled(hint.to_string(), theme::dim()));
+        strip.push(Span::styled(hint.to_string(), theme::faint()));
         let mut out = vec![Line::from(strip)];
         let rows = self.panel_rows(tab);
         let body = (cap as usize).saturating_sub(1);
@@ -48,12 +50,13 @@ impl App {
     }
 
     /// One `label  value` row list per panel tab — read-only v1.
+    /// §4 two-column: keys in `dim`, values in `text`.
     pub(crate) fn panel_rows(&self, tab: usize) -> Vec<Line<'static>> {
         use crate::theme;
         let kv = |k: &str, v: String| {
             Line::from(vec![
                 Span::styled(format!("  {k:<12}"), theme::dim()),
-                Span::styled(v, theme::dialog()),
+                Span::styled(v, theme::text()),
             ])
         };
         match tab {
@@ -77,7 +80,7 @@ impl App {
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_else(|| self.session_dir.display().to_string()),
                     ),
-                    kv("cwd", self.cwd.clone()),
+                    kv("cwd", tilde_home(std::path::Path::new(&self.cwd))),
                     kv("model", self.model.clone()),
                     kv(
                         "mode",
@@ -89,14 +92,16 @@ impl App {
                     kv("state", state),
                     kv("tokens", self.tokens.to_string()),
                     kv("cost", format!("${:.4}", self.cost)),
-                    kv("transcript", format!("{} cells", self.history.len())),
+                    // DEFERRED(owner): real `87% · 41.2K read` once
+                    // Agent::cache_stats()/CacheStats::hit_rate lands.
+                    kv("cache", "—".to_string()),
                 ]
             }
             1 => {
                 if self.agents.is_empty() {
                     return vec![Line::from(Span::styled(
                         "  none yet — task-tool spawns land here",
-                        theme::dim(),
+                        theme::faint(),
                     ))];
                 }
                 self.agents
@@ -108,20 +113,14 @@ impl App {
                             "failed" => theme::tool_err(),
                             _ => theme::spinner(),
                         };
+                        let mode = if a.bg {
+                            format!("{}·bg", a.mode)
+                        } else {
+                            a.mode.to_string()
+                        };
                         Line::from(vec![
-                            Span::styled(format!("  {:<9}", a.state), st),
-                            Span::styled(
-                                format!(
-                                    "{:<9}",
-                                    if a.bg {
-                                        format!("{}·bg", a.mode)
-                                    } else {
-                                        a.mode.to_string()
-                                    }
-                                ),
-                                theme::dim(),
-                            ),
-                            Span::styled(a.prompt.clone(), theme::dialog()),
+                            Span::styled(format!("  {:<10}", a.state), st),
+                            Span::styled(format!("{mode} — {}", a.prompt), theme::text()),
                         ])
                     })
                     .collect()
@@ -157,10 +156,92 @@ impl App {
                     }
                     .to_string(),
                 ),
-                kv("session dir", self.session_dir.display().to_string()),
+                kv("session dir", tilde_home(&self.session_dir)),
                 kv("rules", "~/.overseer/rules".to_string()),
             ],
-            _ => crate::widgets::help_panel(),
+            _ => keys_rows(),
         }
     }
+}
+
+/// Replace the $HOME prefix with `~` — panel paths stay short.
+fn tilde_home(p: &std::path::Path) -> String {
+    match std::env::var_os("HOME") {
+        Some(h) => match p.strip_prefix(std::path::Path::new(&h)) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => p.display().to_string(),
+        },
+        None => p.display().to_string(),
+    }
+}
+
+/// §4 keys tab: grouped, one blank row between groups, key column 14
+/// wide in `dim`, action in `text`.
+const KEY_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "send",
+        &[
+            ("enter", "submit"),
+            ("ctrl+j", "newline"),
+            ("esc", "interrupt / clear"),
+        ],
+    ),
+    (
+        "navigate",
+        &[
+            ("↑", "panel (empty) / history"),
+            ("pgup/pgdn", "scroll"),
+            ("ctrl+p", "sessions"),
+            ("ctrl+o", "search"),
+        ],
+    ),
+    (
+        "edit",
+        &[
+            ("ctrl+w", "word"),
+            ("ctrl+_", "undo"),
+            ("ctrl+s", "stash"),
+            ("alt+e", "editor"),
+            ("tab", "complete"),
+        ],
+    ),
+    (
+        "modes",
+        &[
+            ("shift+tab", "cycle mode"),
+            ("ctrl+t", "plan"),
+            ("ctrl+x", "cancel queued"),
+            ("ctrl+y", "copy reply"),
+        ],
+    ),
+    (
+        "shell and commands",
+        &[
+            ("!cmd", "local shell"),
+            (
+                "/…",
+                "sessions · fork · rewind · diff · approve · search · help · quit",
+            ),
+        ],
+    ),
+];
+
+fn keys_rows() -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for (group, rows) in KEY_GROUPS {
+        if !out.is_empty() {
+            out.push(Line::default());
+        }
+        out.push(Line::from(Span::styled(
+            format!("  {group}"),
+            crate::theme::faint(),
+        )));
+        for (key, action) in *rows {
+            out.push(Line::from(vec![
+                Span::styled(format!("    {key:<14}"), crate::theme::dim()),
+                Span::styled((*action).to_string(), crate::theme::text()),
+            ]));
+        }
+    }
+    out
 }

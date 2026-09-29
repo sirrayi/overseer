@@ -75,12 +75,18 @@ pub(crate) fn transcript_lines(
         .iter()
         .chain(app.live.iter())
         .filter(|c| q.is_empty() || c.plain().to_lowercase().contains(&q))
-        .flat_map(|c| {
-            if expand_tools {
+        .enumerate()
+        .flat_map(|(i, c)| {
+            let mut ls = if expand_tools {
                 c.lines_expanded(width)
             } else {
                 c.lines(width)
+            };
+            // The prompt band's separator row doesn't lead the overlay.
+            if i == 0 {
+                crate::cells::strip_top_gap(c, &mut ls);
             }
+            ls
         })
         .collect()
 }
@@ -241,6 +247,7 @@ impl App {
             self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: "finish or interrupt the run first".into(),
+                link: None,
             });
             return;
         }
@@ -268,6 +275,7 @@ impl App {
             self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: "finish or interrupt the run first".into(),
+                link: None,
             });
             return;
         }
@@ -292,6 +300,7 @@ impl App {
             self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: "finish or interrupt the run first".into(),
+                link: None,
             });
             return;
         }
@@ -309,6 +318,7 @@ impl App {
             self.pending.push(Cell::Meta {
                 style: crate::theme::dim(),
                 text: "no checkpoints yet — checkpoints open on each prompt".into(),
+                link: None,
             });
             return;
         }
@@ -328,6 +338,7 @@ impl App {
                         "rewound to e{} — {} file(s) restored, {} removed, {} event(s) dropped",
                         rep.boundary, rep.restored, rep.deleted, rep.truncated
                     ),
+                    link: None,
                 });
                 // The log changed — rebuild the agent's context too.
                 let _ = self.worker_tx.send(WorkerCmd::SwitchSession {
@@ -337,6 +348,7 @@ impl App {
             Err(e) => self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: format!("rewind failed: {e}"),
+                link: None,
             }),
         }
     }
@@ -359,6 +371,7 @@ impl App {
             self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: "finish or interrupt the run first".into(),
+                link: None,
             });
             return;
         }
@@ -367,6 +380,7 @@ impl App {
             self.pending.push(Cell::Meta {
                 style: crate::theme::dim(),
                 text: "no tracked changes — checkpoints record write/edit only".into(),
+                link: None,
             });
             return;
         }
@@ -440,6 +454,7 @@ impl App {
             self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: "not in plan mode (shift+tab to cycle)".into(),
+                link: None,
             });
             return;
         }
@@ -447,6 +462,7 @@ impl App {
             self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: "finish or interrupt the run first".into(),
+                link: None,
             });
             return;
         }
@@ -454,6 +470,7 @@ impl App {
             self.pending.push(Cell::Meta {
                 style: crate::theme::dim(),
                 text: "no plan yet — ask the agent for one first".into(),
+                link: None,
             });
             return;
         }
@@ -462,6 +479,7 @@ impl App {
         self.pending.push(Cell::Meta {
             style: crate::theme::meta(),
             text: "plan approved — switching to workspace mode".into(),
+            link: None,
         });
         self.submit("The plan is approved — implement it.".to_string());
     }
@@ -472,6 +490,7 @@ impl App {
             self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: "finish or interrupt the run first".into(),
+                link: None,
             });
             return;
         }
@@ -488,6 +507,7 @@ impl App {
                 self.pending.push(Cell::Meta {
                     style: crate::theme::meta(),
                     text: format!("forked → {}", new_dir.display()),
+                    link: None,
                 });
                 let _ = self
                     .worker_tx
@@ -496,6 +516,7 @@ impl App {
             Err(e) => self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: format!("fork failed: {e}"),
+                link: None,
             }),
         }
     }

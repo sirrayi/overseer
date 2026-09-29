@@ -444,6 +444,7 @@ impl App {
                     self.pending.push(Cell::Meta {
                         style: crate::theme::error(),
                         text: format!("engine error: {e}"),
+                        link: None,
                     });
                 }
             }
@@ -533,7 +534,13 @@ impl App {
                 a.state = "done";
             }
         }
-        match cells::feed(ev) {
+        // The run-summary cell wants the elapsed wall time — RunEnd
+        // lands while `run` is still Running.
+        let run_elapsed = match &self.run {
+            RunState::Running { started, .. } => Some(started.elapsed()),
+            _ => None,
+        };
+        match cells::feed(ev, run_elapsed) {
             Feed::NewCells(new) => {
                 for c in new {
                     if let Cell::Tool {
@@ -623,6 +630,7 @@ impl App {
         self.pending.push(Cell::Meta {
             style: crate::theme::meta(),
             text: format!("── session {name} ──"),
+            link: None,
         });
         if let Ok(events) = overseer_core::event::EventLog::replay(dir.join("events.jsonl")) {
             for ev in &events {
@@ -836,6 +844,7 @@ impl App {
             other => self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: format!("unknown command /{other} — try /help"),
+                link: None,
             }),
         }
     }

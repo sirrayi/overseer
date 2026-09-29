@@ -93,6 +93,7 @@ impl App {
         self.pending.push(Cell::Meta {
             style: crate::theme::meta(),
             text: format!("$ {cmd}"),
+            link: None,
         });
         match shell_capture(cmd, &self.cwd) {
             Ok((code, out)) => {
@@ -105,11 +106,13 @@ impl App {
                         crate::theme::error()
                     },
                     text: format!("{tail}{suffix}\n(exit {code})"),
+                    link: None,
                 });
             }
             Err(e) => self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: format!("shell failed: {e}"),
+                link: None,
             }),
         }
     }

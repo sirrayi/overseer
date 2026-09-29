@@ -4,7 +4,7 @@
 //! implementation. An unclosed fence renders as code to the end so a
 //! partially-arrived block never flashes as raw text.
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::theme;
@@ -31,10 +31,19 @@ pub fn render(text: &str) -> Vec<Line<'static>> {
 fn render_line(line: &str) -> Line<'static> {
     if let Some(rest) = line.strip_prefix("#") {
         let rest = rest.trim_start_matches('#').trim_start();
+        // Headings are bold white — the only "louder" narration voice.
         return Line::from(Span::styled(
             rest.to_string(),
-            Style::new().add_modifier(Modifier::BOLD),
+            theme::user().add_modifier(Modifier::BOLD),
         ));
+    }
+    // Bullets flatten to `·` at a 2-col indent (§2).
+    for marker in ["- ", "* "] {
+        if let Some(rest) = line.trim_start().strip_prefix(marker) {
+            let mut spans = vec![Span::styled("  · ", theme::text())];
+            spans.extend(inline_spans(rest));
+            return Line::from(spans);
+        }
     }
     Line::from(inline_spans(line))
 }
@@ -46,7 +55,7 @@ fn inline_spans(text: &str) -> Vec<Span<'static>> {
     let mut chars = text.chars().peekable();
     let flush = |buf: &mut String, spans: &mut Vec<Span<'static>>| {
         if !buf.is_empty() {
-            spans.push(Span::raw(std::mem::take(buf)));
+            spans.push(Span::styled(std::mem::take(buf), theme::text()));
         }
     };
     while let Some(c) = chars.next() {
@@ -86,7 +95,7 @@ fn inline_spans(text: &str) -> Vec<Span<'static>> {
                 if closed {
                     spans.push(Span::styled(
                         bold,
-                        Style::new().add_modifier(Modifier::BOLD),
+                        theme::text().add_modifier(Modifier::BOLD),
                     ));
                 } else {
                     buf.push_str("**");
