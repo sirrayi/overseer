@@ -86,7 +86,10 @@ impl Anthropic {
             })
             .collect();
 
-        let messages: Vec<Value> = req.messages.iter().map(ir_message_to_wire).collect();
+        let mut messages: Vec<Value> = req.messages.iter().map(ir_message_to_wire).collect();
+        if req.cache_breakpoints {
+            place_rolling_breakpoint(&mut messages);
+        }
 
         let mut body = json!({
             "model": req.model,
@@ -233,6 +236,31 @@ impl Anthropic {
             request_bytes,
             latency_ms,
         })
+    }
+}
+
+/// The rolling conversation breakpoint: `cache_control` on the last block
+/// of the last message that can carry it (text/image/tool_use/tool_result;
+/// thinking blocks cannot, and empty text blocks are rejected). Walks
+/// backwards. With the tools and system tails that is 3 of Anthropic's 4
+/// breakpoints, and the whole history is cached as the conversation grows.
+/// Block-level on purpose, not the top-level automatic-caching field:
+/// Anthropic-compatible endpoints behind `base_url` may reject unknown
+/// top-level params.
+fn place_rolling_breakpoint(messages: &mut [Value]) {
+    for m in messages.iter_mut().rev() {
+        let Some(blocks) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let eligible = blocks.iter_mut().rev().find(|b| match b["type"].as_str() {
+            Some("text") => b["text"].as_str().is_some_and(|t| !t.is_empty()),
+            Some("image" | "tool_use" | "tool_result") => true,
+            _ => false,
+        });
+        if let Some(b) = eligible {
+            b["cache_control"] = json!({"type": "ephemeral"});
+            return;
+        }
     }
 }
 
@@ -667,5 +695,136 @@ mod tests {
         let dynamic_only = vec![seg("volatile", false)];
         let body = Anthropic::build_body(&sample_req(&dynamic_only, &[], &msgs));
         assert!(body["system"][0].get("cache_control").is_none());
+    }
+
+    fn breakpoints(v: &Value) -> usize {
+        v.to_string().matches("\"cache_control\"").count()
+    }
+
+    /// K1: the rolling conversation breakpoint sits on the last eligible
+    /// block of the last message; tools + system + messages = 3 ≤ 4.
+    #[test]
+    fn rolling_breakpoint_on_last_message_block() {
+        let system = vec![SystemSegment {
+            name: "test",
+            text: "static".into(),
+            cacheable: true,
+        }];
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "read".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let msgs = vec![
+            Message::user_text("q"),
+            Message {
+                role: Role::Assistant,
+                content: vec![Block::ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    input: json!({}),
+                }],
+            },
+            Message::tool_results(vec![
+                Block::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "a".into(),
+                    is_error: false,
+                },
+                Block::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "b".into(),
+                    is_error: false,
+                },
+            ]),
+        ];
+        let body = Anthropic::build_body(&sample_req(&system, &tools, &msgs));
+        let last = &body["messages"][2]["content"];
+        assert_eq!(last[1]["cache_control"]["type"], "ephemeral");
+        assert!(last[0].get("cache_control").is_none());
+        assert_eq!(breakpoints(&body), 3);
+        assert!(breakpoints(&body) <= 4);
+        // Off when the request opts out.
+        let mut req = sample_req(&system, &tools, &msgs);
+        req.cache_breakpoints = false;
+        assert_eq!(breakpoints(&Anthropic::build_body(&req)), 0);
+    }
+
+    /// K1: thinking / redacted_thinking never carry the breakpoint — the
+    /// walk skips them (and whole messages made only of them).
+    #[test]
+    fn rolling_breakpoint_never_on_thinking() {
+        let system: Vec<SystemSegment> = vec![];
+        let thinking = Block::Reasoning {
+            raw: json!({"type": "thinking", "thinking": "t", "signature": "s"}),
+        };
+        let redacted = Block::Reasoning {
+            raw: json!({"type": "redacted_thinking", "data": "d"}),
+        };
+        let msgs = vec![
+            Message::user_text("q"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    thinking.clone(),
+                    Block::Text { text: "a".into() },
+                    redacted.clone(),
+                ],
+            },
+        ];
+        let body = Anthropic::build_body(&sample_req(&system, &[], &msgs));
+        let asst = &body["messages"][1]["content"];
+        assert_eq!(asst[1]["cache_control"]["type"], "ephemeral");
+        assert!(asst[0].get("cache_control").is_none());
+        assert!(asst[2].get("cache_control").is_none());
+
+        let only_thinking = vec![
+            Message::user_text("q"),
+            Message {
+                role: Role::Assistant,
+                content: vec![thinking, redacted],
+            },
+        ];
+        let body = Anthropic::build_body(&sample_req(&system, &[], &only_thinking));
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(breakpoints(&body["messages"][1]), 0);
+    }
+
+    /// K1: across consecutive turns every message before turn N's last one
+    /// is byte-identical in turn N+1 (only the rolling marker moves).
+    #[test]
+    fn rolling_breakpoint_keeps_history_bytes_stable() {
+        let system = vec![SystemSegment {
+            name: "test",
+            text: "static".into(),
+            cacheable: true,
+        }];
+        let turn1 = vec![
+            Message::user_text("first"),
+            Message {
+                role: Role::Assistant,
+                content: vec![Block::Text { text: "ok".into() }],
+            },
+            Message::user_text("second"),
+        ];
+        let mut turn2 = turn1.clone();
+        turn2.push(Message {
+            role: Role::Assistant,
+            content: vec![Block::Text { text: "ok2".into() }],
+        });
+        turn2.push(Message::user_text("third"));
+        let b1 = Anthropic::build_body(&sample_req(&system, &[], &turn1));
+        let b2 = Anthropic::build_body(&sample_req(&system, &[], &turn2));
+        let n = turn1.len() - 1;
+        let m1 = &b1["messages"].as_array().unwrap()[..n];
+        let m2 = &b2["messages"].as_array().unwrap()[..n];
+        assert_eq!(
+            serde_json::to_string(m1).unwrap(),
+            serde_json::to_string(m2).unwrap()
+        );
+        assert_eq!(b1["system"], b2["system"]);
     }
 }
