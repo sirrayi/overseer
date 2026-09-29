@@ -21,15 +21,18 @@ impl App {
         let mut used = 0usize;
         for (i, name) in PANEL_TABS.iter().enumerate() {
             // §4: active tab = white + underline, inactive = faint —
-            // no colour blocks in any palette.
+            // no colour blocks in any palette. The padding spaces are
+            // separate unstyled spans so the underline hugs the label.
+            strip.push(Span::raw(" "));
             strip.push(Span::styled(
-                format!(" {name} "),
+                name.to_string(),
                 if i == tab {
                     theme::tab_active()
                 } else {
                     theme::tab_idle()
                 },
             ));
+            strip.push(Span::raw(" "));
             used += name.len() + 2;
         }
         let hint = "↑/↓ · ←/→ · esc";
