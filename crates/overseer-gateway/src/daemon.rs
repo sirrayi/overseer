@@ -659,6 +659,12 @@ impl Daemon {
     pub fn run(&mut self) -> i32 {
         install_signal_flag();
         self.dirs.ensure().ok();
+        // A STOP marker left by an unclean exit belongs to the previous
+        // run; only one written while this run is live may stop it.
+        if std::fs::remove_file(self.dirs.killswitch()).is_ok() {
+            self.journal
+                .log("stale_killswitch_cleared", serde_json::json!({}));
+        }
         if let Err(e) = self.write_heartbeat() {
             eprintln!("overseer daemon: heartbeat write failed: {e}");
             return 1;
@@ -876,6 +882,38 @@ mod daemon_pipeline_tests {
         }
         Daemon::new(DaemonDirs::new(root), PathBuf::from("overseer-test-unused"))
             .expect("daemon new")
+    }
+
+    #[test]
+    fn stale_killswitch_does_not_stop_a_fresh_run() {
+        // An unclean exit leaves STOP behind; the next run must clear its
+        // own marker instead of exiting on the first tick.
+        let root = tmpdir("stale-stop");
+        let mut d = new_daemon(root.clone(), Some(&pipeline_config()));
+        std::fs::write(d.dirs.killswitch(), b"").unwrap();
+        let stop = d.dirs.killswitch();
+        let journal_root = root.clone();
+        let observer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !has_kind(&journal_records(&journal_root), "daemon_start") {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Several 50 ms ticks pass before the operator asks it to stop.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let stopped_early = has_kind(&journal_records(&journal_root), "daemon_stop");
+            std::fs::write(&stop, b"").unwrap();
+            stopped_early
+        });
+        assert_eq!(d.run(), 0);
+        let stopped_early = observer.join().unwrap();
+        assert!(
+            !stopped_early,
+            "a stale STOP file ended the run at its first tick"
+        );
+        assert!(!d.dirs.killswitch().exists(), "shutdown clears STOP");
     }
 
     #[test]
