@@ -208,6 +208,9 @@ impl ResponsesApi {
         let cached = usage["input_tokens_details"]["cached_tokens"]
             .as_u64()
             .unwrap_or(0);
+        let cache_write = usage["input_tokens_details"]["cache_write_tokens"]
+            .as_u64()
+            .unwrap_or(0);
         let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
         let reasoning_tokens = usage["output_tokens_details"]["reasoning_tokens"]
             .as_u64()
@@ -237,9 +240,11 @@ impl ResponsesApi {
             blocks,
             stop_reason,
             usage: Usage {
-                fresh_input: input_tokens.saturating_sub(cached),
+                fresh_input: input_tokens
+                    .saturating_sub(cached)
+                    .saturating_sub(cache_write),
                 cache_read: cached,
-                cache_write: 0,
+                cache_write,
                 output: output_tokens.saturating_sub(reasoning_tokens),
                 reasoning: reasoning_tokens,
             },
@@ -669,5 +674,18 @@ mod tests {
         assert!(find("cu_1", "computer_call_output"));
         assert!(find("b_1", "function_call"));
         assert!(find("b_1", "function_call_output"));
+    }
+
+    /// K3: `input_tokens_details.cache_write_tokens` lands in cache_write
+    /// (and, like cached_tokens, is carved out of input_tokens).
+    #[test]
+    fn cache_write_tokens_parsed() {
+        let body = json!({"status": "completed", "output": [],
+            "usage": {"input_tokens": 1000, "output_tokens": 5,
+                "input_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 300}}});
+        let r = ResponsesApi::parse_response(&body, 1, 1).unwrap();
+        assert_eq!(r.usage.cache_read, 600);
+        assert_eq!(r.usage.cache_write, 300);
+        assert_eq!(r.usage.fresh_input, 100);
     }
 }
