@@ -25,9 +25,12 @@ identical tasks so every harness change gets a paired benchmark delta.
 ## Layout
 
 - `tasks/` — public corpus (35 tasks, all oracle-verified)
-- `heldout/tasks/` — private canary-instrumented suite; `run.py
+- `heldout/tasks/` — canary-instrumented suite; `run.py
   --task-dir heldout/tasks` runs it, `--audit` scans stored runs for
-  canary leakage
+  canary leakage. **It is repo-visible, not private:** anyone (or any
+  model trained on or browsing this repo) can read these tasks and their
+  solutions. Treat it as a canary-hygiene check — it catches a run that
+  echoes canary strings — not as a contamination-proof holdout.
 - `rig/` — the rig: taskspec, graders, scheduler, store, stats, report,
   manifest, agents/, benchmarks/
 - `tests/` — pytest suite (offline, no keys)
