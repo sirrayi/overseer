@@ -31,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-from .. import agents, manifest, store
+from .. import agents, keys, manifest, store
 from . import BenchmarkUnavailable, ExternalTask, has_cli, has_docker
 
 NAME = "swe_bench"
@@ -482,9 +482,9 @@ def run_cli(
         seeds = list(range(args.seeds))
     agent = args.agents.split(",")[0].strip()
     model_id = args.model or os.environ.get("OVERSEER_MODEL", "deepseek-v4.1-flash")
-    if preds_arg is None and not os.environ.get("OVERSEER_API_KEY"):
+    if preds_arg is None and not keys.api_key():
         print(
-            "OVERSEER_API_KEY required for swe_bench rollouts "
+            f"{keys.key_label()} required for swe_bench rollouts "
             "(or pass --predictions-path for eval-only)",
             file=sys.stderr,
         )

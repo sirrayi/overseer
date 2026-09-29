@@ -19,6 +19,7 @@ env:
 
 jobs:
   build-test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     steps:
@@ -41,6 +42,7 @@ jobs:
   eval-rig:
     # Offline rig self-tests only — no API keys, no paid runs. Proves the
     # matrix/scheduler/stats/store path on every PR (playbook §4.6 seed).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 15
     steps:
@@ -64,6 +66,7 @@ jobs:
           grep -q "FAIL" out.txt && grep -q "0.0%" out.txt
 
   budgets:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 20
     steps:
@@ -102,8 +105,9 @@ jobs:
     # cargo-deny per deny.toml: RustSEC advisories + yanked/unmaintained,
     # permissive-license allow-list, dup/wildcard bans, registry sources.
     # The local equivalent is `cargo audit` (.cargo/audit.toml).
-    # Self-hosted: the action is a linux container action — cargo deny runs
-    # fine directly, and the binary persists on the runner after first install.
+    # Runs cargo-deny natively on the self-hosted macOS runner (installed on
+    # first use; the binary persists on the runner) — not a container action.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 20
     steps:

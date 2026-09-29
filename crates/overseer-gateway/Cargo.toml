@@ -13,6 +13,6 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # Same spec as overseer-core (R1-F1): the channel clients speak HTTP
 # through it, so the workspace gains no package — only a reuse edge.
 ureq = { version = "3", default-features = false, features = ["rustls", "json", "platform-verifier"] }
-
-[target.'cfg(unix)'.dependencies]
+# Unix-only crate: the ctl socket is std::os::unix::net and every dist
+# target is unix.
 libc = "0.2"

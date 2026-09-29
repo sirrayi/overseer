@@ -48,27 +48,6 @@ pub struct SpawnOutcome {
     pub log_path: String,
 }
 
-/// Spawn `overseer exec --bare` for a prompt. `--bare` = throwaway
-/// session in tmp (never ~/.overseer), fail-closed permission mode —
-/// the unattended default. The child's stdout/stderr go to a per-run
-/// log under `runs/` for post-hoc audit.
-pub fn spawn_run(
-    cfg: &SpawnConfig,
-    runs_dir: &Path,
-    prompt: &str,
-    inbox_id: Option<String>,
-    overseer_bin: &Path,
-) -> Result<Spawned, String> {
-    spawn_run_from(
-        cfg,
-        runs_dir,
-        prompt,
-        inbox_id,
-        overseer_bin,
-        &Origin::Local,
-    )
-}
-
 /// Build the child command. Kept separate (and pure but for `Stdio`) so the
 /// argv and environment a run is launched with can be asserted directly
 /// instead of re-derived in tests.
@@ -99,7 +78,12 @@ fn build_command(
     cmd
 }
 
-/// Spawn with an explicit origin (P7-4). An untrusted origin *adds* the
+/// Spawn `overseer exec --bare` for a prompt. `--bare` = throwaway
+/// session in tmp (never ~/.overseer), fail-closed permission mode —
+/// the unattended default. The child's stdout/stderr go to a per-run
+/// log under `runs/` for post-hoc audit.
+///
+/// The origin is explicit (P7-4): an untrusted origin *adds* the
 /// external-approval autonomy floor and exports the marker the engine
 /// arms on; it never removes anything the local config set.
 pub fn spawn_run_from(
@@ -165,13 +149,7 @@ pub fn reap(sp: &mut Spawned) -> Option<SpawnOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("overseer-gateway-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::test_util::tmpdir;
 
     fn live_child(
         program: &str,

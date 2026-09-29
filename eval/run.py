@@ -11,8 +11,9 @@ self-tests the rig.
   uv run python run.py --agents oracle          # solvability check, no API
   uv run python run.py --report                 # report card from store
 
-Env: OVERSEER_API_KEY (required for overseer/mini), OVERSEER_BASE_URL,
-OVERSEER_MODEL, OVERSEER_BIN.
+Env: the provider key named by OVERSEER_PROVIDER (default opencode →
+OPENCODE_API_KEY; see rig/keys.py) is required for overseer/mini;
+OVERSEER_BASE_URL, OVERSEER_MODEL, OVERSEER_BIN.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent
 sys.path.insert(0, str(ROOT))
 
-from rig import graders, report, scheduler, store, taskspec
+from rig import graders, keys, report, scheduler, store, taskspec
 
 RESULTS = ROOT / "results"
 WORKSPACES = ROOT / "workspaces"
@@ -256,8 +257,8 @@ def main() -> int:
         for a in agent_names
         if a == "mini" or a == "overseer" or a.startswith("overseer@")
     ]
-    if needs_key and not os.environ.get("OVERSEER_API_KEY"):
-        sys.exit("OVERSEER_API_KEY required for " + ",".join(needs_key))
+    if needs_key and not keys.api_key():
+        sys.exit(f"{keys.key_label()} required for " + ",".join(needs_key))
 
     print(f"matrix: {len(tasks)} tasks × {agent_names} × {args.seeds} seeds")
     records = scheduler.run_matrix(

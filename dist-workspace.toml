@@ -8,7 +8,10 @@ cargo-dist-version = "0.33.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = []
+installers = ["shell", "homebrew"]
+# A custom GitHub repo to publish the Homebrew formula to. No homebrew
+# publish-job is enabled: the formula ships as a release artifact only.
+tap = "sirrayi/homebrew-overseer"
 # Target platforms to build apps for (Rust target-triple syntax).
 # Unix-only: overseer's sandbox layer is macOS sandbox-exec / Linux bwrap.
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]

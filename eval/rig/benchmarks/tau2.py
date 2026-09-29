@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-from .. import manifest, store
+from .. import keys, manifest, store
 from . import BenchmarkUnavailable, ExternalTask, has_cli
 
 NAME = "tau2"
@@ -111,7 +111,7 @@ class Tau2Adapter:
         # Configured OpenAI-compatible gateway: litellm resolves
         # openai/<model> against OPENAI_BASE_URL.
         if agent_llm.startswith("openai/") or user_llm.startswith("openai/"):
-            env.setdefault("OPENAI_API_KEY", os.environ.get("OVERSEER_API_KEY", ""))
+            env.setdefault("OPENAI_API_KEY", keys.api_key() or "")
             env.setdefault(
                 "OPENAI_BASE_URL",
                 os.environ.get("OVERSEER_BASE_URL", "https://opencode.ai/zen/go/v1"),
