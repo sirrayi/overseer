@@ -268,15 +268,16 @@ fn wrap_argv(
     ))
 }
 
+/// (binary, argv, optional env file) or a build error; `None` = absent.
+#[cfg(target_os = "macos")]
+type SeatbeltInvocation = Option<Result<(String, Vec<String>, Option<String>), String>>;
+
 /// The macOS seatbelt invocation, or `None` when sandbox-exec is absent
 /// (`Some(Err)` when the profile cannot be built safely). One builder for
 /// both the platform default path and the pinned `--runtime seatbelt`
 /// path, so the two can never drift.
 #[cfg(target_os = "macos")]
-fn seatbelt_invocation(
-    argv: &[String],
-    ctx: &ToolCtx,
-) -> Option<Result<(String, Vec<String>, Option<String>), String>> {
+fn seatbelt_invocation(argv: &[String], ctx: &ToolCtx) -> SeatbeltInvocation {
     let exe = "/usr/bin/sandbox-exec";
     std::path::Path::new(exe).exists().then(|| {
         let mut args = vec!["-p".to_string(), macos_profile(&ctx.cwd)?];
