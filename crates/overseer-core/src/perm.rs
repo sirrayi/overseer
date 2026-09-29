@@ -108,15 +108,10 @@ const BASH_DENY: &[(&str, &str)] = &[
     ("*mkfs*", "filesystem format"),
     ("*of=/dev/*", "raw write to device node"),
     ("*:(){*", "fork bomb"),
-    // System mutation.
-    ("*sudo *", "privilege escalation"),
-    ("sudo", "privilege escalation"),
-    ("* sudo", "privilege escalation"),
-    ("*;sudo", "privilege escalation"),
-    ("*|sudo", "privilege escalation"),
-    ("*&sudo", "privilege escalation"),
-    ("*doas *", "privilege escalation"),
-    ("*pkexec*", "privilege escalation"),
+    // System mutation. Privilege escalation is not a glob — see
+    // `ESCALATION_WORDS`: the words are matched as whole shell tokens,
+    // which is what catches `$(sudo)`, `` `sudo` ``, `(doas ls)` and a
+    // trailing `ls; doas` while `sudoku`/`pseudo-random` pass.
     ("*>/dev/sd*", "raw write to a disk device"),
     ("*> /dev/sd*", "raw write to a disk device"),
     ("*>/dev/disk*", "raw write to a disk device"),
@@ -136,6 +131,13 @@ const BASH_DENY: &[(&str, &str)] = &[
     ("*git push -f*", "force push (history rewrite)"),
     ("*git push --delete*", "remote branch deletion"),
 ];
+
+/// Words that escalate privileges when a shell dispatches on them.
+/// Matched as whole tokens (see [`shell_tokens`]) — never globs — so
+/// the substitution/subshell spellings `$(sudo …)`, `` `sudo …` ``,
+/// `(doas …)` and `(pkexec …)`, and a bare word at end of command
+/// (`ls; doas`), are all caught while lookalikes pass.
+const ESCALATION_WORDS: &[&str] = &["sudo", "doas", "pkexec"];
 
 /// Bash ask rules — destructive-ish but sometimes legitimate. Headless
 /// mode collapses Ask to a denied ToolOutput (fail-closed), but the
@@ -467,6 +469,26 @@ fn normalize_bash(cmd: &str) -> String {
         }
     }
     out.join(" ")
+}
+
+/// The words a shell would dispatch on, for deny matching: the
+/// normalized command split on whitespace and the separators
+/// `( ) | ; & \``. Quotes are NOT peeled — `"sudo"` is a token
+/// carrying quote bytes, not the word `sudo` — so quoted prose
+/// (`echo "use sudo"`) stays allowed at the cost of a quoted smuggle
+/// (`bash -c "sudo ls"`) passing this first wall. The sandbox is the
+/// real boundary; this list only has to be better than a glob.
+fn shell_tokens(cmd: &str) -> impl Iterator<Item = &str> {
+    cmd.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '|' | ';' | '&' | '`'))
+        .filter(|t| !t.is_empty())
+}
+
+/// The escalation word a normalized command invokes, if any.
+fn escalation_token(cmd: &str) -> Option<&'static str> {
+    ESCALATION_WORDS
+        .iter()
+        .copied()
+        .find(|w| shell_tokens(cmd).any(|t| t == *w))
 }
 
 /// One session-scoped allow (P8-B cline `expires_turns` port): the key a
@@ -1033,6 +1055,13 @@ impl Policy {
                     });
                 };
                 let cmd = normalize_bash(cmd);
+                // Whole-token escalation check first — no glob spelling
+                // can see `$(sudo)`, `(doas ls)` or a trailing `ls; doas`.
+                if let Some(word) = escalation_token(&cmd) {
+                    return Some(Verdict::Deny {
+                        reason: format!("bash: '{word}' denied — privilege escalation"),
+                    });
+                }
                 for (pattern, why) in BASH_DENY {
                     if glob_match(pattern, &cmd) {
                         return Some(Verdict::Deny {
@@ -1098,10 +1127,11 @@ impl Policy {
             // hard_deny above (deny wins). Remaining: memory LAYER bar
             // (F5) → Rule-of-Two taint Ask, else Allow.
             "write" | "edit" => {
-                // F5: WRITE_BAR enforcement — identity-layer facts need
-                // approval even in a clean session. Maps the target path to
-                // its memory Layer (None outside memory_dir) and takes the
-                // max of the layer bar and the lane default already computed.
+                // F5: layer-bar enforcement — `layer_bar_for_path` maps
+                // the target path to its memory Layer (None outside
+                // memory_dir); identity-layer facts need approval even in
+                // a clean session. The bar is the layer's floor combined
+                // with the lane default already computed.
                 if let Some(p) = input.get("path").and_then(Value::as_str) {
                     if let Some(need) =
                         crate::memory::layer_bar_for_path(self.memory_dir.as_deref(), &self.root, p)
@@ -2491,6 +2521,62 @@ mod tests {
                     Some(Verdict::Deny { .. })
                 ),
                 "{cmd:?} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn privilege_escalation_is_denied_as_a_whole_shell_token() {
+        let p = pol();
+        // Every spelling a shell would dispatch on the same word: inside
+        // command substitution and subshells, backticks, after a
+        // separator, and bare at end of command.
+        for cmd in [
+            "sudo",
+            "sudo apt install x",
+            "make install && sudo",
+            "echo x;sudo",
+            "ls; doas",
+            "(doas ls)",
+            "(sudo id)",
+            "(pkexec id)",
+            "bash -c 'x=$(sudo id)'",
+            "x=$(sudo)",
+            "echo `sudo id`",
+            "echo `sudo`",
+            "doas rm file",
+            "pkexec bash",
+        ] {
+            assert!(
+                matches!(
+                    p.hard_deny("bash", &json!({"command": cmd})),
+                    Some(Verdict::Deny { .. })
+                ),
+                "{cmd:?} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn escalation_lookalikes_and_quoted_prose_stay_allowed() {
+        let p = pol();
+        for cmd in [
+            "sudoku",
+            "echo pseudo-random",
+            "echo pseudo",
+            "cat sudoers-notes.txt",
+            // Decision: quoting is NOT peeled — `"sudo"` inside quotes is
+            // a token carrying quote bytes, not the word `sudo`. Prose
+            // stays allowed at the cost of a quoted smuggle
+            // (`bash -c "sudo ls"`) also passing this first wall; the
+            // sandbox is the real boundary, not this deny list.
+            "echo \"use sudo\"",
+            "echo 'sudo'",
+        ] {
+            assert_eq!(
+                p.hard_deny("bash", &json!({"command": cmd})),
+                None,
+                "{cmd:?} must stay allowed"
             );
         }
     }

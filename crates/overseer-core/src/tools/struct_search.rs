@@ -39,15 +39,14 @@
 //! Both are reported 1-based here, matching `read` and `diagnostics`, so a
 //! hit can be pasted into `read path:line` unchanged.
 //!
-//! `// DEFERRED(owner): a tree-sitter in-process backend (the feature-gated
-//! `crate::tsitter` module is its registry — this port deliberately does not
-//! import it, so the tool builds without the optional parser stack);
-//! incremental re-indexing (every probe re-walks `path` from scratch);
-//! semgrep's own rule registry (rules arrive via a local `--config` only, no
-//! registry fetch or cache) — all P8-C+ material.`
+//! `// DEFERRED(owner): an in-process parser registry (tree-sitter) if
+//! shell-out latency becomes a problem; incremental re-indexing (every
+//! probe re-walks `path` from scratch); semgrep's own rule registry
+//! (rules arrive via a local `--config` only, no registry fetch or
+//! cache) — all P8-C+ material.`
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -427,7 +426,36 @@ pub fn check_semgrep_config(config: &str, cwd: &Path) -> Result<(), String> {
              pass a local rules file or directory (e.g. `.semgrep.yml`)."
         ));
     }
-    if !cwd.join(c).exists() {
+    // Confinement is lexical — `Path::join` does not do it: an absolute
+    // `c` is returned unchanged by join(), and `..` segments walk above
+    // `cwd`. Reject absolutes, fold `.`/`..` without touching the
+    // filesystem, and refuse anything that leaves the working directory
+    // BEFORE existence is checked.
+    let rel = Path::new(c);
+    if rel.is_absolute() {
+        return Err(format!(
+            "struct_search: semgrep `config` `{c}` is absolute — pass a path under \
+             the working directory."
+        ));
+    }
+    let mut local = PathBuf::new();
+    for comp in rel.components() {
+        match comp {
+            Component::ParentDir => {
+                if !local.pop() {
+                    return Err(format!(
+                        "struct_search: semgrep `config` `{c}` escapes the working \
+                         directory — `..` above the root is refused."
+                    ));
+                }
+            }
+            Component::Normal(name) => local.push(name),
+            // CurDir folds away; RootDir/Prefix cannot occur on a
+            // relative path (is_absolute above).
+            _ => {}
+        }
+    }
+    if !cwd.join(&local).exists() {
         return Err(format!(
             "struct_search: semgrep `config` `{c}` is not a local rules file or directory \
              under the working directory."
@@ -1374,6 +1402,46 @@ mod tests {
         let argv = std::fs::read_to_string(dir.join("argv.txt")).unwrap();
         assert!(argv.contains("--metrics=off"), "{argv}");
         assert!(argv.contains("--config rules.yml"), "{argv}");
+    }
+
+    #[test]
+    fn semgrep_config_must_stay_under_the_working_directory() {
+        let dir = tmpdir("semgrep-confine");
+        std::fs::create_dir_all(dir.join("rules")).unwrap();
+        std::fs::write(dir.join("rules/local.yml"), "rules: []\n").unwrap();
+        // A relative path inside cwd is accepted — including one whose
+        // `..` folds back inside the root.
+        check_semgrep_config("rules/local.yml", &dir).expect("in-cwd config");
+        check_semgrep_config("./rules/../rules/local.yml", &dir).expect("folds back inside");
+        // An absolute path is refused even though `Path::join` would
+        // return it unchanged and the file really sits under cwd.
+        let abs = dir.join("rules/local.yml").to_string_lossy().into_owned();
+        let err = check_semgrep_config(&abs, &dir).unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+        // A real file OUTSIDE cwd reached through `..` is refused — plain
+        // `join().exists()` used to accept it.
+        let escape = dir
+            .parent()
+            .unwrap()
+            .join(format!("escape-rules-{}-x.yml", std::process::id()));
+        std::fs::write(&escape, "rules: []\n").unwrap();
+        let rel = format!("../{}", escape.file_name().unwrap().to_string_lossy());
+        assert!(
+            check_semgrep_config(&rel, &dir).is_err(),
+            "an existing file above cwd must be refused"
+        );
+        let _ = std::fs::remove_file(&escape);
+        // Bare `..` chains that leave the root are refused before the
+        // existence check runs.
+        for bad in ["../../rules.yml", "rules/../../x.yml", ".."] {
+            assert!(
+                check_semgrep_config(bad, &dir).is_err(),
+                "{bad:?} must refuse"
+            );
+        }
+        // Inside-but-missing still reports as missing, not as escaping.
+        let err = check_semgrep_config("rules/missing.yml", &dir).unwrap_err();
+        assert!(err.contains("not a local rules file"), "{err}");
     }
 
     /// Child-process probe with a non-UTF-8 env value (see bash's twin).

@@ -937,7 +937,12 @@ fn canon_deep(p: &Path) -> PathBuf {
 /// returned canonical path is what `snapshot` records and what
 /// [`write_no_follow`] opens — a symlink swapped in after the gate's
 /// containment check can no longer redirect the write.
-// DEFERRED(owner): fd-relative (openat) path walk closes the intermediate-dir TOCTOU
+// DEFERRED(owner): fd-relative (openat) path walk closes the
+// intermediate-dir TOCTOU — including the `create_dir_all` side-effect
+// window below: under a symlink race the mkdirs can still create
+// directories OUTSIDE `root` before the post-canonicalize `starts_with`
+// check refuses the write (the write itself is blocked; the stray dirs
+// are not).
 pub(crate) fn contained_target(path: &Path, root: &Path) -> Result<PathBuf, String> {
     let root = canon_deep(root);
     let outside = |p: &Path| {

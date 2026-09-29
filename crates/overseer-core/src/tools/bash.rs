@@ -176,6 +176,13 @@ fn env_key_allowed(k: &str) -> bool {
             | "GIT_COMMITTER_NAME"
             | "GIT_COMMITTER_EMAIL"
             | "CI"
+            // Rust toolchain paths — sandboxed `diagnostics` runs
+            // `cargo check`, which breaks on rustup-managed setups
+            // without them. Config, not secrets.
+            | "CARGO_HOME"
+            | "RUSTUP_HOME"
+            | "RUSTUP_TOOLCHAIN"
+            | "CARGO_TARGET_DIR"
     ) || k.starts_with("LC_")
 }
 
@@ -772,5 +779,35 @@ mod tests {
             let err = seatbelt_profile(home, Path::new("/ws"), Path::new(broad)).unwrap_err();
             assert!(err.contains("temp"), "{broad}: {err}");
         }
+    }
+
+    #[test]
+    fn child_env_allowlist_passes_the_rust_toolchain_and_still_strips_secrets() {
+        // Sandboxed `diagnostics` runs `cargo check`: rustup-managed
+        // toolchains resolve through these variables. Config, not secrets.
+        for k in [
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "CARGO_TARGET_DIR",
+        ] {
+            assert!(env_key_allowed(k), "{k} must reach the child");
+        }
+        // The same wall still strips secret-looking keys end-to-end.
+        let kept = crate::tools::filter_env(
+            [
+                (
+                    std::ffi::OsString::from("CARGO_TARGET_DIR"),
+                    std::ffi::OsString::from("target/x"),
+                ),
+                (
+                    std::ffi::OsString::from("FOO_API_KEY"),
+                    std::ffi::OsString::from("sk-1"),
+                ),
+            ],
+            env_key_allowed,
+        );
+        assert!(kept.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"));
+        assert!(!kept.iter().any(|(k, _)| k == "FOO_API_KEY"));
     }
 }
