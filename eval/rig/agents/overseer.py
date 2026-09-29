@@ -7,7 +7,8 @@ manifest.rs, P4.5) is harvested into the record's provenance block.
 
 Env: OVERSEER_BIN (default target/release/overseer), OVERSEER_PROVIDER
 (default "opencode" — the opencode.ai/zen/go subscription endpoint),
-OVERSEER_API_KEY / OPENCODE_API_KEY, OVERSEER_BASE_URL, OVERSEER_MODEL.
+the provider's own key (OPENCODE_API_KEY by default; rig/keys.py), which
+the binary inherits, OVERSEER_BASE_URL, OVERSEER_MODEL.
 """
 
 from __future__ import annotations

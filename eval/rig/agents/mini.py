@@ -9,8 +9,8 @@ The loop semantics are frozen — it must stay minimal to remain a valid
 null scaffold. Changes are limited to protocol plumbing (usage capture,
 limits/seed params, trajectory path).
 
-Env: OVERSEER_API_KEY (required), OVERSEER_BASE_URL, OVERSEER_MODEL,
-OVERSEER_PROVIDER.
+Env: the OVERSEER_PROVIDER key (required; rig/keys.py), OVERSEER_BASE_URL,
+OVERSEER_MODEL, OVERSEER_PROVIDER.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ import subprocess
 import time
 import urllib.request
 from pathlib import Path
+
+from .. import keys
 
 OUT_CAP = 4000
 
@@ -67,7 +69,7 @@ def chat(messages: list[dict]) -> tuple[str, dict]:
         }
     ).encode()
     headers = {
-        "Authorization": f"Bearer {os.environ['OVERSEER_API_KEY']}",
+        "Authorization": f"Bearer {keys.require(provider)}",
         "Content-Type": "application/json",
     }
     # The opencode Go gateway requires its routing header on every call.

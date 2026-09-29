@@ -46,5 +46,8 @@ uv run python run.py --agents oracle,fail --seeds 3
 uv run python run.py --report           # report card
 ```
 
-Paid paths (`overseer`, `mini`, τ², LCB, docker benchmarks) need
-`OVERSEER_API_KEY` and spend approval — see LEDGER.md.
+Paid paths (`overseer`, `mini`, τ², LCB, docker benchmarks) need the
+provider's own key — named by `OVERSEER_PROVIDER` via `rig/keys.py`
+(`opencode` → `OPENCODE_API_KEY`, the default; `anthropic` →
+`ANTHROPIC_API_KEY`; `openai` → `OPENAI_API_KEY`; `gemini` →
+`GOOGLE_API_KEY`) — and spend approval; see LEDGER.md.

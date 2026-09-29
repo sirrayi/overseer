@@ -32,7 +32,7 @@ import sys
 import time
 from pathlib import Path
 
-from .. import agents, manifest, store
+from .. import agents, keys, manifest, store
 from . import BenchmarkUnavailable, ExternalTask, has_cli
 
 NAME = "polyglot"
@@ -178,9 +178,9 @@ def run_cli(adapter: PolyglotAdapter, args, st: store.Store,
     agent = args.agents.split(",")[0].strip()
     model = args.model or os.environ.get(
         "OVERSEER_MODEL", "muse-spark-1.3-contributor")
-    if not os.environ.get("OVERSEER_API_KEY") and not os.environ.get(
-            "OPENCODE_API_KEY"):
-        print("model key required for polyglot rollouts", file=sys.stderr)
+    if not keys.api_key():
+        print(f"{keys.key_env()} required for polyglot rollouts",
+              file=sys.stderr)
         return 2
     header = st.matrix_header(
         benchmark=NAME, agents=[agent], k=1,

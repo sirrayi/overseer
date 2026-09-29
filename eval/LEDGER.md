@@ -5,8 +5,12 @@ deferred. Every claim below cites a check that actually ran.
 
 ## Decisions (user-approved)
 
-- Model access: **opencode Go subscription** (`OVERSEER_API_KEY` /
-  `OVERSEER_BASE_URL`; the rig env namespace is `OVERSEER_*`).
+- Model access: **opencode Go subscription** (`OPENCODE_API_KEY` /
+  `OVERSEER_BASE_URL`; the rig's config namespace is `OVERSEER_*`, but
+  keys use each provider's own name — `rig/keys.py`).
+- 2026-09-25: no project-level API key ("we're only making a harness,
+  doesnt make sense to have our own api key"). The CLI and rig read
+  provider-specific key names only.
 - Container runtime: **OrbStack** (installed, daemon verified via
   `docker info`).
 - Spending posture: **zero spend until approved** — no paid benchmark
@@ -141,7 +145,7 @@ deferred. Every claim below cites a check that actually ran.
 9. Relative `--predictions-path` resolved under `cwd=logs_root`.
    Fixed: `.resolve()` before spawn.
 10. `needs_key` gating missed benchmark rollout paths. Fixed: swe_bench
-    rollouts and harbor LLM agents fail fast without `OVERSEER_API_KEY`.
+    rollouts and harbor LLM agents fail fast without the provider key.
 11. `--no-tools` dispatch ran the permission gate first — a TUI user
     could be prompted for a tool that can never run, and the prompt
     still advertised ablated tools. Fixed: disabled check precedes
@@ -164,7 +168,7 @@ deferred. Every claim below cites a check that actually ran.
 - **No paid run has executed.** τ²/LCB `run()` paths are written but
   have never run against the real harnesses — expect first-run fixes
   (litellm model naming, LCB runner deps, output paths).
-- overseer/mini arms require `OVERSEER_API_KEY`; not exercised this round.
+- overseer/mini arms require the provider key; not exercised this round.
 - SWE-bench **rollout** generation (agent solves instances → patches)
   is written and key-gated but unexercised — only the eval path ran.
 - `--no-tools` ablation still leaves non-tool prompt text unchanged
@@ -184,7 +188,7 @@ uv run python run.py --oracle-check       # task solvability
 uv run python run.py --agents oracle,fail --seeds 3   # offline matrix
 uv run python run.py --report             # report card from store
 
-# Paid paths (require OVERSEER_API_KEY + approval):
+# Paid paths (require the provider key, e.g. OPENCODE_API_KEY, + approval):
 uv run python run.py --agents overseer,mini --seeds 3
 uv run python run.py --benchmark tau2 --tau2-domain airline \
     --tau2-user-llm openai/<user-model> --tau2-trials 8
