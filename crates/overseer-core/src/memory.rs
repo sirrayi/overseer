@@ -1280,6 +1280,10 @@ pub fn consolidate(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "consolidate: model reply had no ---INDEX--- section".to_string())?;
+    // The cap bounds the model's reply only; the restore pass below may
+    // push the written INDEX past INDEX_CAP. Intended: a live pointer's
+    // survival outranks the cap (index_segment still truncates what the
+    // prompt carries, with a repair note).
     let mut capped: String = new_index.chars().take(INDEX_CAP).collect();
     // mem0 reconcile enforcement: pointers the plan marked stale never
     // come back, whatever the model replied (ADD-only: this can only drop
