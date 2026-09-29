@@ -368,7 +368,7 @@ impl App {
             };
             // Web mode leaves the glyph row blank — the client
             // overlays the real SVG mark centred on it. The terminal
-            // keeps `⌓`. The wordmark row is server-drawn in both.
+            // keeps `⋈`. The wordmark row is server-drawn in both.
             if caps.term_version.as_deref() != Some("overseer-web") {
                 if let Some(l) = region.get_mut(mid) {
                     *l = center(crate::MARK_GLYPH, crate::theme::faint());

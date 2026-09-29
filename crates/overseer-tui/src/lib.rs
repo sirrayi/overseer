@@ -19,7 +19,7 @@ pub mod widgets;
 /// The overseer mark as a terminal glyph — §10's single swap point:
 /// change this const to re-cut the text-mode mark (the web surface
 /// draws `web/mark.svg` instead; the two files must agree).
-pub(crate) const MARK_GLYPH: &str = "\u{2313}"; // ⌓ SEGMENT
+pub(crate) const MARK_GLYPH: &str = "\u{22C8}"; // ⋈ BOWTIE
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;

@@ -922,7 +922,7 @@ fn full_empty_state_and_placeholder() {
     let (mut app, _e, _w, mut term, caps) = full_harness();
     app.step(&mut term, &caps).unwrap();
     let s = screen(&term);
-    assert!(s.contains('⌓'), "mark glyph centred:\n{s}");
+    assert!(s.contains('⋈'), "mark glyph centred:\n{s}");
     assert!(s.contains("overseer"), "wordmark:\n{s}");
     assert!(s.contains("ask anything"), "composer placeholder:\n{s}");
     insta::assert_snapshot!("empty_state", s);
