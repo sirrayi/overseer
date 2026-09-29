@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 /// Output budget ≈1K tokens.
 pub const MAP_BUDGET: usize = 4_000;
+/// Appended when the ranked list outgrows the budget.
+const BUDGET_MARKER: &str = "[...map budget exhausted — use `symbol` for detail...]\n";
 const MAX_FILES: usize = 5_000;
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 
@@ -264,22 +266,23 @@ pub fn render_map(root: &Path) -> String {
             .then(an.cmp(bn)) // deterministic tiebreak
     });
     let mut out = format!("## Repo map — {} files indexed\n", idx.files_indexed);
+    // Select in global rank order under the budget, then render grouped:
+    // files ordered by their best-ranked symbol, one header per file
+    // (B1-5) counting the lines rendered under it. File text is read once
+    // per render for the signature column.
+    let mut texts: HashMap<&Path, Option<String>> = HashMap::new();
+    let mut files: Vec<(&Path, Vec<String>)> = Vec::new();
+    let mut slot: HashMap<&Path, usize> = HashMap::new();
     let mut used = out.len();
-    let mut last_file: Option<&std::path::Path> = None;
+    let mut exhausted = false;
     for (name, sym) in ranked {
         let (p, l) = &sym.defs[0];
         let rel = p.strip_prefix(root).unwrap_or(p);
-        // Per-file header counts (B1-5): orientation without extra tokens.
-        if last_file.map(|f| f != p.as_path()).unwrap_or(true) {
-            let n_here = sym.defs.len();
-            let hdr = format!("### {} ({n_here} def)\n", rel.display());
-            if used + hdr.len() < MAP_BUDGET {
-                out.push_str(&hdr);
-                used += hdr.len();
-            }
-            last_file = Some(p);
-        }
-        let sig = signature_line(root, p, *l, 120);
+        let sig = texts
+            .entry(p.as_path())
+            .or_insert_with(|| std::fs::read_to_string(p).ok())
+            .as_deref()
+            .and_then(|t| signature_line(t, *l, 120));
         let line = format!(
             "{} — {}:{l} (refs:{}){}",
             name,
@@ -287,15 +290,35 @@ pub fn render_map(root: &Path) -> String {
             sym.refs.len(),
             sig.map(|s| format!(" :: {s}")).unwrap_or_default()
         );
-        if used + line.len() + 1 > MAP_BUDGET {
-            out.push_str("[...map budget exhausted — use `symbol` for detail...]\n");
+        let n = slot.get(p.as_path()).map_or(0, |&i| files[i].1.len());
+        let hdr_prev = if n == 0 { 0 } else { file_header(rel, n).len() };
+        let cost = line.len() + 1 + file_header(rel, n + 1).len() - hdr_prev;
+        if used + cost > MAP_BUDGET {
+            exhausted = true;
             break;
         }
-        out.push_str(&line);
-        out.push('\n');
-        used += line.len() + 1;
+        used += cost;
+        let i = *slot.entry(p.as_path()).or_insert_with(|| {
+            files.push((rel, Vec::new()));
+            files.len() - 1
+        });
+        files[i].1.push(line);
+    }
+    for (rel, lines) in &files {
+        out.push_str(&file_header(rel, lines.len()));
+        for l in lines {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    if exhausted {
+        out.push_str(BUDGET_MARKER);
     }
     out
+}
+
+fn file_header(rel: &Path, n: usize) -> String {
+    format!("### {} ({n} def)\n", rel.display())
 }
 
 /// PageRank-lite (B1-5, aider-repomap pattern): 4 damping iterations over
@@ -354,11 +377,9 @@ fn score_of(scores: &std::collections::HashMap<String, f64>, name: &str, sym: &S
         .unwrap_or(sym.refs.len() as f64 * 3.0 + sym.defs.len() as f64)
 }
 
-/// First logical line at `line` in `path`, trimmed to `cap` chars.
-/// Gives the map signature context (fn signature, struct line) when the
-/// budget allows — falls back to None on read failure.
-fn signature_line(root: &Path, path: &Path, line: usize, cap: usize) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// Line `line` (1-based) of `text`, trimmed to `cap` chars — the map's
+/// signature column (fn signature, struct line). None when blank/absent.
+fn signature_line(text: &str, line: usize, cap: usize) -> Option<String> {
     let l = text.lines().nth(line.saturating_sub(1))?.trim();
     if l.is_empty() {
         return None;
@@ -367,8 +388,6 @@ fn signature_line(root: &Path, path: &Path, line: usize, cap: usize) -> Option<S
     if l.chars().count() > cap {
         s.push('…');
     }
-    // Skip signatures that merely repeat the symbol line with no content.
-    let _ = root;
     Some(s)
 }
 
@@ -489,6 +508,56 @@ mod tests {
         let hub = map.find("hub —").expect("hub in map");
         let leaf = map.find("leaf —").expect("leaf in map");
         assert!(hub < leaf, "hub (4 refs) must precede leaf (1 ref)");
+    }
+
+    #[test]
+    fn map_groups_symbols_under_one_header_per_file() {
+        // Rank interleaves files: a1 (4 refs) > b1 (3) > a2 (1).
+        let dir = tmpdir();
+        std::fs::write(dir.join("a.rs"), "fn a1() {}\nfn a2() {}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn b1() {}\n").unwrap();
+        std::fs::write(dir.join("u1.rs"), "// a1 b1\n").unwrap();
+        std::fs::write(dir.join("u2.rs"), "// a1 b1\n").unwrap();
+        std::fs::write(dir.join("u3.rs"), "// a1\n").unwrap();
+        let map = render_map(&dir);
+        let headers: Vec<&str> = map.lines().filter(|l| l.starts_with("### ")).collect();
+        assert_eq!(headers, ["### a.rs (2 def)", "### b.rs (1 def)"], "{map}");
+        let at = |needle: &str| {
+            map.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {map}"))
+        };
+        assert!(at("### a.rs") < at("a1 —") && at("a1 —") < at("a2 —"));
+        assert!(at("a2 —") < at("### b.rs") && at("### b.rs") < at("b1 —"));
+    }
+
+    #[test]
+    fn grouped_map_stays_within_budget_with_unique_headers() {
+        let dir = tmpdir();
+        for f in 0..60 {
+            let body: String = (0..10)
+                .map(|i| format!("pub fn sym_{f}_{i}() {{}} // sym_{}_{i}\n", (f + 1) % 60))
+                .collect();
+            std::fs::write(dir.join(format!("f{f:02}.rs")), body).unwrap();
+        }
+        let map = render_map(&dir);
+        let content = map.trim_end_matches(BUDGET_MARKER);
+        assert!(content.len() <= MAP_BUDGET, "{}", content.len());
+        assert!(map.ends_with(BUDGET_MARKER), "budget exhausted is marked");
+        let mut seen = std::collections::HashSet::new();
+        for h in map.lines().filter(|l| l.starts_with("### ")) {
+            assert!(seen.insert(h.split(" (").next().unwrap()), "dup header {h}");
+        }
+        // Each header's count equals the symbol lines rendered under it.
+        let mut blocks = map.split("### ").skip(1);
+        let block = blocks.next().unwrap();
+        let n: usize = block
+            .split(" (")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        let lines = block.lines().skip(1).filter(|l| l.contains(" — ")).count();
+        assert_eq!(n, lines, "{block}");
     }
 
     #[test]
