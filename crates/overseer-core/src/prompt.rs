@@ -547,4 +547,34 @@ mod tests {
         let segs = assemble(&AgentConfig::default());
         assert!(segs.iter().all(|s| s.name != "persona"));
     }
+
+    /// K7: startup-token regression guard. The bare static prefix (no
+    /// memory, skills or persona) must not grow more than 5% past the
+    /// measured baseline without a deliberate re-measure.
+    #[test]
+    fn static_prompt_size_guard() {
+        // Measured at 29fa7ce: 929 chars, ~266 tokens (claude-sonnet-5 estimator).
+        const BASELINE_CHARS: usize = 929;
+        let cfg = AgentConfig {
+            cwd: std::env::temp_dir().join("overseer-k7-no-workspace"),
+            disabled_tools: vec!["skill".into()],
+            ..Default::default()
+        };
+        let segs = assemble(&cfg);
+        assert!(segs
+            .iter()
+            .all(|s| !matches!(s.name, "memory" | "skills" | "persona" | "mcp")));
+        let text = segs
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let chars = text.chars().count();
+        let tokens = crate::tokens::count_tokens(&text, &cfg.model);
+        eprintln!("K7 static prompt: {chars} chars, ~{tokens} tokens ({})", cfg.model);
+        assert!(
+            chars * 100 <= BASELINE_CHARS * 105,
+            "static prompt grew to {chars} chars (baseline {BASELINE_CHARS} + 5%)"
+        );
+    }
 }
