@@ -688,10 +688,7 @@ impl CivilTime {
     /// Resolve an epoch-ms timestamp to local civil time. `None` before
     /// 1970 (nothing schedulable lives there).
     pub fn from_epoch_ms(ms: u64) -> Option<Self> {
-        let offset_min: i64 = std::env::var("OVERSEER_TZ_OFFSET_MIN")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0);
+        let offset_min = crate::gate::tz_offset_min();
         let secs = (ms / 1000) as i64 + offset_min * 60;
         if secs < 0 {
             return None;
