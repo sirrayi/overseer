@@ -27,8 +27,7 @@ pub struct SkillMeta {
     pub source: &'static str,
     /// `trigger:`/`triggers:` phrases (awesomeclaude convention, B2): a
     /// resident routing hint. Trigger *lines* are rendered in the index
-    /// (routing precision for the model); `matching()` gives the engine the
-    /// same signal for lookup-miss hints.
+    /// (routing precision for the model).
     pub triggers: Vec<String>,
 }
 
@@ -159,116 +158,6 @@ pub fn index_segment(cwd: &Path) -> Option<String> {
         }
     }
     Some(lines)
-}
-
-/// Skills whose triggers match `prompt` (case-insensitive substring), most
-/// specific first: more matched triggers, then name order. Empty when no
-/// skill declares a trigger that hits — a skill without triggers is never
-/// a "match", it is only reachable by description.
-pub fn matching(cwd: &Path, prompt: &str) -> Vec<SkillMeta> {
-    let lower = prompt.to_lowercase();
-    let mut hits: Vec<(usize, SkillMeta)> = scan(cwd)
-        .into_iter()
-        .filter_map(|s| {
-            let n = s
-                .triggers
-                .iter()
-                .filter(|t| {
-                    let t = t.to_lowercase();
-                    !t.is_empty() && lower.contains(&t)
-                })
-                .count();
-            (n > 0).then_some((n, s))
-        })
-        .collect();
-    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
-    hits.into_iter().map(|(_, s)| s).collect()
-}
-
-/// Tokenize for overlap scoring: lowercase alphanumeric tokens.
-fn tokens(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_lowercase())
-        .collect()
-}
-
-/// Score one skill against a query: exact name = 1.0, trigger substring =
-/// 0.8, else the fraction of distinct query tokens present in the skill's
-/// name/description/triggers (0.0 when the query has no tokens).
-fn score_skill(s: &SkillMeta, query: &str) -> f32 {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return 0.0;
-    }
-    if s.name.to_lowercase() == q {
-        return 1.0;
-    }
-    if s.triggers.iter().any(|t| {
-        let t = t.to_lowercase();
-        !t.is_empty() && q.contains(&t)
-    }) {
-        return 0.8;
-    }
-    let mut qtok = tokens(&q);
-    qtok.sort();
-    qtok.dedup();
-    if qtok.is_empty() {
-        return 0.0;
-    }
-    let stext = format!("{} {} {}", s.name, s.description, s.triggers.join(" ")).to_lowercase();
-    let stokens: std::collections::BTreeSet<String> = tokens(&stext).into_iter().collect();
-    let hits = qtok.iter().filter(|t| stokens.contains(*t)).count();
-    hits as f32 / qtok.len() as f32
-}
-
-/// Rank all skills against `query` (exact name, then trigger substring, then
-/// token overlap), score-descending with a name-ascending tiebreak, capped
-/// at `top_k` (`top_k = 0` returns empty). Zero-scored skills are dropped.
-pub fn search_ranked(cwd: &Path, query: &str, top_k: usize) -> Vec<(SkillMeta, f32)> {
-    if top_k == 0 {
-        return Vec::new();
-    }
-    let mut ranked: Vec<(SkillMeta, f32)> = scan(cwd)
-        .into_iter()
-        .map(|s| {
-            let score = score_skill(&s, query);
-            (s, score)
-        })
-        .filter(|(_, score)| *score > 0.0)
-        .collect();
-    ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.name.cmp(&b.0.name))
-    });
-    ranked.truncate(top_k);
-    ranked
-}
-
-/// Minimum score for query-driven autoload.
-pub const AUTOLOAD_THRESHOLD: f32 = 0.8;
-
-/// Skills worth loading for `query` without asking: everything at or above
-/// [`AUTOLOAD_THRESHOLD`], in [`search_ranked`] order.
-pub fn autoload(cwd: &Path, query: &str) -> Vec<SkillMeta> {
-    search_ranked(cwd, query, usize::MAX)
-        .into_iter()
-        .filter(|(_, score)| *score >= AUTOLOAD_THRESHOLD)
-        .map(|(s, _)| s)
-        .collect()
-}
-
-/// One-line multi-skill reminder: names the candidates and points at the
-/// `skill` tool, or reports that nothing matched.
-pub fn reminder_line(names: &[&str]) -> String {
-    if names.is_empty() {
-        return "No skills matched.".to_string();
-    }
-    format!(
-        "Available skills: {} — load via skill tool; bodies on demand.",
-        names.join(", ")
-    )
 }
 
 /// Load a skill body by name, provenance-wrapped. `Err` names the
@@ -403,8 +292,7 @@ mod tests {
     #[test]
     fn trigger_lines_route_without_loading_bodies() {
         // P8-B accept (awesomeclaude `trigger:` frontmatter): trigger
-        // phrases are resident routing hints — indexed, and matchable
-        // engine-side for the same prompt.
+        // phrases are resident routing hints, indexed without the body.
         let dir = tmpdir();
         let root = dir.join(".overseer/skills");
         mk_skill(
@@ -427,94 +315,5 @@ mod tests {
         // The plain skill's line is unchanged — no empty bracket.
         assert!(seg.contains("- plain — no triggers\n"), "{seg}");
         assert!(!seg.contains("SECRET-BODY"), "bodies stay out of the index");
-
-        let hits = matching(&dir, "please fill this ACROFORM for me");
-        assert_eq!(
-            hits.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["pdf"],
-            "a trigger hit routes the skill"
-        );
-        assert!(matching(&dir, "unrelated request").is_empty());
-        // Most-specific first: a skill matching two triggers outranks one.
-        mk_skill(
-            &root,
-            "both",
-            "name: both\ndescription: two hits\ntriggers: acroform, pdf\n",
-            "B",
-        );
-        let hits = matching(&dir, "acroform pdf work");
-        assert_eq!(
-            hits[0].name,
-            "both",
-            "{:?}",
-            hits.iter().map(|s| &s.name).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn ranked_search_orders_exact_then_trigger_then_overlap() {
-        let dir = tmpdir();
-        let root = dir.join(".overseer/skills");
-        mk_skill(
-            &root,
-            "pdf",
-            "name: pdf\ndescription: fill forms\ntrigger: acroform\n",
-            "B",
-        );
-        mk_skill(
-            &root,
-            "alpha",
-            "name: alpha\ndescription: fill forms\n",
-            "B",
-        );
-        // Exact name hit scores 1.0 and leads.
-        let ranked = search_ranked(&dir, "pdf", 10);
-        assert!(!ranked.is_empty());
-        assert_eq!(ranked[0].0.name, "pdf");
-        assert_eq!(ranked[0].1, 1.0);
-        // Trigger hit (0.8) with no token-overlap competition.
-        let ranked = search_ranked(&dir, "acroform", 10);
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].0.name, "pdf");
-        assert_eq!(ranked[0].1, 0.8);
-        // Equal overlap scores break ties by name.
-        let ranked = search_ranked(&dir, "fill forms", 10);
-        let names: Vec<&str> = ranked.iter().map(|(s, _)| s.name.as_str()).collect();
-        assert_eq!(names, ["alpha", "pdf"]);
-        // top_k caps; 0 → empty; unknown query → empty.
-        assert_eq!(search_ranked(&dir, "fill forms", 1).len(), 1);
-        assert!(search_ranked(&dir, "pdf", 0).is_empty());
-        assert!(search_ranked(&dir, "zzzqqq", 10).is_empty());
-    }
-
-    #[test]
-    fn autoload_threshold_and_reminder_line() {
-        let dir = tmpdir();
-        let root = dir.join(".overseer/skills");
-        mk_skill(
-            &root,
-            "pdf",
-            "name: pdf\ndescription: fill forms\ntrigger: acroform\n",
-            "B",
-        );
-        mk_skill(
-            &root,
-            "unrelated",
-            "name: unrelated\ndescription: juggling\n",
-            "B",
-        );
-        assert_eq!(AUTOLOAD_THRESHOLD, 0.8);
-        let loaded = autoload(&dir, "acroform work");
-        assert_eq!(
-            loaded.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["pdf"]
-        );
-        // Pure token overlap (0.25) stays below the threshold.
-        assert!(autoload(&dir, "juggling tips and tricks").is_empty());
-        assert_eq!(
-            reminder_line(&["alpha", "pdf"]),
-            "Available skills: alpha, pdf — load via skill tool; bodies on demand."
-        );
-        assert_eq!(reminder_line(&[]), "No skills matched.");
     }
 }
