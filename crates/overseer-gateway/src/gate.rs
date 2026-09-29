@@ -47,7 +47,7 @@ fn hhmm(s: &str) -> Option<u16> {
 /// Minutes east of UTC from `OVERSEER_TZ_OFFSET_MIN` (surrounding
 /// whitespace ignored); unset or unparseable means UTC. The one parser
 /// for both the quiet-hours gate and the cron clock.
-pub fn tz_offset_min() -> i64 {
+pub(crate) fn tz_offset_min() -> i64 {
     std::env::var("OVERSEER_TZ_OFFSET_MIN")
         .ok()
         .and_then(|v| v.trim().parse().ok())
