@@ -960,7 +960,7 @@ pub fn scan(text: &str) -> Vec<Redaction> {
     }
     // AKIA + 16 uppercase alnum. Byte-indexed (F1): ASCII patterns only
     // match at char boundaries, so pushed spans are always valid str slices.
-    for i in 0..b.len().saturating_sub(20) {
+    for i in 0..(b.len() + 1).saturating_sub(20) {
         if &b[i..i + 4] == b"AKIA"
             && b[i + 4..i + 20]
                 .iter()
@@ -1180,6 +1180,22 @@ mod tests {
         assert_eq!(s.len(), SENTINEL_PREFIX.len() + SENTINEL_HEX_LEN);
         assert!(!s.is_char_boundary(SENTINEL_PREFIX.len()));
         assert!(!is_sentinel(&s));
+    }
+
+    #[test]
+    fn scan_finds_aws_key_ending_at_eof() {
+        for body in ["AKIAIOSFODNN7QWERTYZ", "key AKIAIOSFODNN7QWERTYZ"] {
+            let spans = scan(body);
+            assert!(
+                spans
+                    .iter()
+                    .any(|r| r.family == "aws-key" && r.end == body.len()),
+                "{body}: {spans:?}"
+            );
+        }
+        assert!(scan("AKIAIOSFODNN7QWERTY")
+            .iter()
+            .all(|r| r.family != "aws-key"));
     }
 
     #[test]
