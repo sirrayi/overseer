@@ -736,37 +736,72 @@ fn rank(s: Sensitivity) -> u8 {
     }
 }
 
-/// First `*.md` token on an index line, if any.
+/// First `*.md` token on an index line, if it is a valid pointer (see
+/// `valid_pointer`).
 fn topic_name(line: &str) -> Option<&str> {
     line.split_whitespace()
         .find(|tok| tok.ends_with(".md"))
-        .map(|tok| tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';'))
-        .filter(|tok| !tok.is_empty() && !tok.contains('/') && !tok.contains('\\'))
+        .map(trim_pointer)
+        .filter(|tok| valid_pointer(tok))
 }
 
-/// True when some line of `index` names topic `name` as a whole token.
-fn index_names(index: &str, name: &str) -> bool {
+fn trim_pointer(tok: &str) -> &str {
+    tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';')
+}
+
+/// A pointer names a topic either bare (`prefs.md`) or qualified by one
+/// memory layer (`semantic/prefs.md`). Anything else — other dirs,
+/// nesting, `..`, absolute paths, backslashes — is not a pointer.
+fn valid_pointer(name: &str) -> bool {
+    let file = match name.split_once('/') {
+        None => name,
+        Some((layer, file)) if Layer::ALL.iter().any(|l| l.name() == layer) => file,
+        Some(_) => return false,
+    };
+    file.len() > ".md".len() && file.ends_with(".md") && !file.contains('/') && !file.contains('\\')
+}
+
+/// The memory-relative path (`/`-separated) a pointer resolves to: a
+/// qualified pointer names its exact layer file; a bare one is looked up
+/// in the memory root first, then each layer subdir. None when the
+/// pointer is invalid or no backing file exists.
+fn resolve_pointer(dir: &Path, name: &str) -> Option<String> {
+    if !valid_pointer(name) {
+        return None;
+    }
+    if dir.join(name).is_file() {
+        return Some(name.to_string());
+    }
+    if name.contains('/') {
+        return None;
+    }
+    Layer::ALL
+        .iter()
+        .map(|l| format!("{}/{name}", l.name()))
+        .find(|rel| dir.join(rel).is_file())
+}
+
+/// Identity of a pointer for "same topic?" comparisons: its resolved
+/// relative path, or the name as written when nothing backs it — so
+/// `foo.md` and `semantic/foo.md` agree when both resolve to one file.
+fn pointer_key(dir: &Path, name: &str) -> String {
+    resolve_pointer(dir, name).unwrap_or_else(|| name.to_string())
+}
+
+/// True when some line of `index` names the topic keyed `key` (see
+/// `pointer_key`) as a whole token.
+fn index_names(dir: &Path, index: &str, key: &str) -> bool {
     index.lines().any(|l| {
-        l.split_whitespace().any(|tok| {
-            tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';') == name
-        })
+        l.split_whitespace()
+            .map(trim_pointer)
+            .any(|tok| tok.ends_with(".md") && valid_pointer(tok) && pointer_key(dir, tok) == key)
     })
 }
 
-/// Locate a topic file by name: memory root first, then each layer
-/// subdir. None when no backing file exists.
+/// Locate a topic file by pointer name (bare or layer-qualified, see
+/// `resolve_pointer`). None when no backing file exists.
 pub fn layer_path(dir: &Path, name: &str) -> Option<PathBuf> {
-    let root = dir.join(name);
-    if root.is_file() {
-        return Some(root);
-    }
-    for layer in Layer::ALL {
-        let p = dir.join(layer.name()).join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
+    resolve_pointer(dir, name).map(|rel| dir.join(rel))
 }
 
 /// Git-version the memory dir. Runs `git init` once, then commits any dirty
@@ -876,21 +911,24 @@ impl ReconcilePlan {
 /// Classify the index against the directory. `index_text` is passed in so
 /// callers can reconcile a proposed index as well as the live one.
 fn reconcile(dir: &Path, index_text: &str) -> ReconcilePlan {
-    let mut named: Vec<String> = Vec::new();
+    // (name as written, resolved key) — one entry per distinct topic.
+    let mut named: Vec<(String, String)> = Vec::new();
     for line in index_text.lines() {
         // Proposals are never part of the trusted index (RT-3).
         if is_proposal_pointer(line) {
             continue;
         }
         if let Some(n) = topic_name(line) {
-            named.push(n.to_string());
+            let key = pointer_key(dir, n);
+            if !named.iter().any(|(_, k)| *k == key) {
+                named.push((n.to_string(), key));
+            }
         }
     }
     named.sort();
-    named.dedup();
 
     let mut plan = ReconcilePlan::default();
-    for n in &named {
+    for (n, _) in &named {
         let (topic, mtime) = topic_of(dir, n);
         let live = match topic {
             Topic::Missing => false,
@@ -905,13 +943,13 @@ fn reconcile(dir: &Path, index_text: &str) -> ReconcilePlan {
         }
     }
 
-    // Untracked topics: a file on disk no pointer names. Root and the layer
-    // subdirs both count (pointers are always bare file names).
-    let mut dirs = vec![dir.to_path_buf()];
+    // Untracked topics: a file on disk no pointer resolves to. Root and
+    // the layer subdirs both count.
+    let mut dirs = vec![(dir.to_path_buf(), None)];
     for layer in Layer::ALL {
-        dirs.push(dir.join(layer.name()));
+        dirs.push((dir.join(layer.name()), Some(layer.name())));
     }
-    for d in dirs {
+    for (d, layer) in dirs {
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
@@ -920,7 +958,11 @@ fn reconcile(dir: &Path, index_text: &str) -> ReconcilePlan {
             if !name.ends_with(".md") || name == INDEX_NAME || name == CORE_NAME {
                 continue;
             }
-            if !named.iter().any(|n| n == &name) {
+            let rel = match layer {
+                Some(l) => format!("{l}/{name}"),
+                None => name.clone(),
+            };
+            if !named.iter().any(|(_, k)| *k == rel) {
                 plan.add.push(name);
             }
         }
@@ -1242,15 +1284,13 @@ pub fn consolidate(
     // mem0 reconcile enforcement: pointers the plan marked stale never
     // come back, whatever the model replied (ADD-only: this can only drop
     // a pointer whose backing file is gone or whose asset expired).
+    let drop_keys: Vec<String> = plan.drop.iter().map(|d| pointer_key(dir, d)).collect();
     let mut dropped_stale = 0usize;
     if !plan.drop.is_empty() {
         let kept: Vec<&str> = capped
             .lines()
             .filter(|l| {
-                let stale = plan
-                    .drop
-                    .iter()
-                    .any(|d| topic_name(l).is_some_and(|n| n == d.as_str()));
+                let stale = topic_name(l).is_some_and(|n| drop_keys.contains(&pointer_key(dir, n)));
                 if stale {
                     dropped_stale += 1;
                 }
@@ -1261,8 +1301,9 @@ pub fn consolidate(
     }
     // ADD-only enforcement: every live pointer in the old index survives.
     // A pointer the reply no longer names is re-appended with its original
-    // line; one the reply rewrote or merged (still naming the topic, e.g.
-    // behind a `superseded_by` trailer) counts as kept.
+    // line; one the reply rewrote, merged, or re-qualified (still naming
+    // the same resolved topic, e.g. behind a `superseded_by` trailer or
+    // promoted from `foo.md` to `semantic/foo.md`) counts as kept.
     let mut restored = 0usize;
     for line in old_index.lines() {
         if is_proposal_pointer(line) {
@@ -1271,7 +1312,8 @@ pub fn consolidate(
         let Some(name) = topic_name(line) else {
             continue;
         };
-        if plan.drop.iter().any(|d| d == name) || index_names(&capped, name) {
+        let key = pointer_key(dir, name);
+        if drop_keys.contains(&key) || index_names(dir, &capped, &key) {
             continue;
         }
         if !capped.is_empty() && !capped.ends_with('\n') {
@@ -1546,6 +1588,99 @@ mod tests {
         assert!(new.contains("new.md — added"), "additions stay: {new}");
         assert!(!new.contains("gone.md"), "stale pointer still drops: {new}");
         assert!(msg.contains("1 live restored"), "{msg}");
+    }
+
+    #[test]
+    fn consolidate_restores_an_omitted_layer_qualified_pointer() {
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(
+            &idx,
+            "# Memory Index\n\nfacts.md — facts\nsemantic/prefs.md — `tabs` over spaces\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("facts.md"), "data").unwrap();
+        std::fs::write(dir.join("semantic/prefs.md"), "tabs").unwrap();
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\nfacts.md — facts\n---INDEX---",
+        );
+        let msg = consolidate(&p, "tiny", &dir).unwrap();
+        let new = std::fs::read_to_string(&idx).unwrap();
+        assert!(
+            new.lines()
+                .any(|l| l == "semantic/prefs.md — `tabs` over spaces"),
+            "omitted qualified pointer restored verbatim: {new}"
+        );
+        assert!(msg.contains("1 live restored"), "{msg}");
+    }
+
+    #[test]
+    fn consolidate_bare_to_qualified_promotion_is_not_duplicated() {
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(&idx, "# Memory Index\n\nfoo.md — foo\n").unwrap();
+        std::fs::write(dir.join("semantic/foo.md"), "foo body").unwrap();
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\nsemantic/foo.md — foo, promoted\n---INDEX---",
+        );
+        let msg = consolidate(&p, "tiny", &dir).unwrap();
+        let new = std::fs::read_to_string(&idx).unwrap();
+        assert_eq!(
+            new.lines().filter(|l| l.contains("foo.md")).count(),
+            1,
+            "a promoted pointer still names the topic: {new}"
+        );
+        assert!(new.contains("semantic/foo.md — foo, promoted"), "{new}");
+        assert!(msg.contains("0 live restored"), "{msg}");
+    }
+
+    #[test]
+    fn qualified_pointer_to_a_missing_file_is_dropped() {
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(dir.join("semantic/live.md"), "body\n").unwrap();
+        let index = "# Memory Index\n\nsemantic/live.md — fine\nsemantic/gone.md — missing\n";
+        std::fs::write(&idx, index).unwrap();
+
+        let plan = reconcile(&dir, index);
+        assert_eq!(plan.drop, vec!["semantic/gone.md".to_string()]);
+        assert_eq!(plan.keep, 1, "semantic/live.md agrees");
+        assert!(
+            plan.add.is_empty(),
+            "a qualified pointer tracks its file: {plan:?}"
+        );
+
+        // The model lazily keeps the stale qualified pointer: the engine
+        // reclaims it and never restores it.
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\nsemantic/gone.md — missing\n---INDEX---",
+        );
+        let msg = consolidate(&p, "tiny", &dir).unwrap();
+        let new = std::fs::read_to_string(&idx).unwrap();
+        assert!(!new.contains("semantic/gone.md"), "{new}");
+        assert!(new.contains("semantic/live.md — fine"), "{new}");
+        assert!(msg.contains("1 stale reclaimed"), "{msg}");
+    }
+
+    #[test]
+    fn topic_name_accepts_bare_and_layer_qualified_pointers_only() {
+        assert_eq!(topic_name("prefs.md — tabs"), Some("prefs.md"));
+        for layer in Layer::ALL {
+            let line = format!("{}/x.md — y", layer.name());
+            let want = format!("{}/x.md", layer.name());
+            assert_eq!(topic_name(&line), Some(want.as_str()));
+        }
+        for bad in [
+            "other/x.md — y",
+            "semantic/../x.md — y",
+            "semantic/a/x.md — y",
+            "/abs/x.md — y",
+            "semantic/.md — y",
+            "semantic\\x.md — y",
+            "proposals/x.md — y",
+        ] {
+            assert_eq!(topic_name(bad), None, "{bad}");
+        }
     }
 
     #[test]
