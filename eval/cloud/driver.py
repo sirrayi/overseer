@@ -116,7 +116,7 @@ runbook EXACTLY — do not improvise extra tasks.
 
 6. Collect results into the repo and push:
    `cd ~/overseer && git checkout -b eval/{spec['run']} &&`
-   `git add -f eval/results eval/stress/out eval/cloud/state.json 2>/dev/null;`
+   `git add -f eval/results eval/stress/out 2>/dev/null;`
    `git commit -m "eval({spec['run']}): worker results" &&`
    `git push -u origin eval/{spec['run']}`
 

@@ -160,3 +160,12 @@ class TestDriverMatrix:
         launched = {v["run"] for v in st["sessions"].values()}
         assert "stress-muse" in launched
         assert "sweb-muse-s00" not in launched
+
+
+def test_worker_prompt_never_force_adds_driver_state():
+    """state.json is the driver's gitignored local bookkeeping, not a result."""
+    for spec in driver.matrix():
+        prompt = driver.worker_prompt(spec)
+        assert "git add -f" in prompt
+        add = next(ln for ln in prompt.splitlines() if "git add -f" in ln)
+        assert "state.json" not in add, spec["run"]
