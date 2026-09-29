@@ -470,6 +470,16 @@ impl ToolRegistry {
                 }
             }
         }
+        // B1-2 (Instructor/FastMCP): hand-rolled required/type check against
+        // the advertised `input_schema` before the gate and dispatch — a
+        // malformed call never reaches a human approval dialog. Zero-dep
+        // (serde_json is already in the tree); failures return a field-level
+        // error that names the violated field — no dispatch, no side effects.
+        if let Some(spec) = self.specs.iter().find(|s| s.name == name) {
+            if let Err(e) = check_args(&spec.input_schema, input) {
+                return e;
+            }
+        }
         match self.policy.gate(name, input) {
             crate::perm::Gate::Allow => {}
             crate::perm::Gate::Deny(reason) => {
@@ -493,15 +503,6 @@ impl ToolRegistry {
                     }
                 }
                 return ToolOutput::denied(reason);
-            }
-        }
-        // B1-2 (Instructor/FastMCP): hand-rolled required/type check against
-        // the advertised `input_schema` before dispatch. Zero-dep (serde_json
-        // is already in the tree); failures return a field-level error that
-        // names the violated field — no dispatch, no side effects.
-        if let Some(spec) = self.specs.iter().find(|s| s.name == name) {
-            if let Err(e) = check_args(&spec.input_schema, input) {
-                return e;
             }
         }
         let out = match name {
@@ -777,6 +778,152 @@ pub fn resolve(ctx: &ToolCtx, path: &str) -> PathBuf {
     }
 }
 
+/// `O_NOFOLLOW` per target (no libc crate): the open fails with `ELOOP`
+/// when the final path component is a symlink.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "powerpc",
+        target_arch = "powerpc64"
+    )
+))]
+const O_NOFOLLOW: i32 = 0o100000;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "powerpc",
+        target_arch = "powerpc64"
+    ))
+))]
+const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))
+))]
+const O_NOFOLLOW: i32 = 0;
+
+/// Canonicalize the longest existing ancestor of `p` and re-append the
+/// missing remainder (the same shape as the permission gate's check).
+fn canon_deep(p: &Path) -> PathBuf {
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            let mut out = c;
+            for comp in missing.iter().rev() {
+                out.push(comp);
+            }
+            return out;
+        }
+        match cur.file_name() {
+            Some(name) => {
+                missing.push(name.to_os_string());
+                cur.pop();
+            }
+            None => return p.to_path_buf(),
+        }
+    }
+}
+
+/// Resolve the file a write/edit will touch, immediately before the write:
+/// create missing parents (only after the deepest existing ancestor is
+/// proven contained), canonicalize the PARENT, check it sits under `root`,
+/// and resolve a final-component symlink to its (contained) target. The
+/// returned canonical path is what `snapshot` records and what
+/// [`write_no_follow`] opens — a symlink swapped in after the gate's
+/// containment check can no longer redirect the write.
+// DEFERRED(owner): fd-relative (openat) path walk closes the intermediate-dir TOCTOU
+pub(crate) fn contained_target(path: &Path, root: &Path) -> Result<PathBuf, String> {
+    let root = canon_deep(root);
+    let outside = |p: &Path| {
+        format!(
+            "Refusing to write {}: it resolves to {}, outside the working directory {}.",
+            path.display(),
+            p.display(),
+            root.display()
+        )
+    };
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("Cannot write {}: not a file path.", path.display()));
+    };
+    let pre = canon_deep(parent);
+    if !pre.starts_with(&root) {
+        return Err(outside(&pre));
+    }
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve {}: {e}", parent.display()))?;
+    if !parent.starts_with(&root) {
+        return Err(outside(&parent));
+    }
+    let target = parent.join(name);
+    let is_link = std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return Ok(target);
+    }
+    let resolved = target.canonicalize().map_err(|e| {
+        format!(
+            "Refusing to write {}: dangling symlink ({e}).",
+            path.display()
+        )
+    })?;
+    if !resolved.starts_with(&root) {
+        return Err(outside(&resolved));
+    }
+    Ok(resolved)
+}
+
+/// Create/truncate `target` and write `content` through a handle opened
+/// with `O_NOFOLLOW`: if the final component is (or became) a symlink,
+/// the open fails instead of writing through it.
+pub(crate) fn write_no_follow(target: &Path, content: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NOFOLLOW);
+        if O_NOFOLLOW == 0
+            && std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return Err(format!(
+                "Cannot write {}: it is a symlink.",
+                target.display()
+            ));
+        }
+    }
+    let mut f = opts
+        .open(target)
+        .map_err(|e| format!("Cannot write {}: {e}", target.display()))?;
+    f.write_all(content)
+        .map_err(|e| format!("Cannot write {}: {e}", target.display()))
+}
+
 /// Shared JSON-schema fragment builders.
 pub fn schema(properties: Value, required: &[&str]) -> Value {
     json!({
@@ -904,6 +1051,42 @@ mod tests {
                 "payload {i} kept"
             );
         }
+    }
+
+    #[test]
+    fn a_malformed_call_never_reaches_the_permission_gate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = tmpdir();
+        let asks = Arc::new(AtomicUsize::new(0));
+        let seen = asks.clone();
+        let mut pol = crate::perm::Policy::preset(crate::perm::Preset::WorkspaceWrite, dir.clone());
+        pol.ask_handler = Some(crate::perm::AskHandler(Arc::new(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            crate::perm::AskDecision::Deny
+        })));
+        let mut reg = ToolRegistry::core(pol);
+        let mut c = ctx(&dir);
+        // `git push` Asks — but a wrong-typed field must fail first.
+        for bad in [
+            serde_json::json!({"command": "git push", "timeout_ms": "soon"}),
+            serde_json::json!({"command": "git push", "bogus": 1}),
+        ] {
+            let out = reg.call("bash", &bad, &mut c);
+            assert!(out.is_error && !out.denied, "{}", out.text);
+        }
+        assert_eq!(
+            asks.load(Ordering::SeqCst),
+            0,
+            "no dialog for a malformed call"
+        );
+        let out = reg.call("bash", &serde_json::json!({"command": "git push"}), &mut c);
+        assert!(out.denied, "{}", out.text);
+        assert_eq!(
+            asks.load(Ordering::SeqCst),
+            1,
+            "a well-formed call is gated"
+        );
     }
 
     #[test]
@@ -1222,6 +1405,8 @@ mod tests {
             broker: None,
         };
 
+        // Overwriting an existing file needs a read first (T3).
+        reg.call("read", &json!({"path": "old.txt"}), &mut c);
         reg.call(
             "write",
             &json!({"path": "old.txt", "content": "v1"}),

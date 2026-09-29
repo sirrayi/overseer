@@ -113,6 +113,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
             first_change,
             added.max(0) as usize + 1,
             ctx,
+            &reg.policy.root,
             &format!("applied patch ({added:+} lines)"),
         );
     }
@@ -168,6 +169,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
                     line_no,
                     new_lines,
                     ctx,
+                    &reg.policy.root,
                     "whitespace-tolerant match (diff format)",
                 );
             }
@@ -220,7 +222,16 @@ pub fn run(input: &Value, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutp
         new.matches('\n').count() + 1
     };
     let line_no = replaced[..upto.min(replaced.len())].matches('\n').count() + 1;
-    commit_edit(&path, replaced, count, line_no, new_lines, ctx, "")
+    commit_edit(
+        &path,
+        replaced,
+        count,
+        line_no,
+        new_lines,
+        ctx,
+        &reg.policy.root,
+        "",
+    )
 }
 
 /// Validate, snapshot, write, and report one applied edit. The lint gate
@@ -235,6 +246,7 @@ fn commit_edit(
     line_no: usize,
     new_lines: usize,
     ctx: &mut ToolCtx,
+    root: &std::path::Path,
     note: &str,
 ) -> ToolOutput {
     if let Some(diag) = edit_lint_gate(path, &replaced) {
@@ -245,9 +257,13 @@ fn commit_edit(
             path.display()
         ));
     }
-    super::snapshot(ctx, path);
-    if let Err(e) = std::fs::write(path, &replaced) {
-        return ToolOutput::err(format!("Cannot write {}: {e}", path.display()));
+    let target = match super::contained_target(path, root) {
+        Ok(t) => t,
+        Err(e) => return ToolOutput::err(e),
+    };
+    super::snapshot(ctx, &target);
+    if let Err(e) = super::write_no_follow(&target, replaced.as_bytes()) {
+        return ToolOutput::err(e);
     }
     // Return the applied hunk (±3 lines context) — never the whole file.
     let suffix = if note.is_empty() {
@@ -962,6 +978,60 @@ mod tests {
         assert_eq!(
             apply_unified_diff(content, grow).unwrap(),
             "x\nNEW\nkeep\ny\nmid\nx\nKEPT\ny\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_through_a_symlink_to_an_outside_file_is_refused() {
+        use crate::tools::ToolCtx;
+        let dir = std::env::temp_dir().join(format!("overseer-editlink-{}", uuid::Uuid::now_v7()));
+        let outside = dir.with_extension("outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        std::fs::write(outside.join("v.txt"), "alpha\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("v.txt"), dir.join("l.txt")).unwrap();
+        let mut reg = crate::tools::ToolRegistry::core(crate::perm::Policy::headless(dir.clone()));
+        reg.mark_read(&dir.join("l.txt"));
+        let mut c = ToolCtx {
+            cwd: dir.clone(),
+            session_dir: dir.join("session"),
+            spill_seq: 0,
+            provider: None,
+            agent_config: None,
+            subagent_seq: 0,
+            checkpoint: None,
+            sandbox: false,
+            broker: None,
+        };
+        let out = run(
+            &json!({"path": "l.txt", "old_string": "alpha", "new_string": "pwned"}),
+            &mut c,
+            &mut reg,
+        );
+        assert!(out.is_error, "{}", out.text);
+        assert!(
+            out.text.contains("outside the working directory"),
+            "{}",
+            out.text
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("v.txt")).unwrap(),
+            "alpha\n"
+        );
+        // A normal in-workspace edit is unchanged.
+        std::fs::write(dir.join("n.txt"), "alpha\n").unwrap();
+        reg.mark_read(&dir.join("n.txt"));
+        let out = run(
+            &json!({"path": "n.txt", "old_string": "alpha", "new_string": "beta"}),
+            &mut c,
+            &mut reg,
+        );
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("n.txt")).unwrap(),
+            "beta\n"
         );
     }
 
