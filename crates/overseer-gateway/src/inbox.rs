@@ -67,9 +67,11 @@ impl Inbox {
         std::fs::rename(tmp, self.path(&item.id))
     }
 
-    /// Open a new item and journal it.
+    /// Journal a new item, then write it. Journal-first means a crash
+    /// between the steps leaves a record without a file (visible, and
+    /// followed by `inbox_open_failed` when the write errors) rather than
+    /// an item the journal has no trace of.
     pub fn open(&self, journal: &Journal, item: InboxItem) -> std::io::Result<()> {
-        self.write_item(&item)?;
         journal.log(
             "inbox_open",
             serde_json::json!({
@@ -77,7 +79,12 @@ impl Inbox {
                 "title": item.title,
             }),
         );
-        Ok(())
+        self.write_item(&item).inspect_err(|e| {
+            journal.log(
+                "inbox_open_failed",
+                serde_json::json!({"id": item.id, "error": e.to_string()}),
+            );
+        })
     }
 
     /// List items, open-snoozed-by-expiry first (resurface), then open,
@@ -237,6 +244,24 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].get("id").and_then(|v| v.as_str()), Some("item1"));
         assert_no_tmp(&root);
+    }
+
+    #[test]
+    fn open_is_journaled_before_the_item_file_exists() {
+        // A failure (or crash) between the two steps must leave a journal
+        // record, never an item the journal has no trace of.
+        let (root, inbox, journal) = setup("open-journal-first");
+        std::fs::remove_dir_all(root.join("inbox")).unwrap();
+        std::fs::write(root.join("inbox"), "not a dir").unwrap();
+        assert!(inbox
+            .open(&journal, mk("lost", 1000, ItemState::Open, None))
+            .is_err());
+        let opened = journal_kinds(&root, "inbox_open");
+        assert_eq!(opened.len(), 1, "the attempt was never journaled");
+        assert_eq!(opened[0]["id"], "lost");
+        let failed = journal_kinds(&root, "inbox_open_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["id"], "lost");
     }
 
     #[test]
