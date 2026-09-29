@@ -28,9 +28,10 @@
 //! appears as a case-insensitive substring of the user's prompt. The
 //! literal trigger `always` matches every prompt (the always-on form).
 //!
-//! Injection is one harness-authored `Nudge` per matching microagent, so
-//! the body is on the event log and replays identically on resume — the
-//! same durability contract as every other Nudge.
+//! Injection is one harness-authored `Nudge` per turn carrying every
+//! matching microagent (`render` joins them), so the bodies are on the
+//! event log and replay identically on resume — the same durability
+//! contract as every other Nudge.
 //! `// DEFERRED(owner): nested-repo microagents (a submodule's own
 //! `.overseer/microagents/`) — the walk is depth-bounded from the session
 //! cwd; extend if monorepo operators ask.`
@@ -58,12 +59,11 @@ pub struct Microagent {
 }
 
 /// `---`-delimited frontmatter → (name, triggers, body-less remainder).
-/// Mirrors `skills::parse_frontmatter`: `key: value` lines only, no YAML
+/// Split by `skills::split_frontmatter`: `key: value` lines only, no YAML
 /// dependency for two fields. A file with no frontmatter is skipped (a
 /// microagent without a name cannot be addressed or deduped).
 fn parse(text: &str) -> Option<(String, Vec<String>)> {
-    let t = text.strip_prefix("---")?;
-    let fm = t.split("\n---").next()?;
+    let (fm, _) = crate::skills::split_frontmatter(text)?;
     let mut name = None;
     let mut triggers: Vec<String> = Vec::new();
     for line in fm.lines() {
@@ -92,9 +92,8 @@ fn parse(text: &str) -> Option<(String, Vec<String>)> {
 
 /// The body after the frontmatter block.
 fn body_of(text: &str) -> String {
-    text.splitn(3, "---")
-        .nth(2)
-        .unwrap_or(text)
+    crate::skills::split_frontmatter(text)
+        .map_or(text, |(_, body)| body)
         .trim()
         .to_string()
 }
@@ -195,6 +194,13 @@ mod tests {
         let d = root.join(".overseer/microagents").join(rel);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(MICROAGENT_FILE), format!("---\n{fm}---\n{body}")).unwrap();
+    }
+
+    #[test]
+    fn frontmatter_values_may_contain_dashes() {
+        let text = "---\nname: a---b\ntriggers: x---y\n---\nbody\n";
+        assert_eq!(parse(text), Some(("a---b".into(), vec!["x---y".into()])));
+        assert_eq!(body_of(text), "body");
     }
 
     #[test]

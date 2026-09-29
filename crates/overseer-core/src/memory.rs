@@ -3,25 +3,13 @@
 //! `/memory/` is a directory of topic files the agent edits with ordinary
 //! file tools — no special memory tool (the playbook's minimal option).
 //! `INDEX.md` is a ≤25KB file of one-line pointers, injected at the *end of
-//! the static prompt region* every turn: the index is always in context,
-//! the topic files are read on demand (progressive disclosure).
+//! the static prompt region* (assembled once per session): the index is
+//! always in context, the topic files are read on demand (progressive
+//! disclosure).
 //!
 //! The dir is git-versioned (Letta MemFS): free history, diffs, rollback.
 //! Commits are engine-made at turn boundaries, not model actions.
-//!
-//! Two P8-C ports (memory-graph wave), both pure over the same file
-//! convention and both reusing this module's liveness rules — a port never
-//! invents a second way to read the dir:
-//!
-//! - **mcp-mem-server `search_memory`** — deterministic lexical search over
-//!   the live topic files: a scored, capped, name-tie-broken result set
-//!   carrying the quotable line so a hit can be re-read instead of trusted.
-//! - **LanceDB frontmatter prefilter** — the `WHERE` half of a vector
-//!   search: header columns decide who is rankable, *before* scoring, so a
-//!   filtered-out asset can never occupy a result slot.
-// DEFERRED(owner): vector embeddings, an ANN/LanceDB index, and body-level
-// ranking — this port lands the prefilter plus lexical scoring only; the
-// delivery gate forbids new dependencies and a real index needs one.
+// DEFERRED(owner): ranked retrieval (FTS5 + activation scoring) — prior lexical helpers removed at 51b4adb; see git history
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,17 +22,17 @@ pub const INDEX_NAME: &str = "INDEX.md";
 pub const CORE_NAME: &str = "CORE.md";
 /// Hard cap on the resident core block (2KB ≈ 500 tokens). Over the cap the
 /// block is truncated *with a repair note*, never silently.
-pub const CORE_CAP: usize = 2_048;
+const CORE_CAP: usize = 2_048;
 /// Routing hint (LightRAG pattern, arsenal B2): level-aware retrieval is a
 /// prompt contract, not code — tell the model which layer answers which
 /// kind of question, and the local/global split falls out of the files.
-pub const ROUTING_HINT: &str = "Retrieval: answer specific questions from \
+const ROUTING_HINT: &str = "Retrieval: answer specific questions from \
     topic files (`read` them); answer overview questions from this index.";
 
 /// Ceiling on a declared per-asset TTL (100 years — a bound, not a policy).
-pub const MAX_TTL_DAYS: u64 = 36_500;
+const MAX_TTL_DAYS: u64 = 36_500;
 /// Playbook cap: the index is a pointer table, not a document store.
-pub const INDEX_CAP: usize = 25_000;
+const INDEX_CAP: usize = 25_000;
 
 const SEED_INDEX: &str = "# Memory Index\n\n\
     One line per topic file: `name.md — what it's about`. \
@@ -157,7 +145,7 @@ impl Default for EntryMeta {
 /// the whole text as body; malformed frontmatter → Err naming the fault.
 /// Range/date/sensitivity validation runs through `validate_meta` so
 /// parse and direct construction share one gate.
-pub fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
+fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
     let all: Vec<&str> = text.lines().collect();
     if all.first().map(|l| l.trim()) != Some("---") {
         return Ok((EntryMeta::default(), text.to_string()));
@@ -224,7 +212,7 @@ pub fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
 
 /// The one gate on entry metadata: confidence must be finite and in
 /// 0..=1; validity bounds must be RFC3339 when present.
-pub fn validate_meta(meta: &EntryMeta) -> Result<(), String> {
+fn validate_meta(meta: &EntryMeta) -> Result<(), String> {
     if !meta.confidence.is_finite() || meta.confidence < 0.0 || meta.confidence > 1.0 {
         return Err(format!(
             "memory: confidence {} out of range — want 0..1",
@@ -392,14 +380,6 @@ impl Layer {
     }
 }
 
-/// Layer → autonomy write bar as data (mirrors `Layer::write_bar`).
-pub const WRITE_BAR: [(Layer, crate::perm::Autonomy); 4] = [
-    (Layer::Profile, crate::perm::Autonomy::ActWithApproval),
-    (Layer::Episodic, crate::perm::Autonomy::ActAndReport),
-    (Layer::Semantic, crate::perm::Autonomy::ActSilently),
-    (Layer::Procedural, crate::perm::Autonomy::ActAndReport),
-];
-
 /// Map a write/edit target to its memory layer's write bar (F5).
 /// None when the target is outside `memory_dir` (or no memory dir): the
 /// lane default decides. Pure path-prefix check — no fs access.
@@ -427,7 +407,7 @@ pub fn layer_bar_for_path(
 
 /// Prompt legend for the memory segment: layer dirs + header keys.
 /// Static bytes (prefix-cache safe); the ≤200B cap is asserted in test.
-pub const MEMORY_LEGEND: &str = "Layers: profile/ identity, episodic/ events, \
+const MEMORY_LEGEND: &str = "Layers: profile/ identity, episodic/ events, \
     semantic/ facts, procedural/ how-to. Headers: provenance, confidence 0-1, \
     sensitivity public|personal|secret.";
 
@@ -445,64 +425,28 @@ pub fn ensure(dir: &Path) -> std::io::Result<PathBuf> {
     Ok(idx)
 }
 
-/// The system-prompt segment carrying the index — sits at the end of the
-/// static region (Invariant 2): stable bytes when the index is unchanged,
-/// and an edit only invalidates cache from this segment onward.
-/// Re-read every turn because the model may have just edited it. An index
-/// over the cap is truncated *with a repair note* — never silently.
-/// True when an INDEX pointer line names a quarantine proposal: unreviewed
-/// untrusted text (RT-3). Proposals stay on disk for human review but are
-/// never injected into the trusted memory segment.
-/// Lexicographic RFC-3339 expiry check (UTC `now`): valid_to past → expired.
-/// No chrono dep — RFC-3339 UTC strings compare lexicographically.
+/// `valid_to` expiry: the stored instant is strictly before now. Compared
+/// as epoch seconds so `Z` and `±HH:MM` stamps order by the instant they
+/// name, not by their spelling. An unparseable stamp reads as not expired
+/// — `parse_meta` already refuses one, so only a directly constructed
+/// `EntryMeta` can carry it.
 fn meta_expired(meta: &EntryMeta) -> bool {
-    let Some(to) = &meta.valid_to else {
+    let Some(to) = meta.valid_to.as_deref().and_then(rfc3339_epoch) else {
         return false;
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Format now as RFC-3339-ish UTC for string comparison via the same
-    // lexicographic property: compare against the stored string's prefix.
-    // Simplest sound rule: a valid_to strictly earlier than the current
-    // year-month-day prefix chain — compare full strings against a
-    // now-formatted stamp built without chrono.
-    let stamp = format_utc_stamp(now);
-    to.as_str() < stamp.as_str()
-}
-
-fn format_utc_stamp(secs: u64) -> String {
-    // Days since epoch → civil date (Howard Hinnant's algorithm), UTC.
-    let days = (secs / 86_400) as i64;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    let sod = secs % 86_400;
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y,
-        m,
-        d,
-        sod / 3600,
-        (sod % 3600) / 60,
-        sod % 60
-    )
+    to < now
 }
 
 /// True when the topic body carries a `superseded_by` trailer pointing at
-/// a live successor (F9 — `invalidate()` appends these; the pointer is
-/// stale). Both spellings are accepted: `superseded_by: name` (the
-/// frontmatter-ish form) and `superseded_by name` (exactly what
-/// `invalidate()` writes). Requiring only the colon was the F9 gap this
-/// port closes: an invalidated asset stayed "live" to every reader.
+/// a live successor (F9 — the pointer is stale). Both spellings are
+/// accepted: `superseded_by: name` (the frontmatter-ish form) and
+/// `superseded_by name` (the ADD-only trailer form). Requiring only the
+/// colon was the F9 gap this port closes: a superseded asset stayed
+/// "live" to every reader.
 fn meta_superseded(text: &str) -> bool {
     text.lines().any(|l| {
         let t = l.trim();
@@ -591,23 +535,11 @@ fn topic_of(dir: &Path, name: &str) -> (Topic, Option<std::time::SystemTime>) {
 /// B2 `ttl_days` clock) and not superseded. This is the entry-level half
 /// of the zep validity-interval filter — the INDEX half (`pointer_live`)
 /// only drops pointers; bodies are what a fetch actually returns.
-pub fn entry_valid(text: &str, mtime: Option<std::time::SystemTime>) -> bool {
+fn entry_valid(text: &str, mtime: Option<std::time::SystemTime>) -> bool {
     match parse_meta(text) {
         Ok((meta, _)) => meta_current(&meta, text, mtime),
         // Unparsable header: fail closed (not served as current).
         Err(_) => false,
-    }
-}
-
-/// Read a topic file by name, refusing expired/superseded content.
-/// `None` when the file is missing or no longer current — the caller then
-/// behaves as if the pointer were stale.
-pub fn topic_text(dir: &Path, name: &str) -> Option<String> {
-    let (topic, mtime) = topic_of(dir, name);
-    match topic {
-        Topic::Bare(text) => entry_valid(&text, mtime).then_some(text),
-        Topic::Headed(meta, text) => meta_current(&meta, &text, mtime).then_some(text),
-        Topic::Missing | Topic::Malformed => None,
     }
 }
 
@@ -682,11 +614,22 @@ fn pointer_live(dir: &Path, line: &str) -> bool {
     true
 }
 
+/// True when an INDEX pointer line names a quarantine proposal: unreviewed
+/// untrusted text (RT-3). Proposals stay on disk for human review but are
+/// never injected into the trusted memory segment.
 fn is_proposal_pointer(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with("proposals/") || t.contains("proposals/")
 }
 
+/// The system-prompt segment carrying the index — sits at the end of the
+/// static region (Invariant 2): stable bytes when the index is unchanged,
+/// and an edit only invalidates cache from this segment onward. Proposal
+/// pointers and expired/superseded pointers are filtered out. Assembled
+/// once per session; mid-session edits apply from the next session/resume.
+/// An index over the cap is truncated *with a repair note* — never
+/// silently. The dir is named relative to the workspace (see
+/// `prompt_path`) so the cached prefix carries no machine-specific path.
 pub fn index_segment(dir: &Path) -> String {
     let idx = dir.join(INDEX_NAME);
     let text = std::fs::read_to_string(&idx).unwrap_or_default();
@@ -717,17 +660,52 @@ pub fn index_segment(dir: &Path) -> String {
          `{}/` is your persistent memory — read and update it with ordinary \
          file tools. {INDEX_NAME} holds one-line pointers (≤25KB); details \
          live in topic files you create there.\n\n{ROUTING_HINT}\n\n{body}{note}\n\n{MEMORY_LEGEND}{core}",
-        dir.display(),
+        prompt_path(dir),
         core = core_block(dir)
     )
+}
+
+/// `dir` as the prompt names it: relative to the workspace (the process
+/// cwd) when inside it, else `~`-relative when under `$HOME`, else as-is.
+fn prompt_path(dir: &Path) -> String {
+    let cwd = std::env::current_dir().ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    relative_display(dir, cwd.as_deref(), home.as_deref())
+}
+
+fn relative_display(dir: &Path, cwd: Option<&Path>, home: Option<&Path>) -> String {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let under = |base: &Path| -> Option<PathBuf> {
+        dir.strip_prefix(base)
+            .map(Path::to_path_buf)
+            .or_else(|_| canon(dir).strip_prefix(canon(base)).map(Path::to_path_buf))
+            .ok()
+    };
+    if let Some(rel) = cwd.and_then(under) {
+        return if rel.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            rel.display().to_string()
+        };
+    }
+    let home = home.filter(|h| h.is_absolute() && h.parent().is_some());
+    if let Some(rel) = home.and_then(under) {
+        return if rel.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rel.display())
+        };
+    }
+    // DEFERRED(owner): pass the session cwd from prompt::assemble so dirs outside cwd/$HOME render relative — needs prompt.rs
+    dir.display().to_string()
 }
 
 /// The resident core block (Letta `CORE.md`): the always-in-context handful
 /// of lines, capped with a repair note when over budget. Empty when the
 /// file is absent — the block is opt-in by existence, like everything else
-/// in the memory dir. Parent view only: `index_segment_filtered` (the
-/// quarantined subagent view) never carries it — core memory is not
-/// scoped per entry, so there is no sensitivity ceiling to apply to it.
+/// in the memory dir. Parent view only: the quarantined subagent view
+/// (`subagent_view`) never carries it — core memory is not scoped per
+/// entry, so there is no sensitivity ceiling to apply to it.
 fn core_block(dir: &Path) -> String {
     let Ok(text) = std::fs::read_to_string(dir.join(CORE_NAME)) else {
         return String::new();
@@ -745,64 +723,9 @@ fn core_block(dir: &Path) -> String {
     }
 }
 
-/// Sensitivity-filtered index view (P6-2): the quarantined subagent
-/// context shows only entries at or below `filter`. `Secret` topic
-/// files stay in the index body only when the filter admits them;
-/// `index_segment` is the unfiltered (Personal-default parent) path.
-/// Filtering is line-scoped: a line names a layer file; its header
-/// decides. Unresolvable lines pass through (fail-open for pointers,
-/// fail-closed for bodies — the subagent has no write tools anyway).
-pub fn index_segment_filtered(dir: &Path, filter: Sensitivity) -> String {
-    let idx = dir.join(INDEX_NAME);
-    let text = std::fs::read_to_string(&idx).unwrap_or_default();
-    let kept: Vec<&str> = text
-        .lines()
-        .filter(|line| {
-            // RT-3: proposals never enter any view.
-            if is_proposal_pointer(line) {
-                return false;
-            }
-            let Some(name) = topic_name(line) else {
-                // F8: orphan/unresolvable pointer lines pass through
-                // (fail-open for pointers, fail-closed for bodies).
-                return true;
-            };
-            // P8-B: one rule for the index view and the copied bodies —
-            // current, within the sensitivity ceiling, not regulated.
-            match subagent_view(dir, name, filter) {
-                View::Admitted(_) | View::PointerOnly => true,
-                View::Hidden => false,
-            }
-        })
-        .collect();
-    let body = kept.join("\n");
-    let (body, note) = if body.len() > INDEX_CAP {
-        let cut = body
-            .char_indices()
-            .map(|(i, c)| i + c.len_utf8())
-            .take_while(|end| *end <= INDEX_CAP)
-            .last()
-            .unwrap_or(0);
-        (
-            body[..cut].to_string(),
-            "\n\n[overseer] INDEX.md exceeds 25KB — prune it: keep only \
-             one-line pointers and move detail into topic files.",
-        )
-    } else {
-        (body, "")
-    };
-    format!(
-        "## Memory index\n\
-         `{}/` is your persistent memory — read and update it with ordinary \
-         file tools. {INDEX_NAME} holds one-line pointers (≤25KB); details \
-         live in topic files you create there.\n\n{body}{note}\n\n{MEMORY_LEGEND}",
-        dir.display()
-    )
-}
-
 /// Ordering on sensitivity tiers: Public < Personal < Secret. A filter
 /// admits every entry at or below its own tier.
-pub fn admits(filter: Sensitivity, entry: Sensitivity) -> bool {
+fn admits(filter: Sensitivity, entry: Sensitivity) -> bool {
     rank(entry) <= rank(filter)
 }
 
@@ -814,41 +737,72 @@ fn rank(s: Sensitivity) -> u8 {
     }
 }
 
-/// First `*.md` token on an index line, if any.
+/// First `*.md` token on an index line, if it is a valid pointer (see
+/// `valid_pointer`).
 fn topic_name(line: &str) -> Option<&str> {
     line.split_whitespace()
         .find(|tok| tok.ends_with(".md"))
-        .map(|tok| tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';'))
-        .filter(|tok| !tok.is_empty() && !tok.contains('/') && !tok.contains('\\'))
+        .map(trim_pointer)
+        .filter(|tok| valid_pointer(tok))
 }
 
-/// Quarantine a memory entry without overwriting it (P6-2 ADD-only):
-/// appends a `superseded_by <name>` trailer line to `path`. The old
-/// content stays on disk and in git — consolidation never rewrites a
-/// topic file smaller or deletes one.
-pub fn invalidate(path: &Path, superseded_by: &str) -> std::io::Result<()> {
-    let mut text = std::fs::read_to_string(path).unwrap_or_default();
-    if !text.ends_with('\n') {
-        text.push('\n');
+fn trim_pointer(tok: &str) -> &str {
+    tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';')
+}
+
+/// A pointer names a topic either bare (`prefs.md`) or qualified by one
+/// memory layer (`semantic/prefs.md`). Anything else — other dirs,
+/// nesting, `..`, absolute paths, backslashes — is not a pointer.
+fn valid_pointer(name: &str) -> bool {
+    let file = match name.split_once('/') {
+        None => name,
+        Some((layer, file)) if Layer::ALL.iter().any(|l| l.name() == layer) => file,
+        Some(_) => return false,
+    };
+    file.len() > ".md".len() && file.ends_with(".md") && !file.contains('/') && !file.contains('\\')
+}
+
+/// The memory-relative path (`/`-separated) a pointer resolves to: a
+/// qualified pointer names its exact layer file; a bare one is looked up
+/// in the memory root first, then each layer subdir. None when the
+/// pointer is invalid or no backing file exists.
+fn resolve_pointer(dir: &Path, name: &str) -> Option<String> {
+    if !valid_pointer(name) {
+        return None;
     }
-    text.push_str(&format!("superseded_by {superseded_by}\n"));
-    std::fs::write(path, text)
+    if dir.join(name).is_file() {
+        return Some(name.to_string());
+    }
+    if name.contains('/') {
+        return None;
+    }
+    Layer::ALL
+        .iter()
+        .map(|l| format!("{}/{name}", l.name()))
+        .find(|rel| dir.join(rel).is_file())
 }
 
-/// Locate a topic file by name: memory root first, then each layer
-/// subdir. None when no backing file exists.
+/// Identity of a pointer for "same topic?" comparisons: its resolved
+/// relative path, or the name as written when nothing backs it — so
+/// `foo.md` and `semantic/foo.md` agree when both resolve to one file.
+fn pointer_key(dir: &Path, name: &str) -> String {
+    resolve_pointer(dir, name).unwrap_or_else(|| name.to_string())
+}
+
+/// True when some line of `index` names the topic keyed `key` (see
+/// `pointer_key`) as a whole token.
+fn index_names(dir: &Path, index: &str, key: &str) -> bool {
+    index.lines().any(|l| {
+        l.split_whitespace()
+            .map(trim_pointer)
+            .any(|tok| tok.ends_with(".md") && valid_pointer(tok) && pointer_key(dir, tok) == key)
+    })
+}
+
+/// Locate a topic file by pointer name (bare or layer-qualified, see
+/// `resolve_pointer`). None when no backing file exists.
 pub fn layer_path(dir: &Path, name: &str) -> Option<PathBuf> {
-    let root = dir.join(name);
-    if root.is_file() {
-        return Some(root);
-    }
-    for layer in Layer::ALL {
-        let p = dir.join(layer.name()).join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
+    resolve_pointer(dir, name).map(|rel| dir.join(rel))
 }
 
 /// Git-version the memory dir. Runs `git init` once, then commits any dirty
@@ -929,16 +883,16 @@ pub fn dirty_files(dir: &Path) -> Vec<String> {
 /// - `add`  — a topic file that no pointer names;
 /// - `keep` — a pointer and its asset agree (counted, not listed).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ReconcilePlan {
-    pub drop: Vec<String>,
-    pub add: Vec<String>,
-    pub keep: usize,
+struct ReconcilePlan {
+    drop: Vec<String>,
+    add: Vec<String>,
+    keep: usize,
 }
 
 impl ReconcilePlan {
     /// Render the plan for the consolidation prompt — the model sees
     /// exactly what the engine already decided.
-    pub fn render(&self) -> String {
+    fn render(&self) -> String {
         let list = |v: &[String]| {
             if v.is_empty() {
                 "(none)".to_string()
@@ -957,22 +911,25 @@ impl ReconcilePlan {
 
 /// Classify the index against the directory. `index_text` is passed in so
 /// callers can reconcile a proposed index as well as the live one.
-pub fn reconcile(dir: &Path, index_text: &str) -> ReconcilePlan {
-    let mut named: Vec<String> = Vec::new();
+fn reconcile(dir: &Path, index_text: &str) -> ReconcilePlan {
+    // (name as written, resolved key) — one entry per distinct topic.
+    let mut named: Vec<(String, String)> = Vec::new();
     for line in index_text.lines() {
         // Proposals are never part of the trusted index (RT-3).
         if is_proposal_pointer(line) {
             continue;
         }
         if let Some(n) = topic_name(line) {
-            named.push(n.to_string());
+            let key = pointer_key(dir, n);
+            if !named.iter().any(|(_, k)| *k == key) {
+                named.push((n.to_string(), key));
+            }
         }
     }
     named.sort();
-    named.dedup();
 
     let mut plan = ReconcilePlan::default();
-    for n in &named {
+    for (n, _) in &named {
         let (topic, mtime) = topic_of(dir, n);
         let live = match topic {
             Topic::Missing => false,
@@ -987,13 +944,13 @@ pub fn reconcile(dir: &Path, index_text: &str) -> ReconcilePlan {
         }
     }
 
-    // Untracked topics: a file on disk no pointer names. Root and the layer
-    // subdirs both count (pointers are always bare file names).
-    let mut dirs = vec![dir.to_path_buf()];
+    // Untracked topics: a file on disk no pointer resolves to. Root and
+    // the layer subdirs both count.
+    let mut dirs = vec![(dir.to_path_buf(), None)];
     for layer in Layer::ALL {
-        dirs.push(dir.join(layer.name()));
+        dirs.push((dir.join(layer.name()), Some(layer.name())));
     }
-    for d in dirs {
+    for (d, layer) in dirs {
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
@@ -1002,7 +959,11 @@ pub fn reconcile(dir: &Path, index_text: &str) -> ReconcilePlan {
             if !name.ends_with(".md") || name == INDEX_NAME || name == CORE_NAME {
                 continue;
             }
-            if !named.iter().any(|n| n == &name) {
+            let rel = match layer {
+                Some(l) => format!("{l}/{name}"),
+                None => name.clone(),
+            };
+            if !named.iter().any(|(_, k)| *k == rel) {
                 plan.add.push(name);
             }
         }
@@ -1029,8 +990,8 @@ const PROMOTE_AGE_SECS: u64 = 30 * 86_400;
 ///
 /// Promotion is an index pointer add, never a body rewrite: the model
 /// adds a `semantic/` pointer line to the new index while the episodic
-/// file stays on disk untouched (bodies are append-only — see
-/// `invalidate`). Qualification (every clause must hold):
+/// file stays on disk untouched (bodies are append-only — superseded via
+/// a `superseded_by` trailer). Qualification (every clause must hold):
 ///
 /// - the file lives directly under `episodic/` and ends in `.md`;
 /// - `entry_valid` (header parses, `valid_to`/TTL not elapsed);
@@ -1045,7 +1006,7 @@ const PROMOTE_AGE_SECS: u64 = 30 * 86_400;
 /// Sorted ascending and capped at 20, so the prompt section is
 /// deterministic and bounded. Missing `episodic/` dir → empty (a fresh
 /// memory has nothing to promote, which is not an error).
-pub fn promote_candidates(dir: &Path) -> Vec<String> {
+fn promote_candidates(dir: &Path) -> Vec<String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1098,8 +1059,8 @@ pub fn promote_candidates(dir: &Path) -> Vec<String> {
 
 /// Parse an RFC3339 timestamp to Unix epoch seconds (`None` on any
 /// malformed input — callers treat unparseable as "not settled", never
-/// as settled). Zero-dep companion to `format_utc_stamp`: days-from-civil
-/// in reverse (Howard Hinnant's algorithm), with the numeric zone offset
+/// as settled). Zero-dep days-from-civil (Howard Hinnant's algorithm),
+/// with the numeric zone offset
 /// applied. A leap second (`:60`) reads as `:59` — a one-second slop far
 /// below the 30-day promotion bar. Inputs here already passed
 /// `valid_rfc3339` via `parse_meta`, so this re-checks ranges lightly.
@@ -1320,19 +1281,21 @@ pub fn consolidate(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "consolidate: model reply had no ---INDEX--- section".to_string())?;
+    // The cap bounds the model's reply only; the restore pass below may
+    // push the written INDEX past INDEX_CAP. Intended: a live pointer's
+    // survival outranks the cap (index_segment still truncates what the
+    // prompt carries, with a repair note).
     let mut capped: String = new_index.chars().take(INDEX_CAP).collect();
     // mem0 reconcile enforcement: pointers the plan marked stale never
     // come back, whatever the model replied (ADD-only: this can only drop
     // a pointer whose backing file is gone or whose asset expired).
+    let drop_keys: Vec<String> = plan.drop.iter().map(|d| pointer_key(dir, d)).collect();
     let mut dropped_stale = 0usize;
     if !plan.drop.is_empty() {
         let kept: Vec<&str> = capped
             .lines()
             .filter(|l| {
-                let stale = plan
-                    .drop
-                    .iter()
-                    .any(|d| topic_name(l).is_some_and(|n| n == d.as_str()));
+                let stale = topic_name(l).is_some_and(|n| drop_keys.contains(&pointer_key(dir, n)));
                 if stale {
                     dropped_stale += 1;
                 }
@@ -1341,17 +1304,41 @@ pub fn consolidate(
             .collect();
         capped = kept.join("\n");
     }
+    // ADD-only enforcement: every live pointer in the old index survives.
+    // A pointer the reply no longer names is re-appended with its original
+    // line; one the reply rewrote, merged, or re-qualified (still naming
+    // the same resolved topic, e.g. behind a `superseded_by` trailer or
+    // promoted from `foo.md` to `semantic/foo.md`) counts as kept.
+    let mut restored = 0usize;
+    for line in old_index.lines() {
+        if is_proposal_pointer(line) {
+            continue;
+        }
+        let Some(name) = topic_name(line) else {
+            continue;
+        };
+        let key = pointer_key(dir, name);
+        if drop_keys.contains(&key) || index_names(dir, &capped, &key) {
+            continue;
+        }
+        if !capped.is_empty() && !capped.ends_with('\n') {
+            capped.push('\n');
+        }
+        capped.push_str(line);
+        restored += 1;
+    }
     std::fs::write(&idx, format!("{capped}\n")).map_err(|e| e.to_string())?;
     commit(dir, "consolidate");
 
     let dropped = old_index
         .lines()
         .filter(|l| l.contains(".md"))
-        .filter(|l| !new_index.contains(l.trim()))
+        .filter(|l| !capped.contains(l.trim()))
         .count();
     Ok(format!(
         "consolidated: {} → {} index lines, {dropped} pointers dropped \
-         (reconcile: {} stale, {} untracked, {dropped_stale} stale reclaimed)",
+         (reconcile: {} stale, {} untracked, {dropped_stale} stale reclaimed, \
+         {restored} live restored)",
         old_index.lines().count(),
         capped.lines().count(),
         plan.drop.len(),
@@ -1359,447 +1346,11 @@ pub fn consolidate(
     ))
 }
 
-/// Cap on `search_memory` hits. A search answers one question; it must not
-/// stream a whole memory dir into a prompt, so a larger `limit` is clamped
-/// (deliberately — this is a prompt budget, not a pagination knob).
-pub const MAX_SEARCH_HITS: usize = 50;
-
-/// Weight of a query term appearing in the topic file's name. A name hit
-/// says what the file is *about*; a body hit is one mention among many.
-const NAME_WEIGHT: u32 = 3;
-/// Ceiling on one term's body occurrences: a repeated word must not swamp
-/// a name hit (repetition is one fact stated many times).
-const BODY_CAP: usize = 5;
-/// Cap on a snippet's length in chars, the trailing `…` included.
-const SNIPPET_CHARS: usize = 200;
-
-/// LanceDB frontmatter prefilter (the `WHERE` half of a vector search): the
-/// header columns a caller may constrain, applied *before* ranking so a
-/// filtered-out asset can never occupy a result slot. Every clause is
-/// fail-closed — a column that cannot be proven excludes the asset.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EntryFilter {
-    /// Exact layer (directory) match; `None` = every layer.
-    pub layer: Option<Layer>,
-    /// Sensitivity ceiling, checked through `admits`; `None` = no ceiling.
-    pub sensitivity_max: Option<Sensitivity>,
-    /// The subagent-view rule: a `Regulated` asset never fans out, whatever
-    /// its sensitivity tier. Defaults to **true** (see `Default`).
-    pub exclude_regulated: bool,
-    /// Inclusive minimum header confidence. A non-finite entry confidence
-    /// never matches: `validate_meta` cannot produce one, a directly
-    /// constructed `EntryMeta` can, and an unreadable number must not pass
-    /// a numeric gate.
-    pub min_confidence: Option<f64>,
-    /// Exact provenance match, case-insensitive. Not a substring match:
-    /// `"seed"` does not admit `"seed-notes"`.
-    pub provenance: Option<String>,
-}
-
-impl Default for EntryFilter {
-    /// Deliberately hand-written, not derived: `bool`'s derived default is
-    /// `false`, which would fan *regulated* assets out to whoever forgot to
-    /// set the column. The subagent-view rule is the safe default, so the
-    /// column starts at `true`.
-    fn default() -> Self {
-        EntryFilter {
-            layer: None,
-            sensitivity_max: None,
-            exclude_regulated: true,
-            min_confidence: None,
-            provenance: None,
-        }
-    }
-}
-
-/// True when `meta` survives `f` for a file in `layer`: the column checks a
-/// vector store would have run as SQL, decided on the header alone (no body
-/// text, no ranking, no fs). Layer is equality; sensitivity goes through
-/// the one `admits` ordering; confidence is inclusive and must be finite;
-/// provenance is an exact case-insensitive compare.
-pub fn matches_filter(meta: &EntryMeta, layer: Layer, f: &EntryFilter) -> bool {
-    if let Some(want) = f.layer {
-        if layer != want {
-            return false;
-        }
-    }
-    if let Some(max) = f.sensitivity_max {
-        if !admits(max, meta.sensitivity) {
-            return false;
-        }
-    }
-    if f.exclude_regulated && meta.governance == Governance::Regulated {
-        return false;
-    }
-    if let Some(min) = f.min_confidence {
-        if !meta.confidence.is_finite() || meta.confidence < min {
-            return false;
-        }
-    }
-    if let Some(want) = &f.provenance {
-        if !meta.provenance.eq_ignore_ascii_case(want) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Resolve one topic name for filter/search: the layer dir that files it and
-/// the path to read, or `None` when no backing file exists. The layer-dir
-/// copy wins over a root-level duplicate — the filed asset is the one the
-/// layer column judges, and both callers must resolve it the same way.
-///
-/// A root-level topic (the pre-layer `facts.md` files) is filed as
-/// `Layer::Semantic`: it is world-fact-shaped, and an unscoped name must
-/// never be judged as identity (`Profile`) or personal history
-/// (`Episodic`), the two layers with a higher write bar.
-fn filed_topic(dir: &Path, name: &str) -> Option<(Layer, PathBuf)> {
-    for layer in Layer::ALL {
-        let p = dir.join(layer.name()).join(name);
-        if p.is_file() {
-            return Some((layer, p));
-        }
-    }
-    let root = dir.join(name);
-    root.is_file().then_some((Layer::Semantic, root))
-}
-
-/// Distinct topic-file names the filter admits, ascending: memory root plus
-/// the four layer dirs, minus the two non-topic `.md` files (`INDEX.md`,
-/// `CORE.md`). Still-current only (`entry_valid`'s rule: header parses and
-/// is neither expired nor superseded) and matching `f` — this is the
-/// prefilter `search_memory` ranks, so an asset dropped here can never be
-/// scored, let alone returned.
-pub fn filter_entries(dir: &Path, f: &EntryFilter) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    let mut dirs: Vec<PathBuf> = vec![dir.to_path_buf()];
-    for layer in Layer::ALL {
-        dirs.push(dir.join(layer.name()));
-    }
-    for d in dirs {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".md") || name == INDEX_NAME || name == CORE_NAME {
-                continue;
-            }
-            if e.path().is_file() {
-                names.push(name);
-            }
-        }
-    }
-    names.sort();
-    names.dedup();
-    names.retain(|name| {
-        let Some((layer, path)) = filed_topic(dir, name) else {
-            return false;
-        };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return false;
-        };
-        // Unparsable header: fail closed (never served as current).
-        let Ok((meta, _)) = parse_meta(&text) else {
-            return false;
-        };
-        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        meta_current(&meta, &text, mtime) && matches_filter(&meta, layer, f)
-    });
-    names
-}
-
-/// One ranked hit from `search_memory` (mcp-mem-server `search_memory`):
-/// which topic file matched, its layer, the lexical score, and the quotable
-/// line — the caller can re-read `name` at `line` instead of trusting the
-/// snippet.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MemoryHit {
-    pub name: String,
-    pub layer: Layer,
-    pub score: u32,
-    /// 1-based line number of `snippet` in the file; 0 when the file has no
-    /// body line (never a fabricated line 1).
-    pub line: usize,
-    pub snippet: String,
-}
-
-/// Lexical search over the live topic files (mcp-mem-server `search_memory`):
-/// score the *filtered* assets, best first, and return at most `limit` of
-/// them. Deterministic by construction — the ordering is score descending,
-/// then name ascending, so the same dir and query always give the same list.
-///
-/// Contract:
-/// - the query is trimmed; no alphanumeric term after trimming is an error
-///   (a search with no terms matches nothing);
-/// - `limit` must be positive; anything above `MAX_SEARCH_HITS` is clamped
-///   to it (a search must not stream a whole memory dir);
-/// - a term in the file's name scores `NAME_WEIGHT`, each body occurrence 1
-///   up to `BODY_CAP` per term per file, and a file carrying no term at all
-///   is not a hit;
-/// - `filter` runs first (`filter_entries`), so superseded/expired files,
-///   unparsable headers, and everything the filter rejects are never
-///   ranked and never occupy a slot.
-pub fn search_memory(
-    dir: &Path,
-    query: &str,
-    filter: &EntryFilter,
-    limit: usize,
-) -> Result<Vec<MemoryHit>, String> {
-    let terms = query_tokens(query);
-    if terms.is_empty() {
-        return Err(
-            "memory: search_memory: a search with no terms matches nothing — pass at \
-             least one alphanumeric word"
-                .into(),
-        );
-    }
-    if limit == 0 {
-        return Err(
-            "memory: search_memory: limit 0 would return nothing — pass a positive limit".into(),
-        );
-    }
-    let limit = limit.min(MAX_SEARCH_HITS);
-
-    let mut hits: Vec<MemoryHit> = Vec::new();
-    for name in filter_entries(dir, filter) {
-        let Some((layer, path)) = filed_topic(dir, &name) else {
-            continue;
-        };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        // Fail closed: a header that stopped parsing between the prefilter
-        // and the read is not a hit.
-        let Ok((_, body)) = parse_meta(&text) else {
-            continue;
-        };
-        let stem = name.strip_suffix(".md").unwrap_or(&name);
-        let name_words = word_tokens(stem);
-        let body_words = word_tokens(&body);
-        let mut score = 0u32;
-        // Best term wins the snippet; equal scores keep the earlier term, so
-        // a repeated query is not a way to change the answer.
-        let mut best: Option<(usize, u32)> = None;
-        for (i, term) in terms.iter().enumerate() {
-            let weight = NAME_WEIGHT * u32::from(name_words.iter().any(|w| w == term))
-                + occurrences(&body_words, term) as u32;
-            score += weight;
-            if weight > 0 && best.is_none_or(|(_, w)| weight > w) {
-                best = Some((i, weight));
-            }
-        }
-        if score == 0 {
-            continue;
-        }
-        // Frontmatter lines sit above the body, so a body line's number is
-        // its index plus this head — `line` is a real file line.
-        let head = text.lines().count().saturating_sub(body.lines().count());
-        let (snippet, line) = match best {
-            Some((i, _)) => snippet_for(&body, &terms[i], head),
-            None => (String::new(), 0),
-        };
-        hits.push(MemoryHit {
-            name,
-            layer,
-            score,
-            line,
-            snippet,
-        });
-    }
-    hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
-    hits.truncate(limit);
-    Ok(hits)
-}
-
-/// Lowercased alphanumeric words — the module's one tokenizer (`""` splits
-/// into nothing, so punctuation and separators fall out by construction).
-fn word_tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_lowercase())
-        .collect()
-}
-
-/// Query terms: lowercased alphanumeric words, deduplicated, in the order
-/// the caller wrote them (scoring adds either way, but the snippet tie-break
-/// must be reproducible).
-fn query_tokens(query: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for t in word_tokens(query) {
-        if !out.contains(&t) {
-            out.push(t);
-        }
-    }
-    out
-}
-
-/// Occurrences of `term` as a whole word in `words`, capped at `BODY_CAP` —
-/// `"cat"` matches the word `cat`, never `concatenate`.
-fn occurrences(words: &[String], term: &str) -> usize {
-    words
-        .iter()
-        .filter(|w| w.as_str() == term)
-        .count()
-        .min(BODY_CAP)
-}
-
-/// `s` cut to at most `max` chars (char counts, never byte offsets — a
-/// multibyte char is never split); the cut is marked with a trailing `…`
-/// that counts toward the budget.
-fn cut_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
-/// The quotable line for one hit: the trimmed first body line carrying
-/// `term` (the highest-scoring query term), cut to `SNIPPET_CHARS`. A
-/// name-only hit has no such line, so it falls back to the first non-empty
-/// body line — still a line the caller can read. `head` is the number of
-/// frontmatter lines above the body, so the returned number is the line's
-/// real 1-based position in the file; `(String::new(), 0)` means the file
-/// has no body line at all.
-fn snippet_for(body: &str, term: &str, head: usize) -> (String, usize) {
-    let lines: Vec<&str> = body.lines().collect();
-    let mut fallback: Option<usize> = None;
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if fallback.is_none() {
-            fallback = Some(i);
-        }
-        if word_tokens(trimmed).iter().any(|w| w == term) {
-            return (cut_chars(trimmed, SNIPPET_CHARS), head + i + 1);
-        }
-    }
-    match fallback {
-        Some(i) => (cut_chars(lines[i].trim(), SNIPPET_CHARS), head + i + 1),
-        None => (String::new(), 0),
-    }
-}
-
-/// mem0 additive fusion (`score_and_rank` inner loop, arsenal B2): gate
-/// `sem` on `threshold` first, then average the present signals. The
-/// caller supplies `[0,1]` signals; the divisor is the max possible
-/// mass — sem-only 1.0, +keyword 2.0, +entity 2.5, sem+entity 1.5 (the
-/// entity boost caps at 0.5, see `entity_link`, so full house sums to
-/// 2.5). Fail-closed: a gated or non-finite input fuses to 0.0; the
-/// result clamps to 0..1.
-pub fn fuse_scores(
-    sem: f32,
-    kw: f32,
-    ent: f32,
-    has_kw: bool,
-    has_ent: bool,
-    threshold: f32,
-) -> f32 {
-    if !sem.is_finite() || !kw.is_finite() || !ent.is_finite() || !threshold.is_finite() {
-        return 0.0;
-    }
-    if sem < threshold {
-        return 0.0;
-    }
-    let denom = match (has_kw, has_ent) {
-        (false, false) => 1.0,
-        (true, false) => 2.0,
-        (true, true) => 2.5,
-        (false, true) => 1.5,
-    };
-    let num = sem + if has_kw { kw } else { 0.0 } + if has_ent { ent } else { 0.0 };
-    (num / denom).clamp(0.0, 1.0)
-}
-
-/// mem0 BM25 sigmoid (`get_bm25_params`/`normalize_bm25`): the
-/// (midpoint, steepness) pair is picked by term count clamped to the
-/// table ends — a one-term query saturates early, a long one late.
-/// No lemmatizer here by design: the caller passes the raw BM25 sum
-/// and the pre-lemmatization term count.
-pub fn normalize_keyword(raw: f64, n_terms: u64) -> f64 {
-    if !raw.is_finite() {
-        return 0.0;
-    }
-    const TABLE: [(f64, f64); 5] = [(5.0, 0.7), (7.0, 0.6), (9.0, 0.5), (10.0, 0.5), (12.0, 0.5)];
-    let idx = n_terms.clamp(1, TABLE.len() as u64) as usize - 1;
-    let (mid, steep) = TABLE[idx];
-    1.0 / (1.0 + (-steep * (raw - mid)).exp())
-}
-
-/// mem0 entity boost (v3 `_upsert_entity`): an exact normalized match
-/// pays the full 0.5; otherwise the best per-entity token-overlap
-/// fraction (covered entity tokens over entity tokens) pays
-/// proportionally. Capped at 0.5 — the fusion divisor (2.5) already
-/// reserves exactly that mass, so a boost above it would double-count.
-pub fn entity_link(memories: &[&str], entities: &[&str]) -> Vec<f32> {
-    use std::collections::BTreeSet;
-    let ent_norm: Vec<String> = entities.iter().map(|e| word_tokens(e).join(" ")).collect();
-    let ent_sets: Vec<BTreeSet<String>> = entities
-        .iter()
-        .map(|e| word_tokens(e).into_iter().collect())
-        .collect();
-    memories
-        .iter()
-        .map(|m| {
-            let norm = word_tokens(m).join(" ");
-            if !norm.is_empty() && ent_norm.iter().any(|e| e == &norm) {
-                return 0.5;
-            }
-            let mem_set: BTreeSet<String> = word_tokens(m).into_iter().collect();
-            if mem_set.is_empty() {
-                return 0.0;
-            }
-            let best = ent_sets
-                .iter()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.intersection(&mem_set).count() as f32 / s.len() as f32)
-                .fold(0.0f32, f32::max);
-            (best * 0.5).min(0.5)
-        })
-        .collect()
-}
-
-/// cognee content-hash dedup (the `(dataset,owner,content_hash)` index):
-/// sha256 hex of the body bytes. The hash covers content only — the
-/// caller scopes dataset/owner by which entries it passes to
-/// `dedupe_by_hash`.
-pub fn content_hash(text: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(text.as_bytes());
-    format!("{:x}", h.finalize())
-}
-
-/// First-seen wins by `content_hash` of the body: the earliest entry
-/// with a hash keeps its name in `unique`, later collisions land in
-/// `dupes`. Both outputs sorted ascending, so the verdict is
-/// deterministic regardless of input order ties.
-pub fn dedupe_by_hash(entries: &[(String, String)]) -> (Vec<String>, Vec<String>) {
-    use std::collections::BTreeSet;
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut unique = Vec::new();
-    let mut dupes = Vec::new();
-    for (name, body) in entries {
-        if seen.insert(content_hash(body)) {
-            unique.push(name.clone());
-        } else {
-            dupes.push(name.clone());
-        }
-    }
-    unique.sort();
-    dupes.sort();
-    (unique, dupes)
-}
-
 /// letta P1: the `core_block` cap as a reusable pure fn. Under budget
 /// the (trimmed) text rides with no note; over budget the head is cut
 /// on a char boundary (a multibyte char is never split) and rides with
 /// a repair note — never a silent cut.
-pub fn core_budget(text: &str, cap: usize) -> (String, Option<String>) {
+fn core_budget(text: &str, cap: usize) -> (String, Option<String>) {
     let text = text.trim();
     if text.len() <= cap {
         return (text.to_string(), None);
@@ -1819,137 +1370,34 @@ pub fn core_budget(text: &str, cap: usize) -> (String, Option<String>) {
     )
 }
 
-/// letta archival paging over `filter_entries` output: sorted ascending
-/// for determinism, sliced from `cursor`, taking `page_len`. The next
-/// cursor is `Some` only while names remain; a zero page or a cursor
-/// past the end yields empty with no continuation.
-pub fn archive_page(
-    names: &[String],
-    cursor: usize,
-    page_len: usize,
-) -> (Vec<String>, Option<usize>) {
-    let mut sorted: Vec<String> = names.to_vec();
-    sorted.sort();
-    if page_len == 0 || cursor >= sorted.len() {
-        return (Vec::new(), None);
-    }
-    let end = (cursor + page_len).min(sorted.len());
-    let page = sorted[cursor..end].to_vec();
-    let next = if end < sorted.len() { Some(end) } else { None };
-    (page, next)
-}
-
-/// cognee `improve` proposal renderer (P4): a line diff between the
-/// stored note and the session note — dropped lines (`- drop:`) in old
-/// order, added lines (`+ add:`) in new order, multiset-aware so a
-/// repeated line dropped once reports once. Render only: the model
-/// decides, the engine writes. Empty when the notes agree.
-pub fn improve_note(old: &str, new: &str) -> String {
-    use std::collections::BTreeMap;
-    let lines = |s: &str| -> Vec<String> {
-        s.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect()
-    };
-    let old_lines = lines(old);
-    let new_lines = lines(new);
-    let mut avail: BTreeMap<&str, usize> = BTreeMap::new();
-    for l in &new_lines {
-        *avail.entry(l.as_str()).or_insert(0) += 1;
-    }
-    let mut out = Vec::new();
-    for l in &old_lines {
-        match avail.get_mut(l.as_str()) {
-            Some(n) if *n > 0 => *n -= 1,
-            _ => out.push(format!("- drop: {l}")),
-        }
-    }
-    avail.clear();
-    for l in &old_lines {
-        *avail.entry(l.as_str()).or_insert(0) += 1;
-    }
-    for l in &new_lines {
-        match avail.get_mut(l.as_str()) {
-            Some(n) if *n > 0 => *n -= 1,
-            _ => out.push(format!("+ add: {l}")),
-        }
-    }
-    out.join("\n")
-}
-
-/// MiMo phrase-OR CJK tokenizer (`fts-query.ts`): lowercase word tokens
-/// for alphanumeric runs, one token per CJK char (no word segmentation
-/// — each ideograph matches alone), deduped and sorted so the term
-/// list is deterministic.
-pub fn tokenize_fts(query: &str) -> Vec<String> {
-    use std::collections::BTreeSet;
-    fn is_cjk(c: char) -> bool {
-        matches!(
-            c as u32,
-            0x3400..=0x4DBF
-                | 0x4E00..=0x9FFF
-                | 0xF900..=0xFAFF
-                | 0x3040..=0x30FF
-                | 0xAC00..=0xD7AF
-                | 0x20000..=0x2EBE0
-        )
-    }
-    let mut terms: BTreeSet<String> = BTreeSet::new();
-    let mut buf = String::new();
-    for c in query.chars() {
-        if is_cjk(c) {
-            if !buf.is_empty() {
-                terms.insert(std::mem::take(&mut buf));
-            }
-            terms.insert(c.to_lowercase().collect::<String>());
-        } else if c.is_alphanumeric() {
-            for l in c.to_lowercase() {
-                buf.push(l);
-            }
-        } else if !buf.is_empty() {
-            terms.insert(std::mem::take(&mut buf));
-        }
-    }
-    if !buf.is_empty() {
-        terms.insert(buf);
-    }
-    terms.into_iter().collect()
-}
-
-/// MiMo BM25 floor (`service.ts`): term-hit fraction over the
-/// lowercased text, substring (phrase-OR) per term. A non-empty term
-/// list never scores below 0.05 — an FTS miss is weak evidence, not
-/// disproof; an empty term list matches nothing (0.0).
-pub fn fts_score(terms: &[&str], text: &str) -> f32 {
-    let terms: Vec<&str> = terms.iter().copied().filter(|t| !t.is_empty()).collect();
-    if terms.is_empty() {
-        return 0.0;
-    }
-    let lowered = text.to_lowercase();
-    let hits = terms
-        .iter()
-        .filter(|t| lowered.contains(&t.to_lowercase()))
-        .count();
-    ((hits as f32) / (terms.len() as f32)).max(0.05)
-}
-
-/// MiMo fingerprint reconcile: lowercase alnum-only collapse, then
-/// `content_hash`. Bodies differing only in case/punctuation share a
-/// fingerprint; anything else differs.
-pub fn fingerprint(text: &str) -> String {
-    let collapsed: String = text
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect();
-    content_hash(&collapsed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn format_utc_stamp(secs: u64) -> String {
+        // Days since epoch → civil date (Howard Hinnant's algorithm), UTC.
+        let days = (secs / 86_400) as i64;
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        let sod = secs % 86_400;
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            y,
+            m,
+            d,
+            sod / 3600,
+            (sod % 3600) / 60,
+            sod % 60
+        )
+    }
 
     fn tmpdir() -> PathBuf {
         let d = std::env::temp_dir().join(format!("overseer-mem-{}", uuid::Uuid::now_v7()));
@@ -1981,6 +1429,38 @@ mod tests {
         let seg = index_segment(&dir);
         assert!(seg.contains("exceeds 25KB"));
         assert!(seg.len() < INDEX_CAP + 1_000);
+    }
+
+    #[test]
+    fn segment_names_the_dir_without_absolute_machine_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = cwd.join(format!(".overseer-mem-test-{}", uuid::Uuid::now_v7()));
+        ensure(&dir).unwrap();
+        let seg = index_segment(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let rel = dir.file_name().unwrap().to_string_lossy().to_string();
+        assert!(seg.contains(&format!("`{rel}/`")), "{seg}");
+        assert!(!seg.contains(&cwd.display().to_string()), "{seg}");
+        if let Some(home) = std::env::var_os("HOME").filter(|h| h.len() > 1) {
+            let home = PathBuf::from(home).display().to_string();
+            assert!(!seg.contains(&home), "absolute home path leaked: {seg}");
+        }
+    }
+
+    #[test]
+    fn relative_display_prefers_workspace_then_home() {
+        let cwd = Path::new("/w/proj");
+        let home = Path::new("/h/me");
+        let show = |d: &str| relative_display(Path::new(d), Some(cwd), Some(home));
+        assert_eq!(show("/w/proj/memory"), "memory");
+        assert_eq!(show("/w/proj"), ".");
+        assert_eq!(show("/h/me/.overseer/memory"), "~/.overseer/memory");
+        assert_eq!(show("/srv/mem"), "/srv/mem");
+        assert_eq!(
+            relative_display(Path::new("/x"), None, Some(Path::new("/"))),
+            "/x",
+            "a root HOME is no prefix"
+        );
     }
 
     #[test]
@@ -2082,6 +1562,130 @@ mod tests {
         assert!(new.contains("facts.md — user facts"));
         assert!(!new.contains("dupe.md"), "stale pointer dropped");
         assert!(dir.join(".git").exists(), "consolidate commits");
+    }
+
+    #[test]
+    fn consolidate_restores_live_pointers_the_model_omitted() {
+        // ADD-only: the model may add and merge, never drop a live pointer.
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(
+            &idx,
+            "# Memory Index\n\nfacts.md — user facts\nprefs.md — `tabs` over spaces\ngone.md — missing\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("facts.md"), "data").unwrap();
+        std::fs::write(dir.join("semantic/prefs.md"), "tabs").unwrap();
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\nfacts.md — facts, tightened\nnew.md — added\n---INDEX---",
+        );
+        let msg = consolidate(&p, "tiny", &dir).unwrap();
+        let new = std::fs::read_to_string(&idx).unwrap();
+        assert!(
+            new.contains("prefs.md — `tabs` over spaces"),
+            "omitted live pointer restored verbatim: {new}"
+        );
+        assert!(new.contains("facts.md — facts, tightened"), "{new}");
+        assert!(
+            !new.contains("user facts"),
+            "a rewritten pointer is not duplicated: {new}"
+        );
+        assert!(new.contains("new.md — added"), "additions stay: {new}");
+        assert!(!new.contains("gone.md"), "stale pointer still drops: {new}");
+        assert!(msg.contains("1 live restored"), "{msg}");
+    }
+
+    #[test]
+    fn consolidate_restores_an_omitted_layer_qualified_pointer() {
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(
+            &idx,
+            "# Memory Index\n\nfacts.md — facts\nsemantic/prefs.md — `tabs` over spaces\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("facts.md"), "data").unwrap();
+        std::fs::write(dir.join("semantic/prefs.md"), "tabs").unwrap();
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\nfacts.md — facts\n---INDEX---",
+        );
+        let msg = consolidate(&p, "tiny", &dir).unwrap();
+        let new = std::fs::read_to_string(&idx).unwrap();
+        assert!(
+            new.lines()
+                .any(|l| l == "semantic/prefs.md — `tabs` over spaces"),
+            "omitted qualified pointer restored verbatim: {new}"
+        );
+        assert!(msg.contains("1 live restored"), "{msg}");
+    }
+
+    #[test]
+    fn consolidate_bare_to_qualified_promotion_is_not_duplicated() {
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(&idx, "# Memory Index\n\nfoo.md — foo\n").unwrap();
+        std::fs::write(dir.join("semantic/foo.md"), "foo body").unwrap();
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\nsemantic/foo.md — foo, promoted\n---INDEX---",
+        );
+        let msg = consolidate(&p, "tiny", &dir).unwrap();
+        let new = std::fs::read_to_string(&idx).unwrap();
+        assert_eq!(
+            new.lines().filter(|l| l.contains("foo.md")).count(),
+            1,
+            "a promoted pointer still names the topic: {new}"
+        );
+        assert!(new.contains("semantic/foo.md — foo, promoted"), "{new}");
+        assert!(msg.contains("0 live restored"), "{msg}");
+    }
+
+    #[test]
+    fn qualified_pointer_to_a_missing_file_is_dropped() {
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(dir.join("semantic/live.md"), "body\n").unwrap();
+        let index = "# Memory Index\n\nsemantic/live.md — fine\nsemantic/gone.md — missing\n";
+        std::fs::write(&idx, index).unwrap();
+
+        let plan = reconcile(&dir, index);
+        assert_eq!(plan.drop, vec!["semantic/gone.md".to_string()]);
+        assert_eq!(plan.keep, 1, "semantic/live.md agrees");
+        assert!(
+            plan.add.is_empty(),
+            "a qualified pointer tracks its file: {plan:?}"
+        );
+
+        // The model lazily keeps the stale qualified pointer: the engine
+        // reclaims it and never restores it.
+        let p = FixedProvider::with_reply(
+            "---INDEX---\n# Memory Index\n\nsemantic/gone.md — missing\n---INDEX---",
+        );
+        let msg = consolidate(&p, "tiny", &dir).unwrap();
+        let new = std::fs::read_to_string(&idx).unwrap();
+        assert!(!new.contains("semantic/gone.md"), "{new}");
+        assert!(new.contains("semantic/live.md — fine"), "{new}");
+        assert!(msg.contains("1 stale reclaimed"), "{msg}");
+    }
+
+    #[test]
+    fn topic_name_accepts_bare_and_layer_qualified_pointers_only() {
+        assert_eq!(topic_name("prefs.md — tabs"), Some("prefs.md"));
+        for layer in Layer::ALL {
+            let line = format!("{}/x.md — y", layer.name());
+            let want = format!("{}/x.md", layer.name());
+            assert_eq!(topic_name(&line), Some(want.as_str()));
+        }
+        for bad in [
+            "other/x.md — y",
+            "semantic/../x.md — y",
+            "semantic/a/x.md — y",
+            "/abs/x.md — y",
+            "semantic/.md — y",
+            "semantic\\x.md — y",
+            "proposals/x.md — y",
+        ] {
+            assert_eq!(topic_name(bad), None, "{bad}");
+        }
     }
 
     #[test]
@@ -2194,13 +1798,8 @@ mod tests {
         assert!(seg.contains("exceeds"), "{seg}");
         assert!(seg.len() < INDEX_CAP + CORE_CAP + 2_000, "{}", seg.len());
 
-        // CORE.md is not a topic: it never appears as a pointer, and the
-        // quarantined subagent view carries neither the block nor a pointer.
+        // CORE.md is not a topic: it must never be reconciled as one.
         std::fs::write(dir.join(CORE_NAME), "core\n").unwrap();
-        let filtered = index_segment_filtered(&dir, Sensitivity::Personal);
-        assert!(!filtered.contains("Memory core"), "{filtered}");
-        assert!(!filtered.contains("CORE.md"), "{filtered}");
-        // CORE.md must never be reconciled as a topic file.
         let plan = reconcile(&dir, "# Memory Index\n\nfacts.md — facts\n");
         assert!(!plan.add.iter().any(|a| a == CORE_NAME));
     }
@@ -2294,22 +1893,8 @@ mod tests {
     }
 
     #[test]
-    fn write_bar_map_covers_all_layers() {
+    fn write_bar_gates_identity_above_world_facts() {
         use crate::perm::Autonomy;
-        assert_eq!(WRITE_BAR.len(), 4);
-        assert_eq!(
-            WRITE_BAR
-                .iter()
-                .map(|(l, _)| *l)
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            4,
-            "one bar entry per layer"
-        );
-        // Table and method agree.
-        for (layer, bar) in WRITE_BAR {
-            assert_eq!(layer.write_bar(), bar);
-        }
         // Identity facts need approval; world facts are low-risk.
         assert_eq!(Layer::Profile.write_bar(), Autonomy::ActWithApproval);
         assert_eq!(Layer::Semantic.write_bar(), Autonomy::ActSilently);
@@ -2330,36 +1915,6 @@ mod tests {
         let dir = tmpdir();
         ensure(&dir).unwrap();
         assert!(index_segment(&dir).contains(MEMORY_LEGEND));
-    }
-
-    #[test]
-    fn filtered_view_hides_secret() {
-        let dir = tmpdir();
-        ensure(&dir).unwrap();
-        std::fs::write(
-            dir.join("episodic").join("diary.md"),
-            "---\nsensitivity: personal\n---\nhad lunch\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("semantic").join("token.md"),
-            "---\nsensitivity: secret\n---\nsk-abc\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join(INDEX_NAME),
-            "# Memory Index\n\ndiary.md — lunch notes\ntoken.md — api token\n",
-        )
-        .unwrap();
-        let personal = index_segment_filtered(&dir, Sensitivity::Personal);
-        assert!(personal.contains("diary.md"), "{personal}");
-        assert!(!personal.contains("token.md"), "{personal}");
-        let secret = index_segment_filtered(&dir, Sensitivity::Secret);
-        assert!(secret.contains("diary.md"));
-        assert!(secret.contains("token.md"));
-        let public = index_segment_filtered(&dir, Sensitivity::Public);
-        assert!(!public.contains("diary.md"), "{public}");
-        assert!(!public.contains("token.md"), "{public}");
     }
 
     #[test]
@@ -2401,12 +1956,17 @@ mod tests {
             "---\nttl_days: 0\n---\nshort lived\n",
         )
         .unwrap();
-        assert!(topic_text(&dir, "live.md").is_some());
+        assert!(matches!(
+            subagent_view(&dir, "live.md", Sensitivity::Secret),
+            View::Admitted(_)
+        ));
         assert!(
-            topic_text(&dir, "gone.md").is_none(),
+            matches!(
+                subagent_view(&dir, "gone.md", Sensitivity::Secret),
+                View::Hidden
+            ),
             "ttl_days=0 has expired"
         );
-        assert!(topic_text(&dir, "missing.md").is_none());
 
         // The INDEX drops the expired pointer but keeps the live one.
         std::fs::write(
@@ -2484,34 +2044,21 @@ mod tests {
             subagent_view(&dir, "reg.md", Sensitivity::Secret),
             View::Hidden
         ));
-
-        // The index view agrees with the body view — one rule, two views.
-        std::fs::write(
-            dir.join(INDEX_NAME),
-            "# Memory Index\n\nok.md — fine\nreg.md — compliance\ndead.md — short\n",
-        )
-        .unwrap();
-        let seg = index_segment_filtered(&dir, personal);
-        assert!(seg.contains("ok.md"), "{seg}");
-        assert!(!seg.contains("reg.md"), "{seg}");
-        assert!(!seg.contains("dead.md"), "{seg}");
     }
 
     #[test]
-    fn invalidate_appends_trailer() {
+    fn space_form_superseded_trailer_retires_the_asset() {
+        // F9: the reader accepts `superseded_by name` (no colon), so the
+        // pointer drops and the body stops being served.
         let dir = tmpdir();
         ensure(&dir).unwrap();
         let p = dir.join("episodic").join("old.md");
-        std::fs::write(&p, "old content\n").unwrap();
-        invalidate(&p, "new.md").unwrap();
-        let text = std::fs::read_to_string(&p).unwrap();
-        assert!(text.contains("old content"), "history preserved: {text}");
-        assert!(text.contains("superseded_by new.md"), "{text}");
-        // The trailer `invalidate` writes must actually retire the asset —
-        // the reader accepts the space form, so the pointer drops and the
-        // body stops being served (F9: requiring a colon left it "live").
+        std::fs::write(&p, "old content\nsuperseded_by new.md\n").unwrap();
         assert!(
-            topic_text(&dir, "old.md").is_none(),
+            matches!(
+                subagent_view(&dir, "old.md", Sensitivity::Secret),
+                View::Hidden
+            ),
             "superseded body served"
         );
         std::fs::write(dir.join(INDEX_NAME), "# Memory Index\n\nold.md — stale\n").unwrap();
@@ -2572,338 +2119,6 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(p, text).unwrap();
-    }
-
-    fn search(dir: &Path, q: &str, f: &EntryFilter) -> Vec<MemoryHit> {
-        search_memory(dir, q, f, 10).unwrap()
-    }
-
-    fn names(hits: &[MemoryHit]) -> Vec<&str> {
-        hits.iter().map(|h| h.name.as_str()).collect()
-    }
-
-    #[test]
-    fn search_weights_name_hits_above_body_only_hits() {
-        let dir = tmpdir();
-        put(&dir, "semantic/other.md", "the kettle boils slowly\n");
-        put(&dir, "semantic/kettle.md", "no query word in this body\n");
-        let hits = search(&dir, "  Kettle  ", &EntryFilter::default());
-        assert_eq!(names(&hits), ["kettle.md", "other.md"]);
-        assert_eq!(hits[0].score, NAME_WEIGHT, "a name hit is worth 3");
-        assert_eq!(hits[1].score, 1, "one body occurrence is worth 1");
-    }
-
-    #[test]
-    fn search_excludes_expired_and_superseded_assets() {
-        let dir = tmpdir();
-        put(
-            &dir,
-            "semantic/expired.md",
-            "---\nvalid_to: 2000-01-01T00:00:00Z\n---\nkettle kettle kettle\n",
-        );
-        put(
-            &dir,
-            "semantic/superseded.md",
-            "kettle kettle\nsuperseded_by live.md\n",
-        );
-        put(&dir, "semantic/live.md", "kettle\n");
-        let hits = search(&dir, "kettle", &EntryFilter::default());
-        assert_eq!(
-            names(&hits),
-            ["live.md"],
-            "stale assets are not ranked, let alone returned"
-        );
-    }
-
-    #[test]
-    fn search_honours_a_personal_ceiling_over_secret_entries() {
-        let dir = tmpdir();
-        // The secret twin scores highest (name hit + body hit) — only the
-        // ceiling removes it.
-        put(
-            &dir,
-            "semantic/kettle-secret.md",
-            "---\nsensitivity: secret\n---\nkettle kettle\n",
-        );
-        put(&dir, "semantic/kettle-open.md", "one kettle mention\n");
-        let ceiling = EntryFilter {
-            sensitivity_max: Some(Sensitivity::Personal),
-            ..EntryFilter::default()
-        };
-        assert_eq!(
-            names(&search(&dir, "kettle", &ceiling)),
-            ["kettle-open.md"],
-            "a secret body is never served under a personal ceiling"
-        );
-        // Without a ceiling the secret twin is the top scorer, which is what
-        // proves the ceiling — not the ranking — removed it.
-        let open = search(&dir, "kettle", &EntryFilter::default());
-        assert_eq!(open[0].name, "kettle-secret.md", "{open:?}");
-    }
-
-    #[test]
-    fn search_never_returns_a_regulated_entry_even_when_it_scores_highest() {
-        let dir = tmpdir();
-        put(
-            &dir,
-            "semantic/kettle-regulated.md",
-            "---\ngovernance: regulated\n---\nkettle kettle kettle kettle kettle kettle\n",
-        );
-        put(&dir, "semantic/kettle-notes.md", "one kettle mention\n");
-        // With the governance column switched off the regulated asset is
-        // rank 0: its text really does score highest.
-        let ungoverned = EntryFilter {
-            exclude_regulated: false,
-            ..EntryFilter::default()
-        };
-        assert_eq!(
-            search(&dir, "kettle", &ungoverned)[0].name,
-            "kettle-regulated.md"
-        );
-        assert_eq!(
-            names(&search(&dir, "kettle", &EntryFilter::default())),
-            ["kettle-notes.md"],
-            "the prefilter runs before ranking, so nothing regulated takes a slot"
-        );
-    }
-
-    #[test]
-    fn search_skips_malformed_headers() {
-        let dir = tmpdir();
-        put(
-            &dir,
-            "semantic/broken.md",
-            "---\nconfidence: nonsense\n---\nkettle kettle kettle\n",
-        );
-        put(&dir, "semantic/fine.md", "kettle\n");
-        assert_eq!(
-            names(&search(&dir, "kettle", &EntryFilter::default())),
-            ["fine.md"]
-        );
-        // The prefilter and the search read the same gate.
-        assert_eq!(filter_entries(&dir, &EntryFilter::default()), ["fine.md"]);
-    }
-
-    #[test]
-    fn search_ties_break_on_name_ascending() {
-        let dir = tmpdir();
-        for n in ["c.md", "a.md", "b.md"] {
-            put(&dir, &format!("semantic/{n}"), "kettle\n");
-        }
-        let hits = search(&dir, "kettle", &EntryFilter::default());
-        assert!(hits.iter().all(|h| h.score == 1));
-        assert_eq!(names(&hits), ["a.md", "b.md", "c.md"], "{hits:?}");
-        // Same dir, same query, same order — every run.
-        assert_eq!(
-            names(&hits),
-            names(&search(&dir, "kettle", &EntryFilter::default()))
-        );
-    }
-
-    #[test]
-    fn search_rejects_a_query_with_no_terms() {
-        let dir = tmpdir();
-        put(&dir, "semantic/kettle.md", "kettle\n");
-        for q in ["", "   ", " — ... "] {
-            let e = search_memory(&dir, q, &EntryFilter::default(), 5).unwrap_err();
-            assert!(e.contains("no terms"), "{e}");
-            assert!(e.contains("matches nothing"), "{e}");
-        }
-    }
-
-    #[test]
-    fn search_clamps_limit_and_rejects_zero() {
-        let dir = tmpdir();
-        for i in 0..(MAX_SEARCH_HITS + 5) {
-            put(&dir, &format!("semantic/n{i:03}.md"), "kettle\n");
-        }
-        assert_eq!(
-            search_memory(&dir, "kettle", &EntryFilter::default(), 10_000)
-                .unwrap()
-                .len(),
-            MAX_SEARCH_HITS,
-            "a search must not stream the whole memory dir"
-        );
-        assert_eq!(
-            search_memory(&dir, "kettle", &EntryFilter::default(), 3)
-                .unwrap()
-                .len(),
-            3
-        );
-        let e = search_memory(&dir, "kettle", &EntryFilter::default(), 0).unwrap_err();
-        assert!(e.contains("limit 0"), "{e}");
-    }
-
-    #[test]
-    fn search_snippet_line_number_matches_the_file() {
-        let dir = tmpdir();
-        let text = "---\nconfidence: 0.9\n---\n# Notes\n\nfirst kettle line\nsecond line\n";
-        put(&dir, "semantic/lines.md", text);
-        let hits = search(&dir, "kettle", &EntryFilter::default());
-        assert_eq!(hits[0].snippet, "first kettle line");
-        assert_eq!(hits[0].line, 6);
-        assert_eq!(
-            text.lines().nth(hits[0].line - 1).unwrap().trim(),
-            hits[0].snippet,
-            "the line number must address the snippet in the file"
-        );
-
-        // A name-only hit has no matching body line: the first non-empty
-        // body line is quoted, and its number is still the file's.
-        put(
-            &dir,
-            "semantic/only-name.md",
-            "---\nx: 1\n---\n\nfirst real line\nsecond\n",
-        );
-        let hits = search(&dir, "only", &EntryFilter::default());
-        assert_eq!(names(&hits), ["only-name.md"]);
-        assert_eq!(hits[0].snippet, "first real line");
-        assert_eq!(hits[0].line, 5);
-
-        // A long line is cut to the cap, and the cut is marked.
-        put(
-            &dir,
-            "semantic/long.md",
-            &format!("kettle {}\n", "w".repeat(500)),
-        );
-        let hits = search(&dir, "kettle", &EntryFilter::default());
-        let long = hits
-            .iter()
-            .find(|h| h.name == "long.md")
-            .unwrap_or_else(|| panic!("long.md must be a hit: {hits:?}"));
-        assert_eq!(long.snippet.chars().count(), SNIPPET_CHARS);
-        assert!(long.snippet.ends_with('…'), "{}", long.snippet);
-    }
-
-    #[test]
-    fn filter_entries_is_sorted_distinct_and_current() {
-        let dir = tmpdir();
-        put(&dir, "semantic/zeta.md", "z\n");
-        put(&dir, "profile/alpha.md", "a\n");
-        put(&dir, "beta.md", "b\n");
-        put(
-            &dir,
-            "expired.md",
-            "---\nvalid_to: 2000-01-01T00:00:00Z\n---\nx\n",
-        );
-        put(&dir, INDEX_NAME, "index\n");
-        put(&dir, CORE_NAME, "core\n");
-        put(&dir, "semantic/notes.txt", "not a topic\n");
-        assert_eq!(
-            filter_entries(&dir, &EntryFilter::default()),
-            ["alpha.md", "beta.md", "zeta.md"],
-            "layer dirs and the root, minus INDEX/CORE, current only, sorted"
-        );
-        let profile = EntryFilter {
-            layer: Some(Layer::Profile),
-            ..EntryFilter::default()
-        };
-        assert_eq!(filter_entries(&dir, &profile), ["alpha.md"]);
-        // A root-level topic is filed as Semantic (never as a higher-bar
-        // layer), so a semantic column still reaches it.
-        let semantic = EntryFilter {
-            layer: Some(Layer::Semantic),
-            ..EntryFilter::default()
-        };
-        assert_eq!(filter_entries(&dir, &semantic), ["beta.md", "zeta.md"]);
-    }
-
-    #[test]
-    fn filter_default_is_default_deny_on_regulated() {
-        let f = EntryFilter::default();
-        assert!(
-            f.exclude_regulated,
-            "a derived default would fan regulated assets out"
-        );
-        let regulated = EntryMeta {
-            governance: Governance::Regulated,
-            ..EntryMeta::default()
-        };
-        assert!(!matches_filter(&regulated, Layer::Semantic, &f));
-        assert!(matches_filter(&EntryMeta::default(), Layer::Semantic, &f));
-
-        // Layer is equality; the sensitivity ceiling goes through `admits`.
-        let profile = EntryFilter {
-            layer: Some(Layer::Profile),
-            ..EntryFilter::default()
-        };
-        assert!(matches_filter(
-            &EntryMeta::default(),
-            Layer::Profile,
-            &profile
-        ));
-        assert!(!matches_filter(
-            &EntryMeta::default(),
-            Layer::Semantic,
-            &profile
-        ));
-        let personal = EntryFilter {
-            sensitivity_max: Some(Sensitivity::Personal),
-            ..EntryFilter::default()
-        };
-        let public = EntryMeta {
-            sensitivity: Sensitivity::Public,
-            ..EntryMeta::default()
-        };
-        let secret = EntryMeta {
-            sensitivity: Sensitivity::Secret,
-            ..EntryMeta::default()
-        };
-        assert!(matches_filter(&public, Layer::Semantic, &personal));
-        assert!(!matches_filter(&secret, Layer::Semantic, &personal));
-    }
-
-    #[test]
-    fn filter_min_confidence_is_inclusive_and_rejects_non_finite() {
-        let meta = EntryMeta {
-            confidence: 0.5,
-            ..EntryMeta::default()
-        };
-        let at = EntryFilter {
-            min_confidence: Some(0.5),
-            ..EntryFilter::default()
-        };
-        assert!(matches_filter(&meta, Layer::Semantic, &at), "inclusive");
-        let above = EntryFilter {
-            min_confidence: Some(0.51),
-            ..EntryFilter::default()
-        };
-        assert!(!matches_filter(&meta, Layer::Semantic, &above));
-        let nan = EntryMeta {
-            confidence: f64::NAN,
-            ..EntryMeta::default()
-        };
-        let any = EntryFilter {
-            min_confidence: Some(0.0),
-            ..EntryFilter::default()
-        };
-        assert!(
-            !matches_filter(&nan, Layer::Semantic, &any),
-            "an unreadable confidence never passes a numeric gate"
-        );
-    }
-
-    #[test]
-    fn filter_provenance_is_case_insensitive_but_exact() {
-        let meta = EntryMeta {
-            provenance: "Seed-Notes".into(),
-            ..EntryMeta::default()
-        };
-        let same = EntryFilter {
-            provenance: Some("seed-notes".into()),
-            ..EntryFilter::default()
-        };
-        assert!(matches_filter(&meta, Layer::Semantic, &same));
-        let prefix = EntryFilter {
-            provenance: Some("seed".into()),
-            ..EntryFilter::default()
-        };
-        assert!(
-            !matches_filter(&meta, Layer::Semantic, &prefix),
-            "no substring match"
-        );
-        let absent = EntryMeta::default();
-        assert!(!matches_filter(&absent, Layer::Semantic, &same));
     }
 
     #[test]
@@ -3025,96 +2240,6 @@ mod tests {
     }
 
     #[test]
-    fn fuse_scores_gates_and_denoms() {
-        assert_eq!(
-            fuse_scores(0.4, 0.9, 0.5, true, true, 0.5),
-            0.0,
-            "sem under threshold gates"
-        );
-        assert!((fuse_scores(0.8, 0.0, 0.0, false, false, 0.0) - 0.8).abs() < 1e-6);
-        assert!((fuse_scores(0.8, 0.6, 0.0, true, false, 0.0) - 0.7).abs() < 1e-6);
-        assert!((fuse_scores(0.8, 0.6, 0.5, true, true, 0.0) - 0.76).abs() < 1e-6);
-        assert!((fuse_scores(0.8, 0.0, 0.5, false, true, 0.0) - 1.3 / 1.5).abs() < 1e-6);
-        assert_eq!(
-            fuse_scores(f32::NAN, 0.5, 0.5, true, true, 0.0),
-            0.0,
-            "non-finite fails closed"
-        );
-        assert!(
-            fuse_scores(1.0, 1.0, 1.0, true, true, 0.0) <= 1.0,
-            "clamped"
-        );
-    }
-
-    #[test]
-    fn normalize_keyword_hits_table_midpoints() {
-        for (raw, n) in [(5.0, 1), (7.0, 2), (9.0, 3), (10.0, 4), (12.0, 5)] {
-            let got = normalize_keyword(raw, n);
-            assert!(
-                (got - 0.5).abs() < 1e-9,
-                "midpoint saturates at .5: raw={raw} n={n} got={got}"
-            );
-        }
-        assert!(
-            (normalize_keyword(5.0, 0) - 0.5).abs() < 1e-9,
-            "n_terms clamps to table head"
-        );
-        assert!(
-            (normalize_keyword(12.0, 99) - 0.5).abs() < 1e-9,
-            "n_terms clamps to table tail"
-        );
-        assert!(normalize_keyword(100.0, 1) > 0.99, "saturates high");
-        assert!(normalize_keyword(-100.0, 1) < 0.01, "saturates low");
-        assert_eq!(normalize_keyword(f64::NAN, 1), 0.0);
-    }
-
-    #[test]
-    fn entity_link_exact_and_capped_overlap() {
-        let boosts = entity_link(&["Paris trip"], &["paris trip"]);
-        assert_eq!(boosts, vec![0.5], "exact normalized match pays full boost");
-        let partial = entity_link(&["loves paris cafes"], &["paris trip"])[0];
-        assert!(
-            (partial - 0.25).abs() < 1e-6,
-            "one of two entity tokens covered: {partial}"
-        );
-        assert!(entity_link(&["unrelated text"], &["paris trip"])[0] < 0.25);
-        assert_eq!(entity_link(&[""], &["paris"])[0], 0.0);
-        assert!(
-            entity_link(&["anything"], &["a b c d"])
-                .iter()
-                .all(|b| *b <= 0.5),
-            "cap holds"
-        );
-    }
-
-    #[test]
-    fn content_hash_stable_hex() {
-        assert_eq!(
-            content_hash(""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(content_hash("abc"), content_hash("abc"));
-        assert_ne!(content_hash("abc"), content_hash("abd"));
-        assert_eq!(content_hash("abc").len(), 64);
-    }
-
-    #[test]
-    fn dedupe_by_hash_first_wins_sorted() {
-        let entries = vec![
-            ("b.md".to_string(), "same".to_string()),
-            ("a.md".to_string(), "same".to_string()),
-            ("c.md".to_string(), "other".to_string()),
-        ];
-        let (unique, dupes) = dedupe_by_hash(&entries);
-        assert_eq!(
-            unique,
-            vec!["b.md".to_string(), "c.md".to_string()],
-            "first-seen keeps its name"
-        );
-        assert_eq!(dupes, vec!["a.md".to_string()]);
-    }
-
-    #[test]
     fn core_budget_truncates_with_note() {
         let (kept, note) = core_budget("small", 100);
         assert_eq!(kept, "small");
@@ -3131,70 +2256,46 @@ mod tests {
         assert!(std::str::from_utf8(kept.as_bytes()).is_ok());
     }
 
-    #[test]
-    fn archive_page_sorts_and_continues() {
-        let names = vec!["c.md".to_string(), "a.md".to_string(), "b.md".to_string()];
-        let (page, next) = archive_page(&names, 0, 2);
-        assert_eq!(page, vec!["a.md".to_string(), "b.md".to_string()]);
-        assert_eq!(next, Some(2));
-        let (page, next) = archive_page(&names, 2, 2);
-        assert_eq!(page, vec!["c.md".to_string()]);
-        assert_eq!(next, None);
-        assert_eq!(archive_page(&names, 9, 2), (Vec::new(), None));
-        assert_eq!(archive_page(&names, 0, 0), (Vec::new(), None));
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// RFC3339 stamp for instant `epoch` written in the zone `off_mins`
+    /// east of UTC (0 → `Z`).
+    fn stamp_at(epoch: u64, off_mins: i64) -> String {
+        let wall = format_utc_stamp((epoch as i64 + off_mins * 60) as u64);
+        if off_mins == 0 {
+            return wall;
+        }
+        let sign = if off_mins < 0 { '-' } else { '+' };
+        let a = off_mins.abs();
+        format!("{}{sign}{:02}:{:02}", &wall[..19], a / 60, a % 60)
     }
 
     #[test]
-    fn improve_note_renders_drop_add_lines() {
-        assert_eq!(improve_note("a\nb", "a\nb"), "", "agreement renders empty");
-        let diff = improve_note("a\nb\nc", "b\nc\nd");
-        assert!(diff.contains("- drop: a"), "{diff}");
-        assert!(diff.contains("+ add: d"), "{diff}");
-        let dup = improve_note("x\nx\ny", "x\ny");
-        assert_eq!(
-            dup.lines().filter(|l| l.starts_with("- drop:")).count(),
-            1,
-            "{dup}"
-        );
-    }
-
-    #[test]
-    fn tokenize_fts_cjk_phrase_or_sorted() {
-        let toks = tokenize_fts("hello 世界");
-        assert!(toks.contains(&"hello".to_string()), "{toks:?}");
-        assert!(toks.contains(&"世".to_string()), "{toks:?}");
-        assert!(toks.contains(&"界".to_string()), "{toks:?}");
-        let mut sorted = toks.clone();
-        sorted.sort();
-        assert_eq!(toks, sorted, "deterministic order");
-        assert_eq!(
-            tokenize_fts("hi, hi! HI"),
-            vec!["hi".to_string()],
-            "dedup + lowercase"
-        );
-        assert!(tokenize_fts("").is_empty());
-    }
-
-    #[test]
-    fn fts_score_fraction_and_floor() {
-        assert_eq!(fts_score(&[], "anything"), 0.0, "no terms matches nothing");
-        let half = fts_score(&["hello", "world"], "hello there");
-        assert!((half - 0.5).abs() < 1e-6, "{half}");
+    fn valid_to_expiry_compares_instants_across_offsets() {
+        let now = now_secs();
+        let meta = |to: String| EntryMeta {
+            valid_to: Some(to),
+            ..EntryMeta::default()
+        };
+        for off in [300, -180, 0] {
+            let past = stamp_at(now - 3_600, off);
+            let future = stamp_at(now + 3_600, off);
+            assert!(parse_meta(&format!("---\nvalid_to: {past}\n---\n")).is_ok());
+            assert!(meta_expired(&meta(past.clone())), "{past} is an hour ago");
+            assert!(
+                !meta_expired(&meta(future.clone())),
+                "{future} is an hour ahead"
+            );
+        }
         assert!(
-            (fts_score(&["zzz"], "hello there") - 0.05).abs() < 1e-6,
-            "miss is weak evidence, not disproof"
+            !meta_expired(&meta("not-a-date".into())),
+            "unparseable reads as not expired"
         );
-        assert!(
-            (fts_score(&["世"], "世界") - 1.0).abs() < 1e-6,
-            "CJK single-char matches"
-        );
-    }
-
-    #[test]
-    fn fingerprint_ignores_case_punct() {
-        assert_eq!(fingerprint("Hello, World!"), fingerprint("hello world"));
-        assert_ne!(fingerprint("hello world"), fingerprint("hello worlds"));
-        assert_eq!(fingerprint("abc").len(), 64);
     }
 
     #[test]

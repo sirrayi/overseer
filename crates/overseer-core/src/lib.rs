@@ -27,7 +27,6 @@ pub mod perm;
 pub mod profile;
 pub mod prompt;
 pub mod provider;
-pub mod recipe;
 pub mod repomap;
 pub mod rewind;
 pub mod session;
@@ -36,9 +35,3 @@ pub mod stuck;
 pub mod tokens;
 pub mod tools;
 pub mod toon;
-/// P8-C tree-sitter registry: the grammar/query descriptors a real
-/// `tree-sitter` binding registers against. Default-off and
-/// dependency-free — see the module header for why the binding is not
-/// linked (offline build + the zero-new-crate gate).
-#[cfg(feature = "tree-sitter")]
-pub mod tsitter;
