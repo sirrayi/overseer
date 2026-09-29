@@ -12,11 +12,16 @@
 //! never be the reason a turn dies. A non-zero exit is expected and
 //! meaningful (errors present); it never turns into a tool error.
 //!
+//! `cargo check` is code execution, not a read-only probe: it runs
+//! `build.rs` and proc-macros the model can write. So the checker runs
+//! inside the bash sandbox (same backend, same `--runtime` pin, same
+//! `env_clear` + allowlist); under a network-denying sandbox cargo gets
+//! `--offline`, and dependencies missing from the local cache are
+//! reported plainly.
+//!
 //! `// DEFERRED(owner): LSP diagnostics for non-Rust files (@typescript-
 //! language-server et al.) — cargo is the only host toolchain this port
-//! shells out to; an LSP client is P8-C+ material. The check runs
-//! unsandboxed (it is a workspace-local read-only probe); route it through
-//! the bash sandbox when that grows a non-shell entry point.`
+//! shells out to; an LSP client is P8-C+ material.`
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -172,14 +177,14 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         .get("level")
         .and_then(Value::as_str)
         .unwrap_or("error");
-    let argv = check_argv(package);
-    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-    collect(&ctx.cwd, "cargo", &args, level)
+    let args = check_argv(package, super::bash::denies_network(ctx));
+    collect(ctx, "cargo", &args, level)
 }
 
 /// The `cargo check` argv for an optional package (pure — the tool's only
 /// policy decision, so it is testable without spawning a toolchain).
-pub fn check_argv(package: Option<&str>) -> Vec<String> {
+/// `offline` adds `--offline` (a network-denying sandbox).
+pub fn check_argv(package: Option<&str>, offline: bool) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "check".into(),
         "--message-format=json".into(),
@@ -187,6 +192,9 @@ pub fn check_argv(package: Option<&str>) -> Vec<String> {
         // parse; the diagnostics are the point, not the build log.
         "--quiet".into(),
     ];
+    if offline {
+        args.push("--offline".into());
+    }
     if let Some(p) = package {
         args.push("-p".into());
         args.push(p.to_string());
@@ -194,9 +202,21 @@ pub fn check_argv(package: Option<&str>) -> Vec<String> {
     args
 }
 
+/// Whether the check output is cargo refusing to resolve dependencies it
+/// would have to download while `--offline`.
+fn offline_miss(output: &str) -> bool {
+    output.contains("--offline was specified") || output.contains("offline mode (via `--offline`)")
+}
+
 /// Run `program args…` in `cwd` and turn its JSON stream into a result.
 /// Every failure mode is a note, never a tool error (fail-open).
-fn collect(cwd: &Path, program: &str, args: &[&str], level: &str) -> ToolOutput {
+fn collect(ctx: &ToolCtx, program: &str, args: &[String], level: &str) -> ToolOutput {
+    let mut argv = vec![program.to_string()];
+    argv.extend(args.iter().cloned());
+    let inv = match super::bash::sandboxed(&argv, ctx) {
+        Ok(i) => i,
+        Err(e) => return ToolOutput::ok(format!("diagnostics: {e} — skipped (fail-open).")),
+    };
     let log_path = std::env::temp_dir().join(format!("overseer-diag-{}.log", uuid::Uuid::now_v7()));
     let Ok(file) = std::fs::File::create(&log_path) else {
         return ToolOutput::ok(
@@ -209,9 +229,11 @@ fn collect(cwd: &Path, program: &str, args: &[&str], level: &str) -> ToolOutput 
             "diagnostics: cannot create a temp log — skipped (fail-open).".into(),
         );
     };
-    let child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
+    let child = Command::new(&inv.program)
+        .args(&inv.args)
+        .current_dir(&ctx.cwd)
+        .env_clear()
+        .envs(super::bash::child_env())
         .stdin(Stdio::null())
         .stdout(file)
         .stderr(err_file)
@@ -256,7 +278,12 @@ fn collect(cwd: &Path, program: &str, args: &[&str], level: &str) -> ToolOutput 
     let kept = filter_level(&all, level);
     let mut text = if kept.is_empty() {
         if all.is_empty() {
-            if timed_out {
+            if offline_miss(&stdout) {
+                "diagnostics: dependencies are not in the local cargo cache and the sandbox \
+                 denies network, so the check ran `--offline` and could not resolve them — \
+                 run `cargo fetch` outside the sandbox, then retry (fail-open)."
+                    .to_string()
+            } else if timed_out {
                 format!(
                     "diagnostics: `{program} {}` timed out after {CHECK_TIMEOUT_S}s — no \
                      diagnostics reported (fail-open).",
@@ -285,6 +312,9 @@ fn collect(cwd: &Path, program: &str, args: &[&str], level: &str) -> ToolOutput 
     };
     if timed_out && !kept.is_empty() {
         text.push_str("\n[check timed out — the list is partial]");
+    }
+    if let Some(n) = inv.note {
+        text.push_str(&format!("\n[{n}]"));
     }
     ToolOutput::ok(text)
 }
@@ -389,10 +419,40 @@ mod tests {
         assert_eq!(capped.lines().count(), MAX_DIAGS + 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_secret_never_reaches_the_checker_child() {
+        use std::os::unix::fs::PermissionsExt;
+        std::env::set_var("FOO_API_KEY", "sk-t6-parent-secret");
+        let dir = tmpdir();
+        let script = dir.join("fake-checker");
+        std::fs::write(&script, "#!/bin/sh\nenv > \"$PWD/child-env.txt\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for sandbox in [false, true] {
+            let _ = std::fs::remove_file(dir.join("child-env.txt"));
+            let mut c = ctx(&dir);
+            c.sandbox = sandbox;
+            let out = collect(&c, script.to_str().unwrap(), &[], "error");
+            assert!(!out.is_error, "{}", out.text);
+            let env = std::fs::read_to_string(dir.join("child-env.txt")).unwrap();
+            assert!(!env.contains("FOO_API_KEY"), "secret leaked: {env}");
+            assert!(!env.contains("sk-t6-parent-secret"), "secret leaked: {env}");
+            assert!(
+                env.contains("PATH="),
+                "the allowlist still carries PATH: {env}"
+            );
+        }
+    }
+
     #[test]
     fn missing_toolchain_fails_open_with_a_note() {
         let dir = tmpdir();
-        let out = collect(&dir, "overseer-no-such-binary-xyz", &["check"], "error");
+        let out = collect(
+            &ctx(&dir),
+            "overseer-no-such-binary-xyz",
+            &["check".to_string()],
+            "error",
+        );
         assert!(
             !out.is_error,
             "a missing binary must not error: {}",
@@ -410,9 +470,9 @@ mod tests {
         let fixture = dir.join("stream.jsonl");
         std::fs::write(&fixture, STREAM).unwrap();
         let out = collect(
-            &dir,
+            &ctx(&dir),
             "sh",
-            &["-c", &format!("cat {}", fixture.display())],
+            &["-c".to_string(), format!("cat {}", fixture.display())],
             "error",
         );
         assert!(!out.is_error);
@@ -427,11 +487,11 @@ mod tests {
         // The tool's argv policy (no toolchain spawn in the suite: `collect`
         // above already covers spawn → parse → render end to end).
         assert_eq!(
-            check_argv(None),
+            check_argv(None, false),
             vec!["check", "--message-format=json", "--quiet"]
         );
         assert_eq!(
-            check_argv(Some("overseer-core")),
+            check_argv(Some("overseer-core"), false),
             vec![
                 "check",
                 "--message-format=json",
@@ -440,6 +500,53 @@ mod tests {
                 "overseer-core"
             ]
         );
-        let _ = ctx(&dir);
+    }
+
+    #[test]
+    fn a_network_denying_sandbox_runs_cargo_offline() {
+        assert_eq!(
+            check_argv(Some("p"), true),
+            vec![
+                "check",
+                "--message-format=json",
+                "--quiet",
+                "--offline",
+                "-p",
+                "p"
+            ]
+        );
+        let dir = tmpdir();
+        let mut c = ctx(&dir);
+        assert!(!crate::tools::bash::denies_network(&c), "sandbox off");
+        c.sandbox = true;
+        let wrapped = crate::tools::bash::sandboxed(&["cargo".to_string()], &c).unwrap();
+        assert_eq!(
+            crate::tools::bash::denies_network(&c),
+            wrapped.note.is_none()
+        );
+    }
+
+    #[test]
+    fn uncached_dependencies_under_offline_say_so() {
+        let dir = tmpdir();
+        let msg = "error: no matching package named `zzz` found\n\
+                   note: offline mode (via `--offline`) can sometimes cause surprising \
+                   resolution failures\n";
+        let out = collect(
+            &ctx(&dir),
+            "sh",
+            &[
+                "-c".to_string(),
+                format!("printf '%s' '{msg}' >&2; exit 101"),
+            ],
+            "error",
+        );
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.contains("not in the local cargo cache"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("cargo fetch"), "{}", out.text);
     }
 }

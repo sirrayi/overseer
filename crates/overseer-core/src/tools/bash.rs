@@ -59,43 +59,21 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     // unavailable runtime fails the call with the requirement spelled out —
     // a run that asked for gVisor must never execute unsandboxed because
     // `runsc` was missing.
-    let (prog, args, note) = match ctx
-        .agent_config
-        .as_ref()
-        .and_then(|c| c.sandbox_runtime.as_deref())
-    {
-        Some(requested) => match pinned_wrap(requested, command, ctx) {
-            Ok(v) => v,
-            Err(e) => return ToolOutput::err(e),
-        },
-        None => wrap_command(command, ctx),
+    let Invocation {
+        program: prog,
+        args,
+        note,
+        ..
+    } = match sandboxed(&sh_argv(command), ctx) {
+        Ok(v) => v,
+        Err(e) => return ToolOutput::err(e),
     };
 
     let mut child = match Command::new(&prog)
         .args(&args)
         .current_dir(&ctx.cwd)
         .env_clear()
-        .envs(std::env::vars().filter(|(k, _)| {
-            // Minimal allowlisted env — secrets stay out of child scope
-            // unless deliberately inherited (playbook Ch.10 §4).
-            matches!(
-                k.as_str(),
-                "PATH"
-                    | "HOME"
-                    | "USER"
-                    | "SHELL"
-                    | "TERM"
-                    | "LANG"
-                    | "LC_ALL"
-                    | "TMPDIR"
-                    | "SSH_AUTH_SOCK"
-                    | "GIT_AUTHOR_NAME"
-                    | "GIT_AUTHOR_EMAIL"
-                    | "GIT_COMMITTER_NAME"
-                    | "GIT_COMMITTER_EMAIL"
-                    | "CI"
-            ) || k.starts_with("LC_")
-        }))
+        .envs(child_env())
         // P6-3 broker injection: declared secrets enter the child's env
         // (selector → real). The model never sees these values — tool
         // results sanitize back to sentinels in `call()`.
@@ -240,24 +218,102 @@ fn broker_env(ctx: &ToolCtx) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Parent-env keys a sandboxed child inherits — secrets stay out of child
+/// scope unless deliberately inherited (playbook Ch.10 §4).
+fn env_key_allowed(k: &str) -> bool {
+    matches!(
+        k,
+        "PATH"
+            | "HOME"
+            | "USER"
+            | "SHELL"
+            | "TERM"
+            | "LANG"
+            | "LC_ALL"
+            | "TMPDIR"
+            | "SSH_AUTH_SOCK"
+            | "GIT_AUTHOR_NAME"
+            | "GIT_AUTHOR_EMAIL"
+            | "GIT_COMMITTER_NAME"
+            | "GIT_COMMITTER_EMAIL"
+            | "CI"
+    ) || k.starts_with("LC_")
+}
+
+/// The allowlisted parent env for a sandboxed child (bash, diagnostics).
+/// Pair with `env_clear()`.
+pub(crate) fn child_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    super::filter_env(std::env::vars_os(), env_key_allowed)
+}
+
+/// A child invocation wrapped in the session's sandbox.
+pub(crate) struct Invocation {
+    pub program: String,
+    pub args: Vec<String>,
+    /// Model-visible note when the run is NOT sandboxed.
+    pub note: Option<String>,
+    /// Whether the child runs with network denied (a sandbox backend
+    /// wrapped it; both seatbelt and bwrap deny all egress).
+    pub network_denied: bool,
+}
+
+/// Wrap `argv` in the sandbox bash uses: the pinned `--runtime` when set
+/// (an unavailable runtime is an error, never a silent downgrade), else
+/// the platform default. `argv` must be non-empty.
+pub(crate) fn sandboxed(argv: &[String], ctx: &ToolCtx) -> Result<Invocation, String> {
+    let (program, args, note) = match ctx
+        .agent_config
+        .as_ref()
+        .and_then(|c| c.sandbox_runtime.as_deref())
+    {
+        Some(requested) => pinned_argv(requested, argv, ctx)?,
+        None => wrap_argv(argv, ctx),
+    };
+    let network_denied = argv.first() != Some(&program);
+    Ok(Invocation {
+        program,
+        args,
+        note,
+        network_denied,
+    })
+}
+
+/// Whether a child wrapped by [`sandboxed`] would run with network denied.
+pub(crate) fn denies_network(ctx: &ToolCtx) -> bool {
+    sandboxed(&["true".to_string()], ctx).is_ok_and(|i| i.network_denied)
+}
+
+fn sh_argv(command: &str) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), command.into()]
+}
+
+fn unwrapped(argv: &[String], note: Option<String>) -> (String, Vec<String>, Option<String>) {
+    (argv[0].clone(), argv[1..].to_vec(), note)
+}
+
 /// Pick the exec backend for a bash call. Returns (program, argv, warning):
 /// sandbox-exec on macOS, bwrap on Linux, plain `sh` when sandboxing is off
 /// or no backend exists (with an honest note so the model/user can see it).
+#[cfg(test)]
 fn wrap_command(command: &str, ctx: &ToolCtx) -> (String, Vec<String>, Option<String>) {
+    wrap_argv(&sh_argv(command), ctx)
+}
+
+/// [`wrap_command`] for an arbitrary argv.
+fn wrap_argv(argv: &[String], ctx: &ToolCtx) -> (String, Vec<String>, Option<String>) {
     if !ctx.sandbox {
-        return ("sh".into(), vec!["-c".into(), command.into()], None);
+        return unwrapped(argv, None);
     }
     #[cfg(target_os = "macos")]
-    if let Some(inv) = seatbelt_invocation(command, ctx) {
+    if let Some(inv) = seatbelt_invocation(argv, ctx) {
         return inv;
     }
     #[cfg(target_os = "linux")]
-    if let Some(inv) = bubblewrap_invocation(command, ctx) {
+    if let Some(inv) = bubblewrap_invocation(argv, ctx) {
         return inv;
     }
-    (
-        "sh".into(),
-        vec!["-c".into(), command.into()],
+    unwrapped(
+        argv,
         Some("no sandbox backend (sandbox-exec/bwrap) — ran unsandboxed".into()),
     )
 }
@@ -267,22 +323,14 @@ fn wrap_command(command: &str, ctx: &ToolCtx) -> (String, Vec<String>, Option<St
 /// `--runtime seatbelt` path, so the two can never drift.
 #[cfg(target_os = "macos")]
 fn seatbelt_invocation(
-    command: &str,
+    argv: &[String],
     ctx: &ToolCtx,
 ) -> Option<(String, Vec<String>, Option<String>)> {
     let exe = "/usr/bin/sandbox-exec";
     std::path::Path::new(exe).exists().then(|| {
-        (
-            exe.into(),
-            vec![
-                "-p".into(),
-                macos_profile(&ctx.cwd),
-                "sh".into(),
-                "-c".into(),
-                command.into(),
-            ],
-            None,
-        )
+        let mut args = vec!["-p".to_string(), macos_profile(&ctx.cwd)];
+        args.extend(argv.iter().cloned());
+        (exe.into(), args, None)
     })
 }
 
@@ -290,39 +338,34 @@ fn seatbelt_invocation(
 /// as `seatbelt_invocation`: one builder, two callers.
 #[cfg(target_os = "linux")]
 fn bubblewrap_invocation(
-    command: &str,
+    argv: &[String],
     ctx: &ToolCtx,
 ) -> Option<(String, Vec<String>, Option<String>)> {
     if !bwrap_available() {
         return None;
     }
     let root = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
-    Some((
-        "bwrap".into(),
-        vec![
-            "--ro-bind".into(),
-            "/".into(),
-            "/".into(),
-            // Mount order matters: a later mount shadows an earlier one, so
-            // the scratch /tmp goes first and a workspace under /tmp stays
-            // writable on top of it.
-            "--tmpfs".into(),
-            "/tmp".into(),
-            "--bind".into(),
-            root.display().to_string(),
-            root.display().to_string(),
-            "--dev".into(),
-            "/dev".into(),
-            "--proc".into(),
-            "/proc".into(),
-            "--unshare-net".into(),
-            "--die-with-parent".into(),
-            "sh".into(),
-            "-c".into(),
-            command.into(),
-        ],
-        None,
-    ))
+    let mut args: Vec<String> = vec![
+        "--ro-bind".into(),
+        "/".into(),
+        "/".into(),
+        // Mount order matters: a later mount shadows an earlier one, so
+        // the scratch /tmp goes first and a workspace under /tmp stays
+        // writable on top of it.
+        "--tmpfs".into(),
+        "/tmp".into(),
+        "--bind".into(),
+        root.display().to_string(),
+        root.display().to_string(),
+        "--dev".into(),
+        "/dev".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--unshare-net".into(),
+        "--die-with-parent".into(),
+    ];
+    args.extend(argv.iter().cloned());
+    Some(("bwrap".into(), args, None))
 }
 
 /// macOS Seatbelt profile for `sandbox-exec -p` (P1.5): deny-by-default,
@@ -363,17 +406,26 @@ fn macos_profile(cwd: &std::path::Path) -> String {
 /// (or to unsandboxed exec) would make `--runtime` a lie — and a sandbox that
 /// quietly is not there is worse than no sandbox at all, because the operator
 /// stops checking.
+#[cfg(test)]
 fn pinned_wrap(
     requested: &str,
     command: &str,
     ctx: &ToolCtx,
 ) -> Result<(String, Vec<String>, Option<String>), String> {
+    pinned_argv(requested, &sh_argv(command), ctx)
+}
+
+/// [`pinned_wrap`] for an arbitrary argv.
+fn pinned_argv(
+    requested: &str,
+    argv: &[String],
+    ctx: &ToolCtx,
+) -> Result<(String, Vec<String>, Option<String>), String> {
     let runtime = crate::backends::SandboxRuntime::parse(requested)
         .map_err(|e| format!("bash: {e} — drop --runtime to use the platform default"))?;
     match runtime {
-        crate::backends::SandboxRuntime::Native => Ok((
-            "sh".into(),
-            vec!["-c".into(), command.into()],
+        crate::backends::SandboxRuntime::Native => Ok(unwrapped(
+            argv,
             Some(
                 "runtime=native — running unsandboxed because --runtime native was requested"
                     .into(),
@@ -382,7 +434,7 @@ fn pinned_wrap(
         crate::backends::SandboxRuntime::Seatbelt => {
             #[cfg(target_os = "macos")]
             {
-                seatbelt_invocation(command, ctx).ok_or_else(|| {
+                seatbelt_invocation(argv, ctx).ok_or_else(|| {
                     "bash: --runtime seatbelt needs /usr/bin/sandbox-exec, which is not present \
                      on this host — drop --runtime or pass --runtime native"
                         .to_string()
@@ -400,7 +452,7 @@ fn pinned_wrap(
         crate::backends::SandboxRuntime::Bubblewrap => {
             #[cfg(target_os = "linux")]
             {
-                bubblewrap_invocation(command, ctx).ok_or_else(|| {
+                bubblewrap_invocation(argv, ctx).ok_or_else(|| {
                     "bash: --runtime bubblewrap needs `bwrap` on PATH (and a user namespace \
                      it can create) — drop --runtime or pass --runtime native"
                         .to_string()
@@ -474,6 +526,43 @@ mod tests {
             sandbox,
             broker: None,
         }
+    }
+
+    /// Re-runs this test in a child test process whose env carries a
+    /// non-UTF-8 `LC_*` value — mutating this process's env would race
+    /// every other test that spawns a child.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_env_value_does_not_kill_bash() {
+        use std::os::unix::ffi::OsStringExt;
+        const MARK: &str = "LC_OVERSEER_T12_PROBE";
+        if std::env::var_os(MARK).is_some() {
+            let dir = std::env::temp_dir();
+            let out = run(
+                &serde_json::json!({"command": "echo alive-$LC_OVERSEER_T12_PROBE"}),
+                &mut ctx(&dir, false),
+            );
+            assert!(out.text.contains("alive-f"), "{}", out.text);
+            return;
+        }
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::bash::tests::a_non_utf8_env_value_does_not_kill_bash",
+                "--test-threads=1",
+            ])
+            .env(MARK, std::ffi::OsString::from_vec(vec![b'f', 0xff, 0xfe]))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "the child really ran the probe"
+        );
     }
 
     #[test]

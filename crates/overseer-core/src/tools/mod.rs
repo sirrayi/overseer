@@ -924,6 +924,18 @@ pub(crate) fn write_no_follow(target: &Path, content: &[u8]) -> Result<(), Strin
         .map_err(|e| format!("Cannot write {}: {e}", target.display()))
 }
 
+/// Keep the env pairs whose key passes `keep`. Built on `vars_os` so a
+/// non-UTF-8 entry never panics: a non-UTF-8 key cannot match an allowlist
+/// and is skipped; values pass through byte-exact.
+pub(crate) fn filter_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    keep: impl Fn(&str) -> bool,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter()
+        .filter(|(k, _)| k.to_str().is_some_and(&keep))
+        .collect()
+}
+
 /// Shared JSON-schema fragment builders.
 pub fn schema(properties: Value, required: &[&str]) -> Value {
     json!({
@@ -1382,6 +1394,31 @@ mod tests {
         let out = reg.call("grep", &json!({"pattern": "x"}), &mut c);
         assert!(out.is_error);
         assert!(out.text.contains("disabled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filter_env_survives_non_utf8_entries() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![b'x', 0xff]);
+        let vars = vec![
+            (OsString::from("LC_CTYPE"), bad.clone()),
+            (
+                OsString::from_vec(vec![b'L', b'C', b'_', 0xfe]),
+                OsString::from("v"),
+            ),
+            (OsString::from("FOO_API_KEY"), OsString::from("secret")),
+            (OsString::from("PATH"), OsString::from("/bin")),
+        ];
+        let kept = filter_env(vars, |k| k == "PATH" || k.starts_with("LC_"));
+        assert_eq!(
+            kept,
+            vec![
+                (OsString::from("LC_CTYPE"), bad),
+                (OsString::from("PATH"), OsString::from("/bin")),
+            ]
+        );
     }
 
     #[test]
