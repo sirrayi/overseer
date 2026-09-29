@@ -51,16 +51,18 @@ impl Anthropic {
     }
 
     fn build_body(req: &Request) -> Value {
-        // System: segments in order; ephemeral breakpoint on the last
-        // cacheable segment's tail (and on the last tool — Anthropic's
-        // breakpoint hierarchy is tools → system → messages).
+        // System: segments in order; ephemeral breakpoint on the LAST
+        // CACHEABLE segment (a trailing volatile segment must never carry
+        // it — invariant 2), and on the last tool (Anthropic's breakpoint
+        // hierarchy is tools → system → messages).
+        let last_cacheable = req.system.iter().rposition(|s| s.cacheable);
         let system: Vec<Value> = req
             .system
             .iter()
             .enumerate()
             .map(|(i, s)| {
                 let mut blk = json!({"type": "text", "text": s.text});
-                if req.cache_breakpoints && i == req.system.len() - 1 {
+                if req.cache_breakpoints && Some(i) == last_cacheable {
                     blk["cache_control"] = json!({"type": "ephemeral"});
                 }
                 blk
@@ -388,8 +390,10 @@ mod tests {
         let body = Anthropic::build_body(&sample_req(&system, &tools, &msgs));
         assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
         assert!(body["tools"][0].get("cache_control").is_none());
-        assert_eq!(body["system"][1]["cache_control"]["type"], "ephemeral");
-        assert!(body["system"][0].get("cache_control").is_none());
+        // The breakpoint sits on the last CACHEABLE segment, not the
+        // trailing dynamic one (C5).
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(body["system"][1].get("cache_control").is_none());
         assert!(body.get("temperature").is_none());
     }
 
@@ -642,5 +646,26 @@ mod tests {
         let system = vec![];
         let err = a.complete(&sample_req(&system, &tools, &msgs)).unwrap_err();
         assert!(matches!(err, ProviderError::Transport(_)));
+    }
+
+    /// C5 (invariant 2): the system breakpoint goes on the LAST cacheable
+    /// segment — never on a trailing volatile one.
+    #[test]
+    fn system_breakpoint_on_last_cacheable_segment() {
+        let seg = |text: &str, cacheable| SystemSegment {
+            name: "test",
+            text: text.into(),
+            cacheable,
+        };
+        let system = vec![seg("a", true), seg("b", true), seg("volatile", false)];
+        let msgs = vec![Message::user_text("hi")];
+        let body = Anthropic::build_body(&sample_req(&system, &[], &msgs));
+        assert_eq!(body["system"][1]["cache_control"]["type"], "ephemeral");
+        assert!(body["system"][0].get("cache_control").is_none());
+        assert!(body["system"][2].get("cache_control").is_none());
+        // No cacheable segment → no system breakpoint at all.
+        let dynamic_only = vec![seg("volatile", false)];
+        let body = Anthropic::build_body(&sample_req(&dynamic_only, &[], &msgs));
+        assert!(body["system"][0].get("cache_control").is_none());
     }
 }
