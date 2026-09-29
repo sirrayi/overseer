@@ -9,7 +9,7 @@
 //!
 //! The dir is git-versioned (Letta MemFS): free history, diffs, rollback.
 //! Commits are engine-made at turn boundaries, not model actions.
-// DEFERRED(owner): ranked retrieval (FTS5 + activation scoring) — prior lexical helpers removed at <sha>; see git history
+// DEFERRED(owner): ranked retrieval (FTS5 + activation scoring) — prior lexical helpers removed at 51b4adb; see git history
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
