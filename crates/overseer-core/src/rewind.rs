@@ -72,7 +72,7 @@ pub fn restore(session_dir: &Path, boundary: Option<u64>, mode: Mode) -> std::io
     };
 
     if matches!(mode, Mode::Code | Mode::Both) {
-        restore_files(session_dir, boundary, &mut report);
+        restore_files(session_dir, boundary, &mut report)?;
     }
 
     if !matches!(mode, Mode::Code) {
@@ -87,11 +87,18 @@ pub fn restore(session_dir: &Path, boundary: Option<u64>, mode: Mode) -> std::io
     Ok(report)
 }
 
-fn restore_files(session_dir: &Path, boundary: u64, report: &mut Report) {
+/// Restore files from checkpoint `e<boundary>`. Every manifest entry is
+/// validated BEFORE any fs change: its `path` must resolve (the way
+/// `tools::snapshot` records it) under the session's workspace root, and
+/// `stored` must be a bare file name inside the checkpoint. One bad entry
+/// refuses the whole restore — a tampered manifest never writes or deletes
+/// outside the workspace.
+fn restore_files(session_dir: &Path, boundary: u64, report: &mut Report) -> std::io::Result<()> {
     let cp_dir = session_dir.join("checkpoints").join(format!("e{boundary}"));
     let Ok(manifest) = std::fs::read_to_string(cp_dir.join("manifest.jsonl")) else {
-        return;
+        return Ok(());
     };
+    let mut entries = Vec::new();
     for line in manifest.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -102,19 +109,113 @@ fn restore_files(session_dir: &Path, boundary: u64, report: &mut Report) {
         ) else {
             continue;
         };
-        if v.get("existed").and_then(|e| e.as_bool()).unwrap_or(false) {
-            let src = cp_dir.join("files").join(stored);
-            let dst = PathBuf::from(path);
+        let existed = v.get("existed").and_then(|e| e.as_bool()).unwrap_or(false);
+        entries.push((path.to_string(), stored.to_string(), existed));
+    }
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let root = workspace_root(session_dir)?;
+    let refuse = |what: String| std::io::Error::new(std::io::ErrorKind::PermissionDenied, what);
+    let mut plan = Vec::with_capacity(entries.len());
+    for (path, stored, existed) in entries {
+        let Some(dst) = resolve_in_workspace(&root, &path) else {
+            return Err(refuse(format!(
+                "rewind: manifest path `{path}` resolves outside the workspace {} — refusing to restore",
+                root.display()
+            )));
+        };
+        let bare = {
+            let mut c = Path::new(&stored).components();
+            matches!(
+                (c.next(), c.next()),
+                (Some(std::path::Component::Normal(_)), None)
+            )
+        };
+        if existed && !bare {
+            return Err(refuse(format!(
+                "rewind: manifest snapshot name `{stored}` for `{path}` is not a bare file name — refusing to restore"
+            )));
+        }
+        plan.push((dst, stored, existed));
+    }
+    for (dst, stored, existed) in plan {
+        if existed {
+            let src = cp_dir.join("files").join(&stored);
             if let Some(parent) = dst.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             if std::fs::copy(&src, &dst).is_ok() {
                 report.restored += 1;
             }
-        } else if std::fs::remove_file(path).is_ok() {
+        } else if std::fs::remove_file(&dst).is_ok() {
             report.deleted += 1;
         }
     }
+    Ok(())
+}
+
+/// The workspace root a session's manifest paths must stay under: the cwd
+/// of the LAST `SessionStart` (a fork's own), canonicalized.
+fn workspace_root(session_dir: &Path) -> std::io::Result<PathBuf> {
+    use crate::event::{EventKind, EventLog};
+    let events = EventLog::replay(session_dir.join("events.jsonl"))?;
+    let cwd = events
+        .iter()
+        .rev()
+        .find_map(|e| match &e.kind {
+            EventKind::SessionStart { cwd, .. } if !cwd.is_empty() => Some(PathBuf::from(cwd)),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "rewind: no workspace cwd recorded in {} — refusing to restore files",
+                    session_dir.join("events.jsonl").display()
+                ),
+            )
+        })?;
+    Ok(cwd.canonicalize().unwrap_or(cwd))
+}
+
+/// Resolve a manifest `path` the way `tools::snapshot` records it
+/// (relative → anchored at the workspace, `.`/`..` folded), then resolve
+/// symlinks through the deepest existing ancestor. `Some` only when the
+/// result lies under `root`; the returned path is the one fs ops use.
+fn resolve_in_workspace(root: &Path, raw: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let p = Path::new(raw);
+    let anchored = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.join(p)
+    };
+    let mut norm = PathBuf::new();
+    for c in anchored.components() {
+        match c {
+            Component::ParentDir => {
+                if !norm.pop() {
+                    return None;
+                }
+            }
+            Component::CurDir => {}
+            other => norm.push(other.as_os_str()),
+        }
+    }
+    let mut base = norm.as_path();
+    let mut rest = Vec::new();
+    let mut full = loop {
+        if let Ok(c) = base.canonicalize() {
+            break c;
+        }
+        rest.push(base.file_name()?);
+        base = base.parent()?;
+    };
+    for r in rest.iter().rev() {
+        full.push(r);
+    }
+    full.starts_with(root).then_some(full)
 }
 
 fn truncate_log(session_dir: &Path, boundary: u64) -> std::io::Result<u32> {
@@ -179,7 +280,7 @@ mod tests {
         let mut log = EventLog::create(dir.join("events.jsonl")).unwrap();
         log.append(EventKind::SessionStart {
             session_id: "s".into(),
-            cwd: "/work".into(),
+            cwd: root.display().to_string(),
             model: "m".into(),
             harness_version: "0".into(),
             parent: None,
@@ -332,5 +433,38 @@ mod tests {
         assert_eq!(r.boundary, 4);
         assert_eq!(ids(&dir), vec![1, 2, 3, 4]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C7: manifest paths that resolve outside the session's workspace
+    /// (relative traversal or absolute) are refused before any fs change.
+    #[test]
+    fn manifest_paths_outside_workspace_are_refused() {
+        let root = tmpdir("escape");
+        let dir = mk_session(&root, 2); // workspace = root
+        let outside_dir = root
+            .parent()
+            .unwrap()
+            .join(format!("overseer-rewind-outside-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let victim = outside_dir.join("outside.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        let rel = PathBuf::from("..")
+            .join(outside_dir.file_name().unwrap())
+            .join("outside.txt");
+
+        // Relative traversal, existed:false → would delete the victim.
+        mk_checkpoint(&dir, 2, &rel, false);
+        let err = restore(&dir, Some(2), Mode::Both).unwrap_err();
+        assert!(err.to_string().contains("outside.txt"), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(ids(&dir).len(), 5, "refused rewind leaves the log alone");
+
+        // Absolute path outside the root, existed:true → would overwrite.
+        mk_checkpoint(&dir, 2, &victim, true);
+        let err = restore(&dir, Some(2), Mode::Code).unwrap_err();
+        assert!(err.to_string().contains("outside.txt"), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside_dir);
     }
 }
