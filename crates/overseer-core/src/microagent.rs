@@ -28,9 +28,10 @@
 //! appears as a case-insensitive substring of the user's prompt. The
 //! literal trigger `always` matches every prompt (the always-on form).
 //!
-//! Injection is one harness-authored `Nudge` per matching microagent, so
-//! the body is on the event log and replays identically on resume — the
-//! same durability contract as every other Nudge.
+//! Injection is one harness-authored `Nudge` per turn carrying every
+//! matching microagent (`render` joins them), so the bodies are on the
+//! event log and replay identically on resume — the same durability
+//! contract as every other Nudge.
 //! `// DEFERRED(owner): nested-repo microagents (a submodule's own
 //! `.overseer/microagents/`) — the walk is depth-bounded from the session
 //! cwd; extend if monorepo operators ask.`
