@@ -14,6 +14,7 @@
 //!   - watchdog: heartbeat in the pidfile; a parent monitor (or
 //!     launchd KeepAlive) can detect a silently-dead daemon
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -168,26 +169,45 @@ impl Daemon {
     }
 
     fn reload_if_changed(&mut self) {
-        let m = file_mtime(&self.dirs.config());
-        if m == self.cfg_mtime {
+        if file_mtime(&self.dirs.config()) == self.cfg_mtime {
             return;
         }
-        match load(&self.dirs.config()) {
-            Ok(cfg) => {
-                self.dedup = Dedup::new(cfg.dedup_window_s);
-                self.triggers = cfg
-                    .triggers
-                    .iter()
-                    .map(|spec| Trigger::from_spec(&resolve_spec(spec, &self.dirs)))
-                    .collect();
-                self.cfg_mtime = m;
-                self.cfg = cfg;
-                self.journal.log("config_reload", serde_json::json!({}));
-            }
-            Err(e) => self
-                .journal
-                .log("config_reload_failed", serde_json::json!({"error": e})),
+        if let Err(e) = self.apply_config() {
+            self.journal
+                .log("config_reload_failed", serde_json::json!({"error": e}));
         }
+    }
+
+    /// Re-read the config file and swap it in. Triggers are rebuilt from
+    /// the new specs, inheriting runtime state (offsets, limiter windows,
+    /// watch mtimes) from the old trigger with the same id; the dedup
+    /// memory survives unless its window changed. A malformed
+    /// file leaves the running config untouched.
+    fn apply_config(&mut self) -> Result<(), String> {
+        let m = file_mtime(&self.dirs.config());
+        let cfg = load(&self.dirs.config())?;
+        let mut old: HashMap<String, Trigger> = std::mem::take(&mut self.triggers)
+            .into_iter()
+            .map(|t| (t.id().to_string(), t))
+            .collect();
+        self.triggers = cfg
+            .triggers
+            .iter()
+            .map(|spec| {
+                let mut t = Trigger::from_spec(&resolve_spec(spec, &self.dirs));
+                if let Some(prev) = old.remove(t.id()) {
+                    t.inherit(prev);
+                }
+                t
+            })
+            .collect();
+        if cfg.dedup_window_s != self.cfg.dedup_window_s {
+            self.dedup = Dedup::new(cfg.dedup_window_s);
+        }
+        self.cfg_mtime = m;
+        self.cfg = cfg;
+        self.journal.log("config_reload", serde_json::json!({}));
+        Ok(())
     }
 
     /// The pipeline for one event: dedup → triage → gate → notify/spawn.
@@ -635,23 +655,10 @@ impl Daemon {
                 let cards = crate::notify::expire(cards, now_ms());
                 CtlResponse::ok(crate::notify::digest_view(&cards))
             }
-            CtlRequest::Reload => {
-                let m = file_mtime(&self.dirs.config());
-                match load(&self.dirs.config()) {
-                    Ok(cfg) => {
-                        self.dedup = Dedup::new(cfg.dedup_window_s);
-                        self.triggers = cfg
-                            .triggers
-                            .iter()
-                            .map(|spec| Trigger::from_spec(&resolve_spec(spec, &self.dirs)))
-                            .collect();
-                        self.cfg_mtime = m;
-                        self.cfg = cfg;
-                        CtlResponse::ok(serde_json::json!({"reloaded": true}))
-                    }
-                    Err(e) => CtlResponse::err(e),
-                }
-            }
+            CtlRequest::Reload => match self.apply_config() {
+                Ok(()) => CtlResponse::ok(serde_json::json!({"reloaded": true})),
+                Err(e) => CtlResponse::err(e),
+            },
         }
     }
 
@@ -1285,6 +1292,104 @@ mod daemon_pipeline_tests {
             "at a breakpoint",
         ));
         assert_eq!(d3.counts.pushed, pushes_before + 2, "away is a breakpoint");
+    }
+
+    fn stateful_config(watch_dir: &std::path::Path) -> DaemonConfig {
+        let mut cfg = pipeline_config();
+        cfg.triggers = serde_json::from_value(serde_json::json!([
+            {"kind": "telegram", "id": "tg", "token_env": "OVERSEER_TEST_UNSET_TG_TOKEN",
+             "allow_senders": ["alice"], "rate_per_min": 1},
+            {"kind": "webhook", "id": "wh", "allow_senders": ["alice"], "rate_per_min": 1},
+            {"kind": "watch", "id": "w", "dir": watch_dir, "body": "changed"},
+        ]))
+        .unwrap();
+        cfg
+    }
+
+    /// Mutate each stateful trigger the way a few live ticks would.
+    fn age_triggers(d: &mut Daemon, now: u64) {
+        for t in d.triggers.iter_mut() {
+            match t {
+                Trigger::Telegram {
+                    offset, limiter, ..
+                } => {
+                    *offset = Some(42);
+                    assert!(limiter.admit_at("alice", now));
+                }
+                Trigger::Webhook { limiter, .. } => assert!(limiter.admit_at("alice", now)),
+                Trigger::Watch { .. } => assert!(t.poll_at(now).is_empty(), "seeding scan"),
+                _ => {}
+            }
+        }
+    }
+
+    fn assert_state_survived(d: &mut Daemon, now: u64) {
+        assert_eq!(d.triggers.len(), 3);
+        for t in d.triggers.iter_mut() {
+            match t {
+                Trigger::Telegram {
+                    offset, limiter, ..
+                } => {
+                    assert_eq!(*offset, Some(42), "telegram offset re-delivers updates");
+                    assert!(!limiter.admit_at("alice", now), "telegram limiter reset");
+                }
+                Trigger::Webhook { limiter, .. } => {
+                    assert!(!limiter.admit_at("alice", now), "webhook limiter reset")
+                }
+                Trigger::Watch { primed, mtimes, .. } => {
+                    assert!(*primed, "watch re-primes and misses changes");
+                    assert_eq!(mtimes.len(), 1, "watch mtimes dropped");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn mtime_reload_carries_trigger_state_by_id() {
+        let root = tmpdir("reload-state");
+        let watch = root.join("watched");
+        std::fs::create_dir_all(&watch).unwrap();
+        std::fs::write(watch.join("a.txt"), "x").unwrap();
+        let cfg = stateful_config(&watch);
+        let mut d = new_daemon(root.clone(), Some(&cfg));
+        let now = now_ms();
+        age_triggers(&mut d, now);
+        std::fs::write(
+            root.join("config.json"),
+            serde_json::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+        d.cfg_mtime = 0;
+        d.reload_if_changed();
+        assert!(has_kind(&journal_records(&root), "config_reload"));
+        assert_state_survived(&mut d, now);
+    }
+
+    #[test]
+    fn ctl_reload_carries_trigger_state_by_id() {
+        let root = tmpdir("ctl-reload-state");
+        let watch = root.join("watched");
+        std::fs::create_dir_all(&watch).unwrap();
+        std::fs::write(watch.join("a.txt"), "x").unwrap();
+        let mut d = new_daemon(root.clone(), Some(&stateful_config(&watch)));
+        let now = now_ms();
+        age_triggers(&mut d, now);
+        let resp = d.handle_ctl(CtlRequest::Reload);
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_state_survived(&mut d, now);
+    }
+
+    #[test]
+    fn ctl_reload_of_a_malformed_config_is_an_error_and_keeps_triggers() {
+        let root = tmpdir("ctl-reload-bad");
+        let watch = root.join("watched");
+        std::fs::create_dir_all(&watch).unwrap();
+        let mut d = new_daemon(root.clone(), Some(&stateful_config(&watch)));
+        std::fs::write(root.join("config.json"), "{ malformed json").unwrap();
+        let resp = d.handle_ctl(CtlRequest::Reload);
+        assert!(!resp.ok);
+        assert_eq!(d.triggers.len(), 3);
     }
 
     #[test]

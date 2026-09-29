@@ -151,6 +151,89 @@ impl Trigger {
         }
     }
 
+    /// Carry runtime state from the trigger this one replaces on a config
+    /// reload. Only same-kind state that still means the same thing moves:
+    /// a watcher keeps its mtimes only for the same dir and filter, a bot
+    /// keeps its offset only for the same token variable and API base, and
+    /// schedules keep their next fire only for an unchanged period.
+    pub fn inherit(&mut self, old: Trigger) {
+        match (self, old) {
+            (
+                Trigger::Interval {
+                    every_ms, next_ms, ..
+                },
+                Trigger::Interval {
+                    every_ms: old_every,
+                    next_ms: old_next,
+                    ..
+                },
+            )
+            | (
+                Trigger::Heartbeat {
+                    every_ms, next_ms, ..
+                },
+                Trigger::Heartbeat {
+                    every_ms: old_every,
+                    next_ms: old_next,
+                    ..
+                },
+            ) if *every_ms == old_every => *next_ms = old_next,
+            (
+                Trigger::Watch {
+                    dir,
+                    name_contains,
+                    mtimes,
+                    primed,
+                    ..
+                },
+                Trigger::Watch {
+                    dir: old_dir,
+                    name_contains: old_filter,
+                    mtimes: old_mtimes,
+                    primed: old_primed,
+                    ..
+                },
+            ) if *dir == old_dir && *name_contains == old_filter => {
+                *mtimes = old_mtimes;
+                *primed = old_primed;
+            }
+            (
+                Trigger::Cron { last_minute, .. },
+                Trigger::Cron {
+                    last_minute: old_minute,
+                    ..
+                },
+            ) => *last_minute = old_minute,
+            (
+                Trigger::Webhook { limiter, .. },
+                Trigger::Webhook {
+                    limiter: old_limiter,
+                    ..
+                },
+            ) => limiter.inherit(old_limiter),
+            (
+                Trigger::Telegram {
+                    spec,
+                    limiter,
+                    offset,
+                    ..
+                },
+                Trigger::Telegram {
+                    spec: old_spec,
+                    limiter: old_limiter,
+                    offset: old_offset,
+                    ..
+                },
+            ) => {
+                limiter.inherit(old_limiter);
+                if spec.token_env == old_spec.token_env && spec.base == old_spec.base {
+                    *offset = old_offset;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The reason this trigger cannot run, if any (unset token, bad cron).
     /// The daemon journals it once at startup so a misconfiguration is
     /// visible instead of just quiet.
@@ -646,6 +729,55 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use crate::test_util::tmpdir;
+
+    fn watch_spec(id: &str, dir: &Path) -> TriggerSpec {
+        TriggerSpec::Watch {
+            id: id.to_string(),
+            dir: dir.to_path_buf(),
+            name_contains: String::new(),
+            body: "changed".to_string(),
+            class: String::new(),
+        }
+    }
+
+    fn telegram_spec(token_env: &str) -> TriggerSpec {
+        serde_json::from_value(serde_json::json!({
+            "kind": "telegram", "id": "tg", "token_env": token_env,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn inherit_keeps_state_only_where_it_still_applies() {
+        let a = tmpdir("inherit-a");
+        let b = tmpdir("inherit-b");
+        std::fs::write(a.join("f.txt"), "x").unwrap();
+        let mut old = Trigger::from_spec(&watch_spec("w", &a));
+        assert!(old.poll().is_empty());
+        let mut same = Trigger::from_spec(&watch_spec("w", &a));
+        same.inherit(old);
+        assert!(matches!(same, Trigger::Watch { primed: true, .. }));
+        assert!(same.poll().is_empty(), "inherited mtimes: no re-fire");
+
+        let mut moved = Trigger::from_spec(&watch_spec("w", &b));
+        moved.inherit(same);
+        assert!(
+            matches!(moved, Trigger::Watch { primed: false, .. }),
+            "a new dir starts unprimed so existing files don't storm"
+        );
+
+        let mut tg = Trigger::from_spec(&telegram_spec("OVERSEER_TEST_TG_A"));
+        if let Trigger::Telegram { offset, .. } = &mut tg {
+            *offset = Some(7);
+        }
+        let mut other_bot = Trigger::from_spec(&telegram_spec("OVERSEER_TEST_TG_B"));
+        other_bot.inherit(tg);
+        assert!(matches!(other_bot, Trigger::Telegram { offset: None, .. }));
+
+        let mut kind_change = Trigger::from_spec(&interval_spec("w", 60));
+        kind_change.inherit(moved);
+        assert_eq!(kind_change.id(), "w");
+    }
 
     fn interval_spec(id: &str, every_s: u64) -> TriggerSpec {
         TriggerSpec::Interval {

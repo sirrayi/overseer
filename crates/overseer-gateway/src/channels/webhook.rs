@@ -58,6 +58,12 @@ impl RateLimiter {
         }
     }
 
+    /// Take over another limiter's arrival history (config reload keeps
+    /// the window; the new `per_min` applies from now on).
+    pub fn inherit(&mut self, old: RateLimiter) {
+        self.window = old.window;
+    }
+
     /// Admit (or refuse) an arrival at `now_ms`. `per_min == 0` refuses
     /// everything: an unset limit is a closed door, not an open one.
     pub fn admit_at(&mut self, key: &str, now_ms: u64) -> bool {
