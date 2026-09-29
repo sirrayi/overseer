@@ -696,6 +696,7 @@ fn relative_display(dir: &Path, cwd: Option<&Path>, home: Option<&Path>) -> Stri
             format!("~/{}", rel.display())
         };
     }
+    // DEFERRED(owner): pass the session cwd from prompt::assemble so dirs outside cwd/$HOME render relative — needs prompt.rs
     dir.display().to_string()
 }
 
