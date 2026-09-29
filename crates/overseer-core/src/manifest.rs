@@ -39,10 +39,10 @@ pub fn write(
     provider: &dyn Provider,
     tools: &ToolRegistry,
 ) -> std::io::Result<()> {
-    // The same assembler the ReAct loop calls each turn — captured here at
-    // session start, so the hash identifies the initial system prompt.
-    // Memory-index or skill changes later in the run alter subsequent
-    // prompts; `scope: session_start` records that honestly.
+    // The same assembler the Agent freezes its static prefix with, captured
+    // here at session start, so the hash identifies the system prompt the
+    // Agent sends. A resume or model switch re-assembles;
+    // `scope: session_start` records that honestly.
     let system = crate::prompt::assemble(config);
     let prompt_text = system
         .iter()

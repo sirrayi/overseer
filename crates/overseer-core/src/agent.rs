@@ -15,9 +15,10 @@ use crate::provider::{Provider, Request, StopReason};
 use crate::stuck::StuckDetector;
 use crate::tools::{ToolCtx, ToolRegistry};
 
-// Static system prompt — assembled per turn by `prompt::assemble` as an
-// ordered section pipeline with an explicit STATIC/DYNAMIC boundary
-// (Invariant 2: nothing volatile lives above it).
+// Static system prompt — assembled ONCE per Agent (start/resume, and on a
+// model switch) by `prompt::assemble` as an ordered section pipeline with an
+// explicit STATIC/DYNAMIC boundary (Invariant 2: nothing volatile lives
+// above it). Every request of the Agent reuses the exact bytes.
 
 /// P7-4: the marker an untrusted-originated spawn exports
 /// (`channel:<channel>:<sender>`). Absent/empty = a locally-originated run.
@@ -314,6 +315,10 @@ pub struct Agent {
     /// Frontend steering handle (P2.4): interrupt + queued input, checked
     /// at safe boundaries only. Default = headless, never fires.
     control: Control,
+    /// The frozen static system prefix (invariant 2). Mid-session edits to
+    /// memory INDEX/CORE, skills or persona reach the model through its
+    /// tools, not by rewriting these bytes (which would bust the cache).
+    system: Vec<crate::provider::SystemSegment>,
 }
 
 impl Agent {
@@ -362,6 +367,7 @@ impl Agent {
             verify_blocks: 0,
             checkpoint: None,
             control: Control::default(),
+            system: Vec::new(),
         };
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
@@ -371,6 +377,7 @@ impl Agent {
         if let Some(dir) = agent.config.persona_dir.clone() {
             crate::onboard::ensure_persona_dir(&dir)?;
         }
+        agent.system = crate::prompt::assemble(&agent.config);
         let cwd = agent.config.cwd.display().to_string();
         agent.log.append(EventKind::SessionStart {
             session_id: session_id.clone(),
@@ -436,6 +443,7 @@ impl Agent {
         let log = EventLog::open(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::open(session_dir.join("ledger.jsonl"))?;
         let tools = Self::registry(&config);
+        let system = crate::prompt::assemble(&config);
         // Seed the spill counter past existing files so resume can't
         // overwrite earlier spilled output.
         let spill_seq = std::fs::read_dir(session_dir.join("tool-outputs"))
@@ -460,6 +468,7 @@ impl Agent {
             verify_blocks: 0,
             checkpoint: None,
             control: Control::default(),
+            system,
         })
     }
 
@@ -495,7 +504,9 @@ impl Agent {
     /// audit event carries the from/to ids plus the new model's list
     /// prices (`profile::lookup`), so a session's cost steps are
     /// attributable without re-deriving them from the table later.
-    /// Switching to the current model is a no-op (no event).
+    /// Switching to the current model is a no-op (no event). The static
+    /// system prefix re-assembles: the edit-format contract is per model,
+    /// and a new model has no cache to keep warm.
     pub fn set_model(
         &mut self,
         model: &str,
@@ -506,6 +517,7 @@ impl Agent {
         }
         let p = profile::lookup(model);
         let from = std::mem::replace(&mut self.config.model, model.to_string());
+        self.system = crate::prompt::assemble(&self.config);
         self.emit(
             EventKind::ModelSwitch {
                 from,
@@ -670,15 +682,11 @@ impl Agent {
                 );
             }
 
-            // System segments assemble per turn via the section pipeline:
-            // the static sections are byte-stable; the memory index sits in
-            // the last static slot so an edit only invalidates cache from
-            // that segment onward — tools+prompt stay warm.
-            let system = crate::prompt::assemble(&self.config);
-
+            // The frozen static prefix (assembled at start/resume): every
+            // request of this Agent sends identical system bytes.
             let req = Request {
                 model: &self.config.model,
-                system: &system,
+                system: &self.system,
                 tools: &self.tools.specs,
                 messages: &self.messages,
                 max_tokens: self.config.max_output_tokens,
@@ -1847,7 +1855,7 @@ mod tests {
 
     /// With memory enabled, the provider sees a second system segment
     /// carrying INDEX.md — appended *after* the static prompt (end of the
-    /// static region), updated across turns, and git-versioned.
+    /// static region), frozen for the Agent's life, and git-versioned.
     #[test]
     fn memory_index_reaches_provider() {
         let dir = tmpdir();
@@ -3069,5 +3077,36 @@ mod tests {
         }];
         let text = prompt_text_for_estimate(&msgs);
         assert!(text.len() >= 100_000, "estimate saw {} chars", text.len());
+    }
+
+    /// K5 (invariant 2): the static system prefix is frozen per Agent — an
+    /// INDEX.md edit between steps leaves the next request's system bytes
+    /// identical (the model reads fresh memory through its tools).
+    #[test]
+    fn system_prefix_frozen_across_memory_edits() {
+        let dir = tmpdir();
+        let memdir = dir.join("memory");
+        std::fs::create_dir_all(&memdir).unwrap();
+        std::fs::write(memdir.join("INDEX.md"), "facts.md — v1\n").unwrap();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            memory_dir: Some(memdir.clone()),
+            ..AgentConfig::default()
+        };
+        let provider = Arc::new(Mock::new(vec![done()]));
+        let mut agent = Agent::start(provider.clone(), cfg, dir.join("s"), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        agent.run_turn("one", &mut sink).unwrap();
+        std::fs::write(memdir.join("INDEX.md"), "facts.md — v2 EDITED\n").unwrap();
+        agent.run_turn("two", &mut sink).unwrap();
+        let seen = provider.seen_systems.lock().unwrap();
+        assert!(seen.len() >= 2);
+        assert_eq!(
+            seen[0],
+            seen[seen.len() - 1],
+            "system bytes moved mid-session"
+        );
+        assert!(seen[0].iter().any(|s| s.contains("v1")));
     }
 }
