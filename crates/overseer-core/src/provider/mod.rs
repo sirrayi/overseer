@@ -18,6 +18,18 @@ pub mod responses;
 /// Re-export only — no existing item touched.
 pub use crate::compact::{provider_compact_capability, NativeCompaction};
 
+/// Coerce a wire tool-call input into a JSON object. A non-object value
+/// (string/array/number from the wire) is preserved under `_unparsed`, so
+/// adapters can attach linkage fields without `IndexMut` panicking and the
+/// tool sees a schema error instead of silently losing the call.
+pub(crate) fn object_input(v: Value) -> Value {
+    if v.is_object() {
+        v
+    } else {
+        serde_json::json!({ "_unparsed": v })
+    }
+}
+
 /// Cross-provider effort ladder (P3.2). Each adapter maps the enum onto
 /// its native knob — Anthropic `thinking.budget_tokens`, OpenAI
 /// `reasoning_effort`, Gemini `thinkingConfig.thinkingBudget`. A raw

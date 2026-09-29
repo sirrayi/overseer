@@ -159,7 +159,7 @@ impl Gemini {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let mut input = fc.get("args").cloned().unwrap_or(json!({}));
+                let mut input = super::object_input(fc.get("args").cloned().unwrap_or(json!({})));
                 // P7-2 CU: per-step `safety_decision` rides alongside the
                 // functionCall — the gate maps require_approval→Ask,
                 // deny→Deny (fail-closed); absence means no safety hold.
@@ -709,5 +709,30 @@ mod tests {
         let system = vec![];
         let err = g.complete(&sample_req(&system, &tools, &msgs)).unwrap_err();
         assert!(matches!(err, ProviderError::Transport(_)));
+    }
+
+    /// C3: `args` from the wire may be a string/array — attaching the
+    /// safety decision must not panic, and the raw value survives.
+    #[test]
+    fn non_object_args_with_safety_decision_preserved() {
+        for args in [json!("raw string"), json!([1, 2])] {
+            let body = json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [
+                        {"functionCall": {"name": "computer", "args": args.clone()},
+                         "safety_decision": "require_approval"}
+                    ]},
+                    "finishReason": "STOP"
+                }]
+            });
+            let r = Gemini::parse_response(&body, 0, 0).unwrap();
+            match &r.blocks[0] {
+                Block::ToolCall { input, .. } => {
+                    assert_eq!(input["_unparsed"], args);
+                    assert_eq!(input["safety_decision"], "require_approval");
+                }
+                other => panic!("expected ToolCall, got {other:?}"),
+            }
+        }
     }
 }
