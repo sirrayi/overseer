@@ -936,6 +936,25 @@ pub(crate) fn filter_env(
         .collect()
 }
 
+/// `cmd.spawn()`, retried briefly on `ETXTBSY`: an executable that was just
+/// written can stay "busy" while a concurrently forked child still holds
+/// the writer's fd until its own exec.
+pub(crate) fn spawn_retrying_busy(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    const ETXTBSY: i32 = 26;
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && tries < 20 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Shared JSON-schema fragment builders.
 pub fn schema(properties: Value, required: &[&str]) -> Value {
     json!({

@@ -229,15 +229,15 @@ fn collect(ctx: &ToolCtx, program: &str, args: &[String], level: &str) -> ToolOu
             "diagnostics: cannot create a temp log — skipped (fail-open).".into(),
         );
     };
-    let child = Command::new(&inv.program)
-        .args(&inv.args)
+    let mut cmd = Command::new(&inv.program);
+    cmd.args(&inv.args)
         .current_dir(&ctx.cwd)
         .env_clear()
         .envs(super::bash::child_env())
         .stdin(Stdio::null())
         .stdout(file)
-        .stderr(err_file)
-        .spawn();
+        .stderr(err_file);
+    let child = super::spawn_retrying_busy(&mut cmd);
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {

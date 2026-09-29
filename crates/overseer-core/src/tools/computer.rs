@@ -348,6 +348,26 @@ fn write_owner_only(path: &std::path::Path, content: &str) -> std::io::Result<()
     }
 }
 
+/// Parent-env keys a helper inherits: the bash allowlist's basics plus the
+/// three tier variables (a helper may chain to a sibling tier).
+fn helper_env_allowed(k: &str) -> bool {
+    matches!(
+        k,
+        "PATH"
+            | "HOME"
+            | "USER"
+            | "SHELL"
+            | "TERM"
+            | "LANG"
+            | "LC_ALL"
+            | "TMPDIR"
+            | ENV_STRUCTURED
+            | ENV_A11Y
+            | ENV_PIXEL
+            | "CI"
+    ) || k.starts_with("LC_")
+}
+
 /// One JSON request in, one JSON response out.
 fn call_helper(helper: &Path, request: &Value) -> Result<Value, String> {
     use std::io::Write;
@@ -355,33 +375,25 @@ fn call_helper(helper: &Path, request: &Value) -> Result<Value, String> {
     // F1 (extreme): no-creds invariant — helpers inherit the allowlisted
     // env only (mirrors bash.rs). The full process env carries brokered
     // secrets and webhook tokens; ComputerConfig::env_allowed was dead code.
-    let mut child = Command::new(helper)
-        .env_clear()
-        .envs(std::env::vars().filter(|(k, _)| {
-            matches!(
-                k.as_str(),
-                "PATH"
-                    | "HOME"
-                    | "USER"
-                    | "SHELL"
-                    | "TERM"
-                    | "LANG"
-                    | "LC_ALL"
-                    | "TMPDIR"
-                    | "OVERSEER_COMPUTER_PIXEL"
-                    | "OVERSEER_COMPUTER_A11Y"
-                    | "OVERSEER_COMPUTER_API"
-                    | "CI"
-            ) || k.starts_with("LC_")
-        }))
+    let mut cmd = Command::new(helper);
+    cmd.env_clear()
+        .envs(super::filter_env(std::env::vars_os(), helper_env_allowed))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = super::spawn_retrying_busy(&mut cmd)
         .map_err(|e| format!("computer: cannot start backend {}: {e}", helper.display()))?;
     match child.stdin.take() {
         Some(mut stdin) => {
-            if let Err(e) = stdin.write_all(request.to_string().as_bytes()) {
+            // A helper that exits without reading its request closes the
+            // pipe; its exit status is the real answer, so EPIPE is not.
+            if let Err(e) = stdin
+                .write_all(request.to_string().as_bytes())
+                .or_else(|e| match e.kind() {
+                    std::io::ErrorKind::BrokenPipe => Ok(()),
+                    _ => Err(e),
+                })
+            {
                 return Err(format!(
                     "computer: cannot write to backend {}: {e}",
                     helper.display()
@@ -527,8 +539,9 @@ fn run_capture(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Valu
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
-    let seq = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
-    let file = dir.join(format!("capture-{seq}.json"));
+    // UUID-v7 names are unique and time-ordered; a count of the dir would
+    // reuse a live index after any deletion.
+    let file = dir.join(format!("capture-{}.json", uuid::Uuid::now_v7()));
     let capture = json!({
         "media_type": media_type,
         "data_b64": data,
@@ -1252,6 +1265,76 @@ mod tests {
         )
         .expect_err("string coords must refuse");
         assert!(err.contains("finite number"), "got: {err}");
+    }
+
+    #[test]
+    fn helper_env_forwards_every_tier_variable_and_nothing_undefined() {
+        for k in [ENV_STRUCTURED, ENV_A11Y, ENV_PIXEL, "PATH", "LC_CTYPE"] {
+            assert!(helper_env_allowed(k), "{k} must reach the helper");
+        }
+        for k in [
+            "OVERSEER_COMPUTER_API",
+            "FOO_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(!helper_env_allowed(k), "{k} must not reach the helper");
+        }
+    }
+
+    #[test]
+    fn a_deleted_capture_never_lets_the_next_one_overwrite_a_survivor() {
+        let dir = tmpdir("capture-seq");
+        let pixel = fixed(
+            &dir,
+            "pixel.sh",
+            r#"{"ok":true,"media_type":"image/png","data_b64":"aGVsbG8=","px_w":2,"px_h":2,"sent_w":2,"sent_h":2}"#,
+        );
+        let backends = Backends {
+            structured: None,
+            a11y: None,
+            pixel: Some(pixel),
+        };
+        let mut c = ctx(&dir);
+        let shot = |c: &mut ToolCtx| {
+            run_with(&json!({"action": "screenshot"}), c, &backends).unwrap()["image_file"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let first = shot(&mut c);
+        let second = shot(&mut c);
+        std::fs::remove_file(&first).unwrap();
+        std::fs::write(&second, "survivor").unwrap();
+        let third = shot(&mut c);
+        assert_ne!(third, second, "a new capture reused a live file name");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "survivor");
+    }
+
+    /// Child-process probe with a non-UTF-8 env value (see bash's twin).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_env_value_does_not_kill_the_helper_call() {
+        use std::os::unix::ffi::OsStringExt;
+        const MARK: &str = "LC_OVERSEER_T12_PROBE";
+        if std::env::var_os(MARK).is_some() {
+            let dir = tmpdir("nonutf8");
+            let h = fixed(&dir, "h.sh", r#"{"ok":true}"#);
+            let out = call_helper(&h, &json!({"probe": 1})).unwrap();
+            assert_eq!(out["ok"], true);
+            return;
+        }
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::computer::tests::a_non_utf8_env_value_does_not_kill_the_helper_call",
+                "--test-threads=1",
+            ])
+            .env(MARK, std::ffi::OsString::from_vec(vec![b'f', 0xff]))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
     }
 
     #[test]

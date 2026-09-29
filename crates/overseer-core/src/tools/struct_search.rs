@@ -535,8 +535,8 @@ fn probe(
     config: Option<&str>,
     limit: Option<u64>,
 ) -> ToolOutput {
-    let mut child = match Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .current_dir(&ctx.cwd)
         .env_clear()
         .envs(super::filter_env(std::env::vars_os(), |k| {
@@ -544,9 +544,8 @@ fn probe(
         }))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    let mut child = match super::spawn_retrying_busy(&mut cmd) {
         Ok(c) => c,
         Err(e) => return ToolOutput::ok(note(lane, "the binary would not start", &e.to_string())),
     };
