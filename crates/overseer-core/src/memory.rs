@@ -535,7 +535,7 @@ fn topic_of(dir: &Path, name: &str) -> (Topic, Option<std::time::SystemTime>) {
 /// B2 `ttl_days` clock) and not superseded. This is the entry-level half
 /// of the zep validity-interval filter — the INDEX half (`pointer_live`)
 /// only drops pointers; bodies are what a fetch actually returns.
-pub fn entry_valid(text: &str, mtime: Option<std::time::SystemTime>) -> bool {
+fn entry_valid(text: &str, mtime: Option<std::time::SystemTime>) -> bool {
     match parse_meta(text) {
         Ok((meta, _)) => meta_current(&meta, text, mtime),
         // Unparsable header: fail closed (not served as current).
@@ -724,7 +724,7 @@ fn core_block(dir: &Path) -> String {
 
 /// Ordering on sensitivity tiers: Public < Personal < Secret. A filter
 /// admits every entry at or below its own tier.
-pub fn admits(filter: Sensitivity, entry: Sensitivity) -> bool {
+fn admits(filter: Sensitivity, entry: Sensitivity) -> bool {
     rank(entry) <= rank(filter)
 }
 
@@ -882,16 +882,16 @@ pub fn dirty_files(dir: &Path) -> Vec<String> {
 /// - `add`  — a topic file that no pointer names;
 /// - `keep` — a pointer and its asset agree (counted, not listed).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ReconcilePlan {
-    pub drop: Vec<String>,
-    pub add: Vec<String>,
-    pub keep: usize,
+struct ReconcilePlan {
+    drop: Vec<String>,
+    add: Vec<String>,
+    keep: usize,
 }
 
 impl ReconcilePlan {
     /// Render the plan for the consolidation prompt — the model sees
     /// exactly what the engine already decided.
-    pub fn render(&self) -> String {
+    fn render(&self) -> String {
         let list = |v: &[String]| {
             if v.is_empty() {
                 "(none)".to_string()
