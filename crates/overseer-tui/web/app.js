@@ -22,7 +22,9 @@ cursor.id = 'cursor';
 screen.appendChild(cursor);
 
 function locked() {
-  document.getElementById('lock').classList.add('on');
+  // body.locked hides the whole window and shows the mark + one
+  // instruction line (see style.css).
+  document.body.classList.add('locked');
 }
 
 // ── cell metrics ──────────────────────────────────────────────────
@@ -93,8 +95,6 @@ const rowCache = [];
 
 function render(f) {
   if (f.bye) { document.getElementById('bye').classList.add('on'); es.close(); return; }
-  // §5: the server flags a fresh session — overlay the real mark.
-  document.getElementById('empty').classList.toggle('on', !!f.e);
   screen.style.width = (f.w * CH) + 'px';
   screen.style.height = (f.h * LH) + 'px';
   while (rowEls.length < f.h) {
@@ -113,6 +113,15 @@ function render(f) {
   // the dip+divider track the layout whether or not the panel band is
   // open below it.
   const pt = f.p ?? f.h - 3;
+  // §5: fresh session — the server leaves the glyph row blank and
+  // paints the wordmark; the client overlays ONLY the 40px mark,
+  // centred on that row (mid = (t_rows-1)/2, t_rows = pt).
+  const empty = document.getElementById('empty');
+  empty.classList.toggle('on', !!f.e);
+  if (f.e) {
+    const mid = Math.max(0, (pt - 1) >> 1);
+    empty.style.top = (mid * LH + TOP_OFF + LH / 2 - 20) + 'px';
+  }
   const frag = document.createDocumentFragment();
   for (let y = 0; y < f.h; y++) {
     const row = f.rows[y];
@@ -152,13 +161,20 @@ let es;
 // Referrer-Policy: no-referrer keeps it out of Referer headers).
 const post = o => {
   const body = JSON.stringify(o);
+  const get = () =>
+    fetch('/input?t=' + encodeURIComponent(TOKEN) + '&d=' + encodeURIComponent(body));
   fetch('/input', {
     method: 'POST',
     headers: { 'X-Overseer-Token': TOKEN },
     body,
-  }).catch(() =>
-    fetch('/input?t=' + encodeURIComponent(TOKEN) + '&d=' + encodeURIComponent(body))
-  );
+  })
+    .then(res => {
+      // fetch resolves on HTTP errors — a body-stripping proxy's 400
+      // is a RESOLVED 400, not a rejection. Retry over GET for
+      // anything that isn't a real auth verdict.
+      if (!res.ok && res.status !== 401 && res.status !== 403) get();
+    })
+    .catch(get);
 };
 
 // §6 installed PWA is full-bleed: no title bar, no page margin.
@@ -202,15 +218,18 @@ const KEYS = {
 
 // The bottom mark is the panel button — same as F1 / ↑ on empty input.
 // §10 swap point: /mark.svg is the ONE geometry file; it's injected
-// inline (never innerHTML strings we build) into the button and the
-// empty-state mark so CSS currentColor controls each copy.
+// inline (never innerHTML strings we build) into the button, the
+// empty-state mark and the locked-screen mark so CSS currentColor
+// controls each copy.
 const markBtn = document.getElementById('mark');
 fetch('/mark.svg')
   .then(r => r.text())
   .then(svg => {
     markBtn.innerHTML = svg;
-    const em = document.getElementById('emark');
-    if (em) em.innerHTML = svg;
+    for (const id of ['emark', 'lockmark']) {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = svg;
+    }
   })
   .catch(() => {});
 markBtn.addEventListener('click', e => {

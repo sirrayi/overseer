@@ -77,21 +77,22 @@ html, body {
   pointer-events: none;
 }
 
-/* §5 empty state: real SVG mark 40px above the wordmark, centred over
-   the transcript; `e:true` frames toggle it. */
+/* §5 empty state: the server leaves the glyph row blank and paints
+   the wordmark; the client overlays ONLY the 40px mark, centred on
+   that row — top is computed per frame in app.js (#empty lives inside
+   #screen so it shares the row coordinate space). */
 #empty {
   position: absolute;
-  inset: 0;
+  left: 0;
+  right: 0;
+  height: 40px;
   display: none;
-  flex-direction: column;
-  align-items: center;
   justify-content: center;
   pointer-events: none;
 }
 #empty.on { display: flex; }
-#emark { color: #50545c; margin-bottom: 40px; }
-#emark svg { width: 28px; height: 28px; display: block; }
-#eword { color: #858a94; font: 12px/1 -apple-system, system-ui, sans-serif; }
+#emark { color: rgba(255,255,255,.35); }
+#emark svg { width: 40px; height: 40px; display: block; }
 
 /* §10: the bottom mark is the small cut from /mark.svg, injected
    inline so currentColor applies — a mark swap stays a one-file
@@ -115,9 +116,12 @@ html, body {
 }
 #mark svg { width: 14px; height: 14px; }
 #mark:hover, #mark:focus-visible { color: rgba(255,255,255,.6); }
-#mark:focus-visible { outline: none; }
+#mark:focus-visible {
+  outline: 1px solid rgba(255,255,255,.35);
+  outline-offset: 3px;
+}
 
-#bye, #lock {
+#bye {
   position: fixed;
   inset: 0;
   display: none;
@@ -127,7 +131,31 @@ html, body {
   color: #a9adb6;
   background: rgba(13,14,16,.7);
 }
-#bye.on, #lock.on { display: flex; }
+#bye.on { display: flex; }
+
+/* Locked (no/bad token): the whole window hides and one centred
+   block shows — mark, 16px, one text line. #lockmsg is a single
+   inline container so the spaces around <code> can't collapse. */
+body.locked #win { display: none; }
+#lock {
+  position: fixed;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+}
+body.locked #lock { display: flex; }
+#lockmark { color: rgba(255,255,255,.35); }
+#lockmark svg { width: 40px; height: 40px; display: block; }
+#lockmsg { color: #a9adb6; font: 14px -apple-system, system-ui, sans-serif; }
+#lockmsg code {
+  font-family: "SF Mono", Menlo, ui-monospace, monospace;
+  background: #24262b;
+  padding: 3px 6px;
+  border-radius: 4px;
+}
 
 /* Unfocused = dimmed; one click inside returns input. */
 #win { transition: opacity .12s; }

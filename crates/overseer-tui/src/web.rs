@@ -40,6 +40,18 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use crate::probe::{Caps, ColorDepth};
 use crate::TuiConfig;
 
+/// Capabilities the web surface presents to `draw`: the browser
+/// renders everything — treat it as a truecolor, non-mux peer. OSC
+/// stays off: there is no scrollback stream. `term_version` doubles
+/// as the "web" marker the empty-state code keys on.
+fn web_caps() -> Caps {
+    Caps {
+        color: ColorDepth::TrueColor,
+        term_version: Some("overseer-web".into()),
+        ..Caps::default()
+    }
+}
+
 /// Shared input channel — every HTTP connection thread can inject
 /// events into the drive loop.
 type InputTx = mpsc::Sender<CtEvent>;
@@ -125,15 +137,13 @@ pub fn run_web_with(cfg: TuiConfig, opts: WebOpts) -> std::io::Result<i32> {
         });
     }
 
+    let caps = web_caps();
+    // Same OnceLock as run/run_inline — install before `launch` so
+    // nothing inside App::new reads the default palette first.
+    crate::theme::set_theme(crate::theme::Theme::detect(&caps));
+
     let (mut app, worker) = crate::launch(cfg);
     app.mode = crate::app::UiMode::Full;
-    // The browser renders everything — treat it as a truecolor,
-    // non-mux peer. OSC stays off: there is no scrollback stream.
-    let caps = Caps {
-        color: ColorDepth::TrueColor,
-        term_version: Some("overseer-web".into()),
-        ..Caps::default()
-    };
 
     let backend = TestBackend::new(100, 30);
     let mut term = Terminal::with_options(
@@ -150,7 +160,8 @@ pub fn run_web_with(cfg: TuiConfig, opts: WebOpts) -> std::io::Result<i32> {
     }
 
     // Frame diffing happens on the buffer + cursor + prompt_top BEFORE
-    // serialization — an idle tick costs a PartialEq, not a JSON write.
+    // serialization — an idle tick costs a PartialEq compare, not a
+    // JSON write. The Buffer is cloned only when it actually changed.
     let mut prev: Option<(Buffer, (u16, u16), u16)> = None;
     while !app.quit {
         match input_rx.recv_timeout(std::time::Duration::from_millis(80)) {
@@ -171,17 +182,22 @@ pub fn run_web_with(cfg: TuiConfig, opts: WebOpts) -> std::io::Result<i32> {
                 .get_cursor_position()
                 .map(|p| (p.x, p.y))
                 .unwrap_or((0, 0));
-            let cur = (backend.buffer().clone(), pos, app.prompt_top);
             match &prev {
-                Some(p) if *p == cur => false,
+                Some((pb, ppos, ptop))
+                    if pb == backend.buffer() && *ppos == pos && *ptop == app.prompt_top =>
+                {
+                    false
+                }
                 _ => {
-                    prev = Some(cur);
+                    prev = Some((backend.buffer().clone(), pos, app.prompt_top));
                     true
                 }
             }
         };
         if changed {
-            let frame = frame_json(&mut term, app.prompt_top, app.transcript_empty());
+            // `e` uses the same guard as the drawn empty state — no
+            // mark overlay while a panel or dialog is open.
+            let frame = frame_json(&mut term, app.prompt_top, app.empty_state_shown());
             *ctx.last.lock().unwrap() = Some(frame.clone());
             broadcast(&ctx.clients, &format!("data: {frame}\n\n"));
         }
@@ -557,8 +573,8 @@ enum HeadErr {
 /// accept (not per-read): a 1-byte-per-9 s dribbler can't pin one of
 /// the 32 connection slots forever. Content-Length is capped at
 /// 64 KiB BEFORE the body allocation — a lying header gets 413, never
-/// a giant `vec!`. Head reads never wait on the body beyond the
-/// socket's own read timeout.
+/// a giant `vec!` — and the body shares the same wall-clock deadline:
+/// each body read gets only the remaining slice as its timeout.
 fn read_request(stream: &TcpStream) -> Result<Request, HeadErr> {
     read_request_within(stream, std::time::Instant::now() + READ_TIMEOUT)
 }
@@ -594,19 +610,28 @@ fn read_request_within(
     if method.is_empty() {
         return Err(HeadErr::Silent);
     }
-    let headers = lines
+    let headers: Vec<(String, String)> = lines
         .clone()
         .filter_map(|l| {
             l.split_once(':')
                 .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
         })
         .collect();
-    let body_len = lines
-        .find_map(|l| {
-            l.split_once(':')
-                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
-                .and_then(|(_, v)| v.trim().parse::<usize>().ok())
-        })
+    // Two Content-Length headers is the request-smuggling shape —
+    // refuse rather than guess which one the body follows. The body
+    // length comes from this same parsed-headers lookup, not a second
+    // scan.
+    let cls: Vec<&str> = headers
+        .iter()
+        .filter(|(k, _)| k == "content-length")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    if cls.len() > 1 {
+        return Err(HeadErr::Status(400));
+    }
+    let body_len = cls
+        .first()
+        .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     if body_len > BODY_CAP {
         return Err(HeadErr::Status(413));
@@ -614,14 +639,27 @@ fn read_request_within(
     // Chunked reads may have already swallowed part of the body.
     let mut body = head[split..].to_vec();
     body.truncate(body_len);
-    if body.len() < body_len {
-        let mut rest = vec![0u8; body_len - body.len()];
-        // Short body = the sender lied about its length — that's a 400,
-        // not a silent trunc.
-        if s.read_exact(&mut rest).is_err() {
-            return Err(HeadErr::Status(400));
+    // The body shares the head's wall-clock deadline — a byte-per-
+    // minute dribbler can't convert a POST into a pinned slot.
+    let mut chunk = [0u8; 8192];
+    while body.len() < body_len {
+        let Some(rem) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Err(HeadErr::Silent);
+        };
+        let _ = s.set_read_timeout(Some(rem));
+        match s.read(&mut chunk[..(body_len - body.len()).min(8192)]) {
+            // A short body means the sender lied about its length —
+            // that's a 400, not a silent trunc.
+            Ok(0) => return Err(HeadErr::Status(400)),
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(HeadErr::Silent);
+            }
+            Err(_) => return Err(HeadErr::Status(400)),
         }
-        body.extend_from_slice(&rest);
     }
     Ok(Request {
         method,
@@ -650,6 +688,10 @@ fn handle_conn(mut stream: TcpStream, ctx: Arc<Ctx>) {
     };
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    // Bound writes up front too — a client that connects but never
+    // reads would otherwise block the SSE 200 head + last-frame
+    // replay below and pin the connection slot forever.
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let req = match read_request(&stream) {
         Ok(r) => r,
         Err(HeadErr::Silent) => return,
@@ -697,7 +739,6 @@ fn handle_conn(mut stream: TcpStream, ctx: Arc<Ctx>) {
                     return;
                 }
             }
-            let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
             ctx.clients.lock().unwrap().push(tx);
             std::thread::spawn(move || sse_writer(stream, rx, guard));
         }
@@ -733,9 +774,8 @@ fn handle_conn(mut stream: TcpStream, ctx: Arc<Ctx>) {
                 "/mark.svg" => ("mark.svg", "image/svg+xml"),
                 "/favicon.svg" => ("favicon.svg", "image/svg+xml"),
                 "/manifest.webmanifest" => ("manifest.webmanifest", "application/manifest+json"),
-                p if p.starts_with("/icon-") && p.ends_with(".png") && !p.contains("..") => {
-                    (&p[1..], "image/png")
-                }
+                "/icon-192.png" => ("icon-192.png", "image/png"),
+                "/icon-512.png" => ("icon-512.png", "image/png"),
                 _ => {
                     let _ = respond(&mut stream, 404, "");
                     return;
@@ -989,6 +1029,16 @@ mod tests {
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    #[test]
+    fn web_surface_resolves_graphite() {
+        // The web caps are truecolor, so `run_web_with` installs the
+        // graphite palette — same OnceLock as the terminal paths.
+        assert_eq!(
+            crate::theme::Theme::detect(&web_caps()),
+            crate::theme::Theme::graphite()
+        );
+    }
+
     fn test_ctx(port: u16) -> (Arc<Ctx>, mpsc::Receiver<CtEvent>) {
         let (input_tx, input_rx) = mpsc::channel();
         (
@@ -1105,6 +1155,48 @@ mod tests {
             rx.recv_timeout(std::time::Duration::from_secs(2)),
             Ok(CtEvent::Key(_))
         ));
+    }
+
+    #[test]
+    fn duplicate_content_length_is_rejected() {
+        // Two CL headers is request smuggling — refuse rather than
+        // pick one.
+        let (port, _rx, _ctx) = server();
+        assert_eq!(
+            exchange(
+                port,
+                &format!(
+                    "POST /input HTTP/1.1\r\n{}X-Overseer-Token: {TOKEN}\r\nContent-Length: 2\r\nContent-Length: 30\r\n\r\n{{}}",
+                    host(port)
+                )
+            ),
+            "HTTP/1.1 400 Bad Request"
+        );
+    }
+
+    #[test]
+    fn body_respects_wall_clock_deadline() {
+        // A body dribbler must die on the SAME deadline as the head —
+        // not a fresh per-read budget.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (srv, _) = listener.accept().unwrap();
+            let _ = srv.set_read_timeout(Some(std::time::Duration::from_secs(60)));
+            let r = read_request_within(
+                &srv,
+                std::time::Instant::now() + std::time::Duration::from_millis(100),
+            );
+            done_tx.send(matches!(r, Err(HeadErr::Silent))).unwrap();
+        });
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // Complete head promising 64 bytes, then silence.
+        c.write_all(b"POST /input HTTP/1.1\r\nContent-Length: 64\r\n\r\n{}")
+            .unwrap();
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap());
     }
 
     #[test]

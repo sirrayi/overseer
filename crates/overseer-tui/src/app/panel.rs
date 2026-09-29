@@ -20,14 +20,14 @@ impl App {
         let mut strip = Vec::new();
         let mut used = 0usize;
         for (i, name) in PANEL_TABS.iter().enumerate() {
-            // §4: active tab = white + underline (dialog_sel), inactive
-            // fade to faint — no colour blocks.
+            // §4: active tab = white + underline, inactive = faint —
+            // no colour blocks in any palette.
             strip.push(Span::styled(
                 format!(" {name} "),
                 if i == tab {
-                    theme::dialog_sel()
+                    theme::tab_active()
                 } else {
-                    theme::faint()
+                    theme::tab_idle()
                 },
             ));
             used += name.len() + 2;

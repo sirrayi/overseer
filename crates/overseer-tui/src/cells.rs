@@ -316,14 +316,28 @@ pub(crate) fn strip_top_gap(cell: &Cell, lines: &mut Vec<Line<'static>>) {
     }
 }
 
+/// Truncate to `n` DISPLAY COLUMNS — the budget is visual width, so
+/// CJK and emoji (2 cols) count double; a grapheme count would let
+/// them overflow and wrap. A truncation always shows `…` and never
+/// exceeds the budget: a full-width tail gives up columns for it.
 fn truncate(s: &str, n: usize) -> String {
-    let mut g = s.graphemes(true);
-    let taken: String = g.by_ref().take(n).collect();
-    if g.next().is_some() {
-        format!("{taken}…")
-    } else {
-        taken
+    if n == 0 {
+        return String::new();
     }
+    let mut w = 0usize;
+    let mut taken = Vec::new();
+    for g in s.graphemes(true) {
+        let gw = UnicodeWidthStr::width(g);
+        if w + gw > n {
+            while w + 1 > n && !taken.is_empty() {
+                w -= UnicodeWidthStr::width(taken.pop().unwrap());
+            }
+            return format!("{}…", taken.concat());
+        }
+        w += gw;
+        taken.push(g);
+    }
+    taken.concat()
 }
 
 /// Reduce one engine event to zero or more cells. ToolCallStart/ToolResult
@@ -584,6 +598,18 @@ mod tests {
     fn tool_summary_bash() {
         let s = tool_summary("bash", &serde_json::json!({"command": "cargo test"}));
         assert_eq!(s, "cargo test");
+    }
+
+    #[test]
+    fn truncate_counts_display_columns() {
+        // The budget is columns, not graphemes — CJK/emoji are 2 wide
+        // and must never overflow it.
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        assert_eq!(truncate("あいうえ", 5), "あい…");
+        assert_eq!(truncate("a🎉b🎉c", 5), "a🎉b…");
+        assert_eq!(truncate("hi", 5), "hi");
+        // A full-width tail gives up a column for the marker.
+        assert_eq!(truncate("あいう", 4), "あ…");
     }
 
     #[test]

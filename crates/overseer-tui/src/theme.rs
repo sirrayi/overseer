@@ -42,6 +42,10 @@ pub struct Theme {
     pub dialog: Style,
     pub dialog_key: Style,
     pub dialog_sel: Style,
+    /// Panel tab strip: active is underline + white (never a colour
+    /// block), idle is faint text.
+    pub tab_active: Style,
+    pub tab_idle: Style,
     pub code: Style,
     pub prompt: Style,
     pub link: Style,
@@ -87,6 +91,11 @@ impl Theme {
                 .fg(Color::Black)
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
+            tab_active: Style::new()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED),
+            tab_idle: Style::new().fg(Color::DarkGray),
             code: Style::new().fg(Color::Green),
             prompt: Style::new().fg(Color::Rgb(255, 255, 255)),
             link: Style::new()
@@ -129,6 +138,8 @@ impl Theme {
             dialog: Style::new(),
             dialog_key: Style::new().add_modifier(Modifier::BOLD),
             dialog_sel: Style::new().add_modifier(Modifier::REVERSED),
+            tab_active: Style::new().add_modifier(Modifier::UNDERLINED),
+            tab_idle: Style::new(),
             code: Style::new(),
             prompt: Style::new(),
             link: Style::new().add_modifier(Modifier::UNDERLINED),
@@ -151,6 +162,7 @@ impl Theme {
             .fg(Color::Black)
             .bg(Color::White)
             .add_modifier(Modifier::BOLD);
+        t.tab_idle = Style::new().fg(Color::Gray);
         t.meta = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
         t.error = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
         t.warn = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
@@ -185,6 +197,11 @@ impl Theme {
             dialog_sel: Style::new()
                 .fg(Color::Rgb(0xff, 0xff, 0xff))
                 .add_modifier(Modifier::UNDERLINED),
+            tab_active: Style::new()
+                .fg(Color::Rgb(0xff, 0xff, 0xff))
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED),
+            tab_idle: Style::new().fg(Color::Rgb(0x50, 0x54, 0x5c)),
             code: Style::new()
                 .fg(Color::Rgb(0xe6, 0xe8, 0xec))
                 .bg(Color::Rgb(0x24, 0x26, 0x2b)),
@@ -236,7 +253,7 @@ macro_rules! accessors {
 accessors! {
     text, user, dim, faint, reasoning, tool, tool_ok, tool_err, warn, meta,
     error, badge, badge_plan, badge_ro, status, spinner, queue, dialog,
-    dialog_key, dialog_sel, code, prompt, link, user_bg,
+    dialog_key, dialog_sel, tab_active, tab_idle, code, prompt, link, user_bg,
 }
 
 #[cfg(test)]

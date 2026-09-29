@@ -149,6 +149,14 @@ impl App {
         self.history.is_empty() && self.live.is_empty() && self.pending.is_empty()
     }
 
+    /// The §5 empty state is only on screen when the transcript is
+    /// empty AND nothing sits above it — the web `e` flag uses this
+    /// same guard so the client's mark can't overlay an open panel
+    /// or dialog.
+    pub(crate) fn empty_state_shown(&self) -> bool {
+        self.transcript_empty() && self.overlay.is_none() && self.dialog.is_none()
+    }
+
     pub(crate) fn live_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         // A modal overlay owns the whole live region — nothing else
@@ -349,7 +357,7 @@ impl App {
 
         // §5 empty state: a fresh session greets with the centred mark
         // over the wordmark, gone the moment the first cell lands.
-        if self.transcript_empty() && self.overlay.is_none() && self.dialog.is_none() {
+        if self.empty_state_shown() {
             let mid = t_rows.saturating_sub(1) / 2;
             let center = |txt: &str, st| {
                 let pad = (width as usize).saturating_sub(UnicodeWidthStr::width(txt)) / 2;
@@ -358,8 +366,13 @@ impl App {
                     Span::styled(txt.to_string(), st),
                 ])
             };
-            if let Some(l) = region.get_mut(mid) {
-                *l = center(crate::MARK_GLYPH, crate::theme::faint());
+            // Web mode leaves the glyph row blank — the client
+            // overlays the real SVG mark centred on it. The terminal
+            // keeps `⌓`. The wordmark row is server-drawn in both.
+            if caps.term_version.as_deref() != Some("overseer-web") {
+                if let Some(l) = region.get_mut(mid) {
+                    *l = center(crate::MARK_GLYPH, crate::theme::faint());
+                }
             }
             if let Some(l) = region.get_mut(mid + 1) {
                 *l = center("overseer", crate::theme::dim());

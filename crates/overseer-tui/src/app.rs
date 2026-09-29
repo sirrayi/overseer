@@ -574,6 +574,29 @@ impl App {
                     }
                     let done = self.live.remove(pos);
                     self.pending.push(done);
+                } else {
+                    // Reseed paths drain `live` into `pending` (or
+                    // history) before the ToolResult replays —
+                    // resolve the cell wherever it landed or it
+                    // renders as `◌` forever.
+                    for c in self.pending.iter_mut().chain(self.history.iter_mut()).rev() {
+                        if let Cell::Tool {
+                            id,
+                            status: s,
+                            output: o,
+                            ..
+                        } = c
+                        {
+                            if *id == call_id {
+                                *s = status;
+                                *o = output;
+                                // `tbuf` may already hold a stale
+                                // render of this row — rebuild it.
+                                self.tbuf_w = 0;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             Feed::Ignore => {}
@@ -941,6 +964,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(code, 0);
         assert!(out.contains("marker-ok"));
+    }
+
+    #[test]
+    fn seed_resolves_tool_status_from_replayed_results() {
+        use overseer_core::event::EventKind;
+        let ev = |kind| Event {
+            id: 0,
+            parent_id: None,
+            ts_ms: 0,
+            prev_hash: 0,
+            hash: 0,
+            kind,
+        };
+        let mut app = test_app("/tmp");
+        // A replayed ToolCallStart drains live→pending before its
+        // ToolResult replays — the done must find the cell wherever
+        // it landed or a resumed session renders every tool `◌`.
+        app.seed(&ev(EventKind::ToolCallStart {
+            call_id: "c1".into(),
+            name: "write".into(),
+            input: serde_json::json!({"path": "a"}),
+        }));
+        app.seed(&ev(EventKind::ToolResult {
+            call_id: "c1".into(),
+            name: "write".into(),
+            content: "ok".into(),
+            is_error: false,
+            raw_bytes: 2,
+            spilled_to: None,
+            denied: false,
+        }));
+        app.seed(&ev(EventKind::ToolCallStart {
+            call_id: "c2".into(),
+            name: "write".into(),
+            input: serde_json::json!({"path": "b"}),
+        }));
+        app.seed(&ev(EventKind::ToolResult {
+            call_id: "c2".into(),
+            name: "write".into(),
+            content: "boom".into(),
+            is_error: true,
+            raw_bytes: 4,
+            spilled_to: None,
+            denied: false,
+        }));
+        let statuses: Vec<ToolStatus> = app
+            .pending
+            .iter()
+            .chain(app.history.iter())
+            .filter_map(|c| match c {
+                Cell::Tool { status, .. } => Some(*status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses, vec![ToolStatus::Ok, ToolStatus::Err]);
+        assert!(app.live.is_empty());
+    }
+
+    #[test]
+    fn empty_state_guard_respects_overlay() {
+        // The web `e` flag shares this guard — the client's mark
+        // must not paint over an open panel.
+        let mut app = test_app("/tmp");
+        assert!(app.empty_state_shown());
+        app.overlay = Some(Overlay::Panel { tab: 0, scroll: 0 });
+        assert!(!app.empty_state_shown());
+        app.overlay = None;
+        assert!(app.empty_state_shown());
     }
 
     #[test]
