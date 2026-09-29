@@ -137,9 +137,9 @@ impl std::fmt::Debug for Credential {
 }
 
 impl Credential {
-    /// Build a credential, deriving a deterministic sentinel from
-    /// (id, real) via sha256 hex (first 32 chars). Same (id, real) →
-    /// same sentinel (1:1 mapping the tests pin).
+    /// Build a credential, deriving its sentinel from (id, real) via
+    /// `sentinel_for` (keyed HMAC, first 32 hex chars). Same (id, real) →
+    /// same sentinel within the process (1:1 mapping the tests pin).
     pub fn new(
         id: impl Into<String>,
         selector: impl Into<String>,
@@ -183,16 +183,63 @@ impl Credential {
     }
 }
 
-/// Deterministic sentinel for (id, real): sha256, first 32 hex chars.
+/// Sentinel for (id, real): HMAC-SHA256 under the per-process key, first
+/// 32 hex chars. Stable for the life of the process (so sentinel↔real
+/// mapping holds across brokers and turns); a fresh process draws a fresh
+/// key, so a low-entropy real cannot be dictionary-recovered offline.
 pub fn sentinel_for(id: &str, real: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"overseer-cred-v1:");
-    h.update(id.as_bytes());
-    h.update(b":");
-    h.update(real.as_bytes());
-    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    sentinel_with_key(sentinel_key(), id, real)
+}
+
+fn sentinel_with_key(key: &[u8], id: &str, real: &str) -> String {
+    let mut msg = Vec::with_capacity(id.len() + real.len() + 18);
+    msg.extend_from_slice(b"overseer-cred-v2:");
+    msg.extend_from_slice(id.as_bytes());
+    msg.push(b':');
+    msg.extend_from_slice(real.as_bytes());
+    let hex: String = hmac_sha256(key, &msg)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     format!("{SENTINEL_PREFIX}{}", &hex[..SENTINEL_HEX_LEN])
+}
+
+/// The per-process sentinel key: 32 bytes from `/dev/urandom`, falling
+/// back to two v7 UUIDs (74 random bits each) where that device is absent.
+fn sentinel_key() -> &'static [u8; 32] {
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        use std::io::Read;
+        let mut k = [0u8; 32];
+        let urandom = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut k));
+        if urandom.is_err() {
+            k[..16].copy_from_slice(uuid::Uuid::now_v7().as_bytes());
+            k[16..].copy_from_slice(uuid::Uuid::now_v7().as_bytes());
+        }
+        k
+    })
+}
+
+/// HMAC-SHA256 (RFC 2104) over `sha2`.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let pad = |byte: u8| k.map(|b| b ^ byte);
+    let inner = Sha256::new()
+        .chain_update(pad(0x36))
+        .chain_update(msg)
+        .finalize();
+    Sha256::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner)
+        .finalize()
+        .into()
 }
 
 /// True when `s` is exactly a sentinel (`ovsent_` + 32 lowercase hex).
@@ -1196,6 +1243,39 @@ mod tests {
         assert!(scan("AKIAIOSFODNN7QWERTY")
             .iter()
             .all(|r| r.family != "aws-key"));
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_case_1() {
+        let mac = hmac_sha256(&[0x0b; 20], b"Hi There");
+        let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn sentinel_is_keyed_and_stable_within_the_process() {
+        let mut br = Broker::new();
+        let s1 = br.issue_capability("db", "DB_PASS", "1234", vec![], vec![], None);
+        let s2 = br.issue_capability("db", "DB_PASS", "1234", vec![], vec![], None);
+        assert_eq!(s1, s2, "stable within one broker");
+        assert_eq!(s1, sentinel_for("db", "1234"));
+        let a = sentinel_with_key(&[1; 32], "db", "1234");
+        let b = sentinel_with_key(&[2; 32], "db", "1234");
+        assert_ne!(a, b, "different keys, different sentinels");
+        assert!(is_sentinel(&a) && is_sentinel(&b));
+        // Not the old unkeyed sha256(id:real) — a PIN is not dictionary-recoverable.
+        use sha2::{Digest, Sha256};
+        let unkeyed: String = Sha256::digest(b"overseer-cred-v1:db:1234")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_ne!(
+            s1,
+            format!("{SENTINEL_PREFIX}{}", &unkeyed[..SENTINEL_HEX_LEN])
+        );
     }
 
     #[test]
