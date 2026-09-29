@@ -303,11 +303,14 @@ fn bubblewrap_invocation(
             "--ro-bind".into(),
             "/".into(),
             "/".into(),
+            // Mount order matters: a later mount shadows an earlier one, so
+            // the scratch /tmp goes first and a workspace under /tmp stays
+            // writable on top of it.
+            "--tmpfs".into(),
+            "/tmp".into(),
             "--bind".into(),
             root.display().to_string(),
             root.display().to_string(),
-            "--tmpfs".into(),
-            "/tmp".into(),
             "--dev".into(),
             "/dev".into(),
             "--proc".into(),
