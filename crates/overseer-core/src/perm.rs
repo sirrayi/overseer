@@ -87,6 +87,9 @@ pub enum Preset {
 /// Bash deny rules — glob patterns over the whole command string
 /// (`*`/`?` wildcards, `\` escapes a literal). Ordered deny → ask → allow:
 /// a deny match short-circuits before ask/allow is even considered.
+/// Patterns match the [`normalize_bash`] form: whitespace runs collapsed
+/// to one space and every recursive+forced `rm` flag spelling (`-fr`,
+/// `-Rf`, `-r -f`, `--recursive --force`, `-rfv`, …) rewritten to `-rf`.
 const BASH_DENY: &[(&str, &str)] = &[
     // Destructive filesystem ops (playbook: fail closed).
     ("*rm -rf \\**", "recursive delete with an unqualified glob"),
@@ -107,6 +110,19 @@ const BASH_DENY: &[(&str, &str)] = &[
     ("*:(){*", "fork bomb"),
     // System mutation.
     ("*sudo *", "privilege escalation"),
+    ("sudo", "privilege escalation"),
+    ("* sudo", "privilege escalation"),
+    ("*;sudo", "privilege escalation"),
+    ("*|sudo", "privilege escalation"),
+    ("*&sudo", "privilege escalation"),
+    ("*doas *", "privilege escalation"),
+    ("*pkexec*", "privilege escalation"),
+    ("*>/dev/sd*", "raw write to a disk device"),
+    ("*> /dev/sd*", "raw write to a disk device"),
+    ("*>/dev/disk*", "raw write to a disk device"),
+    ("*> /dev/disk*", "raw write to a disk device"),
+    ("*>/dev/nvme*", "raw write to a disk device"),
+    ("*> /dev/nvme*", "raw write to a disk device"),
     ("*shutdown*", "system power control"),
     ("*reboot*", "system power control"),
     // Remote code execution pattern.
@@ -194,7 +210,6 @@ const SENSITIVE_PATHS: &[&str] = &[
 ];
 
 /// Content markers that mark a result as carrying secret material.
-/// Content markers that mark a result as carrying secret material.
 /// Lowercase: compared against lowercased text (RT-1: uppercase markers
 /// were dead code — lowercased text can never contain them).
 const SENSITIVE_CONTENT: &[&str] = &["-----begin", "private key-----"];
@@ -253,8 +268,9 @@ pub enum Autonomy {
 }
 
 /// External-communication markers for the bash classifier: networked
-/// sends, publishes, and message-sending CLIs. Conservative substring
-/// match (first wall, like BASH_DENY) — the sandbox is the real boundary.
+/// sends, publishes, and message-sending CLIs. Word-boundary match
+/// ([`has_marker`]: `gh` fires on `gh pr`, not inside `through`); first
+/// wall, like BASH_DENY — the sandbox is the real boundary.
 const EXTERNAL_MARKERS: &[&str] = &[
     "curl",
     "wget",
@@ -363,7 +379,7 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
                 Irreversibility::Identity
             } else if MONEY_MARKERS.iter().any(|m| cmd.contains(m)) {
                 Irreversibility::Money
-            } else if EXTERNAL_MARKERS.iter().any(|m| cmd.contains(m)) {
+            } else if EXTERNAL_MARKERS.iter().any(|m| has_marker(&cmd, m)) {
                 Irreversibility::ExternalComms
             } else {
                 Irreversibility::InternalWrite
@@ -400,73 +416,57 @@ pub fn classify_batch(tool: &str, input: &Value) -> Irreversibility {
     }
     classify(tool, input)
 }
-/// Risk class of an MCP server/tool (awesome-mcp-servers taxonomy, arsenal
-/// B2). Used when deciding how much trust a server listing earns before any
-/// of its tools are exposed: a filesystem or shell server is not the same
-/// proposition as a read-only docs server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Risk {
-    /// Reads data, changes nothing.
-    Low,
-    /// Network or filesystem reach with bounded blast radius.
-    Medium,
-    /// Writes outside a sandbox, or mutates a datastore.
-    High,
-    /// Arbitrary execution or credential access.
-    Critical,
+
+/// Whether `marker` occurs in `cmd` as a whole word: a marker edge that is
+/// a word character (alphanumeric or `_`) must sit next to a non-word
+/// character or the string edge. Trailing spaces in a marker are dropped —
+/// the boundary check replaces them.
+fn has_marker(cmd: &str, marker: &str) -> bool {
+    let m = marker.trim_end();
+    if m.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let first_word = m.chars().next().is_some_and(is_word);
+    let last_word = m.chars().next_back().is_some_and(is_word);
+    cmd.match_indices(m).any(|(at, _)| {
+        let before_ok = !first_word || !cmd[..at].chars().next_back().is_some_and(is_word);
+        let after_ok = !last_word || !cmd[at + m.len()..].chars().next().is_some_and(is_word);
+        before_ok && after_ok
+    })
 }
 
-impl Risk {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Risk::Low => "low",
-            Risk::Medium => "medium",
-            Risk::High => "high",
-            Risk::Critical => "critical",
+/// The form [`BASH_DENY`] is matched against: whitespace runs collapsed to
+/// one space (ends trimmed), and each `rm` whose flags (`-…` words right
+/// after it) include both recursive and force rewritten as `rm -rf`.
+fn normalize_bash(cmd: &str) -> String {
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        out.push(w.to_string());
+        i += 1;
+        if w != "rm" && !w.ends_with("/rm") {
+            continue;
+        }
+        let flags_end = words[i..]
+            .iter()
+            .position(|f| !f.starts_with('-') || *f == "--")
+            .map_or(words.len(), |n| i + n);
+        let flags = &words[i..flags_end];
+        let has = |short: &[char], long: &str| {
+            flags.iter().any(|f| {
+                *f == long
+                    || (!f.starts_with("--") && f.chars().skip(1).any(|c| short.contains(&c)))
+            })
+        };
+        if has(&['r', 'R'], "--recursive") && has(&['f'], "--force") {
+            out.push("-rf".into());
+            i = flags_end;
         }
     }
-
-    /// Whether exposing this server's tools requires a human decision up
-    /// front (rather than only at the call site).
-    pub const fn needs_approval(self) -> bool {
-        matches!(self, Risk::High | Risk::Critical)
-    }
-}
-
-/// Classify a server/tool by its declared capabilities. Unknown capability
-/// strings fail **up** (High): an unrecognized claim is not evidence of
-/// safety, the same rule `classify` uses for unknown tools.
-pub fn mcp_risk(tool: &str, capabilities: &[&str]) -> Risk {
-    let mut risk = Risk::Low;
-    let mut unknown = false;
-    for cap in capabilities {
-        let c = cap.trim().to_ascii_lowercase();
-        let r = match c.as_str() {
-            "read" | "read-only" | "search" | "list" | "docs" => Risk::Low,
-            "network" | "fetch" | "http" | "browser" | "file-write" | "write" => Risk::Medium,
-            "database-write" | "sql-write" | "delete" | "admin" | "filesystem-write" => Risk::High,
-            "shell" | "exec" | "execute" | "credentials" | "secrets" | "cloud-admin" => {
-                Risk::Critical
-            }
-            _ => {
-                unknown = true;
-                Risk::High
-            }
-        };
-        risk = risk.max(r);
-    }
-    if unknown {
-        risk = risk.max(Risk::High);
-    }
-    // The tool name is evidence too: a server that calls itself a shell is
-    // one, whatever its capability list claims.
-    let name_risk = match tool.to_ascii_lowercase().as_str() {
-        n if n.contains("shell") || n.contains("exec") || n.contains("terminal") => Risk::Critical,
-        n if n.contains("filesystem") || n.contains("postgres") || n.contains("sql") => Risk::High,
-        n if n.contains("fetch") || n.contains("browser") || n.contains("http") => Risk::Medium,
-        _ => Risk::Low,
-    };
-    risk.max(name_risk)
+    out.join(" ")
 }
 
 /// One session-scoped allow (P8-B cline `expires_turns` port): the key a
@@ -1032,8 +1032,9 @@ impl Policy {
                         reason: "bash: missing 'command'".into(),
                     });
                 };
+                let cmd = normalize_bash(cmd);
                 for (pattern, why) in BASH_DENY {
-                    if glob_match(pattern, cmd) {
+                    if glob_match(pattern, &cmd) {
                         return Some(Verdict::Deny {
                             reason: format!("bash: '{pattern}' denied — {why}"),
                         });
@@ -2287,27 +2288,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mcp_risk_takes_the_max_and_fails_up_on_unknowns() {
-        assert_eq!(mcp_risk("docs", &["read-only", "search"]), Risk::Low);
-        assert_eq!(mcp_risk("web", &["network"]), Risk::Medium);
-        assert_eq!(mcp_risk("db", &["read", "database-write"]), Risk::High);
-        assert_eq!(mcp_risk("ops", &["read", "shell"]), Risk::Critical);
-        assert_eq!(mcp_risk("vault", &["credentials"]), Risk::Critical);
-        // Unknown capability → High, never Low.
-        assert_eq!(mcp_risk("mystery", &["teleport"]), Risk::High);
-        // The name is evidence even with a benign capability list.
-        assert_eq!(mcp_risk("my-shell-server", &["read"]), Risk::Critical);
-        assert_eq!(mcp_risk("postgres-tools", &[]), Risk::High);
-        assert_eq!(mcp_risk("weather", &[]), Risk::Low);
-        // Approval is required exactly for the top two classes.
-        assert!(!Risk::Low.needs_approval() && !Risk::Medium.needs_approval());
-        assert!(Risk::High.needs_approval() && Risk::Critical.needs_approval());
-        assert_eq!(Risk::Critical.as_str(), "critical");
-        // Ordering is the class ladder (used by the max above).
-        assert!(Risk::Critical > Risk::High && Risk::High > Risk::Medium);
-    }
-
     /// Count a shared Ask counter without unwrapping the lock (house
     /// style: a poisoned lock is a zero, never a panic).
     fn tally(c: &std::sync::Arc<std::sync::Mutex<usize>>) -> usize {
@@ -2480,5 +2460,85 @@ mod tests {
             Verdict::Ask { .. }
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bash_deny_catches_every_spelling_of_the_same_class() {
+        let p = pol();
+        for cmd in [
+            "rm -fr /",
+            "rm -Rf ~",
+            "rm -r -f /etc",
+            "rm -f -r $HOME",
+            "rm  -rf   /",
+            "rm\t-rf /",
+            "rm -rfv ../up",
+            "rm --recursive --force /",
+            "cd x && rm -fR *",
+            "doas rm file",
+            "pkexec bash",
+            "sudo",
+            "make install && sudo",
+            "echo x;sudo",
+            "cat img > /dev/sda",
+            "cat img >/dev/sdb1",
+            "dd if=x.img >> /dev/disk2",
+            "cat x > /dev/nvme0n1",
+        ] {
+            assert!(
+                matches!(
+                    p.hard_deny("bash", &json!({"command": cmd})),
+                    Some(Verdict::Deny { .. })
+                ),
+                "{cmd:?} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_deny_leaves_scoped_and_lookalike_commands_alone() {
+        let p = pol();
+        for cmd in [
+            "rm -r build/",
+            "rm -rf build/",
+            "rm  -r   build/",
+            "rm -f notes.txt",
+            "rm -r -v build/",
+            "echo pseudo",
+            "ls -la",
+            "echo hi > /dev/null",
+            "cat log 2>/dev/stderr",
+            "git status",
+        ] {
+            assert_eq!(
+                p.hard_deny("bash", &json!({"command": cmd})),
+                None,
+                "{cmd:?} must stay allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn external_markers_match_whole_words_only() {
+        let class = |c: &str| classify("bash", &json!({"command": c}));
+        for cmd in [
+            "gh pr create --fill",
+            "curl https://example.com",
+            "wget -q http://x",
+            "ssh host uptime",
+            "git fetch && gh-dash",
+            "which gh",
+        ] {
+            assert_eq!(class(cmd), Irreversibility::ExternalComms, "{cmd:?}");
+        }
+        for cmd in [
+            "echo through the list",
+            "grep high scores.txt",
+            "cat curly.txt",
+            "sort uses.txt",
+            "ls slacker/",
+        ] {
+            assert_eq!(class(cmd), Irreversibility::InternalWrite, "{cmd:?}");
+        }
     }
 }
