@@ -73,6 +73,7 @@ def solve(
         "--max-steps",
         str(max_steps),
         "--full-access",
+        "--no-memory",
         *(extra_flags or []),
         "-",
     ]

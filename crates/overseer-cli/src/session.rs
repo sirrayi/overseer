@@ -1,7 +1,8 @@
 //! Session plumbing shared by every engine-backed command: where the
 //! session lives, the run config built from flags, and credential loading.
 
-use std::path::PathBuf;
+use overseer_core::memory::Scope;
+use std::path::{Path, PathBuf};
 
 use crate::flags::ExecFlags;
 
@@ -56,6 +57,7 @@ pub(crate) fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConf
         .cwd
         .canonicalize()
         .unwrap_or_else(|_| flags.cwd.clone());
+    let (user_memory, project_memory) = memory_stores(flags, &cwd_canonical);
     overseer_core::agent::AgentConfig {
         model: flags.model.clone(),
         max_steps: flags.max_steps,
@@ -73,8 +75,8 @@ pub(crate) fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConf
         policy_preset: flags.policy,
         auto_compact: flags.auto_compact,
         compact_at: flags.compact_at,
-        memory_dir: flags.memory.then(|| cwd_canonical.join("memory")),
-        user_memory_dir: None,
+        memory_dir: project_memory,
+        user_memory_dir: user_memory,
         memory_recall: true,
         is_subagent: false,
         // P6-2: the parent agent sees the full index; the ceiling applies
@@ -195,6 +197,34 @@ pub(crate) fn apply_credentials(config: &mut overseer_core::agent::AgentConfig) 
         Ok(_) => {}
         Err(e) => eprintln!("overseer: credentials — {e} (ignored)"),
     }
+}
+
+/// Memory v2 stores `(user, project)`: on by default under the overseer
+/// home; `--memory` keeps v1's in-workspace `<cwd>/memory` as the project
+/// store; `--no-memory` and `--bare` turn both off.
+pub(crate) fn memory_stores(flags: &ExecFlags, cwd: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
+    if flags.bare || flags.no_memory {
+        return (None, None);
+    }
+    let home = overseer_core::memory::overseer_home();
+    let user = home
+        .as_deref()
+        .map(overseer_core::memory::stores::user_store);
+    let project = if flags.memory {
+        Some(cwd.join("memory"))
+    } else {
+        home.map(|h| overseer_core::memory::stores::project_store(&h, cwd))
+    };
+    (user, project)
+}
+
+/// [`memory_stores`] as the scoped list the core memory APIs take.
+pub(crate) fn memory_store_list(flags: &ExecFlags, cwd: &Path) -> Vec<(Scope, PathBuf)> {
+    let (user, project) = memory_stores(flags, cwd);
+    [(Scope::User, user), (Scope::Project, project)]
+        .into_iter()
+        .filter_map(|(s, d)| Some((s, d?)))
+        .collect()
 }
 
 pub(crate) fn dirs_home() -> PathBuf {

@@ -73,7 +73,7 @@ class OverseerAgent(BaseAgent):
         }
         await environment.exec(
             f"{CONTAINER_BIN} exec --json --provider opencode "
-            f"--model {model} --cwd {cwd} --full-access --max-steps 40 "
+            f"--model {model} --cwd {cwd} --full-access --no-memory --max-steps 40 "
             f"--session /opt/overseer/session - < /opt/overseer/prompt.txt",
             env=env,
             timeout_sec=int(os.environ.get("OVERSEER_TIMEOUT", "1500")),
