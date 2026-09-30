@@ -2832,6 +2832,27 @@ mod tests {
         ));
         // An unqualified forget target has no layer to read: fail closed.
         assert!(deny(&p, json!({"op": "forget", "name": "x", "text": "r"})));
+        // The gate reads the layer from the tool's qualified form only.
+        assert!(!deny(
+            &p,
+            json!({"op": "forget", "name": "semantic/x.md", "text": "r"})
+        ));
+        for bad in [
+            "semantic/x",
+            "bogus:semantic/x.md",
+            "semantic/a/x.md",
+            "x.md",
+            "user:x.md",
+        ] {
+            assert!(
+                deny(&p, json!({"op": "forget", "name": bad, "text": "r"})),
+                "{bad}"
+            );
+        }
+        assert!(deny(
+            &p,
+            json!({"op": "forget", "name": "profile/me.md", "text": "r"})
+        ));
         p.memory_readonly = true;
         assert!(!deny(&p, json!({"op": "search", "query": "x"})));
         assert_eq!(

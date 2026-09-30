@@ -176,7 +176,8 @@ pub struct Distilled {
 /// Distil the project store's episodes not yet in [`DISTILLED`] (by body)
 /// into at most five validated semantic/procedural notes: one small-model
 /// call whose reply lines must be `ADD <semantic|procedural> <name> |
-/// <cues> | <text>` or `SUPERSEDE <existing-name> -> <new-name> | <text>`.
+/// <cues> | <text>` or `SUPERSEDE <scope:layer/name.md> -> <new-name> |
+/// <text>` (the target qualified as for `forget`).
 /// Anything else is skipped and counted; `profile/` is never written.
 pub fn distill(
     provider: &dyn crate::provider::Provider,
@@ -226,7 +227,7 @@ pub fn distill(
         "Distil durable facts (semantic) and how-tos (procedural) from these agent \
          session episodes. Reply with at most {DISTILL_LINES_MAX} lines, nothing else, each \
          exactly one of:\nADD <semantic|procedural> <name> | <cues> | <text>\n\
-         SUPERSEDE <existing-name> -> <new-name> | <text>\n\
+         SUPERSEDE <existing scope:layer/name.md> -> <new-name> | <text>\n\
          Only what a future session would need; no reply lines if nothing is durable.\n\
          == EXISTING NOTES ==\n{existing}== EPISODES ==\n"
     );
@@ -305,11 +306,7 @@ pub fn distill(
                 let text = super::redact::scrub(text);
                 let cues = super::redact::scrub(&cues);
                 let text = text.as_ref();
-                let scope = if layer == Layer::Procedural {
-                    Scope::User
-                } else {
-                    Scope::Project
-                };
+                let scope = layer.default_scope();
                 let dir = stores.iter().find(|(s, _)| *s == scope).map(|(_, d)| d)?;
                 if idx
                     .docs
@@ -327,7 +324,7 @@ pub fn distill(
             parse_supersede(rest).and_then(|(old, new, text)| {
                 let text = super::redact::scrub(text);
                 let text = text.as_ref();
-                let doc = idx.find(old)?;
+                let doc = idx.resolve_qualified(old).ok()?;
                 let layer = doc
                     .layer()
                     .filter(|l| matches!(l, Layer::Semantic | Layer::Procedural))?;
@@ -383,7 +380,7 @@ fn parse_add(rest: &str) -> Option<(Layer, String, String, &str)> {
     (!text.is_empty()).then_some((layer, name, cues, text))
 }
 
-/// `<existing-name> -> <new-name> | <text>` → (existing, new slug, text).
+/// `<scope:layer/name.md> -> <new-name> | <text>` → (existing, new slug, text).
 fn parse_supersede(rest: &str) -> Option<(&str, String, &str)> {
     let (head, text) = rest.split_once('|')?;
     let (old, new) = head.split_once("->")?;
@@ -588,8 +585,8 @@ mod tests {
             text: "ADD semantic ci-cache | ci, cache | CI caches target/ per branch\n\
                    ADD profile me | x | I am the owner\n\
                    ADD semantic Bad Name | x | spaces are not a slug\n\
-                   SUPERSEDE db -> db-16 | postgres 16 since the upgrade\n\
-                   SUPERSEDE nope -> x | no such note\n\
+                   SUPERSEDE semantic/db.md -> db-16 | postgres 16 since the upgrade\n\
+                   SUPERSEDE db -> x | unqualified target\n\
                    ADD procedural release | ship | tag then push\n\
                    garbage"
                 .into(),
@@ -608,7 +605,7 @@ mod tests {
                 duplicates: 0,
                 invalid: 5,
             },
-            "profile, bad slug, unknown target and lines past the fifth are skipped"
+            "profile, bad slug, unqualified target and lines past the fifth are skipped"
         );
         let input = reply.seen.lock().unwrap()[0].clone();
         assert!(

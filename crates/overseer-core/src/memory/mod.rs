@@ -405,6 +405,15 @@ impl Layer {
         Layer::ALL.into_iter().find(|l| l.name() == name)
     }
 
+    /// The store a note lands in when no scope is given: identity and
+    /// how-tos follow the user, everything else stays with the project.
+    pub const fn default_scope(self) -> Scope {
+        match self {
+            Layer::Profile | Layer::Procedural => Scope::User,
+            _ => Scope::Project,
+        }
+    }
+
     /// Minimum autonomy a session needs to write this layer: identity
     /// facts need approval; personal history and how-tos journal a
     /// receipt; world facts are low-risk.
@@ -451,14 +460,39 @@ pub fn layer_bar_for_path(
 pub fn layer_bar_for_input(input: &serde_json::Value) -> crate::perm::Autonomy {
     let field = |k: &str| input.get(k).and_then(serde_json::Value::as_str);
     let layer = if field("op") == Some("forget") {
-        field("name").and_then(|n| {
-            let n = n.split_once(':').map_or(n, |(_, rest)| rest);
-            n.split_once('/').and_then(|(l, _)| Layer::parse(l))
-        })
+        field("name")
+            .and_then(parse_qualified)
+            .map(|(_, layer, _)| layer)
     } else {
         field("layer").and_then(Layer::parse)
     };
     layer.map_or(crate::perm::Autonomy::ActWithApproval, Layer::write_bar)
+}
+
+/// A qualified note name — `scope:layer/name.md` or `layer/name.md`, the
+/// scope then defaulting by layer as in `remember` — as (scope, layer,
+/// rel). The one parser shared by `forget`, distillation SUPERSEDE and the
+/// permission gate, so the gate always judges the note the tool writes.
+pub fn parse_qualified(name: &str) -> Option<(Scope, Layer, String)> {
+    let name = name.trim();
+    let (scope, rel) = match name.split_once(':') {
+        Some((s, rel)) => (Some(Scope::parse(s)?), rel),
+        None => (None, name),
+    };
+    let (layer, file) = rel.split_once('/')?;
+    let layer = Layer::parse(layer)?;
+    let stem = file.strip_suffix(".md")?;
+    let ok = !stem.is_empty()
+        && !stem.starts_with('.')
+        && !stem.contains(['/', '\\', ':'])
+        && !stem.chars().any(char::is_whitespace);
+    ok.then(|| {
+        (
+            scope.unwrap_or(layer.default_scope()),
+            layer,
+            rel.to_string(),
+        )
+    })
 }
 
 /// Prompt legend for the memory segment: layer dirs + header keys.
@@ -2093,6 +2127,36 @@ mod tests {
             "proposals/x.md — y",
         ] {
             assert_eq!(topic_name(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn qualified_names_parse_with_layer_default_scopes() {
+        let q = |n: &str| parse_qualified(n).map(|(s, l, r)| (s.name(), l.name(), r));
+        assert_eq!(
+            q("semantic/db.md"),
+            Some(("project", "semantic", "semantic/db.md".into()))
+        );
+        assert_eq!(
+            q("procedural/fmt.md"),
+            Some(("user", "procedural", "procedural/fmt.md".into()))
+        );
+        assert_eq!(
+            q("user:semantic/db.md"),
+            Some(("user", "semantic", "semantic/db.md".into()))
+        );
+        for bad in [
+            "db",
+            "db.md",
+            "semantic/db",
+            "semantic/.md",
+            "semantic/a/db.md",
+            "other/db.md",
+            "team:semantic/db.md",
+            "semantic/my note.md",
+            "proposals/db.md",
+        ] {
+            assert_eq!(q(bad), None, "{bad}");
         }
     }
 

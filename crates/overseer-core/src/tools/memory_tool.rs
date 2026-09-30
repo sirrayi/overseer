@@ -27,9 +27,9 @@ pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "memory".into(),
         description: concat!(
-            "Long-term memory across sessions (user + this project). search {query}; ",
+            "Long-term memory across sessions (user + project). search {query}; ",
             "get {name}; remember {text, layer, name?, cues?, scope?, trigger?}; ",
-            "forget {name, text=reason}."
+            "forget {name=layer/n.md, text=reason}."
         )
         .into(),
         input_schema: schema(
@@ -302,8 +302,7 @@ impl MemoryState {
             .and_then(|l| Layer::parse(l).ok_or("unknown `layer`"))?;
         let scope = match field("scope") {
             Some(s) => Scope::parse(s).ok_or("`scope` is user or project")?,
-            None if matches!(layer, Layer::Profile | Layer::Procedural) => Scope::User,
-            None => Scope::Project,
+            None => layer.default_scope(),
         };
         let dir = self
             .dir(scope)
@@ -429,9 +428,7 @@ impl MemoryState {
             return Err("needs `name` and `reason`".into());
         }
         let idx = fresh(&mut self.index, &self.stores, now);
-        let d = idx
-            .find(name)
-            .ok_or_else(|| format!("no current note named `{name}`"))?;
+        let d = idx.resolve_qualified(name)?;
         let (id, path) = (d.id(), d.path.clone());
         let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let mut text = crate::memory::set_meta_key(&text, "valid_to", &crate::memory::rfc3339(now));
@@ -692,6 +689,53 @@ mod tests {
             call(&mut st, json!({"op": "forget", "name": "old"})).is_error,
             "reason required"
         );
+    }
+
+    /// `forget` takes `scope:layer/name.md` or `layer/name.md` (scope by
+    /// layer default); anything else is rejected with the candidates.
+    #[test]
+    fn forget_needs_a_qualified_name() {
+        let (mut st, _, project) = state("qualified");
+        for (scope, layer) in [("project", "semantic"), ("user", "procedural")] {
+            call(
+                &mut st,
+                json!({"op": "remember", "layer": layer, "scope": scope, "name": "old", "text": format!("{layer} kiwi")}),
+            );
+        }
+        for bad in ["old", "old.md", "project:old.md", "bogus:semantic/old.md"] {
+            st.writes = 0;
+            let out = call(&mut st, json!({"op": "forget", "name": bad, "text": "r"}));
+            assert!(out.is_error, "{bad}: {}", out.text);
+            assert!(
+                out.text.contains("not qualified")
+                    && out
+                        .text
+                        .contains("candidates: user:procedural/old.md, project:semantic/old.md"),
+                "{bad}: {}",
+                out.text
+            );
+        }
+        let out = call(
+            &mut st,
+            json!({"op": "forget", "name": "user:semantic/old.md", "text": "r"}),
+        );
+        assert!(
+            out.is_error && out.text.contains("no current note named"),
+            "{}",
+            out.text
+        );
+        let out = call(
+            &mut st,
+            json!({"op": "forget", "name": "semantic/old.md", "text": "r"}),
+        );
+        assert!(
+            out.text.contains("forgot project:semantic/old.md"),
+            "{}",
+            out.text
+        );
+        assert!(std::fs::read_to_string(project.join("semantic/old.md"))
+            .unwrap()
+            .contains("forgotten: r"));
     }
 
     #[test]

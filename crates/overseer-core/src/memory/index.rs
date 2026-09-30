@@ -376,6 +376,36 @@ impl Index {
             })
     }
 
+    /// The current note a qualified name ([`super::parse_qualified`])
+    /// names. An unqualified or unknown name is an error listing the
+    /// qualified ids whose file name matches.
+    pub fn resolve_qualified(&self, name: &str) -> Result<&Doc, String> {
+        let found = super::parse_qualified(name).and_then(|(scope, _, rel)| {
+            self.docs.iter().find(|d| d.scope == scope && d.rel == rel)
+        });
+        if let Some(d) = found {
+            return Ok(d);
+        }
+        let stem = name.trim().rsplit(['/', ':']).next().unwrap_or("");
+        let stem = stem.strip_suffix(".md").unwrap_or(stem);
+        let candidates: Vec<String> = self
+            .docs
+            .iter()
+            .filter(|d| d.rel.rsplit('/').next() == Some(&format!("{stem}.md")))
+            .map(Doc::id)
+            .collect();
+        let head = if super::parse_qualified(name).is_some() {
+            format!("no current note named `{name}`")
+        } else {
+            format!("`{name}` is not qualified — use scope:layer/name.md or layer/name.md")
+        };
+        Err(if candidates.is_empty() {
+            head
+        } else {
+            format!("{head}; candidates: {}", candidates.join(", "))
+        })
+    }
+
     /// BM25F over `query`: `(doc, score, matched terms, Σ idf matched)`.
     fn bm25f(&self, query: &[String]) -> HashMap<u32, (f64, usize, f64)> {
         let mut acc: HashMap<u32, (f64, usize, f64)> = HashMap::new();
