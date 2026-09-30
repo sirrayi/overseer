@@ -1,0 +1,20 @@
+---
+source: crates/overseer-tui/tests/snapshots.rs
+expression: picker
+---
+
+
+
+
+
+
+
+
+
+
+› [ago] · s1 · fix the flaky test
+  [ago] · s2 · add a parser
+1 session(s) skipped — unreadable log
+type to filter · ↑↓ · tab preview · enter switch · esc
+❯ ask anything  ·  ↑ panel  ·  ? keys
+ workspace  /repo                       test-model · $0.0000

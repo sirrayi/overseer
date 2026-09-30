@@ -97,6 +97,9 @@ pub enum Overlay {
         /// Git branch per row's cwd (computed once at open — spawning
         /// `git` per frame would stall the picker).
         branches: Vec<Option<String>>,
+        /// Sessions skipped because their log wouldn't parse (S1 rev):
+        /// surfaced as one faint footer line, reasons go to /tmp.
+        skipped: usize,
         sel: usize,
         filter: String,
         /// false = one line per session; true = adds a preview line.

@@ -254,7 +254,20 @@ impl App {
         let Some(root) = self.session_dir.parent().map(|p| p.to_path_buf()) else {
             return;
         };
-        let mut rows = overseer_core::session::list(&root);
+        let (mut rows, warnings) = overseer_core::session::list_with_warnings(&root);
+        if !warnings.is_empty() {
+            // Full reasons stay out of the UI — debug log under /tmp.
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::env::temp_dir().join("overseer-session-warnings.log"))
+            {
+                use std::io::Write;
+                for w in &warnings {
+                    let _ = writeln!(f, "{w}");
+                }
+            }
+        }
         // Current-cwd sessions first (the picker is cwd-scoped by
         // convention, like --continue).
         let cwd = self.cwd.clone();
@@ -263,6 +276,7 @@ impl App {
         self.overlay = Some(Overlay::Sessions {
             rows,
             branches,
+            skipped: warnings.len(),
             sel: 0,
             filter: String::new(),
             wide: false,
@@ -527,6 +541,7 @@ impl App {
             Overlay::Sessions {
                 rows,
                 branches,
+                skipped,
                 sel,
                 filter,
                 wide,
@@ -578,6 +593,12 @@ impl App {
                             theme::dim(),
                         )));
                     }
+                }
+                if *skipped > 0 {
+                    out.push(Line::from(Span::styled(
+                        format!("{skipped} session(s) skipped — unreadable log"),
+                        theme::faint(),
+                    )));
                 }
                 out.push(Line::from(Span::styled(
                     "type to filter · ↑↓ · tab preview · enter switch · esc",

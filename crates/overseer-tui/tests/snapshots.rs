@@ -297,6 +297,30 @@ fn session_picker_filters_and_switches() {
 }
 
 #[test]
+fn session_picker_marks_skipped_corrupt_sessions() {
+    let (mut app, _e, _w, mut term, caps, root) = session_harness();
+    // A sibling session with a corrupt mid-file line — skipped with a
+    // warning; the picker shows one faint footer line (S1 review).
+    let bad = mk_session(&root, "bad1", "/repo", "gone");
+    let path = bad.join("events.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.insert(1, "{\"id\":77,\"garbage");
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    app.submit_text("/sessions");
+    app.step(&mut term, &caps).unwrap();
+    let picker = screen(&term)
+        .replace("0s ·", "[ago] ·")
+        .replace("1s ·", "[ago] ·");
+    assert!(
+        picker.contains("1 session(s) skipped — unreadable log"),
+        "skipped footer:\n{picker}"
+    );
+    insta::assert_snapshot!("session_picker_skipped", picker);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn session_switch_reseeds_transcript() {
     let (mut app, etx, _w, mut term, caps, root) = session_harness();
     etx.send(EngineMsg::SessionSwitched {
