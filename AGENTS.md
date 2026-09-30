@@ -63,7 +63,13 @@ architecture.
   consult is one no-tools call; each run's cap is carved from the
   parent's remaining budget and its spend settles into the parent
   ledger; background results land via SubagentDone notices (max
-  `max_bg_subagents`, default 4, in flight).
+  `max_bg_subagents`, default 4, in flight). Task ids are
+  session-monotonic `task-N` dirs under `subagents/` with a `task.json`
+  sidecar (mode, tier, worktree, cap, spend) that resume reuses. Readers
+  get `readonly` (`read`, `grep`, `glob`, `memory`), verifiers
+  `readonly_with_bash`, writers `core_in` at their worktree; every mode
+  with tools, resumes included, sees memory v2's filtered user/project
+  copies under its task dir with writes denied (`memory_readonly`).
   Rule-of-Two (perm.rs): untrusted-content + sensitive-data latches
   arm the exfil gate (side effects force Ask); tool results enter the
   model view provenance-wrapped. Bash calls run
