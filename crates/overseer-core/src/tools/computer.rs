@@ -665,7 +665,9 @@ fn run_act(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Value, S
             req["text"] = json!(keys);
         }
     }
-    for key in ["text", "button"] {
+    // Named targeting is helper vocabulary: api/name/role ride along
+    // verbatim so the structured/a11y tiers can resolve the act (F4).
+    for key in ["text", "button", "api", "name", "role"] {
         copy_str(input, &mut req, key);
     }
     for key in ["dy", "dx", "to_x", "to_y", "count"] {
@@ -736,6 +738,13 @@ fn run_batch(input: &Value, ctx: &ToolCtx, st: &mut ComputerState) -> Result<Val
         if action == "batch" {
             return Err(format!(
                 "computer: actions[{i}] is a nested batch — not allowed"
+            ));
+        }
+        // A capture's pixels can't ride a batch result envelope.
+        if matches!(action.as_str(), "screenshot" | "zoom") {
+            return Err(format!(
+                "computer: actions[{i}] is a capture — captures can't be batched — call \
+                 screenshot on its own"
             ));
         }
         validate(a).map_err(|e| format!("computer: actions[{i}] — {e}"))?;
@@ -831,8 +840,18 @@ fn validate(input: &Value) -> Result<String, String> {
         "zoom" if !(pair("x1", "y1") && pair("x2", "y2")) => {
             return Err("'zoom' needs the region 'x1','y1','x2','y2'".into());
         }
-        "click" if input.get("element").is_none() && !pair("x", "y") => {
-            return Err("'click' needs an 'element' index or 'x'/'y' coordinates".into());
+        // api/name/role are helper-vocabulary targeting — under a driver
+        // cua::click refuses them with a pointer at element/x,y (F4).
+        "click"
+            if input.get("element").is_none()
+                && !pair("x", "y")
+                && input.get("api").is_none()
+                && input.get("name").is_none()
+                && input.get("role").is_none() =>
+        {
+            return Err(
+                "'click' needs an 'element' index, 'x'/'y' coordinates, or a name/role".into(),
+            );
         }
         "type" if !has_text(input, "text") => {
             return Err("'type' needs 'text'".into());
@@ -1315,6 +1334,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("actions[1]"), "got: {err}");
+        // Captures can't be batched — their pixels would be dropped.
+        let err = run_with(
+            &json!({"action": "batch", "actions": [{"action": "screenshot"}]}),
+            &mut c,
+            &mut st(&backends),
+        )
+        .unwrap_err();
+        assert!(err.contains("captures can't be batched"), "got: {err}");
         // Empty / oversized batches are refused before any backend runs.
         let empty = run_with(
             &json!({"action": "batch", "actions": []}),
@@ -1322,6 +1349,40 @@ mod tests {
             &mut st(&backends),
         );
         assert!(empty.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn named_act_forwards_api_name_and_role_to_the_helper() {
+        // F4: api/name/role are helper vocabulary — they ride the request
+        // verbatim so a11y/structured tiers can resolve named acts.
+        let dir = tmpdir("named");
+        let log = dir.join("req.log");
+        let a11y = helper(
+            &dir,
+            "a11y.sh",
+            &format!(
+                "cat >> {log}\nprintf '%s' '{{\"ok\":true,\"detail\":\"done\"}}'",
+                log = log.display()
+            ),
+        );
+        let backends = Backends {
+            driver: None,
+            structured: None,
+            a11y: Some(a11y),
+            pixel: None,
+        };
+        let mut c = ctx(&dir);
+        run_with(
+            &json!({"action": "click", "api": "App.press", "name": "OK", "role": "button"}),
+            &mut c,
+            &mut st(&backends),
+        )
+        .unwrap();
+        let req: Value =
+            serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
+        assert_eq!(req["api"], "App.press");
+        assert_eq!(req["name"], "OK");
+        assert_eq!(req["role"], "button");
     }
 
     #[test]

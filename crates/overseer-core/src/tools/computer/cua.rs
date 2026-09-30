@@ -836,6 +836,15 @@ fn click(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
         (_, 2) => "double_click",
         _ => "click",
     };
+    // api/name/role are helper vocabulary — the driver addresses by
+    // element token or x/y only (F4).
+    if input.get("element").is_none() && input.get("x").is_none() {
+        return Err(CallErr::Refused(
+            "computer: click by 'api'/'name'/'role' is helper vocabulary — under cua-driver \
+             pass 'element' (from observe) or 'x'/'y'"
+                .into(),
+        ));
+    }
     let mut a = Map::new();
     put(&mut a, "pid", input);
     put(&mut a, "window_id", input);
