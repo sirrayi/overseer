@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::event::Event;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Restore files from the checkpoint manifest only.
@@ -221,17 +223,47 @@ fn resolve_in_workspace(root: &Path, raw: &str) -> Option<PathBuf> {
 fn truncate_log(session_dir: &Path, boundary: u64) -> std::io::Result<u32> {
     let events_path = session_dir.join("events.jsonl");
     let text = std::fs::read_to_string(&events_path)?;
-    let kept: Vec<&str> = text
-        .lines()
+    // Durable-tail rule, same as EventLog::replay: a corrupt NON-final
+    // line refuses the truncate before any change — keeping it would
+    // leave a log resume can never replay. The last non-empty line may
+    // be a torn write and is tolerated.
+    let lines: Vec<&str> = text.lines().collect();
+    let last_nonempty = lines.iter().rposition(|l| !l.trim().is_empty());
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim().is_empty() {
+            continue;
+        }
+        if let Err(e) = serde_json::from_str::<Event>(l) {
+            if Some(i) != last_nonempty {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: corrupt event at line {}: {e}",
+                        events_path.display(),
+                        i + 1
+                    ),
+                ));
+            }
+        }
+    }
+    let kept: Vec<&str> = lines
+        .iter()
         .filter(|l| {
-            serde_json::from_str::<serde_json::Value>(l)
-                .ok()
-                .and_then(|v| v.get("id").and_then(|id| id.as_u64()))
-                .map(|id| id <= boundary)
-                .unwrap_or(true)
+            if l.trim().is_empty() {
+                return true; // blank lines pass through verbatim
+            }
+            match serde_json::from_str::<Event>(l) {
+                Ok(ev) => ev.id <= boundary,
+                // Only the torn final line reaches here (middles were
+                // refused above) — drop it like replay does, so a later
+                // append (summarize's Compaction) can't strand a corrupt
+                // line mid-file.
+                Err(_) => false,
+            }
         })
+        .copied()
         .collect();
-    let dropped = text.lines().count() - kept.len();
+    let dropped = lines.len() - kept.len();
     let tmp = events_path.with_extension("jsonl.tmp");
     std::fs::write(&tmp, kept.join("\n") + "\n")?;
     std::fs::rename(&tmp, &events_path)?;
@@ -336,6 +368,49 @@ mod tests {
         let r = restore(&dir, Some(4), Mode::Conversation).unwrap();
         assert_eq!(r.truncated, 3);
         assert_eq!(r.restored + r.deleted, 0, "no file work");
+        assert_eq!(ids(&dir), vec![1, 2, 3, 4]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S1-review: a corrupt NON-final line refuses the truncate before
+    /// any change — keeping it would leave a log resume can't replay.
+    #[test]
+    fn truncate_refuses_corrupt_middle_line() {
+        let root = tmpdir("corrupt");
+        let dir = mk_session(&root, 3);
+        mk_checkpoint(&dir, 2, Path::new("/tmp/nope"), true);
+        let path = dir.join("events.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.insert(3, "{\"id\":99,\"garbage");
+        let mutated = lines.join("\n") + "\n";
+        std::fs::write(&path, &mutated).unwrap();
+        let e = restore(&dir, Some(2), Mode::Conversation).unwrap_err();
+        assert!(
+            e.to_string().contains("corrupt event at line 4"),
+            "replay-style 1-based line error: {e}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            mutated,
+            "refused before any change"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The durable tail is still tolerated: a torn final line drops out
+    /// like replay, never refuses.
+    #[test]
+    fn truncate_drops_torn_final_line() {
+        let root = tmpdir("torn");
+        let dir = mk_session(&root, 3); // ids 1..7
+        mk_checkpoint(&dir, 4, Path::new("/tmp/nope"), true);
+        let path = dir.join("events.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{text}{{\"id\":99,\"partial\n")).unwrap();
+        let r = restore(&dir, Some(4), Mode::Conversation).unwrap();
+        // 3 events over the boundary + the torn tail = 4 lines dropped.
+        assert_eq!(r.truncated, 4);
         assert_eq!(ids(&dir), vec![1, 2, 3, 4]);
         let _ = std::fs::remove_dir_all(&root);
     }
