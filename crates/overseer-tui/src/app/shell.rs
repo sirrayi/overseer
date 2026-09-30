@@ -30,12 +30,18 @@ pub(crate) fn shell_capture_timeout(
     } else {
         "."
     };
+    use std::os::unix::process::CommandExt as _;
     let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .current_dir(dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // Own process group: dash keeps `sleep`-style children (and any
+        // pipeline) as separate processes, so killing only `sh` orphans
+        // grandchildren that hold the pipe write ends — the reader
+        // joins below would block until they exit on their own.
+        .process_group(0)
         .spawn()?;
     // Reader threads drain the pipes so a chatty child never
     // blocks on a full buffer while we poll try_wait.
@@ -61,6 +67,12 @@ pub(crate) fn shell_capture_timeout(
         match child.try_wait()? {
             Some(status) => break Some(status.code().unwrap_or(-1)),
             None if Instant::now() >= deadline => {
+                // Kill the whole group (pgid == child.id() because of
+                // process_group(0)); ESRCH means it already exited, so
+                // also kill the child itself as a fallback. Once every
+                // group member is dead the pipes EOF and the reader
+                // joins return promptly.
+                unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;

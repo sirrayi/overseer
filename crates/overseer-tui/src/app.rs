@@ -963,6 +963,45 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(3));
     }
 
+    /// Linux/dash keeps `sleep` as a separate child under `sh -c` (and
+    /// pipelines spawn one process per side anywhere); killing only `sh`
+    /// orphans grandchildren that hold the pipe write ends and the
+    /// reader joins block for their full lifetimes. The timeout must
+    /// kill the whole process group.
+    #[test]
+    fn shell_timeout_kills_the_whole_process_group() {
+        let pgid_file = std::env::temp_dir().join(format!("ovw-pgid-{}", std::process::id()));
+        // `$$` is the `sh` pid, which is also the process-group id.
+        let cmd = format!("echo $$ > {}; sleep 30 | cat", pgid_file.display());
+        let t = Instant::now();
+        let (code, out) =
+            shell_capture_timeout(&cmd, ".", Duration::from_secs(1)).unwrap();
+        assert_eq!(code, -1);
+        assert!(out.contains("timed out"));
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "grandchildren pinned the reader joins: {:?}",
+            t.elapsed()
+        );
+        let pgid: i32 = std::fs::read_to_string(&pgid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(&pgid_file);
+        // Brief window for init to reap the SIGKILLed group members.
+        let mut esrch = false;
+        for _ in 0..40 {
+            let rc = unsafe { libc::kill(-pgid, 0) };
+            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                esrch = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(esrch, "process group {pgid} still has live members");
+    }
+
     #[test]
     fn shell_capture_collects_stdout_and_stderr() {
         let (code, out) = shell_capture("echo hi; echo err >&2", "/").unwrap();
