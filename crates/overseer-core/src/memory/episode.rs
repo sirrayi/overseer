@@ -87,7 +87,8 @@ pub fn derive(events: &[Event]) -> Option<Episode> {
     let start = super::rfc3339(start_ms / 1000);
     let date = &start[..10];
     let id8 = crate::tools::memory_tool::id8(id);
-    let first = prompts.first().map_or("", |p| p.trim());
+    let first = super::redact::scrub(prompts.first().map_or("", |p| p.trim()));
+    let first = first.as_ref();
     let one_line = |s: &str, n: usize| -> String {
         s.split_whitespace()
             .collect::<Vec<_>>()
@@ -276,6 +277,9 @@ pub fn distill(
             None
         } else if let Some(rest) = line.strip_prefix("ADD ") {
             parse_add(rest).and_then(|(layer, name, cues, text)| {
+                let text = super::redact::scrub(text);
+                let cues = super::redact::scrub(&cues);
+                let text = text.as_ref();
                 let scope = if layer == Layer::Procedural {
                     Scope::User
                 } else {
@@ -296,6 +300,8 @@ pub fn distill(
             })
         } else if let Some(rest) = line.strip_prefix("SUPERSEDE ") {
             parse_supersede(rest).and_then(|(old, new, text)| {
+                let text = super::redact::scrub(text);
+                let text = text.as_ref();
                 let doc = idx.find(old)?;
                 let layer = doc
                     .layer()
@@ -478,6 +484,20 @@ mod tests {
     }
 
     #[test]
+    fn episode_prompt_is_redacted_before_truncation() {
+        let mut events = session(vec![run_end(3)]);
+        events[1].kind = EventKind::UserInput {
+            text: "deploy with sk-abcdefghijklmnopqrstuvwxyz0123 please".into(),
+        };
+        let ep = derive(&events).unwrap();
+        assert!(!ep.text.contains("sk-abc"), "{}", ep.text);
+        assert!(ep
+            .text
+            .contains("Prompt: deploy with [redacted:api-key] please"));
+        assert!(!ep.title.contains("sk-abc"), "{}", ep.title);
+    }
+
+    #[test]
     fn write_rewrites_in_place_and_points_once() {
         let dir = std::env::temp_dir().join(format!("ov-episode-{}", uuid::Uuid::now_v7()));
         crate::memory::ensure(&dir).unwrap();
@@ -605,6 +625,49 @@ mod tests {
         assert!(
             again.seen.lock().unwrap()[0].contains("### session-b.md")
                 && !again.seen.lock().unwrap()[0].contains("### session-a.md")
+        );
+    }
+
+    #[test]
+    fn distilled_text_is_redacted() {
+        let root = std::env::temp_dir().join(format!("ov-distill-r-{}", uuid::Uuid::now_v7()));
+        let stores = vec![
+            (Scope::User, root.join("user")),
+            (Scope::Project, root.join("project")),
+        ];
+        for (_, d) in &stores {
+            super::super::ensure(d).unwrap();
+        }
+        let project = &stores[1].1;
+        std::fs::write(
+            project.join("semantic/db.md"),
+            "# DB
+postgres 15
+",
+        )
+        .unwrap();
+        super::super::append_pointer(project, "semantic/db.md — DB").unwrap();
+        std::fs::write(
+            project.join("episodic/session-a.md"),
+            "# Session a
+",
+        )
+        .unwrap();
+        let reply = Reply {
+            text: "ADD semantic ci | ci | CI uses token: abcdefgh12345678
+\
+                   SUPERSEDE project:semantic/db.md -> db-16 | dsn secret=pg-pass-0123456789"
+                .into(),
+            seen: Default::default(),
+        };
+        let d = distill(&reply, "small", &stores, 1_790_000_000).unwrap();
+        assert_eq!(d.added.len(), 2, "{d:?}");
+        let ci = std::fs::read_to_string(project.join("semantic/ci.md")).unwrap();
+        let db = std::fs::read_to_string(project.join("semantic/db-16.md")).unwrap();
+        assert!(ci.contains("CI uses [redacted:secret]"), "{ci}");
+        assert!(
+            db.contains("dsn [redacted:secret]") && !db.contains("pg-pass"),
+            "{db}"
         );
     }
 }

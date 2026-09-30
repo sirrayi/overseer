@@ -16,6 +16,7 @@ pub mod activation;
 pub mod episode;
 pub mod index;
 pub mod notice;
+pub mod redact;
 pub mod stores;
 
 pub use stores::{overseer_home, Scope};

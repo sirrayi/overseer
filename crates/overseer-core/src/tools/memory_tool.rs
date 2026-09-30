@@ -292,6 +292,8 @@ impl MemoryState {
         let text = field("text")
             .filter(|t| !t.is_empty())
             .ok_or("needs `text`")?;
+        let scrubbed = crate::memory::redact::scrub(text);
+        let text = scrubbed.as_ref();
         let layer = field("layer")
             .ok_or("needs `layer`")
             .and_then(|l| Layer::parse(l).ok_or("unknown `layer`"))?;
@@ -548,6 +550,38 @@ mod tests {
         assert!(user.join("procedural/run-fmt-before-commit.md").is_file());
         // Each remember recorded a use.
         assert_eq!(activation::load(&project).len(), 2);
+    }
+
+    /// Secrets are scrubbed at write time on every remember path: new
+    /// note, append and quarantined proposal.
+    #[test]
+    fn remember_redacts_secrets_on_every_path() {
+        let (mut st, _, project) = state("redact");
+        let key = "AKIAIOSFODNN7ABCDEFG";
+        call(
+            &mut st,
+            json!({"op": "remember", "layer": "semantic", "name": "aws", "text": format!("deploy key {key}")}),
+        );
+        call(
+            &mut st,
+            json!({"op": "remember", "layer": "semantic", "name": "aws", "text": "rotate: password=hunter2hunter2"}),
+        );
+        let note = std::fs::read_to_string(project.join("semantic/aws.md")).unwrap();
+        assert!(
+            note.contains("[redacted:aws-key]") && note.contains("[redacted:secret]"),
+            "{note}"
+        );
+        assert!(!note.contains(key) && !note.contains("hunter2"), "{note}");
+        st.run(
+            &json!({"op": "remember", "layer": "semantic", "name": "p", "text": format!("x {key}")}),
+            Some("web_fetch"),
+            NOW,
+        );
+        let prop = std::fs::read_to_string(project.join("proposals/p.md")).unwrap();
+        assert!(
+            prop.contains("[redacted:aws-key]") && !prop.contains(key),
+            "{prop}"
+        );
     }
 
     #[test]
