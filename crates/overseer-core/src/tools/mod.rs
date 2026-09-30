@@ -27,6 +27,7 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod mcp_tool;
+pub mod memory_tool;
 pub mod plan;
 pub mod read;
 pub mod repomap;
@@ -179,7 +180,7 @@ struct ReadRecord {
 /// Sorted; `all_core_specs_deny_additional_properties` pins the count to
 /// the registry's spec list. `mcp` is the one name that is not always
 /// resident: the spec exists only when a server is configured (`with_mcp`).
-pub const TOOL_NAMES: [&str; 15] = [
+pub const TOOL_NAMES: [&str; 16] = [
     "bash",
     "computer",
     "diagnostics",
@@ -187,6 +188,7 @@ pub const TOOL_NAMES: [&str; 15] = [
     "glob",
     "grep",
     "mcp",
+    "memory",
     "plan",
     "read",
     "repo_map",
@@ -289,6 +291,9 @@ pub struct ToolRegistry {
     /// — the spec never depends on which is present (D1) — plus the
     /// lazily-spawned cua-driver client when one is configured (D2).
     computer: computer::ComputerState,
+    /// Memory v2 state behind the `memory` tool (and the engine's recall
+    /// and reminder hooks).
+    pub memory: memory_tool::MemoryState,
 }
 
 impl ToolRegistry {
@@ -317,6 +322,7 @@ impl ToolRegistry {
             computer::spec(),
             diagnostics::spec(),
             struct_search::spec(),
+            memory_tool::spec(),
         ];
         specs.retain(|s| !unavailable.iter().any(|(n, _)| *n == s.name));
         specs.sort_by(|a, b| a.name.cmp(&b.name));
@@ -334,6 +340,7 @@ impl ToolRegistry {
             mcp: None,
             unavailable,
             computer: computer::ComputerState::detect(),
+            memory: Default::default(),
         }
     }
 
@@ -342,7 +349,12 @@ impl ToolRegistry {
     /// subagents cannot spawn subagents.
     pub fn readonly(policy: crate::perm::Policy) -> Self {
         let hooks = crate::hooks::load(&policy.root);
-        let specs = vec![read::spec(), grep::spec(), glob::spec()];
+        let specs = vec![
+            read::spec(),
+            grep::spec(),
+            glob::spec(),
+            memory_tool::spec(),
+        ];
         ToolRegistry {
             base_specs: specs.clone(),
             specs,
@@ -356,6 +368,7 @@ impl ToolRegistry {
             mcp: None,
             unavailable: Vec::new(),
             computer: computer::ComputerState::detect(),
+            memory: Default::default(),
         }
     }
 
@@ -379,6 +392,7 @@ impl ToolRegistry {
             mcp: None,
             unavailable: Vec::new(),
             computer: computer::ComputerState::detect(),
+            memory: Default::default(),
         }
     }
 
@@ -608,6 +622,7 @@ impl ToolRegistry {
             "computer" => computer::run(input, ctx, &mut self.computer),
             "diagnostics" => diagnostics::run(input, ctx),
             "struct_search" => struct_search::run(input, ctx),
+            "memory" => memory_tool::run(input, ctx, &mut self.memory, &self.policy),
             // MCP (R1/R4): one op tool over the configured servers. The
             // discovered tool definitions live in the state, never in
             // `specs`; a server is spawned on first use and dropped if it
@@ -624,6 +639,13 @@ impl ToolRegistry {
                 TOOL_NAMES.join(", ")
             )),
         };
+        self.memory.observe(
+            name,
+            input,
+            !out.is_error,
+            &ctx.cwd,
+            crate::memory::now_secs(),
+        );
         // P8-B post_tool_use hooks: annotate (never block) the result so
         // the model sees the flagged property inline. Runs on the RAW text
         // — same ordering rule as the taint latch, which reads below.
@@ -1324,10 +1346,11 @@ mod tests {
     /// Startup-token guard: every resident spec with every optional tool
     /// forced on (plus the `mcp` op tool). Post-trim measurement: 9,886
     /// chars (~2,471 tokens at ~4 chars/token); the S5 computer vocabulary
-    /// grew the computer spec from 1,102 to 1,828 chars. +5% headroom.
+    /// grew the computer spec from 1,102 to 1,828 chars; the memory v2
+    /// `memory` spec adds a measured 546 (10,432). +5% headroom.
     #[test]
     fn resident_tool_specs_stay_within_the_startup_budget() {
-        const POST_TRIM_CHARS: usize = 9_886;
+        const POST_TRIM_CHARS: usize = 10_432;
         let mut reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
         reg.specs.push(mcp_tool::spec());
         for s in &reg.specs {

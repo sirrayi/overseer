@@ -86,6 +86,8 @@ fn sub_cfg(ctx: &ToolCtx, input: &Value, cwd: &Path) -> crate::agent::AgentConfi
     cfg.memory_filter = filter;
     cfg.cwd = cwd.to_path_buf();
     cfg.auto_compact = false; // 20-step ceiling can't fill a window
+    cfg.is_subagent = true;
+    cfg.memory_recall = false;
     cfg
 }
 
@@ -297,10 +299,18 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     } else {
         cfg.memory_dir = None;
     }
+    cfg.user_memory_dir = cfg.user_memory_dir.take().and_then(|user| {
+        filtered_memory_dir(
+            &user,
+            cfg.memory_filter,
+            &subagents_dir.join(format!("{id}.user.filtered")),
+        )
+    });
     let policy = if cfg.full_access {
         crate::perm::Policy::allow_all()
     } else {
         let mut pol = crate::perm::Policy::preset(cfg.policy_preset, sub_cwd.clone());
+        pol.memory_readonly = true;
         // F1: draft gate propagates — a read-mode subagent inherits the
         // parent's persona verdict so unapproved drafts stay closed there too.
         if let Some(parent_cfg) = ctx.agent_config.as_ref() {

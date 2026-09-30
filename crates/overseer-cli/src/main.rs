@@ -66,6 +66,7 @@ fn real_main() -> i32 {
         "consolidate" => cmd::consolidate::cmd_consolidate(rest),
         "stats" => cmd::stats::cmd_stats(rest),
         "mcp" => cmd::mcp::cmd_mcp(rest),
+        "memory" => cmd::memory::cmd_memory(rest),
         "rewind" => cmd::rewind::cmd_rewind(rest),
         "daemon" => cmd::daemon::cmd_daemon(rest),
         "inbox" => cmd::inbox::cmd_inbox(rest),
@@ -96,8 +97,12 @@ fn usage() {
          \x20                             persona interview (P6-5); drafts the\n\
          \x20                             four persona files, --approve makes\n\
          \x20                             them visible and readable\n\
-         \x20 overseer consolidate [FLAGS]    sleep-time dedupe of <cwd>/memory\n\
+         \x20 overseer consolidate [FLAGS]    sleep-time memory pass: dedupe INDEX.md,\n\
+         \x20                             compact uses, distil new episodes\n\
          \x20                             (aux call on --small-model, else --model)\n\
+         \x20 overseer memory where [FLAGS]  print the user and project store paths\n\
+         \x20 overseer memory search <query> [FLAGS]\n\
+         \x20                             ranked memory hits, as the memory tool\n\
          \x20 overseer stats <session-dir>    ledger dashboard (tokens, cache-hit, cost)\n\
          \x20 overseer mcp list               MCP servers from ~/.overseer/mcp.json:\n\
          \x20                             spawn each, print the tool names the\n\
@@ -121,7 +126,7 @@ fn usage() {
          \n\
          Every value flag accepts `--flag value` and `--flag=value`.\n\
          \n\
-         FLAGS (exec, tui, consolidate):\n\
+         FLAGS (exec, tui, consolidate, memory):\n\
          \x20 --json              Emit the event stream as JSONL on stdout\n\
          \x20 --bare              Hermetic CI mode: --json + throwaway\n\
          \x20                     session in temp dir + no persisted\n\
@@ -160,7 +165,10 @@ fn usage() {
          \x20 --runtime <name>    Pin the bash sandbox backend (P8-C): native |\n\
          \x20                     seatbelt | bubblewrap | gvisor. An unavailable\n\
          \x20                     runtime fails the call instead of downgrading\n\
-         \x20 --memory            Enable file memory at <cwd>/memory\n\
+         \x20 --memory            Legacy project store at <cwd>/memory (file\n\
+         \x20                     tools can write it); memory is otherwise on\n\
+         \x20                     by default under $OVERSEER_HOME (~/.overseer)\n\
+         \x20 --no-memory         No memory: no stores, recall or episodes\n\
          \x20 --autonomy <d=l>    Per-domain autonomy, repeatable (P5-B):\n\
          \x20                     domains internal|external|money|identity;\n\
          \x20                     levels observe|suggest|approve|report|silent\n\

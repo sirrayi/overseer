@@ -76,10 +76,10 @@ pub fn assemble(config: &AgentConfig) -> Vec<SystemSegment> {
     ];
     // Last static slot: the memory index (volatile content, stable position —
     // cache invalidates only from here when the index changes).
-    if let Some(dir) = &config.memory_dir {
+    if let Some(text) = crate::memory::resident_segment(config) {
         segments.push(SystemSegment {
             name: "memory",
-            text: crate::memory::index_segment(dir),
+            text,
             cacheable: true,
         });
     }

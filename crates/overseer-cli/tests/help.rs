@@ -44,3 +44,8 @@ fn daemon_help_prints_usage_and_exits_0() {
 fn tui_help_prints_usage_and_exits_0() {
     assert_help(run(&["tui", "-h"]));
 }
+
+#[test]
+fn memory_help_prints_usage_and_exits_0() {
+    assert_help(run(&["memory", "--help"]));
+}

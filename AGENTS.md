@@ -22,10 +22,29 @@ architecture.
   detector (`stuck.rs`), L4 permission gate (`perm.rs`), deterministic
   compaction (`compact.rs`). `Effort` (min..max) maps per provider;
   `small_model` covers aux calls (consolidation) with escalate-to-main;
-  each stuck trip bumps effort one notch. `memory.rs` is the
-  git-versioned INDEX.md store; `consolidate` dedupes it via a
-  small-tier call and is ADD-only for live pointers (bare `x.md` or
-  layer-qualified `semantic/x.md` — any the model omits are restored).
+  each stuck trip bumps effort one notch. `memory/` is memory v2: two
+  git-versioned stores, user (`$OVERSEER_HOME/memory`, default
+  `~/.overseer`) and project (`…/projects/<slug>-<hash8>/memory`, keyed by
+  the git toplevel found without spawning; `--memory` keeps v1's
+  `<cwd>/memory` instead, `--no-memory`/`--bare` turn memory off). Notes
+  live in five layers (profile/episodic/semantic/procedural/prospective)
+  with an ADD-only INDEX.md each. The resident `memory` op tool
+  (`tools/memory_tool.rs`) searches (in-memory BM25F fused by RRF with
+  Petrov activation from `.index/uses.jsonl` and confidence), gets,
+  remembers (≤5 writes per user turn; per-layer write bars in `perm.rs`;
+  under the untrusted latch writes go to `proposals/`, never indexed) and
+  forgets (expires, never deletes). On user input the engine may inject a
+  `MemoryNotice` (recall of ≤3 notes, or a prospective `at:`/`kw:`
+  reminder; `path:` reminders queue to the loop boundary), and each run
+  end rewrites an `episodic/session-…` note derived from the log.
+  Subagents get filtered read-only copies and no recall/reminders/
+  episodes. Under `--full-access`, `Policy::allow_all` skips the memory
+  gate arm and its write bars; the tool itself still refuses subagent
+  writes.
+  `overseer consolidate` dedupes each INDEX via a small-tier call
+  (ADD-only for live pointers — any the model omits are restored),
+  compacts the use journal and distils new episodes into ≤5 validated
+  semantic/procedural notes.
   Prompt caching: Anthropic gets explicit breakpoints on the tools tail,
   the last cacheable system segment, and a rolling one on the last
   eligible block of the last message; OpenAI profiles send
@@ -76,7 +95,7 @@ architecture.
   existing `EventKind` variant must be `#[serde(default)]` so old logs
   replay.
 - arsenal modules (ports kept only where wired — the rest was removed and
-  lives in git history): `memory.rs`; retrieval
+  lives in git history): `memory/`; retrieval
   (`tools/struct_search.rs` — ast-grep + semgrep shell-out); runtime
   selection (`backends.rs` — `SandboxRuntime::parse` + `check_runtime`);
   `cred.rs` (credential broker: sentinels are HMAC-SHA256 under a
