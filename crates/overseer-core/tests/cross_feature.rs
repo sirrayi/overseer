@@ -5,11 +5,15 @@
 //! background subagents stay deterministic.
 
 use overseer_core::agent::{Agent, AgentConfig};
-use overseer_core::event::{rehydrate_messages, Event, EventKind, EventLog};
+#[cfg(feature = "code-mode")]
+use overseer_core::event::rehydrate_messages;
+use overseer_core::event::{Event, EventKind, EventLog};
 use overseer_core::ir::{Block, Usage};
+#[cfg(feature = "code-mode")]
 use overseer_core::ledger::Ledger;
 use overseer_core::provider::{Provider, ProviderError, Request, Response, StopReason};
 use overseer_core::tools::memory_tool::SUBAGENT_DENY;
+#[cfg(feature = "code-mode")]
 use overseer_core::tools::task::done_marker;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -189,6 +193,7 @@ fn task_events(session: &Path, id: &str) -> Vec<Event> {
     EventLog::replay(session.join("subagents").join(id).join("events.jsonl")).unwrap()
 }
 
+#[cfg(feature = "code-mode")]
 fn wait_for(p: &Path) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while !p.exists() && std::time::Instant::now() < deadline {
