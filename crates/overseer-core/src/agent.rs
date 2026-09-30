@@ -748,7 +748,8 @@ impl Agent {
         }
         for text in self.control.take_steer() {
             self.messages.push(Message::user_text(text.clone()));
-            self.emit(EventKind::UserInput { text }, on_event)?;
+            self.emit(EventKind::UserInput { text: text.clone() }, on_event)?;
+            self.memory_notices(Some(&text), on_event)?;
         }
         self.drain_bg_notices(on_event)?;
         self.memory_notices(None, on_event)?;
@@ -3481,6 +3482,52 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A steered input runs the same memory hook as a turn's input:
+    /// recall lands right after its UserInput, and resume is identical.
+    #[test]
+    fn steered_input_recalls_and_resumes_identically() {
+        let dir = tmpdir();
+        let cfg = v2_cfg(&dir);
+        let project = cfg.memory_dir.clone().unwrap();
+        note(
+            &project,
+            "semantic/deploy.md",
+            "# Deploy\nstaging deploy uses blue green\n",
+        );
+        let write = calls(vec![call(
+            "w1",
+            "write",
+            serde_json::json!({"path": "f.txt", "content": "x"}),
+        )]);
+        let provider = Arc::new(Mock::new(vec![write, done()]));
+        let session = dir.join("s");
+        let mut agent = Agent::start(provider, cfg, session.clone(), "s".into()).unwrap();
+        let control = crate::control::Control::default();
+        agent.set_control(control.clone());
+        let mut sink = |e: &Event| {
+            if matches!(e.kind, EventKind::ToolCallStart { .. }) {
+                control.steer("the staging deploy");
+            }
+        };
+        agent.run_turn("write a file", &mut sink).unwrap();
+        let events = EventLog::replay(session.join("events.jsonl")).unwrap();
+        let steered = events
+            .iter()
+            .position(
+                |e| matches!(&e.kind, EventKind::UserInput { text } if text.contains("staging")),
+            )
+            .expect("steered UserInput");
+        assert_eq!(
+            notices(&events),
+            [(
+                steered + 1,
+                "recall".into(),
+                vec!["project:semantic/deploy.md".into()]
+            )]
+        );
+        assert_eq!(agent.messages(), rehydrate_messages(&events).as_slice());
     }
 
     /// Recall lands right after the UserInput, the checkpoint is still
