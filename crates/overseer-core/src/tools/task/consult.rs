@@ -61,7 +61,7 @@ fn run(
             message: message.clone(),
         })?;
         log.flush()?;
-        return Ok(Attempt::failed(message));
+        return Ok(Attempt::refused(message));
     }
     let msgs = [Message::user_text(prompt)];
     let req = Request {

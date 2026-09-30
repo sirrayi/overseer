@@ -241,18 +241,43 @@ fn worktree_note(branch: &str, wt: &Path) -> String {
 /// One attempt's result (an agent loop or a consult call).
 pub(super) struct Attempt {
     text: String,
-    outcome: Result<RunOutcome, String>,
+    outcome: Result<RunOutcome, Failure>,
     /// This attempt's spend (its dir's ledger growth).
     cost: f64,
     verdict: Option<verify::Verdict>,
     notes: Vec<String>,
 }
 
+/// An attempt that never produced a run outcome.
+#[derive(Debug)]
+pub(super) enum Failure {
+    Error(String),
+    /// Refused before any call because it could exceed its cap: a bigger
+    /// tier would only cost more, so this never escalates.
+    CapRefused(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Error(m) | Failure::CapRefused(m) => f.write_str(m),
+        }
+    }
+}
+
 impl Attempt {
     fn failed(e: String) -> Self {
+        Self::ending(Failure::Error(e))
+    }
+
+    fn refused(e: String) -> Self {
+        Self::ending(Failure::CapRefused(e))
+    }
+
+    fn ending(f: Failure) -> Self {
         Attempt {
             text: String::new(),
-            outcome: Err(e),
+            outcome: Err(f),
             cost: 0.0,
             verdict: None,
             notes: Vec::new(),
@@ -260,7 +285,7 @@ impl Attempt {
     }
 }
 
-fn status(o: &Result<RunOutcome, String>) -> &'static str {
+fn status(o: &Result<RunOutcome, Failure>) -> &'static str {
     match o {
         Ok(RunOutcome::Completed { .. }) => "completed",
         Ok(RunOutcome::StepBudgetExceeded { .. }) => "max_steps",
@@ -270,17 +295,18 @@ fn status(o: &Result<RunOutcome, String>) -> &'static str {
         Ok(RunOutcome::VerifyFailed { .. }) => "verify_failed",
         Ok(RunOutcome::Interrupted { .. }) => "interrupted",
         Ok(RunOutcome::Provider(_)) => "provider_error",
-        Err(_) => "error",
+        Err(Failure::CapRefused(_)) => "refused",
+        Err(Failure::Error(_)) => "error",
     }
 }
 
 /// Endings a stronger model might get past.
-fn escalation_reason(o: &Result<RunOutcome, String>) -> Option<&'static str> {
+fn escalation_reason(o: &Result<RunOutcome, Failure>) -> Option<&'static str> {
     match o {
         Ok(RunOutcome::StepBudgetExceeded { .. }) => Some("step cap"),
         Ok(RunOutcome::Stuck { .. }) => Some("stuck"),
         Ok(RunOutcome::EmptyResponse { .. }) => Some("empty response"),
-        Ok(RunOutcome::Provider(_)) | Err(_) => Some("run error"),
+        Ok(RunOutcome::Provider(_)) | Err(Failure::Error(_)) => Some("run error"),
         _ => None,
     }
 }
@@ -384,7 +410,9 @@ fn run_once(
         Err(e) => return Attempt::failed(format!("cannot start subagent: {e}")),
     };
     let mut sink = |_: &crate::event::Event| {};
-    let outcome = sub.run_turn(&first, &mut sink).map_err(|e| e.to_string());
+    let outcome = sub
+        .run_turn(&first, &mut sink)
+        .map_err(|e| Failure::Error(e.to_string()));
     let text = sub.messages().last().map(|m| m.text()).unwrap_or_default();
     drop(sub);
     let mut a = Attempt {
@@ -1718,6 +1746,31 @@ mod tests {
             &mut c,
         );
         assert!(out.is_error && out.text.contains("background is refused"));
+    }
+
+    /// A consult refused for its cap never ran; a bigger tier would only
+    /// be dearer, so it must not escalate.
+    #[test]
+    fn consult_cap_refusal_does_not_escalate() {
+        let dir = tmpdir();
+        let (mut c, mock) = ctx_with(&dir, vec![done_text("advice")], cfg(&dir));
+        let out = run(
+            &json!({"prompt": "q", "mode": "consult", "tier": "light", "max_cost_usd": 0.01}),
+            &mut c,
+        );
+        assert!(out.text.contains("above its $0.0100 cap"), "{}", out.text);
+        assert!(!out.text.contains("escalated"), "{}", out.text);
+        assert_eq!(Footer::parse(&out.text).unwrap().status, "refused");
+        assert!(mock.seen.lock().unwrap().is_empty(), "no call made");
+        assert!(!dir.join("session/subagents/task-1-r1").exists());
+        assert_eq!(
+            escalation_reason(&Err(Failure::CapRefused("x".into()))),
+            None
+        );
+        assert_eq!(
+            escalation_reason(&Err(Failure::Error("x".into()))),
+            Some("run error")
+        );
     }
 
     #[test]
