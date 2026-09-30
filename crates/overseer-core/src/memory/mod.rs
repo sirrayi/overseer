@@ -1530,6 +1530,18 @@ pub(crate) fn pointer_title(text: &str) -> String {
 }
 
 /// `base`, else the first free `base-2`, `base-3`, … among `dir/*.md`.
+/// Lowercase hex of `sha256(bytes)`, first `n` chars.
+pub(crate) fn sha_hex(bytes: &[u8], n: usize) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        .chars()
+        .take(n)
+        .collect()
+}
+
 pub(crate) fn unique_name(dir: &Path, base: &str) -> String {
     let mut name = base.to_string();
     let mut n = 1;

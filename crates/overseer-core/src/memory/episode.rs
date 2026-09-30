@@ -143,8 +143,24 @@ pub fn write(dir: &Path, events: &[Event]) -> std::io::Result<Option<String>> {
 const DISTILL_INPUT_MAX: usize = 12_000;
 /// Reply lines the engine will consider; later lines count as invalid.
 const DISTILL_LINES_MAX: usize = 5;
-/// Epoch-seconds mtime of the newest episode already distilled.
-pub const LAST_CONSOLIDATE: &str = ".index/last_consolidate";
+/// Distillation ledger: one `rel<TAB>sha256(body)[..12]` line per episode
+/// already distilled; an episode is distilled again only when its body
+/// hash changes.
+pub const DISTILLED: &str = ".index/distilled";
+
+fn body_hash(text: &str) -> String {
+    let body = super::parse_meta(text).map_or_else(|_| text.to_string(), |(_, b)| b);
+    super::sha_hex(body.as_bytes(), 12)
+}
+
+fn read_ledger(project: &Path) -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(project.join(DISTILLED))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(r, h)| (r.to_string(), h.to_string()))
+        .collect()
+}
 
 /// What one distillation pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -157,7 +173,7 @@ pub struct Distilled {
     pub invalid: usize,
 }
 
-/// Distil the project store's episodes newer than [`LAST_CONSOLIDATE`]
+/// Distil the project store's episodes not yet in [`DISTILLED`] (by body)
 /// into at most five validated semantic/procedural notes: one small-model
 /// call whose reply lines must be `ADD <semantic|procedural> <name> |
 /// <cues> | <text>` or `SUPERSEDE <existing-name> -> <new-name> | <text>`.
@@ -175,20 +191,22 @@ pub fn distill(
     else {
         return Ok(Distilled::default());
     };
-    let since: u64 = std::fs::read_to_string(project.join(LAST_CONSOLIDATE))
-        .ok()
-        .and_then(|t| t.trim().parse().ok())
-        .unwrap_or(0);
-    let mut fresh: Vec<(u64, String, String)> = std::fs::read_dir(project.join("episodic"))
+    let mut ledger = read_ledger(project);
+    let mut fresh: Vec<(u64, String, String, String)> = std::fs::read_dir(project.join("episodic"))
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".md") {
+                return None;
+            }
             let mtime = e.metadata().ok()?.modified().ok()?;
             let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
             let text = std::fs::read_to_string(e.path()).ok()?;
-            (name.ends_with(".md") && secs > since).then_some((secs, name, text))
+            let hash = body_hash(&text);
+            let rel = format!("episodic/{name}");
+            (ledger.get(&rel) != Some(&hash)).then_some((secs, name, text, hash))
         })
         .collect();
     fresh.sort();
@@ -213,15 +231,22 @@ pub fn distill(
          == EXISTING NOTES ==\n{existing}== EPISODES ==\n"
     );
     let mut used = Vec::new();
-    for (secs, name, text) in &fresh {
+    let mut chars = input.chars().count();
+    for (_, name, text, hash) in &fresh {
         let block = format!("### {name}\n{text}\n");
-        if !used.is_empty() && input.chars().count() + block.chars().count() > DISTILL_INPUT_MAX {
-            break;
+        let n = block.chars().count();
+        if chars + n > DISTILL_INPUT_MAX {
+            if !used.is_empty() {
+                break;
+            }
+            // The one bounded cut: the first episode always goes in, clipped.
+            input.extend(block.chars().take(DISTILL_INPUT_MAX.saturating_sub(chars)));
+        } else {
+            input.push_str(&block);
         }
-        input.push_str(&block);
-        used.push((*secs, name.as_str()));
+        chars += n;
+        used.push((name.as_str(), hash.as_str()));
     }
-    let input: String = input.chars().take(DISTILL_INPUT_MAX).collect();
     let msgs = [crate::ir::Message::user_text(input)];
     let req = crate::provider::Request {
         model,
@@ -245,7 +270,7 @@ pub fn distill(
             _ => None,
         })
         .collect();
-    let names: Vec<&str> = used.iter().map(|(_, n)| *n).collect();
+    let names: Vec<&str> = used.iter().map(|(n, _)| *n).collect();
     let meta = |cues: &str| {
         let mut m = format!(
             "provenance: consolidate:{}\nconfidence: 0.6\n",
@@ -330,10 +355,13 @@ pub fn distill(
             out.invalid += 1;
         }
     }
-    if let Some((secs, _)) = used.last() {
+    if !used.is_empty() {
+        for (name, hash) in &used {
+            ledger.insert(format!("episodic/{name}"), (*hash).to_string());
+        }
+        let lines: String = ledger.iter().map(|(r, h)| format!("{r}\t{h}\n")).collect();
         crate::harden::ensure_private_dir(&project.join(".index")).map_err(|e| e.to_string())?;
-        std::fs::write(project.join(LAST_CONSOLIDATE), secs.to_string())
-            .map_err(|e| e.to_string())?;
+        std::fs::write(project.join(DISTILLED), lines).map_err(|e| e.to_string())?;
     }
     Ok(out)
 }
@@ -626,6 +654,53 @@ mod tests {
             again.seen.lock().unwrap()[0].contains("### session-b.md")
                 && !again.seen.lock().unwrap()[0].contains("### session-a.md")
         );
+    }
+
+    /// Resume rewrites the episode with identical bytes (new mtime): the
+    /// body hash is already in the ledger, so consolidate does not distil
+    /// it again; a changed body is distilled once more.
+    #[test]
+    fn distill_once_per_episode_body_across_rewrites() {
+        let root = std::env::temp_dir().join(format!("ov-distill-l-{}", uuid::Uuid::now_v7()));
+        let stores = vec![
+            (Scope::User, root.join("user")),
+            (Scope::Project, root.join("project")),
+        ];
+        for (_, d) in &stores {
+            super::super::ensure(d).unwrap();
+        }
+        let project = &stores[1].1;
+        let reply = Reply {
+            text: "---INDEX---\n# Memory Index\n---INDEX---".into(),
+            seen: Default::default(),
+        };
+        let distills = || {
+            reply
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.starts_with("Distil durable facts"))
+                .count()
+        };
+        let live = session(vec![run_end(3)]);
+        let rel = write(project, &live).unwrap().unwrap();
+        crate::memory::consolidate_stores(&reply, "small", &stores, 1_790_000_000).unwrap();
+        assert_eq!(distills(), 1);
+        let ledger = std::fs::read_to_string(project.join(DISTILLED)).unwrap();
+        let hash = body_hash(&std::fs::read_to_string(project.join(&rel)).unwrap());
+        assert_eq!(ledger, format!("{rel}\t{hash}\n"));
+        assert_eq!(hash.len(), 12);
+        // Resume: same events → same bytes, fresh mtime.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        write(project, &live).unwrap();
+        crate::memory::consolidate_stores(&reply, "small", &stores, 1_790_000_100).unwrap();
+        assert_eq!(distills(), 1, "unchanged body is never distilled twice");
+        // The session continued: the body changed, so it is distilled once.
+        write(project, &session(vec![run_end(3), run_end(2)])).unwrap();
+        crate::memory::consolidate_stores(&reply, "small", &stores, 1_790_000_200).unwrap();
+        crate::memory::consolidate_stores(&reply, "small", &stores, 1_790_000_300).unwrap();
+        assert_eq!(distills(), 2);
     }
 
     #[test]
