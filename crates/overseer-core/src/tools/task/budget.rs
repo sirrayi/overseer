@@ -47,8 +47,11 @@ struct Inner {
 }
 
 impl Inner {
+    /// Clamped at 0: the subtraction can land a hair below zero from float
+    /// residue (0.3 - (0.1 + 0.2) is -5.55e-17), and a restored overshoot
+    /// (`restore`) puts it below zero outright — neither is money left.
     fn remaining(&self, max_usd: f64) -> f64 {
-        max_usd - self.recorded_usd - self.reserved.values().fold(0.0, |a, b| a + b)
+        (max_usd - self.recorded_usd - self.reserved.values().fold(0.0, |a, b| a + b)).max(0.0)
     }
 }
 
@@ -83,7 +86,7 @@ impl SpendAccount {
         let remaining = g.remaining(self.max_usd);
         let cap = want.min(remaining);
         if cap < floor {
-            return Err(remaining.max(0.0));
+            return Err(remaining);
         }
         *g.reserved.entry(id.to_string()).or_default() += cap;
         Ok(cap)
@@ -140,6 +143,18 @@ impl SpendAccount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remaining_never_goes_negative() {
+        let residue = SpendAccount::new(0.3, 0.1 + 0.2);
+        assert!(0.3 - (0.1 + 0.2) < 0.0, "the residue this guards");
+        assert_eq!(residue.remaining_usd(), 0.0);
+        assert!(residue.remaining_usd().is_sign_positive());
+        assert_eq!(residue.grant("task-1", 0.25, MIN_CAP_USD), Err(0.0));
+        let over = SpendAccount::new(1.0, 0.9);
+        over.restore("task-1", 0.5, MIN_CAP_USD);
+        assert_eq!(over.remaining_usd(), 0.0);
+    }
 
     #[test]
     fn restore_clamps_then_records_the_overshoot() {
