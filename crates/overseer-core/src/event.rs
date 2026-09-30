@@ -133,6 +133,17 @@ pub enum EventKind {
     MemoryUpdated {
         files: Vec<String>,
     },
+    /// Memory v2 engine notice (`kind`: "recall" | "reminder"): `text`
+    /// was injected as user text — rehydrates exactly like `Nudge`.
+    /// `notes` are the `scope:layer/name.md` ids it names.
+    MemoryNotice {
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        notes: Vec<String>,
+        #[serde(default)]
+        text: String,
+    },
     /// A user consent grant was loaded for this session (P6-4): the OAuth
     /// shape's paper trail — who may exercise which scopes until when, and
     /// which human approved it. Audit-only, like `MemoryUpdated`; carries
@@ -244,6 +255,7 @@ pub fn event_type_str(kind: &EventKind) -> &'static str {
         EventKind::Nudge { .. } => "nudge",
         EventKind::Compaction { .. } => "compaction",
         EventKind::MemoryUpdated { .. } => "memory_updated",
+        EventKind::MemoryNotice { .. } => "memory_notice",
         EventKind::ConsentGranted { .. } => "consent_granted",
         EventKind::Error { .. } => "error",
         EventKind::ModelSwitch { .. } => "model_switch",
@@ -551,6 +563,10 @@ pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
                 {
                     continue; // superseded critique: view-only eviction
                 }
+                flush_results(&mut pending_results, &mut messages);
+                messages.push(Message::user_text(text.clone()));
+            }
+            EventKind::MemoryNotice { text, .. } => {
                 flush_results(&mut pending_results, &mut messages);
                 messages.push(Message::user_text(text.clone()));
             }

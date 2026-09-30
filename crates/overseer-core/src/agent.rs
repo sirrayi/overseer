@@ -69,6 +69,15 @@ pub struct AgentConfig {
     /// `task` subagents see only entries at or below this tier (Secret
     /// hidden by default). The parent always sees the full index.
     pub memory_filter: crate::memory::Sensitivity,
+    /// Memory v2 user store (`<overseer home>/memory`); `memory_dir` is
+    /// the project store. None = no user store.
+    pub user_memory_dir: Option<PathBuf>,
+    /// Memory v2 recall: search each user input and inject the admitted
+    /// notes as a `MemoryNotice`.
+    pub memory_recall: bool,
+    /// Set by `task` for subagents: memory is read-only, and recall,
+    /// reminders and the episode note are off.
+    pub is_subagent: bool,
     /// P6-3 credential broker: process-side secret store. The agent
     /// hands it to each turn's ToolCtx for bash injection + result
     /// sanitization. Default-empty (no creds); P6-4 adds persistence.
@@ -216,6 +225,9 @@ impl Default for AgentConfig {
             compact_at: None,
             memory_dir: None,
             memory_filter: crate::memory::Sensitivity::Personal,
+            user_memory_dir: None,
+            memory_recall: true,
+            is_subagent: false,
             broker: crate::cred::Broker::new(),
             keep_tool_results: 5,
             verify_cmd: None,
@@ -386,6 +398,9 @@ impl Agent {
             run_cache_start: crate::ledger::CacheStats::default(),
         };
         if let Some(dir) = agent.config.memory_dir.clone() {
+            crate::memory::ensure(&dir)?;
+        }
+        if let Some(dir) = agent.config.user_memory_dir.clone() {
             crate::memory::ensure(&dir)?;
         }
         // P6-5: the persona dir is seeded as drafts (never overwritten) so
@@ -658,6 +673,7 @@ impl Agent {
             self.messages.push(Message::user_text(text.clone()));
             self.emit(EventKind::Nudge { text }, on_event)?;
         }
+        self.memory_notices(Some(input), on_event)?;
 
         let mut steps = 0u32;
 
@@ -735,6 +751,7 @@ impl Agent {
             self.emit(EventKind::UserInput { text }, on_event)?;
         }
         self.drain_bg_notices(on_event)?;
+        self.memory_notices(None, on_event)?;
 
         if steps >= self.config.max_steps {
             let out = RunOutcome::StepBudgetExceeded {
@@ -1177,12 +1194,40 @@ impl Agent {
         // log-only MemoryUpdated event (never injected into context).
         // The dirty set is captured BEFORE the commit — afterwards the
         // worktree is clean by construction.
-        if let Some(dir) = &self.config.memory_dir.clone() {
-            let files = crate::memory::dirty_files(dir);
-            crate::memory::commit(dir, &format!("turn {steps}"));
-            if !files.is_empty() {
-                self.emit(EventKind::MemoryUpdated { files }, on_event)?;
-            }
+        let mut files = Vec::new();
+        for (scope, dir) in crate::memory::stores::of_config(&self.config) {
+            let dirty = crate::memory::dirty_files(&dir);
+            crate::memory::commit(&dir, &format!("turn {steps}"));
+            files.extend(dirty.into_iter().map(|f| format!("{}:{f}", scope.name())));
+        }
+        if !files.is_empty() {
+            self.emit(EventKind::MemoryUpdated { files }, on_event)?;
+        }
+        Ok(())
+    }
+
+    /// Memory v2 notices at a durable boundary. `Some(input)` (after the
+    /// checkpoint capture): recall plus due `at:`/`kw:` reminders. `None`
+    /// (loop top, after the batch's results were pushed): queued `path:`
+    /// reminders — never mid-batch, so replay groups results identically.
+    fn memory_notices(
+        &mut self,
+        input: Option<&str>,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<()> {
+        self.tools.memory.init(&self.config, &self.session_dir);
+        let notices = match input {
+            Some(text) => self.tools.memory.on_input(text, crate::memory::now_secs()),
+            None => self.tools.memory.take_queued(),
+        };
+        for n in notices {
+            self.messages.push(Message::user_text(n.text.clone()));
+            let kind = EventKind::MemoryNotice {
+                kind: n.kind.into(),
+                notes: n.notes,
+                text: n.text,
+            };
+            self.emit(kind, on_event)?;
         }
         Ok(())
     }
@@ -1492,6 +1537,7 @@ impl Agent {
             p.ask_handler = config.ask_handler.clone();
             p.autonomy = config.autonomy.clone();
             p.memory_dir = config.memory_dir.clone();
+            p.memory_readonly = config.is_subagent;
             // P6-5: the draft gate needs the dir and the approval verdict —
             // computed once here so a mid-session `--approve` is a restart
             // (approval is a trust-boundary change, like a preset swap).
@@ -1534,7 +1580,27 @@ impl Agent {
             },
             on_event,
         )?;
-        self.log.flush()
+        self.log.flush()?;
+        self.write_episode();
+        Ok(())
+    }
+
+    /// Memory v2 episode note, rewritten from the log at each run end
+    /// (project store; never in subagents). Best-effort, like the commit.
+    fn write_episode(&self) {
+        let Some(dir) = self
+            .config
+            .memory_dir
+            .as_deref()
+            .filter(|_| !self.config.is_subagent)
+        else {
+            return;
+        };
+        if let Ok(events) = EventLog::replay(self.log.path()) {
+            if let Ok(Some(_)) = crate::memory::episode::write(dir, &events) {
+                crate::memory::commit(dir, "episode");
+            }
+        }
     }
 }
 
@@ -2144,10 +2210,11 @@ mod tests {
             .any(|e| matches!(&e.kind, EventKind::UserInput { text } if text.contains("needle"))));
 
         // Quarantine: the read-only registry has exactly the read tools —
-        // no write/bash/task, so a subagent can neither mutate nor recurse.
+        // no write/bash/task, so a subagent can neither mutate nor recurse
+        // (`memory` is search/get-only there: the gate denies writes).
         let ro = crate::tools::ToolRegistry::readonly(crate::perm::Policy::allow_all());
         let names: Vec<&str> = ro.specs.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["read", "grep", "glob"]);
+        assert_eq!(names, ["read", "grep", "glob", "memory"]);
     }
 
     /// P6-2 accept (Secret hidden from subagent view): parent memory with
@@ -3359,5 +3426,248 @@ mod tests {
             keys.iter().all(|k| k.as_deref() == Some("sess-42")),
             "{keys:?}"
         );
+    }
+
+    /// Memory v2 config: home-style user + project stores outside `cwd`.
+    fn v2_cfg(dir: &std::path::Path) -> AgentConfig {
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let (user, project) = (
+            dir.join("home/memory"),
+            dir.join("home/projects/ws-0/memory"),
+        );
+        crate::memory::ensure(&user).unwrap();
+        crate::memory::ensure(&project).unwrap();
+        AgentConfig {
+            cwd: ws,
+            full_access: true,
+            memory_dir: Some(project),
+            user_memory_dir: Some(user),
+            ..AgentConfig::default()
+        }
+    }
+
+    fn note(store: &std::path::Path, rel: &str, text: &str) {
+        std::fs::write(store.join(rel), text).unwrap();
+        crate::memory::append_pointer(store, &format!("{rel} — note")).unwrap();
+    }
+
+    fn call(id: &str, name: &str, input: serde_json::Value) -> Block {
+        Block::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input,
+        }
+    }
+
+    fn calls(blocks: Vec<Block>) -> Response {
+        Response {
+            blocks,
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        }
+    }
+
+    fn notices(events: &[Event]) -> Vec<(usize, String, Vec<String>)> {
+        events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match &e.kind {
+                EventKind::MemoryNotice { kind, notes, .. } => {
+                    Some((i, kind.clone(), notes.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Recall lands right after the UserInput, the checkpoint is still
+    /// named after the input's id, a note is recalled once per session,
+    /// and the resumed view is byte-identical.
+    #[test]
+    fn recall_follows_the_checkpoint_and_resumes_identically() {
+        let dir = tmpdir();
+        let cfg = v2_cfg(&dir);
+        let project = cfg.memory_dir.clone().unwrap();
+        note(
+            &project,
+            "semantic/deploy.md",
+            "# Deploy\nstaging deploy uses blue green\n",
+        );
+        let write = calls(vec![call(
+            "w1",
+            "write",
+            serde_json::json!({"path": "f.txt", "content": "x"}),
+        )]);
+        let provider = Arc::new(Mock::new(vec![write, done(), done()]));
+        let session = dir.join("s");
+        let mut agent = Agent::start(provider, cfg, session.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        agent.run_turn("the staging deploy", &mut sink).unwrap();
+        let events = EventLog::replay(session.join("events.jsonl")).unwrap();
+        let input = events
+            .iter()
+            .position(|e| matches!(e.kind, EventKind::UserInput { .. }))
+            .unwrap();
+        let got = notices(&events);
+        assert_eq!(
+            got,
+            [(
+                input + 1,
+                "recall".into(),
+                vec!["project:semantic/deploy.md".into()]
+            )]
+        );
+        let cp = session
+            .join("checkpoints")
+            .join(format!("e{}", events[input].id));
+        assert!(cp.is_dir(), "checkpoint still named after the UserInput id");
+        assert_eq!(agent.messages(), rehydrate_messages(&events).as_slice());
+
+        agent
+            .run_turn("the staging deploy again", &mut sink)
+            .unwrap();
+        let events = EventLog::replay(session.join("events.jsonl")).unwrap();
+        // The run's own episode note may surface; deploy.md never again.
+        let recalled: Vec<String> = notices(&events).into_iter().flat_map(|n| n.2).collect();
+        assert_eq!(
+            recalled.iter().filter(|n| n.ends_with("deploy.md")).count(),
+            1,
+            "recalled once per session: {recalled:?}"
+        );
+        assert_eq!(agent.messages(), rehydrate_messages(&events).as_slice());
+    }
+
+    /// A path trigger firing mid-batch is queued to the loop boundary:
+    /// one tool_results message, then the reminder; resume is identical;
+    /// the note fires once.
+    #[test]
+    fn path_reminder_waits_for_the_batch_and_fires_once() {
+        let dir = tmpdir();
+        let cfg = v2_cfg(&dir);
+        let project = cfg.memory_dir.clone().unwrap();
+        std::fs::create_dir_all(cfg.cwd.join("docs")).unwrap();
+        std::fs::write(cfg.cwd.join("docs/a.md"), "hello\n").unwrap();
+        note(
+            &project,
+            "prospective/docs.md",
+            "---\ntrigger: path:docs/*.md\n---\nbump the docs version\n",
+        );
+        let batch = || {
+            calls(vec![
+                call("r1", "read", serde_json::json!({"path": "docs/a.md"})),
+                call("b1", "bash", serde_json::json!({"command": "echo hi"})),
+            ])
+        };
+        let again = calls(vec![call(
+            "r2",
+            "read",
+            serde_json::json!({"path": "docs/a.md", "offset": 1}),
+        )]);
+        let provider = Arc::new(Mock::new(vec![batch(), again, done()]));
+        let session = dir.join("s");
+        let mut agent = Agent::start(provider, cfg, session.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        agent.run_turn("go", &mut sink).unwrap();
+        let events = EventLog::replay(session.join("events.jsonl")).unwrap();
+        let got = notices(&events);
+        assert_eq!(got.len(), 1, "fires exactly once: {got:?}");
+        assert_eq!(
+            (got[0].1.as_str(), got[0].2.as_slice()),
+            (
+                "reminder",
+                ["project:prospective/docs.md".to_string()].as_slice()
+            )
+        );
+        let results: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.kind, EventKind::ToolResult { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(results[1] < got[0].0, "after the whole batch");
+        assert_eq!(agent.messages(), rehydrate_messages(&events).as_slice());
+        let text = std::fs::read_to_string(project.join("prospective/docs.md")).unwrap();
+        assert!(text.contains("\nfired: "), "{text}");
+    }
+
+    /// The episode note is written at run end from the log — only past
+    /// the threshold, never in subagents.
+    #[test]
+    fn episode_note_at_run_end() {
+        for (sub, turns, want) in [(false, 3, true), (false, 1, false), (true, 3, false)] {
+            let dir = tmpdir();
+            let mut cfg = v2_cfg(&dir);
+            cfg.is_subagent = sub;
+            let project = cfg.memory_dir.clone().unwrap();
+            let mut script: Vec<Response> = (1..turns).map(tool_turn).collect();
+            script.push(done());
+            let mut agent =
+                Agent::start(Arc::new(Mock::new(script)), cfg, dir.join("s"), "s".into()).unwrap();
+            agent.run_turn("do it", &mut |_: &Event| {}).unwrap();
+            let episodes = std::fs::read_dir(project.join("episodic")).unwrap().count();
+            assert_eq!(episodes == 1, want, "sub={sub} turns={turns}");
+        }
+    }
+
+    /// A spawned subagent sees filtered copies of BOTH stores and can
+    /// search them, but its writes are refused.
+    #[test]
+    fn subagent_memory_covers_both_stores_read_only() {
+        let dir = tmpdir();
+        let mut cfg = v2_cfg(&dir);
+        cfg.full_access = false;
+        let (user, project) = (
+            cfg.user_memory_dir.clone().unwrap(),
+            cfg.memory_dir.clone().unwrap(),
+        );
+        note(&user, "procedural/fmt.md", "# Fmt\nkiwi: run cargo fmt\n");
+        note(
+            &user,
+            "semantic/key.md",
+            "---\nsensitivity: secret\n---\nkiwi sk-live\n",
+        );
+        note(&project, "semantic/ci.md", "# CI\nkiwi pipeline notes\n");
+        let task = calls(vec![call(
+            "t1",
+            "task",
+            serde_json::json!({"prompt": "look", "mode": "read"}),
+        )]);
+        let sub = calls(vec![
+            call(
+                "s1",
+                "memory",
+                serde_json::json!({"op": "search", "query": "kiwi"}),
+            ),
+            call(
+                "s2",
+                "memory",
+                serde_json::json!({"op": "remember", "layer": "semantic", "text": "x"}),
+            ),
+        ]);
+        let provider = Arc::new(Mock::new(vec![task, sub, done(), done()]));
+        let mut agent = Agent::start(provider, cfg, dir.join("s"), "s".into()).unwrap();
+        agent.run_turn("delegate", &mut |_: &Event| {}).unwrap();
+        let log = EventLog::replay(dir.join("s/subagents/task-1/events.jsonl")).unwrap();
+        let outs: Vec<(String, bool)> = log
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ToolResult {
+                    content, is_error, ..
+                } => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert!(outs[0].0.contains("user:procedural/fmt.md"), "{outs:?}");
+        assert!(outs[0].0.contains("project:semantic/ci.md"), "{outs:?}");
+        assert!(!outs[0].0.contains("key.md"), "secret filtered: {outs:?}");
+        assert!(
+            outs[1].1 && outs[1].0.contains(crate::tools::memory_tool::SUBAGENT_DENY),
+            "{outs:?}"
+        );
+        assert!(notices(&log).is_empty(), "no recall in subagents");
+        assert!(!project.join("semantic/x.md").exists());
     }
 }

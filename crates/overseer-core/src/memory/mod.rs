@@ -1,15 +1,24 @@
-//! File-based memory v1 (playbook Ch.3 §9.4).
+//! File-based memory (playbook Ch.3 §9.4; v2 decision record
+//! docs/research/2026-09-30-memory-v2.md).
 //!
-//! `/memory/` is a directory of topic files the agent edits with ordinary
-//! file tools — no special memory tool (the playbook's minimal option).
-//! `INDEX.md` is a ≤25KB file of one-line pointers, injected at the *end of
-//! the static prompt region* (assembled once per session): the index is
-//! always in context, the topic files are read on demand (progressive
-//! disclosure).
+//! A store is a directory of markdown topic files in layer subdirs plus
+//! `INDEX.md` (one-line pointers) and `CORE.md` (always-resident lines).
+//! v2 runs two stores — user and project (`stores`) — behind the `memory`
+//! tool, ranked by BM25F + activation (`index`, `activation`), with
+//! recall and prospective reminders (`notice`) and per-session episode
+//! notes (`episode`). The legacy `--memory` store lives in the workspace
+//! and stays editable with ordinary file tools.
 //!
-//! The dir is git-versioned (Letta MemFS): free history, diffs, rollback.
-//! Commits are engine-made at turn boundaries, not model actions.
-// DEFERRED(owner): ranked retrieval (FTS5 + activation scoring) — prior lexical helpers removed at 51b4adb; see git history
+//! Every store is git-versioned (Letta MemFS): free history, diffs,
+//! rollback. Commits are engine-made at turn boundaries, not model actions.
+
+pub mod activation;
+pub mod episode;
+pub mod index;
+pub mod notice;
+pub mod stores;
+
+pub use stores::{overseer_home, Scope};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -125,6 +134,12 @@ pub struct EntryMeta {
     pub ttl_days: Option<u64>,
     /// Retention class (see `Governance`).
     pub governance: Governance,
+    /// v2 retrieval cues (`cues: a, b`), indexed with a 3× boost.
+    pub cues: Vec<String>,
+    /// v2 prospective trigger (`at:<rfc3339>`, `kw:<a,b>`, `path:<glob>`).
+    pub trigger: Option<String>,
+    /// v2: when the trigger fired (RFC3339). Set once by the engine.
+    pub fired: Option<String>,
 }
 
 impl Default for EntryMeta {
@@ -137,6 +152,9 @@ impl Default for EntryMeta {
             sensitivity: Sensitivity::Personal,
             ttl_days: None,
             governance: Governance::Private,
+            cues: Vec::new(),
+            trigger: None,
+            fired: None,
         }
     }
 }
@@ -145,7 +163,7 @@ impl Default for EntryMeta {
 /// the whole text as body; malformed frontmatter → Err naming the fault.
 /// Range/date/sensitivity validation runs through `validate_meta` so
 /// parse and direct construction share one gate.
-fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
+pub(crate) fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
     let all: Vec<&str> = text.lines().collect();
     if all.first().map(|l| l.trim()) != Some("---") {
         return Ok((EntryMeta::default(), text.to_string()));
@@ -198,6 +216,16 @@ fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
                 })?)
             }
             "governance" => meta.governance = Governance::parse(v)?,
+            "cues" => {
+                meta.cues = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }
+            "trigger" => meta.trigger = Some(v.to_string()).filter(|t| !t.is_empty()),
+            "fired" => meta.fired = Some(v.to_string()).filter(|t| !t.is_empty()),
             // Unknown keys are ignored (forward-compatible headers).
             _ => {}
         }
@@ -229,6 +257,7 @@ fn validate_meta(meta: &EntryMeta) -> Result<(), String> {
     for (name, v) in [
         ("valid_from", &meta.valid_from),
         ("valid_to", &meta.valid_to),
+        ("fired", &meta.fired),
     ] {
         if let Some(s) = v {
             if !valid_rfc3339(s) {
@@ -347,14 +376,17 @@ pub enum Layer {
     Episodic,
     Semantic,
     Procedural,
+    /// Reminders: notes with a `trigger:` that fire once (`notice`).
+    Prospective,
 }
 
 impl Layer {
-    pub const ALL: [Layer; 4] = [
+    pub const ALL: [Layer; 5] = [
         Layer::Profile,
         Layer::Episodic,
         Layer::Semantic,
         Layer::Procedural,
+        Layer::Prospective,
     ];
 
     /// Subdirectory name under the memory dir.
@@ -364,7 +396,12 @@ impl Layer {
             Layer::Episodic => "episodic",
             Layer::Semantic => "semantic",
             Layer::Procedural => "procedural",
+            Layer::Prospective => "prospective",
         }
+    }
+
+    pub fn parse(name: &str) -> Option<Layer> {
+        Layer::ALL.into_iter().find(|l| l.name() == name)
     }
 
     /// Minimum autonomy a session needs to write this layer: identity
@@ -375,6 +412,7 @@ impl Layer {
             Layer::Profile => crate::perm::Autonomy::ActWithApproval,
             Layer::Episodic => crate::perm::Autonomy::ActAndReport,
             Layer::Procedural => crate::perm::Autonomy::ActAndReport,
+            Layer::Prospective => crate::perm::Autonomy::ActAndReport,
             Layer::Semantic => crate::perm::Autonomy::ActSilently,
         }
     }
@@ -405,18 +443,40 @@ pub fn layer_bar_for_path(
     Some(layer.write_bar())
 }
 
+/// Memory v2 write bar for a `memory` remember/forget call: the layer is
+/// the `layer` input (remember) or the target name's `layer/` segment
+/// (forget — `scope:layer/name.md` as search prints it). No recognizable
+/// layer fails closed to the approval bar.
+pub fn layer_bar_for_input(input: &serde_json::Value) -> crate::perm::Autonomy {
+    let field = |k: &str| input.get(k).and_then(serde_json::Value::as_str);
+    let layer = if field("op") == Some("forget") {
+        field("name").and_then(|n| {
+            let n = n.split_once(':').map_or(n, |(_, rest)| rest);
+            n.split_once('/').and_then(|(l, _)| Layer::parse(l))
+        })
+    } else {
+        field("layer").and_then(Layer::parse)
+    };
+    layer.map_or(crate::perm::Autonomy::ActWithApproval, Layer::write_bar)
+}
+
 /// Prompt legend for the memory segment: layer dirs + header keys.
 /// Static bytes (prefix-cache safe); the ≤200B cap is asserted in test.
 const MEMORY_LEGEND: &str = "Layers: profile/ identity, episodic/ events, \
     semantic/ facts, procedural/ how-to. Headers: provenance, confidence 0-1, \
     sensitivity public|personal|secret.";
 
-/// Create the memory dir, its 4 layer subdirs, and seed INDEX.md if
-/// absent. Returns the index path.
+/// Create the store owner-only with its layer subdirs, a `.gitignore`
+/// keeping the derived `.index/` out of history, and a seeded INDEX.md.
+/// Existing files are never overwritten. Returns the index path.
 pub fn ensure(dir: &Path) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
+    crate::harden::ensure_private_dir(dir)?;
     for layer in Layer::ALL {
-        std::fs::create_dir_all(dir.join(layer.name()))?;
+        crate::harden::ensure_private_dir(&dir.join(layer.name()))?;
+    }
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(&ignore, ".index/\n")?;
     }
     let idx = dir.join(INDEX_NAME);
     if !idx.exists() {
@@ -430,15 +490,16 @@ pub fn ensure(dir: &Path) -> std::io::Result<PathBuf> {
 /// name, not by their spelling. An unparseable stamp reads as not expired
 /// — `parse_meta` already refuses one, so only a directly constructed
 /// `EntryMeta` can carry it.
+#[cfg(test)]
 fn meta_expired(meta: &EntryMeta) -> bool {
-    let Some(to) = meta.valid_to.as_deref().and_then(rfc3339_epoch) else {
-        return false;
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    to < now
+    meta_expired_at(meta, now_secs())
+}
+
+fn meta_expired_at(meta: &EntryMeta, now: u64) -> bool {
+    meta.valid_to
+        .as_deref()
+        .and_then(rfc3339_epoch)
+        .is_some_and(|to| to < now)
 }
 
 /// True when the topic body carries a `superseded_by` trailer pointing at
@@ -466,7 +527,7 @@ fn meta_superseded(text: &str) -> bool {
 /// asset renews it, which is the behavior an operator expects from a
 /// "keep this for N days" column. `mtime: None` (stat failed) → not
 /// expired: fail-open on liveness, fail-closed on bodies.
-fn meta_ttl_expired(meta: &EntryMeta, mtime: Option<std::time::SystemTime>) -> bool {
+fn meta_ttl_expired(meta: &EntryMeta, mtime: Option<std::time::SystemTime>, now: u64) -> bool {
     let Some(days) = meta.ttl_days else {
         return false;
     };
@@ -476,10 +537,6 @@ fn meta_ttl_expired(meta: &EntryMeta, mtime: Option<std::time::SystemTime>) -> b
     let Ok(modified) = mtime.duration_since(std::time::UNIX_EPOCH) else {
         return false;
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     modified
         .as_secs()
         .saturating_add(days.saturating_mul(86_400))
@@ -489,13 +546,17 @@ fn meta_ttl_expired(meta: &EntryMeta, mtime: Option<std::time::SystemTime>) -> b
 /// True when an entry's header says it is still current (validity window
 /// and TTL not elapsed, not superseded).
 fn meta_current(meta: &EntryMeta, text: &str, mtime: Option<std::time::SystemTime>) -> bool {
-    if meta_expired(meta) {
-        return false;
-    }
-    if meta_ttl_expired(meta, mtime) {
-        return false;
-    }
-    !meta_superseded(text)
+    meta_current_at(meta, text, mtime, now_secs())
+}
+
+/// [`meta_current`] against an explicit clock (epoch seconds).
+fn meta_current_at(
+    meta: &EntryMeta,
+    text: &str,
+    mtime: Option<std::time::SystemTime>,
+    now: u64,
+) -> bool {
+    !meta_expired_at(meta, now) && !meta_ttl_expired(meta, mtime, now) && !meta_superseded(text)
 }
 
 /// One topic file's parse state — the single scanner every liveness,
@@ -1348,6 +1409,355 @@ pub fn consolidate(
     ))
 }
 
+/// Wall clock as Unix epoch seconds (0 before the epoch).
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `secs` since the epoch as an RFC3339 UTC stamp (`…T…Z`). Inverse of
+/// `rfc3339_epoch` (civil-from-days, Howard Hinnant's algorithm).
+pub(crate) fn rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let sod = secs % 86_400;
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
+}
+
+/// A note's title: its first `# ` heading, else its first non-empty line.
+pub fn title_of(body: &str) -> &str {
+    body.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("# "))
+        .or_else(|| body.lines().map(str::trim).find(|l| !l.is_empty()))
+        .map(str::trim)
+        .unwrap_or("")
+}
+
+/// `[[name]]` link targets in a note body, in order of appearance.
+pub fn links_of(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(i) = rest.find("[[") {
+        rest = &rest[i + 2..];
+        let Some(j) = rest.find("]]") else { break };
+        let target = rest[..j].trim();
+        if !target.is_empty() && !target.contains('\n') {
+            out.push(target);
+        }
+        rest = &rest[j + 2..];
+    }
+    out
+}
+
+/// `text` with frontmatter key `key` set to `value`: an existing line is
+/// replaced, else the line is added before the closing `---` (a file with
+/// no frontmatter gains one). The body is never touched.
+pub(crate) fn set_meta_key(text: &str, key: &str, value: &str) -> String {
+    let line = format!("{key}: {value}");
+    let mut lines: Vec<&str> = text.lines().collect();
+    let close = (lines.first().map(|l| l.trim()) == Some("---"))
+        .then(|| lines.iter().skip(1).position(|l| l.trim() == "---"))
+        .flatten()
+        .map(|i| i + 1);
+    let Some(close) = close else {
+        return format!("---\n{line}\n---\n{text}");
+    };
+    let prefix = format!("{key}:");
+    match lines[1..close]
+        .iter()
+        .position(|l| l.trim_start().starts_with(&prefix))
+    {
+        Some(i) => lines[i + 1] = &line,
+        None => lines.insert(close, &line),
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Append one pointer line to a store's INDEX.md (ADD-only).
+pub(crate) fn append_pointer(dir: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let idx = dir.join(INDEX_NAME);
+    let old = std::fs::read_to_string(&idx).unwrap_or_default();
+    let sep = if old.is_empty() || old.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&idx)?;
+    f.write_all(format!("{sep}{line}\n").as_bytes())
+}
+
+/// Pointer titles are capped so one INDEX line stays one short line.
+pub(crate) const TITLE_MAX: usize = 80;
+
+/// A note's pointer title: [`title_of`], whitespace-collapsed, capped.
+pub(crate) fn pointer_title(text: &str) -> String {
+    title_of(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(TITLE_MAX)
+        .collect()
+}
+
+/// `base`, else the first free `base-2`, `base-3`, … among `dir/*.md`.
+pub(crate) fn unique_name(dir: &Path, base: &str) -> String {
+    let mut name = base.to_string();
+    let mut n = 1;
+    while dir.join(format!("{name}.md")).exists() {
+        n += 1;
+        name = format!("{base}-{n}");
+    }
+    name
+}
+
+/// ADD a new note `layer/<unique base>.md` to store `dir` with frontmatter
+/// lines `meta` (each `\n`-terminated), then append its one pointer line.
+/// Returns the store-relative path.
+pub(crate) fn add_note(
+    dir: &Path,
+    layer: Layer,
+    base: &str,
+    meta: &str,
+    text: &str,
+) -> std::io::Result<String> {
+    let ldir = dir.join(layer.name());
+    crate::harden::ensure_private_dir(&ldir)?;
+    let name = unique_name(&ldir, base);
+    std::fs::write(
+        ldir.join(format!("{name}.md")),
+        format!("---\n{meta}---\n{text}\n"),
+    )?;
+    let rel = format!("{}/{name}.md", layer.name());
+    append_pointer(dir, &format!("{rel} — {}", pointer_title(text)))?;
+    Ok(rel)
+}
+
+/// Consolidate v2 over the resolved stores: per store, v1's index pass
+/// then the use-journal compaction; then one distillation of the project
+/// store's new episodes ([`episode::distill`]); then a commit per store.
+pub fn consolidate_stores(
+    provider: &dyn crate::provider::Provider,
+    model: &str,
+    stores: &[(Scope, PathBuf)],
+    now: u64,
+) -> Result<String, String> {
+    let mut out = Vec::new();
+    for (scope, dir) in stores {
+        let msg = consolidate(provider, model, dir)?;
+        let n = activation::compact(dir).map_err(|e| e.to_string())?;
+        out.push(format!(
+            "{}: {msg}; uses compacted for {n} notes",
+            scope.name()
+        ));
+    }
+    let d = episode::distill(provider, model, stores, now)?;
+    for (_, dir) in stores {
+        commit(dir, "consolidate: distill");
+    }
+    out.push(format!(
+        "distilled {} episodes: {} added, {} superseded, {} duplicate, {} invalid lines skipped",
+        d.episodes,
+        d.added.len(),
+        d.superseded,
+        d.duplicates,
+        d.invalid
+    ));
+    Ok(out.join("\n"))
+}
+
+/// Hard cap on the v2 resident memory segment.
+pub const RESIDENT_CAP: usize = 10_000;
+
+const CONTRACT: &str = "Use the memory tool: search before asking what you may \
+    already know; remember durable facts, preferences and outcomes.";
+
+const EMPTY_RESIDENT: &str = "## Memory\nNo notes yet. Use the memory tool to \
+    remember durable facts, preferences and outcomes across sessions.";
+
+/// The v2 resident segment for `config`, or None when memory is off.
+/// Assembled once per Agent (prompt.rs); see [`resident`].
+pub fn resident_segment(config: &crate::agent::AgentConfig) -> Option<String> {
+    let stores = stores::of_config(config);
+    if stores.is_empty() {
+        return None;
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let legacy = config
+        .memory_dir
+        .as_deref()
+        .filter(|d| canon(d).starts_with(canon(&config.cwd)));
+    let Some(dir) = legacy else {
+        return Some(resident(&stores, now_secs()));
+    };
+    let user: Vec<_> = stores
+        .into_iter()
+        .filter(|(s, _)| *s == Scope::User)
+        .collect();
+    Some(format!(
+        "{}\n\n{}",
+        index_segment(dir),
+        resident(&user, now_secs())
+    ))
+}
+
+/// The resident memory text over `stores` at clock `now`: the contract,
+/// each store's CORE.md (v1 cap and repair note), then every live INDEX
+/// pointer as `scope:layer/name.md — …`, ranked by activation (desc, ties
+/// by name). Hard-capped at [`RESIDENT_CAP`] bytes with a `… N more`
+/// tail. Deterministic: same stores + same `now` →
+/// same bytes. No absolute paths.
+pub fn resident(stores: &[(Scope, PathBuf)], now: u64) -> String {
+    let head = format!("## Memory\n{CONTRACT}");
+    let mut cores = String::new();
+    for (scope, dir) in stores {
+        let core = core_block(dir);
+        if !core.is_empty() {
+            cores.push_str(&core.replacen(
+                "## Memory core",
+                &format!("## {} core", scope.name()),
+                1,
+            ));
+        }
+    }
+    let mut ranked: Vec<(f64, String)> = Vec::new();
+    for (scope, dir) in stores {
+        let uses = activation::load(dir);
+        for (rel, rest) in live_pointers(dir, now) {
+            let mtime = std::fs::metadata(dir.join(&rel))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            let b = activation::base_level(
+                &uses
+                    .get(&rel)
+                    .cloned()
+                    .unwrap_or_else(|| activation::Uses::once(mtime)),
+                now,
+            );
+            let line = if rest.is_empty() {
+                format!("{}:{rel}", scope.name())
+            } else {
+                format!("{}:{rel} {rest}", scope.name())
+            };
+            ranked.push((b, line));
+        }
+    }
+    if ranked.is_empty() && cores.is_empty() {
+        return EMPTY_RESIDENT.to_string();
+    }
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut out = format!("{head}{cores}");
+    if !ranked.is_empty() {
+        out.push_str("\n\n## Memory index");
+    }
+    let total = ranked.len();
+    for (i, (_, line)) in ranked.iter().enumerate() {
+        let more = total - i - 1;
+        let tail = if more == 0 {
+            0
+        } else {
+            format!("\n… {more} more — memory search").len()
+        };
+        if out.len() + 1 + line.len() + tail > RESIDENT_CAP {
+            out.push_str(&format!("\n… {} more — memory search", total - i));
+            break;
+        }
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
+}
+
+/// INDEX pointers of one store as `(resolved rel path, rest of the line)`:
+/// proposals and orphans dropped, first line per topic wins, index order
+/// kept. Liveness is the caller's call.
+pub(crate) fn pointer_lines(dir: &Path) -> Vec<(String, String)> {
+    let index = std::fs::read_to_string(dir.join(INDEX_NAME)).unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in index.lines() {
+        if is_proposal_pointer(line) {
+            continue;
+        }
+        let Some(name) = topic_name(line) else {
+            continue;
+        };
+        let Some(rel) = resolve_pointer(dir, name) else {
+            continue;
+        };
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        let at = line.find(name).map_or(line.len(), |i| i + name.len());
+        let rest = line[at..]
+            .trim_start_matches(['`', '"', '\'', ',', ';'])
+            .trim()
+            .to_string();
+        out.push((rel, rest));
+    }
+    out
+}
+
+/// [`pointer_lines`] whose topic is current at `now` (bare files count;
+/// malformed headers fail closed).
+fn live_pointers(dir: &Path, now: u64) -> Vec<(String, String)> {
+    pointer_lines(dir)
+        .into_iter()
+        .filter(|(rel, _)| match topic_of(dir, rel) {
+            (Topic::Bare(_), _) => true,
+            (Topic::Headed(meta, text), mtime) => meta_current_at(&meta, &text, mtime, now),
+            (Topic::Missing | Topic::Malformed, _) => false,
+        })
+        .collect()
+}
+
+/// The instant a current entry stops being current (earliest of
+/// `valid_to` and the TTL clock), for index invalidation.
+pub(crate) fn expires_at(meta: &EntryMeta, mtime: u64) -> Option<u64> {
+    // `valid_to` is inclusive (expired once strictly past), the TTL is not.
+    let to = meta
+        .valid_to
+        .as_deref()
+        .and_then(rfc3339_epoch)
+        .map(|t| t.saturating_add(1));
+    let ttl = meta
+        .ttl_days
+        .map(|d| mtime.saturating_add(d.saturating_mul(86_400)));
+    to.into_iter().chain(ttl).min()
+}
+
+/// v1 liveness of a parsed entry at clock `now`.
+pub(crate) fn current_at(meta: &EntryMeta, text: &str, mtime: u64, now: u64) -> bool {
+    let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime);
+    meta_current_at(meta, text, Some(mtime), now)
+}
+
 /// letta P1: the `core_block` cap as a reusable pure fn. Under budget
 /// the (trimmed) text rides with no note; over budget the head is cut
 /// on a char boundary (a multibyte char is never split) and rides with
@@ -1377,28 +1787,7 @@ mod tests {
     use super::*;
 
     fn format_utc_stamp(secs: u64) -> String {
-        // Days since epoch → civil date (Howard Hinnant's algorithm), UTC.
-        let days = (secs / 86_400) as i64;
-        let z = days + 719_468;
-        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-        let doe = z - era * 146_097;
-        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = if m <= 2 { y + 1 } else { y };
-        let sod = secs % 86_400;
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            y,
-            m,
-            d,
-            sod / 3600,
-            (sod % 3600) / 60,
-            sod % 60
-        )
+        rfc3339(secs)
     }
 
     fn tmpdir() -> PathBuf {
@@ -2307,5 +2696,81 @@ mod tests {
         assert_eq!(z, off, "the zone offset must shift the epoch");
         assert!(rfc3339_epoch("not-a-date").is_none());
         assert!(rfc3339_epoch("2020-01-02 00:00:00").is_none());
+    }
+
+    fn v2_stores(tag: &str) -> Vec<(Scope, PathBuf)> {
+        let root = tmpdir().join(tag);
+        let stores = vec![
+            (Scope::User, root.join("user")),
+            (Scope::Project, root.join("project")),
+        ];
+        for (_, d) in &stores {
+            ensure(d).unwrap();
+        }
+        stores
+    }
+
+    #[test]
+    fn resident_empty_is_one_short_line() {
+        let r = resident(&v2_stores("empty"), 1_790_000_000);
+        assert_eq!(r, EMPTY_RESIDENT);
+        assert!(r.lines().nth(1).is_some_and(|l| l.len() <= 130), "{r}");
+    }
+
+    #[test]
+    fn resident_is_byte_stable_ordered_and_path_free() {
+        // A fixed clock a month past the files' mtimes: unused notes are
+        // old, the one used at NOW is fresh.
+        let now = now_secs() + 30 * 86_400;
+        let stores = v2_stores("stable");
+        let (user, project) = (&stores[0].1, &stores[1].1);
+        std::fs::write(user.join(CORE_NAME), "prefers terse replies\n").unwrap();
+        std::fs::write(project.join(CORE_NAME), "rust workspace, cargo\n").unwrap();
+        for n in ["a", "b", "c"] {
+            std::fs::write(project.join(format!("semantic/{n}.md")), format!("# {n}\n")).unwrap();
+            append_pointer(project, &format!("semantic/{n}.md — note {n}")).unwrap();
+        }
+        std::fs::write(user.join("profile/me.md"), "# me\n").unwrap();
+        append_pointer(user, "profile/me.md — me").unwrap();
+        activation::record(project, "semantic/c.md", now).unwrap();
+        let a = resident(&stores, now);
+        assert_eq!(a, resident(&stores, now), "same state + clock → same bytes");
+        let user_core = a.find("prefers terse").unwrap();
+        let project_core = a.find("rust workspace").unwrap();
+        let first = a.find("project:semantic/c.md — note c").unwrap();
+        let rest = a.find("project:semantic/a.md — note a").unwrap();
+        assert!(a.starts_with("## Memory\nUse the memory tool"));
+        assert!(
+            user_core < project_core && project_core < first && first < rest,
+            "{a}"
+        );
+        assert!(
+            a.find("project:semantic/b.md").unwrap() > rest,
+            "ties by name"
+        );
+        assert!(a.contains("user:profile/me.md — me"));
+        assert!(
+            !a.contains(&*user.parent().unwrap().to_string_lossy()),
+            "no absolute paths"
+        );
+    }
+
+    #[test]
+    fn resident_caps_at_10k_with_a_more_tail() {
+        let stores = v2_stores("cap");
+        let project = &stores[1].1;
+        for i in 0..400 {
+            std::fs::write(project.join(format!("semantic/n{i:03}.md")), "x\n").unwrap();
+            append_pointer(
+                project,
+                &format!("semantic/n{i:03}.md — {}", "padding ".repeat(5)),
+            )
+            .unwrap();
+        }
+        let r = resident(&stores, 1_790_000_000);
+        assert!(r.len() <= RESIDENT_CAP, "{}", r.len());
+        let tail = r.lines().last().unwrap();
+        let shown = r.lines().filter(|l| l.starts_with("project:")).count();
+        assert_eq!(tail, format!("… {} more — memory search", 400 - shown));
     }
 }

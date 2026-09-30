@@ -10,6 +10,7 @@ pub mod cells;
 pub mod composer;
 pub mod diff;
 pub mod markdown;
+pub mod notice;
 pub mod notify;
 pub mod probe;
 pub mod theme;

@@ -74,6 +74,9 @@ pub(crate) fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConf
         auto_compact: flags.auto_compact,
         compact_at: flags.compact_at,
         memory_dir: flags.memory.then(|| cwd_canonical.join("memory")),
+        user_memory_dir: None,
+        memory_recall: true,
+        is_subagent: false,
         // P6-2: the parent agent sees the full index; the ceiling applies
         // to the quarantined subagent view only.
         memory_filter: overseer_core::memory::Sensitivity::Personal,

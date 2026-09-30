@@ -435,6 +435,11 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
             text: format!("  ⟲ {text}"),
             link: None,
         }]),
+        EventKind::MemoryNotice { kind, notes, text } => Feed::NewCells(vec![Cell::Meta {
+            style: theme::faint(),
+            text: crate::notice::memory_line(kind, notes, text),
+            link: None,
+        }]),
         EventKind::SubagentDone { task_id: id, trace } => Feed::NewCells(vec![Cell::Meta {
             style: theme::meta(),
             // The trace dir goes into the OSC 8 link, not the text.
