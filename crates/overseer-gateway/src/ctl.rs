@@ -97,12 +97,52 @@ impl CtlResponse {
     }
 }
 
+/// `sockaddr_un.sun_path` capacity: 104 on macOS/BSD, 108 on Linux.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub const SUN_PATH_MAX: usize = 104;
+#[cfg(target_os = "linux")]
+pub const SUN_PATH_MAX: usize = 108;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "linux"
+)))]
+pub const SUN_PATH_MAX: usize = 104;
+
+/// `sun_path` is fixed-size; refuse a path that can never bind with a
+/// clear message instead of libc's opaque failure.
+pub fn check_socket_path(path: &std::path::Path) -> std::io::Result<()> {
+    let n = path.as_os_str().len();
+    if n >= SUN_PATH_MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "control socket path too long ({n} bytes > {SUN_PATH_MAX}): {} — set a shorter daemon dir",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Spawn the listener thread. Requests are pushed to `tx` (the daemon
 /// loop owns all state — the socket thread is just plumbing).
 pub fn listen(
     sock_path: PathBuf,
     tx: std::sync::mpsc::Sender<(CtlRequest, std::sync::mpsc::Sender<CtlResponse>)>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
+    check_socket_path(&sock_path)?;
     let _ = std::fs::remove_file(&sock_path);
     let listener = UnixListener::bind(&sock_path)?;
     // Socket is user-only by default on macOS/Linux (0700 dir handles it).
@@ -192,6 +232,23 @@ mod ctl_serde_tests {
         srv.join().unwrap();
         let reply = writer.join().unwrap();
         serde_json::from_str(&reply).unwrap_or_else(|e| panic!("reply {reply:?}: {e}"))
+    }
+
+    /// A daemon dir under a long TMPDIR (the self-hosted runner) must
+    /// fail up front with a nameable cause, not libc's opaque bind error.
+    #[test]
+    fn socket_path_longer_than_sun_path_is_refused_up_front() {
+        let long = std::path::PathBuf::from(format!("/{}", "d".repeat(SUN_PATH_MAX + 10)));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let e = listen(long, tx).unwrap_err().to_string();
+        assert!(e.contains("control socket path too long"), "{e}");
+        assert!(e.contains(&SUN_PATH_MAX.to_string()), "{e}");
+        assert!(e.contains("set a shorter daemon dir"), "{e}");
+        // A path at the limit still refuses — sun_path needs the NUL.
+        let edge = std::path::PathBuf::from(format!("/{}", "d".repeat(SUN_PATH_MAX - 2)));
+        assert!(check_socket_path(&edge).is_ok());
+        let at = std::path::PathBuf::from(format!("/{}", "d".repeat(SUN_PATH_MAX)));
+        assert!(check_socket_path(&at).is_err());
     }
 
     #[test]

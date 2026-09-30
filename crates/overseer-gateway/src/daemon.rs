@@ -804,7 +804,9 @@ pub fn overseer_binary() -> PathBuf {
 mod daemon_pipeline_tests {
     use super::*;
     use crate::config::{GateConfig, SpawnConfig, TriageRule};
-    use crate::test_util::tmpdir;
+    // run() binds the ctl socket — keep the root short enough for
+    // sun_path under any runner TMPDIR.
+    use crate::test_util::short_tmpdir as tmpdir;
     use std::path::PathBuf;
 
     fn journal_records(dir: &std::path::Path) -> Vec<serde_json::Value> {
