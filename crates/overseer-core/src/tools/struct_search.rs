@@ -824,10 +824,7 @@ pub(crate) fn find_on_path(names: &[&str]) -> Option<PathBuf> {
 /// against the process cwd, where a workspace file could pose as a
 /// system binary and get spawned unsandboxed (F1).
 fn find_in_dirs(names: &[&str], dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-    let dirs: Vec<PathBuf> = dirs
-        .into_iter()
-        .filter(|d| d.is_absolute())
-        .collect();
+    let dirs: Vec<PathBuf> = dirs.into_iter().filter(|d| d.is_absolute()).collect();
     for name in names {
         for dir in &dirs {
             let candidate = dir.join(name);
