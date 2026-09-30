@@ -204,6 +204,7 @@ pub fn all(subagents_dir: &Path) -> Vec<(PathBuf, Sidecar)> {
 /// Mark every `running` sidecar owned by another process `dead`, with
 /// whatever its ledger shows; a background task also gets its done
 /// marker so the next drain notices it and its slot frees.
+// DEFERRED(owner): single-process session assumption — two processes on one session dir would reap each other's live tasks and double-settle — gate: multi-process sessions
 pub fn reap_dead(subagents_dir: &Path) {
     for (dir, mut sc) in all(subagents_dir) {
         if sc.state != State::Running || sc.is_live() {
