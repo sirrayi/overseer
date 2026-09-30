@@ -146,8 +146,9 @@ mod tests {
 
     #[test]
     fn remaining_never_goes_negative() {
-        let residue = SpendAccount::new(0.3, 0.1 + 0.2);
-        assert!(0.3 - (0.1 + 0.2) < 0.0, "the residue this guards");
+        let (max, spent) = (std::hint::black_box(0.3), 0.1 + 0.2);
+        assert!(max - spent < 0.0, "the residue this guards");
+        let residue = SpendAccount::new(max, spent);
         assert_eq!(residue.remaining_usd(), 0.0);
         assert!(residue.remaining_usd().is_sign_positive());
         assert_eq!(residue.grant("task-1", 0.25, MIN_CAP_USD), Err(0.0));
