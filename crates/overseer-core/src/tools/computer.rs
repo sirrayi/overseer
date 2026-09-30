@@ -1105,8 +1105,11 @@ mod tests {
         // F1: a relative env path resolves against the agent's cwd — a
         // workspace `./cua-driver` would be spawned unsandboxed.
         let dir = tmpdir("driverenv");
-        let real = dir.join("cua-driver");
-        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("cua-driver"), "#!/bin/sh\n").unwrap();
+        // Canonicalize the expectation: driver_env_path canonicalizes
+        // (no `..`/symlinks), and on macOS the temp dir is /var →
+        // /private/var.
+        let real = dir.join("cua-driver").canonicalize().unwrap();
         let rel = std::path::Path::new(&real)
             .strip_prefix(std::env::current_dir().unwrap())
             .map(|p| p.to_path_buf())
