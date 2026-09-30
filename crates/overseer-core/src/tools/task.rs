@@ -814,6 +814,20 @@ fn spawn(prompt: &str, input: &Value, ctx: &mut ToolCtx) -> Result<String, Strin
     if target.is_some() && (mode != TaskMode::Verify || prior.is_some()) {
         return Err("target applies to a new mode=verify task".into());
     }
+    // An untargeted verify reviews the parent's own tree; in the
+    // background the lead keeps editing it, and the tamper check would
+    // blame the verifier.
+    let in_parent_tree = prior
+        .as_ref()
+        .map_or(target.is_none(), |p| p.worktree.is_none());
+    if mode == TaskMode::Verify && background && in_parent_tree {
+        return Err(
+            "background mode=verify needs a target — an untargeted verify reviews \
+             your working tree while you keep editing it; run it with \
+             background=false, or target a write task"
+                .into(),
+        );
+    }
     // Bounded fan-out — filesystem-derived (sidecars), so it survives
     // resumes and can't drift from actual thread state.
     let limit = parent.max_bg_subagents;
@@ -1530,6 +1544,30 @@ mod tests {
         assert!(first.first_user.contains("[verifier contract]"));
         assert!(first.tools.iter().any(|t| t == "bash"));
         assert!(!first.tools.iter().any(|t| t == "write" || t == "task"));
+    }
+
+    #[test]
+    fn background_verify_of_the_working_tree_is_refused() {
+        let dir = repo();
+        let (mut c, mock) = ctx_with(&dir, vec![pass_json()], cfg(&dir));
+        let out = run(
+            &json!({"prompt": "check", "mode": "verify", "background": true}),
+            &mut c,
+        );
+        assert!(out.is_error);
+        assert!(out.text.contains("needs a target"), "{}", out.text);
+        assert!(mock.seen.lock().unwrap().is_empty(), "nothing ran");
+        let acct = c.subagents.spend.as_ref().unwrap();
+        assert_eq!(acct.reserved_usd(), 0.0, "nothing reserved");
+        // Foreground stays allowed.
+        let out = run(&json!({"prompt": "check", "mode": "verify"}), &mut c);
+        assert!(!out.is_error, "{}", out.text);
+        // A background resume of it would review the same tree.
+        let out = run(
+            &json!({"prompt": "again", "resume": "task-1", "background": true}),
+            &mut c,
+        );
+        assert!(out.text.contains("needs a target"), "{}", out.text);
     }
 
     #[test]
