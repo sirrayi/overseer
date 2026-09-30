@@ -323,10 +323,12 @@ const IDENTITY_MARKERS: &[&str] = &[
 
 /// Classify a tool call into the irreversibility taxonomy (P5-B).
 /// Pure function of (tool, input) — deterministic, zero deps.
-/// P7-1 computer-use arms: `computer` dispatches on `action` —
-/// screenshot observes (Read); click/move/scroll mutate local UI state
-/// (InternalWrite); type/submit/send emit content outward
-/// (ExternalComms); any credential-field focus escalates to Identity.
+/// P7-1/S5 computer-use arms: `computer` dispatches on `action` — the
+/// observation set (apps/windows/observe/screenshot/zoom/verify/browser)
+/// reads (Read); side-effect acts (click/type/key/set/scroll/drag/menu/
+/// launch/browser_click/browser_type) mutate local UI state
+/// (InternalWrite); `navigate` emits a URL outward (ExternalComms — a URL
+/// can exfiltrate); any credential-field focus escalates to Identity.
 /// Unknown actions default up (InternalWrite), never down.
 /// R6 MCP arm: the `mcp` op tool declares its own class — `search` reads
 /// third-party tool *metadata* (Read); `call` runs a third-party tool, which
@@ -357,16 +359,23 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
         {
             return Irreversibility::Identity;
         }
-        if action == "screenshot" || action == "observe" {
+        if [
+            "apps",
+            "windows",
+            "observe",
+            "screenshot",
+            "zoom",
+            "verify",
+            "browser",
+        ]
+        .contains(&action.as_str())
+        {
             return Irreversibility::Read;
         }
-        if ["click", "move", "scroll", "drag", "hover", "focus"].contains(&action.as_str()) {
-            return Irreversibility::InternalWrite;
-        }
-        if ["type", "key", "submit", "send", "paste"].contains(&action.as_str()) {
+        if action == "navigate" {
             return Irreversibility::ExternalComms;
         }
-        return Irreversibility::InternalWrite; // future actions default up
+        return Irreversibility::InternalWrite; // side-effect acts + future actions default up
     }
     match tool {
         t if READ_TOOLS.contains(&t) => Irreversibility::Read,
@@ -794,16 +803,41 @@ impl Policy {
         self.taint.lock().map(|t| t.sensitive).unwrap_or(false)
     }
 
-    /// P7-1 screenshot-context detector: the `computer` screenshot/observe
-    /// action latches regardless of result text (pixels bypass text scan).
+    /// P7-1/S5 observation-context detector: EVERY computer observation
+    /// action (apps/windows/observe/screenshot/zoom/verify/browser)
+    /// latches `untrusted` regardless of result text — screen and page
+    /// content is attacker-controllable, and pixels bypass text scanning
+    /// (D5). A `batch` latches when any member observes.
     fn is_screenshot_context(tool: &str, input: &Value) -> bool {
         if tool != "computer" {
             return false;
         }
-        matches!(
-            input.get("action").and_then(Value::as_str),
-            Some(a) if a.eq_ignore_ascii_case("screenshot") || a.eq_ignore_ascii_case("observe")
-        )
+        let action = input.get("action").and_then(Value::as_str).unwrap_or("");
+        if [
+            "apps",
+            "windows",
+            "observe",
+            "screenshot",
+            "zoom",
+            "verify",
+            "browser",
+        ]
+        .iter()
+        .any(|a| action.eq_ignore_ascii_case(a))
+        {
+            return true;
+        }
+        if action.eq_ignore_ascii_case("batch") {
+            return input
+                .get("actions")
+                .and_then(Value::as_array)
+                .is_some_and(|members| {
+                    members
+                        .iter()
+                        .any(|m| Self::is_screenshot_context("computer", m))
+                });
+        }
+        false
     }
 
     /// Both Rule-of-Two latches are set — the exfil triangle is armed.
@@ -1537,23 +1571,45 @@ mod tests {
             Irreversibility::InternalWrite
         );
         assert_eq!(
-            classify("computer", &json!({"action": "move", "x": 1, "y": 2})),
-            Irreversibility::InternalWrite
+            classify(
+                "computer",
+                &json!({"action": "zoom", "x1": 0, "y1": 0, "x2": 5, "y2": 5})
+            ),
+            Irreversibility::Read
         );
         assert_eq!(
-            classify("computer", &json!({"action": "scroll", "dy": -3})),
-            Irreversibility::InternalWrite
+            classify("computer", &json!({"action": "verify"})),
+            Irreversibility::Read
         );
         assert_eq!(
-            classify("computer", &json!({"action": "type", "text": "hello"})),
-            Irreversibility::ExternalComms
+            classify("computer", &json!({"action": "browser"})),
+            Irreversibility::Read
         );
+        // Side-effect acts mutate local UI state — InternalWrite.
+        for a in [
+            "click",
+            "type",
+            "key",
+            "set",
+            "scroll",
+            "drag",
+            "menu",
+            "launch",
+            "browser_click",
+            "browser_type",
+        ] {
+            assert_eq!(
+                classify("computer", &json!({"action": a})),
+                Irreversibility::InternalWrite,
+                "{a}"
+            );
+        }
+        // A URL can exfiltrate — navigate is ExternalComms.
         assert_eq!(
-            classify("computer", &json!({"action": "submit"})),
-            Irreversibility::ExternalComms
-        );
-        assert_eq!(
-            classify("computer", &json!({"action": "send"})),
+            classify(
+                "computer",
+                &json!({"action": "navigate", "url": "https://x"})
+            ),
             Irreversibility::ExternalComms
         );
         // Credential-field focus escalates to Identity regardless of action.
@@ -1574,21 +1630,52 @@ mod tests {
 
     #[test]
     fn screenshot_context_always_latches_untrusted() {
-        // P7-1: pixels are opaque to text scanning — ANY screenshot context
-        // latches untrusted, even with benign result text.
-        let p = pol();
-        let notice = p.note_result(
-            "computer",
-            &json!({"action": "screenshot"}),
-            "capture ok, 1280x800",
+        // P7-1/S5: pixels and page content are attacker-controllable —
+        // EVERY observation action latches untrusted, even with benign
+        // result text (D5).
+        for action in [
+            "apps",
+            "windows",
+            "observe",
+            "screenshot",
+            "zoom",
+            "verify",
+            "browser",
+        ] {
+            let p = pol();
+            let notice =
+                p.note_result("computer", &json!({"action": action}), "benign result text");
+            assert!(notice.is_some(), "{action} must latch");
+            assert!(p.taint.lock().map(|t| t.untrusted).unwrap_or(false));
+        }
+        // A batch containing an observation member latches too.
+        let pb = pol();
+        assert!(
+            pb.note_result(
+                "computer",
+                &json!({"action": "batch", "actions": [
+                    {"action": "click", "x": 1, "y": 1},
+                    {"action": "windows"},
+                ]}),
+                "batch ok",
+            )
+            .is_some(),
+            "batch with an observation member must latch"
         );
-        assert!(notice.is_some(), "benign screenshot must still latch");
-        assert!(p.taint.lock().map(|t| t.untrusted).unwrap_or(false));
-        // Non-screenshot computer actions with benign text do not latch.
+        // Acts with benign text do not latch.
         let p2 = pol();
         assert!(p2
             .note_result("computer", &json!({"action": "click"}), "clicked ok")
             .is_none());
+        assert!(
+            p2.note_result(
+                "computer",
+                &json!({"action": "batch", "actions": [{"action": "click", "x": 1, "y": 1}]}),
+                "batch ok",
+            )
+            .is_none(),
+            "act-only batch must not latch"
+        );
     }
 
     #[test]
@@ -2269,18 +2356,26 @@ mod tests {
             strict.check("computer", &json!({"action": "click", "x": 1, "y": 2})),
             Verdict::Ask { .. }
         ));
-        // Type is ExternalComms: the outbox default Asks headless.
+        // navigate is ExternalComms (a URL can exfiltrate): the outbox
+        // default Asks headless; internal acts stay allowed.
         assert!(matches!(
-            p.check("computer", &json!({"action": "type", "text": "hi"})),
+            p.check(
+                "computer",
+                &json!({"action": "navigate", "url": "https://x"}),
+            ),
             Verdict::Ask { .. }
         ));
-        // Batch max-class: a benign click beside an exfil type Asks as a whole.
+        assert_eq!(
+            p.check("computer", &json!({"action": "type", "text": "hi"})),
+            Verdict::Allow
+        );
+        // Batch max-class: a benign click beside a navigate Asks as a whole.
         assert!(matches!(
             p.check(
                 "computer",
                 &json!({"action": "batch", "actions": [
                     {"action": "click", "x": 1, "y": 2},
-                    {"action": "type", "text": "hi"},
+                    {"action": "navigate", "url": "https://x"},
                 ]}),
             ),
             Verdict::Ask { .. }
@@ -2308,7 +2403,7 @@ mod tests {
         assert_eq!(
             classify_batch(
                 "computer",
-                &json!({"actions": [{"action": "screenshot"}, {"action": "type", "text": "x"}]}),
+                &json!({"actions": [{"action": "screenshot"}, {"action": "navigate", "url": "https://x"}]}),
             ),
             Irreversibility::ExternalComms
         );

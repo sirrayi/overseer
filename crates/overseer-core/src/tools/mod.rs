@@ -221,9 +221,7 @@ impl Optional {
         let backends = computer::Backends::detect();
         let bins = struct_search::Bins::detect();
         Optional {
-            computer: computer::Tier::ORDER
-                .iter()
-                .any(|t| backends.configured(*t)),
+            computer: backends.any_configured(),
             struct_search: bins.ast_grep.is_some() || bins.semgrep.is_some(),
             diagnostics: struct_search::find_on_path(&["cargo"]).is_some(),
         }
@@ -235,8 +233,9 @@ impl Optional {
         if !self.computer {
             out.push((
                 "computer",
-                "no computer-use helper is configured (set OVERSEER_COMPUTER_STRUCTURED, \
-                 OVERSEER_COMPUTER_A11Y or OVERSEER_COMPUTER_PIXEL to a helper path)",
+                "no computer-use backend is configured (put `cua-driver` on PATH or set \
+                 OVERSEER_COMPUTER_DRIVER; legacy helpers: OVERSEER_COMPUTER_STRUCTURED, \
+                 OVERSEER_COMPUTER_A11Y or OVERSEER_COMPUTER_PIXEL)",
             ));
         }
         if !self.diagnostics {
@@ -286,6 +285,10 @@ pub struct ToolRegistry {
     /// Optional tools this host cannot serve (see [`Optional`]): absent
     /// from the specs and refused at dispatch with the reason.
     unavailable: Vec<(&'static str, &'static str)>,
+    /// Computer-tool state (S5): backends detected once at registry build
+    /// — the spec never depends on which is present (D1) — plus the
+    /// lazily-spawned cua-driver client when one is configured (D2).
+    computer: computer::ComputerState,
 }
 
 impl ToolRegistry {
@@ -330,6 +333,7 @@ impl ToolRegistry {
             mode: None,
             mcp: None,
             unavailable,
+            computer: computer::ComputerState::detect(),
         }
     }
 
@@ -351,6 +355,7 @@ impl ToolRegistry {
             mode: None,
             mcp: None,
             unavailable: Vec::new(),
+            computer: computer::ComputerState::detect(),
         }
     }
 
@@ -373,6 +378,7 @@ impl ToolRegistry {
             mode: None,
             mcp: None,
             unavailable: Vec::new(),
+            computer: computer::ComputerState::detect(),
         }
     }
 
@@ -599,7 +605,7 @@ impl ToolRegistry {
             "skill" => skill::run(input, ctx),
             "repo_map" => repomap::run_map(input, ctx),
             "symbol" => repomap::run_symbol(input, ctx),
-            "computer" => computer::run(input, ctx),
+            "computer" => computer::run(input, ctx, &mut self.computer),
             "diagnostics" => diagnostics::run(input, ctx),
             "struct_search" => struct_search::run(input, ctx),
             // MCP (R1/R4): one op tool over the configured servers. The
@@ -1316,12 +1322,12 @@ mod tests {
     }
 
     /// Startup-token guard: every resident spec with every optional tool
-    /// forced on (plus the `mcp` op tool). Post-trim measurement: 9,160
-    /// chars (~2,290 tokens at ~4 chars/token), down from 10,650 at base;
-    /// +5% headroom.
+    /// forced on (plus the `mcp` op tool). Post-trim measurement: 10,042
+    /// chars (~2,510 tokens at ~4 chars/token); the S5 computer vocabulary
+    /// grew the computer spec from 1,102 to 1,984 chars. +5% headroom.
     #[test]
     fn resident_tool_specs_stay_within_the_startup_budget() {
-        const POST_TRIM_CHARS: usize = 9_160;
+        const POST_TRIM_CHARS: usize = 10_042;
         let mut reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
         reg.specs.push(mcp_tool::spec());
         for s in &reg.specs {

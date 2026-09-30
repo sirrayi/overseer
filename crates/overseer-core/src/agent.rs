@@ -1110,6 +1110,15 @@ impl Agent {
                 is_error: out.is_error,
             });
 
+            // S5/D4: computer captures ride the conversation as a
+            // sibling user-level image block — pixels never inline
+            // into the tool-result text (budget) or events.jsonl.
+            if name == "computer" {
+                if let Some(img) = crate::tools::computer::image_block(&out.text) {
+                    results.push(img);
+                }
+            }
+
             // Rule-of-Two latch flips are auditable events (P3.10).
             let notices: Vec<String> = std::mem::take(&mut self.tools.taint_notices);
             for notice in notices {
