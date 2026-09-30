@@ -58,6 +58,20 @@ impl OpenAiCompatible {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
 
+    /// I7: `prompt_cache_key` ships only to the real OpenAI API — the
+    /// profile gate alone can't tell api.openai.com apart from a strict
+    /// OpenAI-compatible endpoint serving an official-looking model
+    /// name, and those gateways reject unknown params outright.
+    fn body_with_host_gate(&self, req: &Request) -> Value {
+        let mut body = Self::build_body(req);
+        if !official_openai_host(&self.base_url) {
+            if let Some(o) = body.as_object_mut() {
+                o.remove("prompt_cache_key");
+            }
+        }
+        body
+    }
+
     fn build_body(req: &Request) -> Value {
         let system = req
             .system
@@ -344,9 +358,26 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
     }
 }
 
+/// True only when `base_url`'s host is exactly `api.openai.com` —
+/// scheme/userinfo/port tolerant, everything else strict.
+fn official_openai_host(base_url: &str) -> bool {
+    let rest = base_url
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(base_url);
+    let authority = rest.split('/').next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = host_port
+        .rsplit_once(':')
+        .filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit()))
+        .map(|(h, _)| h)
+        .unwrap_or(host_port);
+    host.eq_ignore_ascii_case("api.openai.com")
+}
+
 impl Provider for OpenAiCompatible {
     fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
-        let body = Self::build_body(req);
+        let body = self.body_with_host_gate(req);
         let request_bytes = body.to_string().len() as u64;
         // P7-2 fail-closed: a CU request without credentials never reaches
         // the wire — honest error, never a silent skip.
@@ -567,6 +598,63 @@ mod tests {
         assert!(body_for("deepseek-v4.1-flash")
             .get("prompt_cache_key")
             .is_none());
+    }
+
+    /// I7: the host gate sits ON TOP of the profile gate — an official
+    /// profile talking to a compatible-but-not-OpenAI endpoint must not
+    /// leak `prompt_cache_key` (strict gateways reject unknown params).
+    #[test]
+    fn prompt_cache_key_never_leaves_non_openai_hosts() {
+        let system: Vec<SystemSegment> = vec![];
+        let tools: Vec<ToolSpec> = vec![];
+        let msgs = vec![Message::user_text("hi")];
+        let req = Request {
+            model: "gpt-5.5",
+            system: &system,
+            tools: &tools,
+            messages: &msgs,
+            max_tokens: 100,
+            thinking_budget: None,
+            effort: None,
+            cache_breakpoints: false,
+            cache_key: Some("sess-1".into()),
+        };
+        // Official host keeps it.
+        let official = OpenAiCompatible::openai("k");
+        assert_eq!(
+            official.body_with_host_gate(&req)["prompt_cache_key"],
+            "sess-1"
+        );
+        // Compatible gateways never see it — even serving a gpt-* model
+        // whose default profile keeps optional params.
+        for url in [
+            "https://gateway.local/v1",
+            "http://localhost:11434/v1",
+            "https://api.openai.com.evil.example/v1",
+            "https://openai.azure.com/openai/deployments/x",
+        ] {
+            let p = OpenAiCompatible::new("k", url);
+            assert!(
+                p.body_with_host_gate(&req)
+                    .get("prompt_cache_key")
+                    .is_none(),
+                "{url} must not receive prompt_cache_key"
+            );
+        }
+    }
+
+    #[test]
+    fn official_openai_host_parsing() {
+        assert!(official_openai_host("https://api.openai.com/v1"));
+        assert!(official_openai_host("https://api.openai.com"));
+        assert!(official_openai_host("https://API.OPENAI.COM/v1"));
+        assert!(official_openai_host("https://api.openai.com:443/v1"));
+        assert!(!official_openai_host(
+            "https://api.openai.com.evil.example/v1"
+        ));
+        assert!(!official_openai_host("https://localhost:8080/v1"));
+        assert!(!official_openai_host("https://openai.com/v1"));
+        assert!(!official_openai_host(""));
     }
 
     #[test]
