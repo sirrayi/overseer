@@ -1068,6 +1068,7 @@ impl Agent {
             sandbox: self.config.sandbox_bash,
             broker: Some(self.config.broker.clone()),
         };
+        self.tools.set_control(self.control.clone());
         let mut results = Vec::new();
         for (idx, (call_id, name, input)) in calls.iter().enumerate() {
             // Tool-launch boundary (P2.4): an interrupt or a queued
@@ -1121,13 +1122,16 @@ impl Agent {
             )?;
 
             let out = self.tools.call(name, input, &mut ctx);
+            // Behaviour keyed on a tool name follows the tool that ran
+            // (`tools op=call` unwraps); the events keep the outer call.
+            let (ran, ran_input) = crate::tools::effective_call(name, input);
             // P7-3: computer-use acts are auditable — the tool's
             // envelope carries the serving tier and the pre/post
             // observation digests (audit-only; never rehydrated).
             // Only this tool's results are parsed (a bash echo of a
             // similar object must not forge an audit record), and
             // error/unconfigured results skip.
-            if name == "computer" {
+            if ran == "computer" {
                 if let Some(kind) = crate::tools::computer::audit_event(&out.text) {
                     self.emit(kind, on_event)?;
                 }
@@ -1144,11 +1148,25 @@ impl Agent {
                 },
                 on_event,
             )?;
+            // Audit-only record of each `run_code` sub-call.
+            for rec in self.tools.take_script_calls() {
+                self.emit(
+                    EventKind::ScriptCall {
+                        parent_call_id: call_id.clone(),
+                        name: rec.name,
+                        input_digest: rec.input_digest,
+                        is_error: rec.is_error,
+                        denied: rec.denied,
+                        raw_bytes: rec.raw_bytes,
+                    },
+                    on_event,
+                )?;
+            }
 
             if stuck_hit.is_none() {
                 stuck_hit = self
                     .stuck
-                    .observe_step(name, input, out.is_error, &out.text);
+                    .observe_step(ran, ran_input, out.is_error, &out.text);
             }
 
             results.push(Block::ToolResult {
@@ -1160,7 +1178,7 @@ impl Agent {
             // S5/D4: computer captures ride the conversation as a
             // sibling user-level image block — pixels never inline
             // into the tool-result text (budget) or events.jsonl.
-            if name == "computer" {
+            if ran == "computer" {
                 if let Some(img) = crate::tools::computer::image_block(&out.text) {
                     results.push(img);
                 }
@@ -1517,7 +1535,10 @@ impl Agent {
         let mut reg = if plan_mode {
             ToolRegistry::plan_mode(policy)
         } else {
-            ToolRegistry::core(policy)
+            // Skills are detected under the session cwd — the root
+            // `prompt::assemble` indexes — so the `skill` spec and the
+            // skills segment always agree (full access's policy root is `/`).
+            ToolRegistry::core_in(policy, &config.cwd)
         };
         if !config.disabled_tools.is_empty() {
             reg.disable(&config.disabled_tools);
@@ -1755,6 +1776,7 @@ mod tests {
     struct Mock {
         responses: Mutex<VecDeque<Response>>,
         seen_systems: Mutex<Vec<Vec<String>>>,
+        seen_messages: Mutex<Vec<Vec<Message>>>,
         seen_models: Mutex<Vec<String>>,
         seen_cache_keys: Mutex<Vec<Option<String>>>,
         /// Models that always error — drives the aux-call escalation path.
@@ -1769,6 +1791,7 @@ mod tests {
             Mock {
                 responses: Mutex::new(VecDeque::from(responses)),
                 seen_systems: Mutex::new(Vec::new()),
+                seen_messages: Mutex::new(Vec::new()),
                 seen_models: Mutex::new(Vec::new()),
                 seen_cache_keys: Mutex::new(Vec::new()),
                 fail_models: Vec::new(),
@@ -1796,6 +1819,10 @@ mod tests {
                 .unwrap()
                 .push(req.system.iter().map(|s| s.text.clone()).collect());
             self.seen_models.lock().unwrap().push(req.model.to_string());
+            self.seen_messages
+                .lock()
+                .unwrap()
+                .push(req.messages.to_vec());
             self.seen_cache_keys
                 .lock()
                 .unwrap()
@@ -2113,9 +2140,9 @@ mod tests {
         agent.run_turn("hi", &mut sink).unwrap();
 
         let seen = provider.seen_systems.lock().unwrap();
-        // identity + contract + safety + memory index, plus the P7-3
-        // computer segment (union ORDER). The count is branch-local, so it
-        // is not pinned here — the *order* is what matters.
+        // identity + contract + safety + memory index (union ORDER). The
+        // count is branch-local, so it is not pinned here — the *order* is
+        // what matters.
         assert!(seen[0].len() >= 4);
         assert!(seen[0][0].contains("Overseer"));
         let idx = seen[0]
@@ -2126,9 +2153,9 @@ mod tests {
         assert!(seen[0][idx].contains("facts.md — user facts"));
         assert!(
             seen[0]
-                .last()
-                .is_some_and(|s| s.starts_with("Computer use is tiered")),
-            "computer segment is the static tail"
+                .iter()
+                .all(|s| !s.starts_with("Computer use is tiered")),
+            "computer guidance rides the deferred tool's description"
         );
         // Git-versioned: a commit landed at the turn boundary.
         assert!(memdir.join(".git").exists());
@@ -3113,6 +3140,159 @@ mod tests {
         assert!(system
             .iter()
             .any(|s| s.name == "persona" && s.text.contains("DRAFT_INSIGHT_A")));
+    }
+
+    /// Screenshots taken through `tools op=call computer` still ride the
+    /// conversation as image siblings (last-2 rule intact) and still emit
+    /// the computer audit event; the events keep the outer `tools` call.
+    #[cfg(feature = "code-mode")]
+    #[test]
+    fn run_code_sub_calls_are_audited_but_never_replayed() {
+        let dir = tmpdir();
+        std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+        let script = Response {
+            blocks: vec![Block::ToolCall {
+                id: "r1".into(),
+                name: "run_code".into(),
+                input: serde_json::json!({"code":
+                    "tools.read({path: 'a.txt'});\nreturn tools.glob({pattern: '*.txt'}).length > 0;"}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        };
+        let provider = Arc::new(Mock::new(vec![script, done()]));
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let mut agent = Agent::start(provider.clone(), cfg, dir.clone(), "s".into())
+            .unwrap()
+            .with_tools(ToolRegistry::core(crate::perm::Policy::allow_all()));
+        agent.run_turn("go", &mut |_: &Event| {}).unwrap();
+
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        let calls: Vec<(&str, &str, &str)> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ScriptCall {
+                    parent_call_id,
+                    name,
+                    input_digest,
+                    ..
+                } => Some((
+                    parent_call_id.as_str(),
+                    name.as_str(),
+                    input_digest.as_str(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!((calls[0].0, calls[0].1), ("r1", "read"));
+        assert_eq!((calls[1].0, calls[1].1), ("r1", "glob"));
+        let result_at = events
+            .iter()
+            .position(|e| matches!(e.kind, EventKind::ToolResult { .. }))
+            .unwrap();
+        let first_audit = events
+            .iter()
+            .position(|e| matches!(e.kind, EventKind::ScriptCall { .. }))
+            .unwrap();
+        assert!(result_at < first_audit, "audit follows the paired result");
+
+        let digest = calls[0].2;
+        let replayed = format!("{:?}", crate::event::rehydrate_messages(&events));
+        assert!(!replayed.contains(digest), "ScriptCall must not rehydrate");
+        let seen = format!(
+            "{:?}",
+            provider.seen_messages.lock().unwrap().last().unwrap()
+        );
+        assert!(!seen.contains(digest) && seen.contains("→ true"), "{seen}");
+    }
+
+    #[test]
+    fn computer_through_tools_keeps_audit_and_image_siblings() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir();
+        let driver = dir.join("fake-cua.sh");
+        let img = r#"{"content":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}],"structuredContent":{"screenshot_width":64,"screenshot_height":32,"screenshot_mime_type":"image/png","window_bounds":{"x":0,"y":0,"width":64,"height":32},"window_id":1,"pid":1}}"#;
+        std::fs::write(
+            &driver,
+            format!(
+                "#!/bin/sh
+                 sid() {{ printf '%s' \"$1\" | sed 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/' | head -1; }}
+                 while IFS= read -r line; do
+                 case \"$line\" in
+                 *'\"method\":\"initialize\"'*) r='{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"f\",\"version\":\"0\"}}}}' ;;
+                 *'\"method\":\"notifications/'*) continue ;;
+                 *'\"method\":\"tools/list\"'*) r='{{\"tools\":[]}}' ;;
+                 *) r='{img}' ;;
+                 esac
+                 printf '%s\\n' \"{{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$(sid \"$line\"),\\\"result\\\":$r}}\"
+                 done
+"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shot = |n: usize| Response {
+            blocks: vec![Block::ToolCall {
+                id: format!("s{n}"),
+                name: "tools".into(),
+                input: serde_json::json!({"op": "call", "name": "computer",
+                    "args": {"action": "screenshot", "pid": 1, "window_id": n}}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        };
+        let provider = Arc::new(Mock::new(vec![shot(1), shot(2), shot(3), done()]));
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let mut tools = ToolRegistry::core_with(
+            crate::perm::Policy::allow_all(),
+            crate::tools::Optional::ALL,
+        );
+        tools.set_computer(crate::tools::computer::ComputerState::new(
+            crate::tools::computer::Backends {
+                driver: Some(driver),
+                ..Default::default()
+            },
+        ));
+        let mut agent = Agent::start(provider.clone(), cfg, dir.clone(), "s".into())
+            .unwrap()
+            .with_tools(tools);
+        agent.run_turn("go", &mut |_: &Event| {}).unwrap();
+
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        let acts = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::ComputerAct { .. }))
+            .count();
+        assert_eq!(acts, 3, "one audit event per screenshot");
+        assert!(events.iter().all(|e| match &e.kind {
+            EventKind::ToolCallStart { name, .. } | EventKind::ToolResult { name, .. } =>
+                name == "tools",
+            _ => true,
+        }));
+        let last = provider
+            .seen_messages
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let images = last
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| matches!(b, Block::Image { .. }))
+            .count();
+        assert_eq!(images, 2, "screenshots reach the model, last two kept");
     }
 
     #[test]

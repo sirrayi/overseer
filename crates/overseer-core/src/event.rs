@@ -5,6 +5,7 @@
 //! The model-facing context is a *view* assembled from this log; nothing is
 //! ever mutated in place.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -109,6 +110,23 @@ pub enum EventKind {
         post: Option<String>,
         #[serde(default)]
         suppressed: bool,
+    },
+    /// One `run_code` sub-call: the tool a script called, a digest of its
+    /// input and how it went. Audit-only, like `ComputerAct`; never
+    /// rehydrates into messages.
+    ScriptCall {
+        #[serde(default)]
+        parent_call_id: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        input_digest: String,
+        #[serde(default)]
+        is_error: bool,
+        #[serde(default)]
+        denied: bool,
+        #[serde(default)]
+        raw_bytes: u64,
     },
     /// Stuck detector tripped — records which of the five patterns fired.
     StuckDetected {
@@ -251,6 +269,7 @@ pub fn event_type_str(kind: &EventKind) -> &'static str {
         EventKind::SubagentDone { .. } => "subagent_done",
         EventKind::Tainted { .. } => "tainted",
         EventKind::ComputerAct { .. } => "computer_act",
+        EventKind::ScriptCall { .. } => "script_call",
         EventKind::StuckDetected { .. } => "stuck_detected",
         EventKind::Nudge { .. } => "nudge",
         EventKind::Compaction { .. } => "compaction",
@@ -614,36 +633,72 @@ pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
 /// no-op byte-wise.
 pub const CLEARED_RESULT: &str = "[tool result cleared — re-read the file if needed]";
 
+/// How many of the most recent `tools` op=search results stay pinned in the
+/// view: they carry the deferred schemas the model is calling against.
+pub const PINNED_SEARCHES: usize = 3;
+
 /// P1.2 stale tool-result clearing: keep the last `keep` `ToolResult` blocks
 /// verbatim; replace older ones' content with `CLEARED_RESULT`. The block
 /// itself (and its `tool_use_id`) survives so tool_use/tool_result pairing
-/// stays valid for the provider.
+/// stays valid for the provider. The last [`PINNED_SEARCHES`] results of
+/// `tools` op=search calls are never cleared — identified by their
+/// `tool_use_id` matching an assistant `ToolCall` block, never by content.
 ///
 /// Pure view transform over the message view — events on disk are never
 /// touched, so a cleared session rehydrates the full history and re-clears
 /// deterministically. Returns how many results were (re)written.
 pub fn clear_stale_tool_results(messages: &mut [crate::ir::Message], keep: usize) -> usize {
-    let total = messages
+    let searches: HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.role == crate::ir::Role::Assistant)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            Block::ToolCall { id, name, input }
+                if name == "tools" && crate::tools::tools_tool::op_is(input, "search") =>
+            {
+                Some(id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let results: Vec<&str> = messages
         .iter()
         .flat_map(|m| m.content.iter())
-        .filter(|b| matches!(b, crate::ir::Block::ToolResult { .. }))
-        .count();
-    let stale = total.saturating_sub(keep);
+        .filter_map(|b| match b {
+            Block::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let stale = results.len().saturating_sub(keep);
     if stale == 0 {
         return 0;
     }
+    let pinned: HashSet<String> = results
+        .iter()
+        .rev()
+        .filter(|id| searches.contains(*id))
+        .take(PINNED_SEARCHES)
+        .map(|id| id.to_string())
+        .collect();
     let mut seen = 0usize;
+    let mut cleared = 0usize;
     for m in messages.iter_mut() {
         for b in m.content.iter_mut() {
-            if let crate::ir::Block::ToolResult { content, .. } = b {
-                if seen < stale {
+            if let Block::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } = b
+            {
+                if seen < stale && !pinned.contains(tool_use_id.as_str()) {
                     *content = CLEARED_RESULT.to_string();
+                    cleared += 1;
                 }
                 seen += 1;
             }
         }
     }
-    stale
+    cleared
 }
 
 /// Placeholder that replaces an elided image block. Fixed text so the
@@ -826,6 +881,56 @@ mod tests {
         assert_eq!(msgs[1].role, Role::Assistant);
         assert_eq!(msgs[2].role, Role::User);
         assert!(matches!(msgs[2].content[0], Block::ToolResult { .. }));
+    }
+
+    #[test]
+    fn clear_stale_pins_the_last_three_tools_searches_by_call_id() {
+        let call = |id: &str, name: &str, input: serde_json::Value| crate::ir::Message {
+            role: Role::Assistant,
+            content: vec![Block::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                input,
+            }],
+        };
+        let result = |id: &str, text: &str| {
+            crate::ir::Message::tool_results(vec![Block::ToolResult {
+                tool_use_id: id.into(),
+                content: text.into(),
+                is_error: false,
+            }])
+        };
+        let search = serde_json::json!({"op": "search", "query": "x"});
+        let mut msgs = Vec::new();
+        for i in 0..4 {
+            msgs.push(call(&format!("s{i}"), "tools", search.clone()));
+            msgs.push(result(&format!("s{i}"), &format!("schemas-{i}")));
+        }
+        // Content that merely looks like a search result is not pinned.
+        msgs.push(call(
+            "c",
+            "tools",
+            serde_json::json!({"op": "call", "name": "plan"}),
+        ));
+        msgs.push(result("c", "{\"name\":\"plan\",\"input_schema\":{}}"));
+        msgs.push(call("b", "bash", serde_json::json!({"command": "ls"})));
+        msgs.push(result("b", "recent"));
+        let cleared = clear_stale_tool_results(&mut msgs, 1);
+        let text = |m: &crate::ir::Message| match &m.content[0] {
+            Block::ToolResult { content, .. } => content.clone(),
+            _ => panic!("expected ToolResult"),
+        };
+        assert_eq!(text(&msgs[1]), CLEARED_RESULT, "4th-newest search clears");
+        for i in 1..4 {
+            assert_eq!(text(&msgs[2 * i + 1]), format!("schemas-{i}"));
+        }
+        assert_eq!(text(&msgs[9]), CLEARED_RESULT, "no content sniffing");
+        assert_eq!(text(&msgs[11]), "recent");
+        assert_eq!(cleared, 2);
+        // Idempotent.
+        let snapshot = msgs.clone();
+        clear_stale_tool_results(&mut msgs, 1);
+        assert_eq!(msgs, snapshot);
     }
 
     #[test]

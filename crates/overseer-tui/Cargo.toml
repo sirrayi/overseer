@@ -10,12 +10,18 @@ name = "overseer_tui"
 path = "src/lib.rs"
 
 [dependencies]
-overseer-core = { path = "../overseer-core", version = "0.1.0" }
+overseer-core = { path = "../overseer-core", version = "0.1.0", default-features = false }
 ratatui = { version = "0.30", features = ["scrolling-regions"] }
 crossterm = { version = "0.29", features = ["bracketed-paste"] }
 unicode-segmentation = "1"
 unicode-width = "0.2"
 serde_json = "1"
+
+# `overseer-core`'s only default feature is `code-mode`; it is re-exposed
+# here so `--no-default-features` really drops `run_code`.
+[features]
+default = ["code-mode"]
+code-mode = ["overseer-core/code-mode"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

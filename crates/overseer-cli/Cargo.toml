@@ -12,7 +12,13 @@ name = "overseer"
 path = "src/main.rs"
 
 [dependencies]
-overseer-core = { path = "../overseer-core", version = "0.1.0" }
+overseer-core = { path = "../overseer-core", version = "0.1.0", default-features = false }
 overseer-gateway = { path = "../overseer-gateway", version = "0.1.0" }
-overseer-tui = { path = "../overseer-tui", version = "0.1.0" }
+overseer-tui = { path = "../overseer-tui", version = "0.1.0", default-features = false }
 serde_json = "1"
+
+# `overseer-core`'s only default feature is `code-mode`; it is re-exposed
+# here so `--no-default-features` really drops `run_code`.
+[features]
+default = ["code-mode"]
+code-mode = ["overseer-core/code-mode", "overseer-tui/code-mode"]

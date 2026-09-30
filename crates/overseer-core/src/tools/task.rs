@@ -42,9 +42,8 @@ pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "task".into(),
         description: concat!(
-            "Spawn a subagent for a self-contained subtask in an isolated ",
-            "context. Returns a compact digest (~2K tokens) plus the path to ",
-            "its full trace."
+            "Run a self-contained subtask in a subagent with an isolated context. ",
+            "Returns a ~2K-token digest plus the path to its full trace."
         )
         .into(),
         input_schema: schema(
@@ -56,11 +55,11 @@ pub fn spec() -> ToolSpec {
                 "mode": {
                     "type": "string",
                     "enum": ["read", "write"],
-                    "description": "read (default): read/grep/glob only, cannot modify files. write: full tools in an isolated git worktree; changes land on a scratch branch, never your checkout."
+                    "description": "read (default): read/grep/glob only, no file changes. write: full tools in an isolated git worktree; changes land on a scratch branch, never your checkout."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Return immediately; the digest arrives as a notice when done (max 4 in flight). Default false."
+                    "description": "Return now; the digest arrives as a notice when done (max 4 in flight). Default false."
                 },
                 "max_steps": {
                     "type": "integer",
@@ -323,7 +322,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         pol
     };
     let mut registry = if write_mode {
-        ToolRegistry::core(policy)
+        ToolRegistry::core_in(policy, &sub_cwd)
     } else {
         ToolRegistry::readonly(policy)
     };
@@ -518,6 +517,74 @@ mod tests {
         assert!(!out.is_error, "{}", out.text);
         assert!(out.text.contains("overseer-task-1"));
         assert!(dir.join("session/subagents/wt-1/wt").exists());
+    }
+
+    /// Records the tool names of every request it answers.
+    struct Seen {
+        tools: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl Provider for Seen {
+        fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
+            let names = req.tools.iter().map(|t| t.name.clone()).collect();
+            self.tools.lock().unwrap().push(names);
+            Ok(done_text("digest body"))
+        }
+        fn name(&self) -> &'static str {
+            "seen"
+        }
+    }
+
+    /// A full-access writer's policy root is `/`, but its skills live in
+    /// its worktree: the registry must look there, like the prompt does.
+    #[test]
+    fn write_subagent_detects_skills_in_its_worktree() {
+        let dir = tmpdir();
+        let skill = dir.join(".overseer/skills/demo");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: demo\ndescription: a demo skill\n---\nbody\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", ".overseer"],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "x",
+            ],
+        ] {
+            let st = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(&args)
+                .output()
+                .unwrap()
+                .status;
+            assert!(st.success());
+        }
+        let tools = Arc::new(Mutex::new(Vec::new()));
+        let mut c = ctx(&dir);
+        c.provider = Some(Arc::new(Seen {
+            tools: tools.clone(),
+        }));
+        let out = run(&json!({"prompt": "write stuff", "mode": "write"}), &mut c);
+        assert!(!out.is_error, "{}", out.text);
+        assert!(dir
+            .join("session/subagents/wt-1/wt/.overseer/skills/demo/SKILL.md")
+            .is_file());
+        let seen = tools.lock().unwrap();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|names| names.iter().any(|n| n == "skill")),
+            "{seen:?}"
+        );
     }
 
     #[test]

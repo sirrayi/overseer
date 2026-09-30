@@ -71,6 +71,7 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
     let mut errors: Vec<String> = Vec::new();
     let mut pending: Option<String> = None;
     let mut n_compactions = 0u32;
+    let mut deferred: Vec<String> = Vec::new();
 
     for e in covered {
         match &e.kind {
@@ -80,6 +81,19 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
                 }
             }
             EventKind::ToolCallStart { name, input, .. } => {
+                // Deferred tools the model called through `tools` — their
+                // schemas were loaded by an op=search now condensed away.
+                if name == "tools" && crate::tools::tools_tool::op_is(input, "call") {
+                    if let Some(inner) = input
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .filter(|n| is_deferred_name(n))
+                    {
+                        if !deferred.iter().any(|d| d == inner) {
+                            deferred.push(inner.to_string());
+                        }
+                    }
+                }
                 if let Some(path) = input.get("path").and_then(|p| p.as_str()) {
                     let list = match name.as_str() {
                         "write" | "edit" => &mut modified,
@@ -150,6 +164,12 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
         out.push_str("\n## Files read\n");
         out.push_str(&file_list_block(&read_only));
     }
+    if !deferred.is_empty() {
+        out.push_str(&format!(
+            "\n## Deferred tools used (search `tools` again for their schemas)\n{}\n",
+            deferred.join(", ")
+        ));
+    }
     if !notes.is_empty() {
         out.push_str("\n## Recent assistant notes (verbatim)\n");
         for (i, n) in notes.iter().enumerate() {
@@ -209,6 +229,13 @@ fn truncate(s: &str, cap: usize) -> String {
 }
 
 // DEFERRED(owner): vendor-native compaction (Anthropic/Gemini condensation endpoints) — the always-false NativeCompaction/provider_compact_capability seam was removed as dead code; reintroduce it with the first real adapter impl — gate: vendor API + keys.
+
+/// A deferred tool's inner name (`mcp` is the router, not a tool) or an
+/// MCP tool's `mcp__server__tool` name.
+fn is_deferred_name(name: &str) -> bool {
+    name.starts_with("mcp__")
+        || (name != "mcp" && crate::tools::tools_tool::DEFERRED.contains(&name))
+}
 
 #[cfg(test)]
 mod tests {
@@ -297,6 +324,93 @@ mod tests {
         assert_eq!(tail_anchor(&events[..8], 2, 0), None);
         // Floor excludes earlier anchors: only turn 40 survives it.
         assert_eq!(tail_anchor(&events, 2, 30), None);
+    }
+
+    #[test]
+    fn summary_lists_deferred_tools_called_through_tools() {
+        let start = |id: u64, name: &str, input: serde_json::Value| {
+            ev(
+                id,
+                EventKind::ToolCallStart {
+                    call_id: format!("c{id}"),
+                    name: name.into(),
+                    input,
+                },
+            )
+        };
+        let events = vec![
+            ev(1, EventKind::UserInput { text: "go".into() }),
+            start(
+                2,
+                "tools",
+                serde_json::json!({"op": "search", "query": "struct"}),
+            ),
+            // A search result naming a tool is never parsed (Invariant 8).
+            ev(
+                3,
+                EventKind::ToolResult {
+                    call_id: "c2".into(),
+                    name: "tools".into(),
+                    content: "{\"name\":\"struct_search\"}".into(),
+                    is_error: false,
+                    raw_bytes: 1,
+                    spilled_to: None,
+                    denied: false,
+                },
+            ),
+            start(
+                4,
+                "tools",
+                serde_json::json!({"op": "call", "name": "repo_map", "args": {}}),
+            ),
+            start(
+                5,
+                "tools",
+                serde_json::json!({"op": "call", "name": "mcp__gh__issue", "args": {}}),
+            ),
+            start(
+                6,
+                "tools",
+                serde_json::json!({"op": "call", "name": "repo_map", "args": {}}),
+            ),
+            // Resident, router and unknown names are not deferred tools,
+            // even when the call went through `tools` (here: and failed).
+            start(
+                7,
+                "tools",
+                serde_json::json!({"op": "call", "name": "read", "args": {"path": "a"}}),
+            ),
+            ev(
+                8,
+                EventKind::ToolResult {
+                    call_id: "c7".into(),
+                    name: "tools".into(),
+                    content: "tools: 'read' is resident; call it directly".into(),
+                    is_error: true,
+                    raw_bytes: 1,
+                    spilled_to: None,
+                    denied: false,
+                },
+            ),
+            start(
+                9,
+                "tools",
+                serde_json::json!({"op": "call", "name": "mcp", "args": {}}),
+            ),
+            start(
+                10,
+                "tools",
+                serde_json::json!({"op": "call", "name": "bogus", "args": {}}),
+            ),
+        ];
+        let s = summarize(&events, 100);
+        assert!(
+            s.contains("## Deferred tools used (search `tools` again for their schemas)\nrepo_map, mcp__gh__issue\n"),
+            "{s}"
+        );
+        assert!(!s.contains("struct_search"), "{s}");
+        let none = summarize(&events[..3], 100);
+        assert!(!none.contains("Deferred tools"), "{none}");
     }
 
     #[test]

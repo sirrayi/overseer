@@ -478,12 +478,13 @@ pub fn collides_with_resident(server: &str, tool: &str) -> bool {
 
 /// Rank `specs` against `query`, best first, deterministically.
 ///
-/// Scoring per spec, first hit wins: an exact name match (ASCII
-/// case-insensitive) scores `1.0`; a substring match of the folded query
-/// in the folded name scores `0.7`; otherwise the fraction of folded
-/// query tokens present in the folded `name + description` token set
-/// (tokens split on non-alphanumerics). Specs scoring nothing are
-/// dropped. Output is sorted score-descending, name-ascending, and
+/// Scoring per spec, first hit wins, in strict tiers: an exact name match
+/// (ASCII case-insensitive) scores `1.0`; a name starting with the folded
+/// query scores `0.85`; a substring match of the folded query in the
+/// folded name scores `0.7`; otherwise half the fraction of folded query
+/// tokens present in the folded `name + description` token set (tokens
+/// split on non-alphanumerics), so overlap never outranks a name hit.
+/// Specs scoring nothing are dropped. Output is sorted score-descending, name-ascending, and
 /// capped at `top_k`. A blank query or `top_k == 0` yields nothing.
 /// Pure function of its inputs: no I/O, no clock, no randomness.
 pub fn search_tools(specs: &[ToolSpec], query: &str, top_k: usize) -> Vec<(String, f32)> {
@@ -503,6 +504,8 @@ pub fn search_tools(specs: &[ToolSpec], query: &str, top_k: usize) -> Vec<(Strin
         let name_fold = spec.name.to_lowercase();
         let score = if name_fold == q {
             1.0
+        } else if name_fold.starts_with(&q) {
+            0.85
         } else if name_fold.contains(&q) {
             0.7
         } else if q_tokens.is_empty() {
@@ -517,7 +520,7 @@ pub fn search_tools(specs: &[ToolSpec], query: &str, top_k: usize) -> Vec<(Strin
             if hits == 0 {
                 continue;
             }
-            hits as f32 / q_tokens.len() as f32
+            0.5 * hits as f32 / q_tokens.len() as f32
         };
         scored.push((spec.name.clone(), score));
     }
@@ -1546,7 +1549,7 @@ exit 0"#;
     }
 
     #[test]
-    fn search_tools_ranks_exact_above_substring_above_overlap() {
+    fn search_tools_ranks_exact_above_prefix_above_substring_above_overlap() {
         let specs = vec![
             ToolSpec {
                 name: "read_file".into(),
@@ -1571,18 +1574,28 @@ exit 0"#;
             vec![("grep_search".to_string(), 1.0)],
             "only the exact name matches `grep_search` as a whole"
         );
-        // Substring match scores 0.7.
+        // Name prefix scores 0.85, a mid-name substring 0.7.
         let hits = search_tools(&specs, "grep", 10);
+        assert_eq!(hits, vec![("grep_search".to_string(), 0.85)]);
+        let hits = search_tools(&specs, "search", 10);
         assert_eq!(hits, vec![("grep_search".to_string(), 0.7)]);
-        // Token overlap fraction: `disk content` fully covers write_file
-        // (content + disk → 1.0) and half-covers read_file (disk only →
-        // 0.5), so overlap outranks nothing here but orders the pair.
+        // Token overlap is half the covered fraction: `disk content` fully
+        // covers write_file (0.5) and half-covers read_file (0.25).
         let hits = search_tools(&specs, "disk content", 10);
         assert_eq!(
             hits,
             vec![
-                ("write_file".to_string(), 1.0),
-                ("read_file".to_string(), 0.5),
+                ("write_file".to_string(), 0.5),
+                ("read_file".to_string(), 0.25),
+            ]
+        );
+        // Strict tiers: exact > prefix > substring > any overlap.
+        let hits = search_tools(&specs, "file", 10);
+        assert_eq!(
+            hits,
+            vec![
+                ("read_file".to_string(), 0.7),
+                ("write_file".to_string(), 0.7),
             ]
         );
         // Equal scores tie-break by name ascending: both carry `disk`.
@@ -1590,8 +1603,8 @@ exit 0"#;
         assert_eq!(
             hits,
             vec![
-                ("read_file".to_string(), 1.0),
-                ("write_file".to_string(), 1.0),
+                ("read_file".to_string(), 0.5),
+                ("write_file".to_string(), 0.5),
             ]
         );
         // Cap, empty query, zero top_k, and no-match all behave.

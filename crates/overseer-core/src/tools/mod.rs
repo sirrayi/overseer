@@ -31,9 +31,12 @@ pub mod memory_tool;
 pub mod plan;
 pub mod read;
 pub mod repomap;
+#[cfg(feature = "code-mode")]
+pub mod run_code;
 pub mod skill;
 pub mod struct_search;
 pub mod task;
+pub mod tools_tool;
 pub mod write;
 
 /// Hard cap on inline tool results, in bytes (`text.len()`) — results over
@@ -163,6 +166,18 @@ impl ToolOutput {
     }
 }
 
+/// One `run_code` sub-call, drained by the agent into an audit-only
+/// `ScriptCall` event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScriptRecord {
+    pub name: String,
+    /// First 12 hex chars of sha256 over the input JSON.
+    pub input_digest: String,
+    pub is_error: bool,
+    pub denied: bool,
+    pub raw_bytes: u64,
+}
+
 /// One completed read: the file's mtime at read time + the line range
 /// returned. Dedup key is (path, mtime, range) per playbook Ch.6 §2.3.
 struct ReadRecord {
@@ -178,9 +193,10 @@ struct ReadRecord {
 /// All tool names the core registry can emit — the validation set for
 /// `--no-tools` ablations (typo'd names fail fast, not silently no-op).
 /// Sorted; `all_core_specs_deny_additional_properties` pins the count to
-/// the registry's spec list. `mcp` is the one name that is not always
-/// resident: the spec exists only when a server is configured (`with_mcp`).
-pub const TOOL_NAMES: [&str; 16] = [
+/// the registry's resident set. `mcp` is the one name that is not always
+/// present: the spec exists only when a server is configured (`with_mcp`),
+/// and it is never advertised — MCP tools are reached through `tools`.
+pub const TOOL_NAMES: [&str; 18] = [
     "bash",
     "computer",
     "diagnostics",
@@ -192,12 +208,16 @@ pub const TOOL_NAMES: [&str; 16] = [
     "plan",
     "read",
     "repo_map",
+    "run_code",
     "skill",
     "struct_search",
     "symbol",
     "task",
+    "tools",
     "write",
 ];
+
+pub use tools_tool::effective_call;
 
 /// Which optional tools this host can serve, decided once per registry.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -208,6 +228,8 @@ pub struct Optional {
     pub struct_search: bool,
     /// A supported checker (`cargo`) is on PATH.
     pub diagnostics: bool,
+    /// At least one skill exists ([`crate::skills::present`]).
+    pub skill: bool,
 }
 
 impl Optional {
@@ -216,16 +238,19 @@ impl Optional {
         computer: true,
         struct_search: true,
         diagnostics: true,
+        skill: true,
     };
 
     /// Probe the host: env vars, PATH lookups and `is_file` checks only.
-    pub fn detect() -> Self {
+    /// Skills are looked up under `root` (the workspace) and `$HOME`.
+    pub fn detect(root: &Path) -> Self {
         let backends = computer::Backends::detect();
         let bins = struct_search::Bins::detect();
         Optional {
             computer: backends.any_configured(),
             struct_search: bins.ast_grep.is_some() || bins.semgrep.is_some(),
             diagnostics: struct_search::find_on_path(&["cargo"]).is_some(),
+            skill: crate::skills::present(root),
         }
     }
 
@@ -242,6 +267,13 @@ impl Optional {
         }
         if !self.diagnostics {
             out.push(("diagnostics", "no supported checker (`cargo`) is on PATH"));
+        }
+        if !self.skill {
+            out.push((
+                "skill",
+                "no skills are installed (add <workspace>/.overseer/skills/<name>/SKILL.md \
+                 or ~/.overseer/skills/<name>/SKILL.md)",
+            ));
         }
         if !self.struct_search {
             out.push((
@@ -270,6 +302,11 @@ pub struct ToolRegistry {
     /// P4.3 ablation: names removed via --no-tools. Hidden from the spec
     /// list AND refused at dispatch — defense in depth.
     disabled: HashSet<String>,
+    /// Resident names kept out of the advertised array and reached through
+    /// the `tools` dispatcher ([`tools_tool::DEFERRED`] ∩ `base_specs`).
+    /// Subtracted by `rebuild_specs` alongside `disabled`; everything else
+    /// (modes, ablation, `check_args`, search) still reads `base_specs`.
+    deferred: HashSet<String>,
     /// P8-B hooks (ECC pattern): data rules loaded from
     /// `<root>/.overseer/hooks.json`. Pre rules block at the dispatch
     /// boundary (before the gate); post rules annotate the result. Empty
@@ -281,8 +318,8 @@ pub struct ToolRegistry {
     /// Configured MCP servers + the live ones (`with_mcp`). `None` = no MCP
     /// in this registry, which is the shipped default. Discovered tool
     /// definitions never enter `base_specs`/`specs` — they live in here,
-    /// behind the single resident `mcp` op tool (Invariant 2: the advertised
-    /// array must not change because a third-party server did).
+    /// found and called through `tools` (Invariant 2: the advertised array
+    /// must not change because a third-party server did).
     mcp: Option<mcp_tool::McpState>,
     /// Optional tools this host cannot serve (see [`Optional`]): absent
     /// from the specs and refused at dispatch with the reason.
@@ -294,19 +331,41 @@ pub struct ToolRegistry {
     /// Memory v2 state behind the `memory` tool (and the engine's recall
     /// and reminder hooks).
     pub memory: memory_tool::MemoryState,
+    /// Set while `run_code` re-enters `call` for a script's sub-call: read
+    /// dedup is off and results cap at 1 MB inline instead of spilling.
+    script: bool,
+    /// `run_code` sub-calls since the last `take_script_calls`.
+    script_calls: Vec<ScriptRecord>,
+    /// The run's steering handle (user interrupt) for `run_code`.
+    control: crate::control::Control,
 }
 
 impl ToolRegistry {
-    /// The full resident registry; optional tools per [`Optional::detect`].
-    pub fn core(policy: crate::perm::Policy) -> Self {
-        Self::core_with(policy, Optional::detect())
+    /// The full resident registry for a session in `cwd`; optional tools
+    /// per [`Optional::detect`], skills looked up under `cwd` — the root
+    /// the prompt's skills segment indexes, not `policy.root` (`/` under
+    /// full access).
+    pub fn core_in(policy: crate::perm::Policy, cwd: &Path) -> Self {
+        Self::core_with(policy, Optional::detect(cwd))
+    }
+
+    /// [`core_in`](Self::core_in) for tests, with `policy.root` as the cwd.
+    #[cfg(test)]
+    pub(crate) fn core(policy: crate::perm::Policy) -> Self {
+        let cwd = policy.root.clone();
+        Self::core_in(policy, &cwd)
     }
 
     /// [`core`](Self::core) with the optional-tool availability given.
     pub fn core_with(policy: crate::perm::Policy, optional: Optional) -> Self {
         // Sorted by name — the tool list serializes deterministically
         // regardless of registration order (Invariant 2: stable prefix).
-        let unavailable = optional.absent();
+        // `tools` is a placeholder here; `rebuild_specs` renders its
+        // description from what this registry actually holds.
+        #[allow(unused_mut)]
+        let mut unavailable = optional.absent();
+        #[cfg(not(feature = "code-mode"))]
+        unavailable.push(("run_code", "this build has no code-mode feature"));
         let mut specs = vec![
             bash::spec(),
             read::spec(),
@@ -323,11 +382,14 @@ impl ToolRegistry {
             diagnostics::spec(),
             struct_search::spec(),
             memory_tool::spec(),
+            tools_tool::spec(&[], false),
         ];
+        #[cfg(feature = "code-mode")]
+        specs.push(run_code::spec());
         specs.retain(|s| !unavailable.iter().any(|(n, _)| *n == s.name));
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         let hooks = crate::hooks::load(&policy.root);
-        ToolRegistry {
+        let mut reg = ToolRegistry {
             base_specs: specs.clone(),
             specs,
             read_paths: HashSet::new(),
@@ -335,13 +397,19 @@ impl ToolRegistry {
             policy,
             taint_notices: Vec::new(),
             disabled: HashSet::new(),
+            deferred: tools_tool::DEFERRED.iter().map(|n| n.to_string()).collect(),
             hooks,
             mode: None,
             mcp: None,
             unavailable,
             computer: computer::ComputerState::detect(),
             memory: Default::default(),
-        }
+            script: false,
+            script_calls: Vec::new(),
+            control: Default::default(),
+        };
+        reg.rebuild_specs();
+        reg
     }
 
     /// Read-only registry for quarantined subagents (playbook Ch.3 §9.6):
@@ -363,12 +431,16 @@ impl ToolRegistry {
             policy,
             taint_notices: Vec::new(),
             disabled: HashSet::new(),
+            deferred: HashSet::new(),
             hooks,
             mode: None,
             mcp: None,
             unavailable: Vec::new(),
             computer: computer::ComputerState::detect(),
             memory: Default::default(),
+            script: false,
+            script_calls: Vec::new(),
+            control: Default::default(),
         }
     }
 
@@ -387,23 +459,29 @@ impl ToolRegistry {
             policy,
             taint_notices: Vec::new(),
             disabled: HashSet::new(),
+            deferred: HashSet::new(),
             hooks,
             mode: None,
             mcp: None,
             unavailable: Vec::new(),
             computer: computer::ComputerState::detect(),
             memory: Default::default(),
+            script: false,
+            script_calls: Vec::new(),
+            control: Default::default(),
         }
     }
 
     /// Install the configured MCP servers.
     ///
-    /// Adds **exactly one** resident spec — `mcp`, whose input schema and
-    /// description are fixed text (see `mcp_tool`) — and moves every
-    /// discovered tool definition behind it. That is the cache-stability
-    /// contract (Invariant 2): a third-party server's names, count and
-    /// descriptions must never enter the advertised array, or a server that
-    /// reorders its list would invalidate the prompt prefix every turn.
+    /// Adds the internal `mcp` op spec to the resident set — deferred, so
+    /// never advertised — and keeps every discovered tool definition in the
+    /// MCP state, reached by name through `tools`. The only advertised
+    /// change is `tools`' description gaining "MCP servers". That is the
+    /// cache-stability contract (Invariant 2): a third-party server's names,
+    /// count and descriptions must never enter the advertised array, or a
+    /// server that reorders its list would invalidate the prompt prefix
+    /// every turn.
     ///
     /// A no-op for an empty list, so a session with no configured server
     /// keeps a byte-identical spec array; the decision is taken here, once,
@@ -441,14 +519,59 @@ impl ToolRegistry {
     }
 
     /// Recompute the advertised list from the resident set minus the
-    /// disabled set (one source of truth for ablation + mode removal).
+    /// disabled and deferred sets (one source of truth for ablation + mode
+    /// removal), and re-render `tools`' description from what is reachable
+    /// behind it. Runs only at construction and mode/ablation changes, so
+    /// the bytes are stable for the session.
     fn rebuild_specs(&mut self) {
+        let catalog: Vec<&str> = self
+            .base_specs
+            .iter()
+            .map(|s| s.name.as_str())
+            .filter(|n| self.deferred.contains(*n) && !self.disabled.contains(*n))
+            .collect();
+        let tools = tools_tool::spec(&catalog, self.mcp_reachable());
         self.specs = self
             .base_specs
             .iter()
-            .filter(|s| !self.disabled.contains(&s.name))
-            .cloned()
+            .filter(|s| !self.disabled.contains(&s.name) && !self.deferred.contains(&s.name))
+            .map(|s| {
+                if s.name == "tools" {
+                    tools.clone()
+                } else {
+                    s.clone()
+                }
+            })
             .collect();
+    }
+
+    /// Pin the computer backends (tests drive a fake cua-driver).
+    #[cfg(test)]
+    pub(crate) fn set_computer(&mut self, state: computer::ComputerState) {
+        self.computer = state;
+    }
+
+    /// `name` is in this registry and neither disabled nor unavailable.
+    pub fn reachable(&self, name: &str) -> bool {
+        self.base_specs.iter().any(|s| s.name == name)
+            && !self.disabled.contains(name)
+            && !self.unavailable.iter().any(|(n, _)| *n == name)
+    }
+
+    /// Attach the run's steering handle: `run_code` aborts on its
+    /// interrupt, between sub-calls and inside the JS interrupt handler.
+    pub fn set_control(&mut self, control: crate::control::Control) {
+        self.control = control;
+    }
+
+    /// Drain the `run_code` sub-call records of the last call.
+    pub fn take_script_calls(&mut self) -> Vec<ScriptRecord> {
+        std::mem::take(&mut self.script_calls)
+    }
+
+    /// MCP servers are configured and `mcp` is not ablated or mode-removed.
+    fn mcp_reachable(&self) -> bool {
+        self.mcp.is_some() && !self.disabled.contains("mcp")
     }
 
     /// The active mode's edit-glob verdict for `path` (no mode or empty
@@ -490,6 +613,10 @@ impl ToolRegistry {
         start: usize,
         end: usize,
     ) -> bool {
+        // A script needs the content; its reads never entered context.
+        if self.script {
+            return false;
+        }
         let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         self.read_log
             .get(&key)
@@ -518,11 +645,13 @@ impl ToolRegistry {
         start: usize,
         end: usize,
     ) {
-        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        self.read_log
-            .entry(key)
-            .or_default()
-            .push(ReadRecord { mtime, start, end });
+        if !self.script {
+            let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            self.read_log
+                .entry(key)
+                .or_default()
+                .push(ReadRecord { mtime, start, end });
+        }
         self.mark_read(path);
     }
 
@@ -577,7 +706,9 @@ impl ToolRegistry {
         // malformed call never reaches a human approval dialog. Zero-dep
         // (serde_json is already in the tree); failures return a field-level
         // error that names the violated field — no dispatch, no side effects.
-        if let Some(spec) = self.specs.iter().find(|s| s.name == name) {
+        // Checked against `base_specs` so a deferred tool reached through
+        // `tools` is validated against its own schema.
+        if let Some(spec) = self.base_specs.iter().find(|s| s.name == name) {
             if let Err(e) = check_args(&spec.input_schema, input) {
                 return e;
             }
@@ -623,7 +754,14 @@ impl ToolRegistry {
             "diagnostics" => diagnostics::run(input, ctx),
             "struct_search" => struct_search::run(input, ctx),
             "memory" => memory_tool::run(input, ctx, &mut self.memory, &self.policy),
-            // MCP (R1/R4): one op tool over the configured servers. The
+            // Re-enters `call` with the inner name: every step above and
+            // below runs keyed on the tool actually executed.
+            "tools" => tools_tool::run(input, ctx, self),
+            #[cfg(feature = "code-mode")]
+            "run_code" => run_code::run(input, ctx, self),
+            // MCP (R1/R4): one internal op tool over the configured servers,
+            // never advertised — `tools` re-enters here for `mcp__…` names,
+            // and a resumed session's old `mcp` calls still land here. The
             // discovered tool definitions live in the state, never in
             // `specs`; a server is spawned on first use and dropped if it
             // dies. The result flows through the same post-hook, taint,
@@ -673,6 +811,10 @@ impl ToolRegistry {
             },
             _ => out,
         };
+        #[cfg(feature = "code-mode")]
+        if self.script {
+            return run_code::script_budget(out);
+        }
         enforce_budget(out, ctx)
     }
 }
@@ -1304,7 +1446,7 @@ mod tests {
         assert!(out.text.contains("semgrep"), "{}", out.text);
         let full = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
         for t in ["computer", "struct_search", "diagnostics"] {
-            assert!(full.specs.iter().any(|s| s.name == t), "{t} forced on");
+            assert!(full.base_specs.iter().any(|s| s.name == t), "{t} forced on");
         }
     }
 
@@ -1343,32 +1485,58 @@ mod tests {
                 .count()
     }
 
-    /// Startup-token guard: every resident spec with every optional tool
-    /// forced on (plus the `mcp` op tool). Post-trim measurement: 9,886
-    /// chars (~2,471 tokens at ~4 chars/token); the S5 computer vocabulary
-    /// grew the computer spec from 1,102 to 1,828 chars; the memory v2
-    /// `memory` spec adds a measured 546 (10,432). +5% headroom.
+    /// Startup-token guard: the advertised array with every optional tool
+    /// available, MCP configured and skills present. The deferred tools
+    /// ride behind `tools`, so only the resident set counts: 9,886 chars
+    /// before deferral; tool economy measured 5,375 and memory v2's
+    /// `memory` spec adds 552 (5,927). ≤ 6,000 is the budget, and the exact total
+    /// is pinned with +5% headroom.
     #[test]
     fn resident_tool_specs_stay_within_the_startup_budget() {
-        const POST_TRIM_CHARS: usize = 10_432;
-        let mut reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
-        reg.specs.push(mcp_tool::spec());
+        const BUDGET_CHARS: usize = 6_000;
+        const RESIDENT_CHARS: usize = 5_927;
+        let reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL)
+            .with_mcp(vec![crate::mcp_config::McpServer {
+                name: "s".into(),
+                command: "/bin/false".into(),
+                args: Vec::new(),
+                env: Default::default(),
+                trust: crate::mcp_config::Trust::Ask,
+            }]);
         for s in &reg.specs {
             println!("spec {:<14} {:>5} chars", s.name, spec_chars(s));
         }
         let total: usize = reg.specs.iter().map(spec_chars).sum();
         println!("spec TOTAL {total} chars (~{} tokens)", total / 4);
+        assert!(total <= BUDGET_CHARS, "resident specs are {total} chars");
         assert!(
-            total <= POST_TRIM_CHARS + POST_TRIM_CHARS / 20,
-            "resident tool specs grew to {total} chars (budget {POST_TRIM_CHARS} + 5%)"
+            total <= RESIDENT_CHARS + RESIDENT_CHARS / 20,
+            "resident tool specs grew to {total} chars (pinned {RESIDENT_CHARS} + 5%)"
+        );
+    }
+
+    #[cfg(not(feature = "code-mode"))]
+    #[test]
+    fn run_code_is_refused_without_code_mode() {
+        let dir = tmpdir();
+        let mut reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
+        assert!(reg.specs.iter().all(|s| s.name != "run_code"));
+        let out = reg.call("run_code", &json!({"code": "return 1;"}), &mut ctx(&dir));
+        assert!(out.is_error, "{}", out.text);
+        assert!(
+            out.text
+                .contains("not available in this session: this build has no code-mode feature"),
+            "{}",
+            out.text
         );
     }
 
     #[test]
     fn all_core_specs_deny_additional_properties() {
-        // B1-2 FastMCP audit: every advertised spec must be strict.
+        // B1-2 FastMCP audit: every resident spec (advertised or deferred)
+        // must be strict.
         let reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
-        for spec in &reg.specs {
+        for spec in &reg.base_specs {
             assert_eq!(
                 spec.input_schema.get("additionalProperties"),
                 Some(&serde_json::Value::Bool(false)),
@@ -1376,15 +1544,18 @@ mod tests {
                 spec.name
             );
         }
-        // `mcp` is the one name that is only resident when a server is
-        // configured, so the count compares against TOOL_NAMES minus it —
-        // the intent (spec list ↔ validation set, one of each) is kept.
+        // `mcp` is only resident when a server is configured and
+        // `run_code` only in a code-mode build, so the count compares
+        // against TOOL_NAMES minus those — the intent (spec list ↔
+        // validation set, one of each) is kept.
         let resident: Vec<&str> = TOOL_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "mcp")
+            .filter(|name| cfg!(feature = "code-mode") || *name != "run_code")
             .collect();
-        assert_eq!(reg.specs.len(), resident.len());
+        assert_eq!(reg.base_specs.len(), resident.len());
+        assert!(!reg.base_specs.iter().any(|s| s.name == "mcp"));
         assert!(!reg.specs.iter().any(|s| s.name == "mcp"));
     }
 
@@ -1473,8 +1644,9 @@ mod tests {
         let dir = tmpdir();
         let mut reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
         assert!(
-            reg.specs.iter().any(|s| s.name == "diagnostics"),
-            "the diagnostics tool is advertised"
+            reg.base_specs.iter().any(|s| s.name == "diagnostics")
+                && !reg.specs.iter().any(|s| s.name == "diagnostics"),
+            "the diagnostics tool is resident but deferred"
         );
         let mut c = ctx(&dir);
         // A typo'd argument is refused before the tool runs (B1-2).

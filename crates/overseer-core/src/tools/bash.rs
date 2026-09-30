@@ -20,22 +20,21 @@ pub fn spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
         name: "bash".into(),
         description: concat!(
-            "Run a shell command in the working directory via `sh -c`. ",
-            "Each call is a fresh, stateless process — no working directory or ",
-            "environment carries over between calls (use absolute paths or cd && cmd). ",
-            "Reserved for what the dedicated tools can't do: building, testing, git, ",
-            "package managers. Output is truncated/spilled to a file when large."
+            "Run a command via `sh -c` in the working directory. Each call is a fresh, ",
+            "stateless process — no cwd or env carries over (use absolute paths or cd && cmd). ",
+            "Only for what the dedicated tools can't do: build, test, git, package managers. ",
+            "Large output is truncated and spilled to a file."
         )
         .into(),
         input_schema: schema(
             json!({
                 "command": {
                     "type": "string",
-                    "description": "The shell command to run (sh -c)."
+                    "description": "Shell command."
                 },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Optional timeout in milliseconds (default 120000, max 600000)."
+                    "description": "Timeout ms (default 120000, max 600000)."
                 }
             }),
             &["command"],
