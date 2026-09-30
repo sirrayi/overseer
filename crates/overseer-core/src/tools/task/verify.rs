@@ -52,7 +52,9 @@ impl Verdict {
     }
 }
 
-/// The verdict from the last fenced block of `text` that parses as JSON.
+/// The verdict from the final fenced block of `text` — only that one: if
+/// it is not a valid verdict (or the last fence never closes), the
+/// verdict is `unknown` whatever came before.
 pub fn parse(text: &str) -> Verdict {
     let mut blocks = Vec::new();
     let mut cur: Option<String> = None;
@@ -72,9 +74,9 @@ pub fn parse(text: &str) -> Verdict {
         blockers: 0,
     };
     let Some(v) = blocks
-        .iter()
-        .rev()
-        .find_map(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+        .last()
+        .filter(|_| cur.is_none())
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
     else {
         return unknown;
     };
@@ -211,7 +213,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verdict_takes_the_last_json_block_and_counts_blockers() {
+    fn verdict_takes_the_final_fence_only_and_counts_blockers() {
         let text = "```json\n{\"verdict\":\"pass\"}\n```\nthen\n```json\n{\"verdict\":\"fail\",\"issues\":[\
             {\"severity\":\"blocker\"},{\"severity\":\"minor\"},{\"severity\":\"blocker\"}]}\n```";
         let v = parse(text);
@@ -222,6 +224,12 @@ mod tests {
             "unknown"
         );
         assert_eq!(parse("```\nnot json\n```").verdict, "unknown");
+        // Only the final fence counts: a valid verdict followed by junk
+        // (or an unclosed fence) is unknown, not the earlier verdict.
+        let junk = "```json\n{\"verdict\":\"pass\"}\n```\nlater\n```\nnot json\n```";
+        assert_eq!(parse(junk).verdict, "unknown");
+        let unclosed = "```json\n{\"verdict\":\"pass\"}\n```\n```json\n{\"verdict\":";
+        assert_eq!(parse(unclosed).verdict, "unknown");
         let mut p = parse("```json\n{\"verdict\":\"pass\"}\n```");
         p.tampered();
         assert_eq!(p.verdict, "partial");
