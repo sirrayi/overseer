@@ -165,22 +165,25 @@ impl Default for EntryMeta {
 /// Range/date/sensitivity validation runs through `validate_meta` so
 /// parse and direct construction share one gate.
 pub(crate) fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
-    let all: Vec<&str> = text.lines().collect();
-    if all.first().map(|l| l.trim()) != Some("---") {
+    let mut lines = text.split_inclusive('\n');
+    if lines.next().map(str::trim) != Some("---") {
         return Ok((EntryMeta::default(), text.to_string()));
     }
-    let mut close = None;
-    for (i, l) in all.iter().enumerate().skip(1) {
+    let (mut off, mut close) = (text.find('\n').map_or(text.len(), |i| i + 1), None);
+    let mut header = Vec::new();
+    for l in lines {
+        off += l.len();
         if l.trim() == "---" {
-            close = Some(i);
+            close = Some(off);
             break;
         }
+        header.push(l);
     }
     let Some(end) = close else {
         return Err("memory: unterminated frontmatter — missing closing `---`".into());
     };
     let mut meta = EntryMeta::default();
-    for line in &all[1..end] {
+    for line in header {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -232,10 +235,21 @@ pub(crate) fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
         }
     }
     validate_meta(&meta)?;
-    let mut body = all[end + 1..].join("\n");
-    if text.ends_with('\n') {
-        body.push('\n');
-    }
+    // The body is the text after the closing line, line endings
+    // normalized to `\n`; an empty body of a newline-terminated file is
+    // one newline.
+    let rest = &text[end..];
+    let body = if rest.contains('\r') {
+        let mut body = rest.lines().collect::<Vec<_>>().join("\n");
+        if text.ends_with('\n') {
+            body.push('\n');
+        }
+        body
+    } else if rest.is_empty() && text.ends_with('\n') {
+        "\n".to_string()
+    } else {
+        rest.to_string()
+    };
     Ok((meta, body))
 }
 
@@ -1895,6 +1909,33 @@ fn core_budget(text: &str, cap: usize) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The slicing parse keeps the line-joining parse's body exactly.
+    #[test]
+    fn parse_meta_body_matches_the_line_join() {
+        fn joined(text: &str) -> String {
+            let all: Vec<&str> = text.lines().collect();
+            let end = (1..all.len()).find(|&i| all[i].trim() == "---").unwrap();
+            let mut body = all[end + 1..].join("\n");
+            if text.ends_with('\n') {
+                body.push('\n');
+            }
+            body
+        }
+        for text in [
+            "---\nconfidence: 0.5\n---\n",
+            "---\nconfidence: 0.5\n---",
+            "---\n---\nbody\n",
+            "---\n---\nbody",
+            "---\ncues: a, b\n---\n# T\n\nx\n\n",
+            "---\r\nconfidence: 0.5\r\n---\r\nline\r\nmore\r\n",
+            "---\n---\r\nmixed\nends\r\n",
+            " --- \n---\n\n\n",
+        ] {
+            let (_, body) = parse_meta(text).unwrap();
+            assert_eq!(body, joined(text), "{text:?}");
+        }
+    }
 
     fn format_utc_stamp(secs: u64) -> String {
         rfc3339(secs)
