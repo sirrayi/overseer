@@ -105,6 +105,7 @@ pub fn recall(idx: &Index, input: &str, seen: &HashSet<String>, now: u64) -> Opt
         if hit.matched < need
             || hit.coverage < RECALL_MIN_COVERAGE
             || doc.layer() == Some(Layer::Prospective)
+            || engine_written(&doc.meta.provenance)
             || seen.contains(&doc.id())
         {
             continue;
@@ -127,6 +128,12 @@ pub fn recall(idx: &Index, input: &str, seen: &HashSet<String>, now: u64) -> Opt
         notes,
         text,
     })
+}
+
+/// Engine-authored notes (session episodes) stay out of recall; they
+/// remain searchable and gettable.
+fn engine_written(provenance: &str) -> bool {
+    provenance.split_whitespace().next() == Some("engine")
 }
 
 /// What a reminder is checked against.
@@ -251,6 +258,25 @@ mod tests {
         let dir = store();
         std::fs::write(dir.join("semantic/k.md"), "# K\nkubernetes cluster\n").unwrap();
         assert!(recall(&build(&dir), "kubernetes?", &HashSet::new(), NOW).is_some());
+    }
+
+    #[test]
+    fn engine_episodes_skip_recall_but_stay_searchable() {
+        let dir = store();
+        std::fs::write(
+            dir.join("episodic/session-a.md"),
+            "---\nprovenance: engine\nconfidence: 0.9\n---\n# Session a\nstaging deploy rollout\n",
+        )
+        .unwrap();
+        let idx = build(&dir);
+        assert_eq!(
+            recall(&idx, "the staging deploy", &HashSet::new(), NOW),
+            None
+        );
+        let hits = idx.search("staging deploy", NOW);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(idx.docs[hits[0].doc].id(), "project:episodic/session-a.md");
+        assert!(idx.find("project:episodic/session-a.md").is_some());
     }
 
     #[test]
