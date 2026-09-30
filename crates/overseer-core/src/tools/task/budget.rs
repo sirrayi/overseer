@@ -109,6 +109,15 @@ impl SpendAccount {
         held
     }
 
+    /// `id` finished but cannot be settled normally: its cap is released
+    /// down to `spent`, which stays held until the ledger shows it.
+    pub fn shrink(&self, id: &str, spent: f64) {
+        let mut g = self.lock();
+        if let Some(held) = g.reserved.get_mut(id) {
+            *held = held.min(spent.max(0.0));
+        }
+    }
+
     /// Drop `id`'s reservation without settling (the spawn never ran).
     pub fn release(&self, id: &str) {
         self.lock().reserved.remove(id);

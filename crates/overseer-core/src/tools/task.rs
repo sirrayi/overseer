@@ -420,10 +420,17 @@ fn open_dir(env: &Env, sc: &Sidecar) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn finish(dir: &Path) {
-    if let Some(mut sc) = Sidecar::load(dir) {
-        let _ = sc.finish(dir, State::Done);
-    }
+/// Mark `dir` done. A failed store still leaves it done for this process
+/// (never live-looking); its cap is released down to what it spent and
+/// the returned note carries the error into the digest.
+fn finish(env: &Env, dir: &Path) -> Option<String> {
+    let mut sc = Sidecar::load(dir)?;
+    let e = sc.finish(dir, State::Done).err()?;
+    env.account.shrink(&sc.id, sc.cost_usd);
+    Some(format!(
+        "[{}: finished, but task.json could not be written — {e}; its cap is released]",
+        sc.id
+    ))
 }
 
 /// Every dir a job can hold `running`: its own, the one a resume
@@ -520,7 +527,7 @@ fn execute(env: &Env, job: &Job) -> String {
                                 job.base.as_deref(),
                                 false,
                             );
-                            finish(&rdir);
+                            notes.extend(finish(env, &rdir));
                             cost += a.cost;
                             notes.push(format!(
                                 "[escalated {}→{}: {reason}; trace: {}]",
@@ -577,7 +584,7 @@ fn execute(env: &Env, job: &Job) -> String {
                             job.base.as_deref(),
                             false,
                         );
-                        finish(&vdir);
+                        let vfinish = finish(env, &vdir);
                         let v = va.verdict.clone().unwrap_or_else(|| verify::parse(""));
                         verdict = Some(v.verdict.clone());
                         let vfooter = Footer {
@@ -598,6 +605,9 @@ fn execute(env: &Env, job: &Job) -> String {
                         for n in &va.notes {
                             block.push_str(&format!("\n[{n}]"));
                         }
+                        if let Some(n) = vfinish {
+                            block.push_str(&format!("\n{n}"));
+                        }
                         block.push_str(&format!(
                             "\n{}",
                             vfooter.render().replacen("[task-", "(task-", 1)
@@ -614,9 +624,9 @@ fn execute(env: &Env, job: &Job) -> String {
         }
     }
     if run_dir != dir {
-        finish(&run_dir);
+        notes.extend(finish(env, &run_dir));
     }
-    finish(&dir);
+    notes.extend(finish(env, &dir));
 
     let mut out = String::new();
     if let Some(v) = &a.verdict {
@@ -1223,6 +1233,46 @@ mod tests {
         assert!(out.text.contains("no spend account"), "{}", out.text);
         assert!(mock.seen.lock().unwrap().is_empty(), "nothing ran");
         assert!(!dir.join("session/subagents/task-1").exists());
+    }
+
+    /// A task dir that turns unwritable mid-run: the finish cannot be
+    /// stored, yet the sidecar reads done (slot free), the cap is released
+    /// and the digest says why.
+    #[cfg(unix)]
+    #[test]
+    fn finish_store_failure_releases_and_never_looks_live() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir();
+        let task_dir = dir.join("session/subagents/task-1");
+        let locked = task_dir.clone();
+        let (mut c, _) = ctx_hooked(
+            &dir,
+            vec![done_text("digest body")],
+            cfg(&dir),
+            Some(Box::new(move || {
+                let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555));
+            })),
+        );
+        let out = run(&json!({"prompt": "p"}), &mut c);
+        let probe = std::fs::write(task_dir.join("probe"), "");
+        std::fs::set_permissions(&task_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if probe.is_ok() {
+            eprintln!("skipped: permissions are not enforced here (root?)");
+            return;
+        }
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("digest body"), "{}", out.text);
+        assert!(
+            out.text
+                .contains("task-1: finished, but task.json could not be written"),
+            "{}",
+            out.text
+        );
+        let s = sc(&dir, "task-1");
+        assert_eq!(s.state, State::Done);
+        assert!(!s.is_live());
+        let acct = c.subagents.spend.as_ref().unwrap();
+        assert!(acct.reserved_usd() < 1e-9, "{}", acct.reserved_usd());
     }
 
     /// A panicking background thread must not strand a live-looking

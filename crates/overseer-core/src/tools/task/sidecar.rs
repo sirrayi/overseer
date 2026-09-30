@@ -3,8 +3,9 @@
 //! in-flight count, the drain and settlement all read it — nothing
 //! guesses paths.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -97,8 +98,22 @@ pub fn ledger_total(dir: &Path) -> f64 {
     crate::ledger::Ledger::summarize(&rows).total_cost_usd
 }
 
+/// Finished records this process could not store (dir → record): what
+/// `load` returns for that dir, so a failed write never leaves a
+/// live-looking `running` sidecar behind in this process.
+fn unstored() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Sidecar>> {
+    static UNSTORED: OnceLock<Mutex<BTreeMap<PathBuf, Sidecar>>> = OnceLock::new();
+    UNSTORED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 impl Sidecar {
     pub fn load(dir: &Path) -> Option<Self> {
+        if let Some(sc) = unstored().get(dir) {
+            return Some(sc.clone());
+        }
         serde_json::from_str(&std::fs::read_to_string(dir.join(FILE)).ok()?).ok()
     }
 
@@ -107,7 +122,9 @@ impl Sidecar {
         let tmp = dir.join(format!("{FILE}.tmp"));
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(&tmp, json)?;
-        std::fs::rename(tmp, dir.join(FILE))
+        std::fs::rename(tmp, dir.join(FILE))?;
+        unstored().remove(dir);
+        Ok(())
     }
 
     /// Running in this process.
@@ -115,11 +132,14 @@ impl Sidecar {
         self.state == State::Running && self.process_nonce == process_nonce()
     }
 
-    /// Mark finished with `dir`'s ledger total.
+    /// Mark finished with `dir`'s ledger total. When the store fails the
+    /// finished record is still what this process loads for `dir`.
     pub fn finish(&mut self, dir: &Path, state: State) -> std::io::Result<()> {
         self.state = state;
         self.cost_usd = ledger_total(dir);
-        self.store(dir)
+        self.store(dir).inspect_err(|_| {
+            unstored().insert(dir.to_path_buf(), self.clone());
+        })
     }
 }
 
