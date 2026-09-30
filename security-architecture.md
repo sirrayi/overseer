@@ -324,8 +324,13 @@ the clean form (keeping raw moves the leak).
 - Age-key pattern: ONE x25519 identity in keychain (`overseer/master-key`)
   decrypts `~/.overseer/secrets.age` (0600) — one prompt surface, many
   secrets, `rage`-CLI interoperable.
-- Precedence: `OVERSEER_API_KEY`/provider env → `api_key_helper` command
+- Precedence: provider-specific env (`ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` / `GOOGLE_API_KEY`→`GEMINI_API_KEY` /
+  `OPENCODE_API_KEY`) → `api_key_helper` command
   (`op read op://…`-style, TTL'd) → keychain master → secrets.age → error.
+  Each step looks up only the provider's own name. There is no
+  project-level key (owner decision 2026-09-25); core's child-env strip
+  list keeps `OVERSEER_API_KEY` only as a defensive strip.
   `credential_store = "env"|"keychain"|"auto"` config knob.
 - `zeroize` for all key material (already in tree via rustls); Debug/
   Display never emit values; `.proxy(None)` on the ureq agent (T6 fix —
