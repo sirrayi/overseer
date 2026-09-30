@@ -84,7 +84,11 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
                 // Deferred tools the model called through `tools` — their
                 // schemas were loaded by an op=search now condensed away.
                 if name == "tools" && crate::tools::tools_tool::op_is(input, "call") {
-                    if let Some(inner) = input.get("name").and_then(|n| n.as_str()) {
+                    if let Some(inner) = input
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .filter(|n| is_deferred_name(n))
+                    {
                         if !deferred.iter().any(|d| d == inner) {
                             deferred.push(inner.to_string());
                         }
@@ -226,6 +230,13 @@ fn truncate(s: &str, cap: usize) -> String {
 
 // DEFERRED(owner): vendor-native compaction (Anthropic/Gemini condensation endpoints) — the always-false NativeCompaction/provider_compact_capability seam was removed as dead code; reintroduce it with the first real adapter impl — gate: vendor API + keys.
 
+/// A deferred tool's inner name (`mcp` is the router, not a tool) or an
+/// MCP tool's `mcp__server__tool` name.
+fn is_deferred_name(name: &str) -> bool {
+    name.starts_with("mcp__")
+        || (name != "mcp" && crate::tools::tools_tool::DEFERRED.contains(&name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,6 +372,35 @@ mod tests {
                 6,
                 "tools",
                 serde_json::json!({"op": "call", "name": "repo_map", "args": {}}),
+            ),
+            // Resident, router and unknown names are not deferred tools,
+            // even when the call went through `tools` (here: and failed).
+            start(
+                7,
+                "tools",
+                serde_json::json!({"op": "call", "name": "read", "args": {"path": "a"}}),
+            ),
+            ev(
+                8,
+                EventKind::ToolResult {
+                    call_id: "c7".into(),
+                    name: "tools".into(),
+                    content: "tools: 'read' is resident; call it directly".into(),
+                    is_error: true,
+                    raw_bytes: 1,
+                    spilled_to: None,
+                    denied: false,
+                },
+            ),
+            start(
+                9,
+                "tools",
+                serde_json::json!({"op": "call", "name": "mcp", "args": {}}),
+            ),
+            start(
+                10,
+                "tools",
+                serde_json::json!({"op": "call", "name": "bogus", "args": {}}),
             ),
         ];
         let s = summarize(&events, 100);
