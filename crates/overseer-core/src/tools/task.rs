@@ -590,7 +590,12 @@ fn execute(env: &Env, job: &Job) -> String {
         }
     }
     let mut verdict = a.verdict.as_ref().map(|v| v.verdict.clone());
-    if let Some(vid) = &job.verify_id {
+    let unchanged = job.verify_id.is_some()
+        && !verify::has_changes(&job.cwd, job.base.as_deref().unwrap_or("HEAD"));
+    if unchanged {
+        notes.push("[verify skipped: no changes]".into());
+    }
+    if let Some(vid) = job.verify_id.as_ref().filter(|_| !unchanged) {
         let vroute = route::resolve(Tier::Standard, &env.parent);
         match env.account.grant(
             vid,
@@ -1678,7 +1683,19 @@ mod tests {
     #[test]
     fn write_with_verify_chains_a_verifier_on_its_worktree() {
         let dir = repo();
-        let mut c = ctx(&dir);
+        let (mut c, _) = ctx_with(
+            &dir,
+            vec![
+                call(
+                    1,
+                    "bash",
+                    json!({"command": "echo made > made.txt"}),
+                    Usage::default(),
+                ),
+                done_text("digest body"),
+            ],
+            cfg(&dir),
+        );
         let out = run(
             &json!({"prompt": "w", "mode": "write", "verify": true}),
             &mut c,
@@ -1714,6 +1731,28 @@ mod tests {
             "{}",
             out.text
         );
+    }
+
+    /// A writer that changed nothing has nothing to verify: no verifier
+    /// runs, no cap is drawn, and the digest says so.
+    #[test]
+    fn chained_verify_is_skipped_without_changes() {
+        let dir = repo();
+        let (mut c, mock) = ctx_with(&dir, vec![done_text("nothing to do")], cfg(&dir));
+        let out = run(
+            &json!({"prompt": "w", "mode": "write", "verify": true}),
+            &mut c,
+        );
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.contains("[verify skipped: no changes]"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("[verify task-2]"), "{}", out.text);
+        assert_eq!(mock.seen.lock().unwrap().len(), 1, "writer only");
+        assert!(Sidecar::load(&dir.join("session/subagents/task-2")).is_none());
+        assert_eq!(Footer::parse(&out.text).unwrap().verdict, None);
     }
 
     #[test]

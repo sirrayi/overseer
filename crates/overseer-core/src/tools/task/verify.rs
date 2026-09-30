@@ -132,6 +132,15 @@ fn porcelain(cwd: &Path) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
+/// Whether `cwd` differs from `base`: a tracked diff (committed or not)
+/// or an untracked file. A git failure counts as changed — the verifier
+/// then runs and reports it.
+pub fn has_changes(cwd: &Path, base: &str) -> bool {
+    let tracked = git(cwd, &["diff", base, "--name-only"]).map(|d| !d.trim().is_empty());
+    let untracked = porcelain(cwd).map(|rows| rows.iter().any(|(c, _)| c == "??"));
+    !matches!((tracked, untracked), (Ok(false), Ok(false)))
+}
+
 /// Path → hash of (status, content) — catches edits to already-dirty
 /// files that `git status` alone would miss.
 pub fn snapshot(cwd: &Path) -> Option<BTreeMap<String, u64>> {
