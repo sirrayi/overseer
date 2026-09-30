@@ -683,7 +683,10 @@ fn at_mention_completes_paths() {
         root.join("session"),
     );
     let _ = etx;
-    let mut backend = TestBackend::new(60, 20);
+    // Wide enough that the status line never truncates the cwd — at 60
+    // cols a long TMPDIR prefix is cut BEFORE `norm` can replace it,
+    // making the snapshot depend on the host's temp-dir length.
+    let mut backend = TestBackend::new(140, 20);
     backend.set_cursor_position((0, 10)).unwrap();
     let mut term = Terminal::with_options(
         backend,
@@ -694,8 +697,10 @@ fn at_mention_completes_paths() {
     .unwrap();
     let caps = Caps::default();
 
-    // The status line truncates the workspace cwd — normalize the
-    // temp-dir prefix and the pid-bearing dirname separately.
+    // Normalize the temp-dir prefix and the pid-bearing dirname; the
+    // status line's pad before the right block is computed from the RAW
+    // cwd length, so also collapse that gap — otherwise TMPDIR length
+    // shifts the layout and the snapshot is host-dependent.
     let tmp = std::env::temp_dir()
         .display()
         .to_string()
@@ -703,7 +708,18 @@ fn at_mention_completes_paths() {
         .to_string();
     let dirname = root.file_name().unwrap().to_str().unwrap().to_string();
     let norm = move |t: &Terminal<TestBackend>| {
-        screen(t).replace(&tmp, "[tmp]").replace(&dirname, "[root]")
+        screen(t)
+            .replace(&tmp, "[tmp]")
+            .replace(&dirname, "[root]")
+            .lines()
+            .map(|l| match (l.find("[tmp]/[root]"), l.find("test-model")) {
+                (Some(i), Some(j)) if i < j => {
+                    format!("{} {}", &l[..i + "[tmp]/[root]".len()], &l[j..])
+                }
+                _ => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     for c in "@mai".chars() {
