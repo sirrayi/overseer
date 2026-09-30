@@ -1042,6 +1042,27 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(5));
     }
 
+    /// Catastrophic backtracking: QuickJS's regex engine polls the
+    /// interrupt handler (`lre_check_timeout`), so the deadline holds
+    /// inside a single `RegExp.prototype.test`.
+    #[test]
+    fn a_backtracking_regex_dies_at_the_deadline() {
+        let dir = tmpdir();
+        let mut r = reg(Policy::allow_all());
+        let t = Instant::now();
+        let out = r.call(
+            "run_code",
+            &json!({"code": "return /(a+)+$/.test('a'.repeat(28) + '!');", "timeout_s": 1}),
+            &mut ctx(&dir),
+        );
+        assert!(
+            out.is_error && out.text == "run_code: timed out after 1s; the script was aborted.",
+            "{}",
+            out.text
+        );
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
     #[test]
     fn a_memory_bomb_dies_at_the_heap_cap() {
         let dir = tmpdir();
