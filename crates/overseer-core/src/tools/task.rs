@@ -487,12 +487,19 @@ fn panicked(env: &Env, job: &Job, payload: &(dyn std::any::Any + Send)) -> Strin
         .map(|s| s.to_string())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "non-string panic payload".into());
+    let mut out = format!("[subagent {} panicked: {msg}]", job.id);
     for dir in job_dirs(env, job) {
         if let Some(mut sc) = Sidecar::load(&dir).filter(|sc| sc.state == State::Running) {
-            let _ = sc.finish(&dir, State::Dead);
+            if let Err(e) = sc.finish(&dir, State::Dead) {
+                out.push_str(&format!(
+                    "\n[{}: task.json could not be written — {e}]",
+                    sc.id
+                ));
+            }
+            env.account.shrink(&sc.id, sc.cost_usd);
         }
     }
-    format!("[subagent {} panicked: {msg}]", job.id)
+    out
 }
 
 fn record(
@@ -1350,6 +1357,8 @@ mod tests {
         assert!(!s.is_live());
         let subs = dir.join("session/subagents");
         assert_eq!(sidecar::in_flight(&subs), 0, "slot freed");
+        let spend = c.subagents.spend.clone().unwrap();
+        assert_eq!(spend.reserved_usd(), 0.0, "cap released at the panic");
         // Resume is allowed again (it gets past the liveness check).
         let out = run(&json!({"prompt": "again", "resume": "task-1"}), &mut c);
         assert!(!out.text.contains("still running"), "{}", out.text);
