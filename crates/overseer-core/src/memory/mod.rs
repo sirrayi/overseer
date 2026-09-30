@@ -680,8 +680,12 @@ fn pointer_live(dir: &Path, line: &str) -> bool {
 /// untrusted text (RT-3). Proposals stay on disk for human review but are
 /// never injected into the trusted memory segment.
 fn is_proposal_pointer(line: &str) -> bool {
-    let t = line.trim_start();
-    t.starts_with("proposals/") || t.contains("proposals/")
+    let mut tokens = line.split_whitespace();
+    let first = match tokens.next() {
+        Some("-" | "*") => tokens.next(),
+        t => t,
+    };
+    first.is_some_and(|t| t.trim_start_matches('`').starts_with("proposals/"))
 }
 
 /// The system-prompt segment carrying the index — sits at the end of the
@@ -2077,6 +2081,25 @@ mod tests {
             "proposals/x.md — y",
         ] {
             assert_eq!(topic_name(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn proposal_pointer_is_decided_by_the_first_token() {
+        for yes in [
+            "proposals/x.md — y",
+            "  proposals/x.md — y",
+            "- proposals/x.md — y",
+            "`proposals/x.md` — y",
+        ] {
+            assert!(is_proposal_pointer(yes), "{yes}");
+        }
+        for no in [
+            "semantic/review.md — how proposals/ are reviewed",
+            "semantic/x.md — see docs/proposals/rfc.md",
+            "",
+        ] {
+            assert!(!is_proposal_pointer(no), "{no}");
         }
     }
 
