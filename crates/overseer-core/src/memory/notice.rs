@@ -170,19 +170,42 @@ pub fn due(idx: &Index, ev: &Event, now: u64) -> Vec<usize> {
         .collect()
 }
 
-/// Fire one due reminder: stamp `fired: <now>` into the note (the engine's
-/// only frontmatter write — it fires exactly once) and render the notice.
-pub fn fire(doc: &mut Doc, now: u64) -> std::io::Result<Notice> {
-    let text = std::fs::read_to_string(&doc.path)?;
+/// Fire one due reminder, exactly once across processes: claim it with
+/// `create_new` on `<store>/.index/fired/<sha256(rel)[..16]>`, then stamp
+/// `fired: <now>` into the note (the engine's only frontmatter write) and
+/// render the notice. `None` when another process already claimed it.
+pub fn fire(doc: &mut Doc, now: u64) -> std::io::Result<Option<Notice>> {
     let stamp = super::rfc3339(now);
+    let depth = doc.rel.split('/').count();
+    let store = doc
+        .path
+        .ancestors()
+        .nth(depth)
+        .ok_or_else(|| std::io::Error::other("note outside its store"))?;
+    let claims = store.join(".index").join("fired");
+    crate::harden::ensure_private_dir(&claims)?;
+    let claim = claims.join(super::sha_hex(doc.rel.as_bytes(), 16));
+    let won = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&claim);
+    doc.meta.fired = Some(stamp.clone());
+    match won {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(format!("{}\t{stamp}\n", doc.rel).as_bytes())?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let text = std::fs::read_to_string(&doc.path)?;
     std::fs::write(&doc.path, super::set_meta_key(&text, "fired", &stamp))?;
-    doc.meta.fired = Some(stamp);
     let body: String = doc.body.trim().chars().take(REMINDER_BODY).collect();
-    Ok(Notice {
+    Ok(Some(Notice {
         kind: "reminder",
         notes: vec![doc.id()],
         text: format!("[reminder] {body} (memory: {})", doc.rel),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -350,7 +373,7 @@ mod tests {
         ] {
             let d = due(&idx, &ev, clock);
             assert_eq!(d.len(), 1);
-            let n = fire(&mut idx.docs[d[0]], clock).unwrap();
+            let n = fire(&mut idx.docs[d[0]], clock).unwrap().unwrap();
             fired.push(n.text);
             assert!(due(&idx, &ev, clock).is_empty(), "fires once in-session");
         }
@@ -374,6 +397,97 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with("bump the changelog\n"));
+    }
+
+    /// Two sessions over one store each hold their own index (nothing
+    /// shared but the files): only the claim winner emits the reminder.
+    #[test]
+    fn fire_claims_once_across_indexes() {
+        let dir = store();
+        std::fs::write(
+            dir.join("prospective/kw.md"),
+            "---\ntrigger: kw:release\n---\nbump the changelog\n",
+        )
+        .unwrap();
+        let mut indexes: Vec<Index> = (0..8).map(|_| build(&dir)).collect();
+        let ev = Event::Input("cut a release");
+        let won = std::thread::scope(|s| {
+            let handles: Vec<_> = indexes
+                .iter_mut()
+                .map(|idx| {
+                    let ev = &ev;
+                    s.spawn(move || {
+                        let d = due(idx, ev, NOW);
+                        assert_eq!(d.len(), 1);
+                        let n = fire(&mut idx.docs[d[0]], NOW).unwrap();
+                        assert!(due(idx, ev, NOW).is_empty(), "quiet after a lost claim too");
+                        n
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .count()
+        });
+        assert_eq!(won, 1);
+        let claim = dir
+            .join(".index/fired")
+            .join(crate::memory::sha_hex(b"prospective/kw.md", 16));
+        assert!(claim.is_file());
+    }
+
+    /// Real processes: the test binary re-runs itself as claimants.
+    #[test]
+    fn fire_claims_once_across_processes() {
+        let dir = store();
+        std::fs::write(
+            dir.join("prospective/kw.md"),
+            "---\ntrigger: kw:release\n---\nbump the changelog\n",
+        )
+        .unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let children: Vec<_> = (0..4)
+            .map(|_| {
+                std::process::Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "memory::notice::tests::fire_claim_child",
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("OV_FIRE_STORE", &dir)
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let fired: usize = children
+            .into_iter()
+            .map(|c| {
+                let out = c.wait_with_output().unwrap();
+                assert!(out.status.success());
+                String::from_utf8_lossy(&out.stdout)
+                    .matches("CLAIM:fired")
+                    .count()
+            })
+            .sum();
+        assert_eq!(fired, 1);
+    }
+
+    #[test]
+    #[ignore = "child process of fire_claims_once_across_processes"]
+    fn fire_claim_child() {
+        let Some(dir) = std::env::var_os("OV_FIRE_STORE") else {
+            return;
+        };
+        let mut idx = build(Path::new(&dir));
+        let d = due(&idx, &Event::Input("release"), NOW);
+        let got = d
+            .first()
+            .map(|i| fire(&mut idx.docs[*i], NOW).unwrap().is_some());
+        println!("CLAIM:{}", if got == Some(true) { "fired" } else { "lost" });
     }
 
     fn rfc(s: &str) -> u64 {

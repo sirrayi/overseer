@@ -172,7 +172,7 @@ impl MemoryState {
             }
         }
         for i in notice::due(idx, &notice::Event::Input(text), now) {
-            if let Ok(n) = notice::fire(&mut idx.docs[i], now) {
+            if let Ok(Some(n)) = notice::fire(&mut idx.docs[i], now) {
                 out.push(n);
             }
         }
@@ -197,7 +197,7 @@ impl MemoryState {
         let rel = p.strip_prefix(cwd).unwrap_or(p);
         let rel = rel.strip_prefix(".").unwrap_or(rel);
         for i in notice::due(idx, &notice::Event::Path(rel), now) {
-            if let Ok(n) = notice::fire(&mut idx.docs[i], now) {
+            if let Ok(Some(n)) = notice::fire(&mut idx.docs[i], now) {
                 self.queued.push(n);
             }
         }
