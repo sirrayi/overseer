@@ -496,6 +496,7 @@ mod tests {
             stop_reason: "completed".into(),
             steps,
             total_cost_usd: 0.25,
+            subagent_cost_usd: 0.0,
             cache: Default::default(),
         }
     }
