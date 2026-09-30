@@ -453,20 +453,14 @@ impl Job {
     }
 
     fn describe<'js>(&self, ctx: &Ctx<'js>, e: CaughtError<'js>) -> String {
-        if self.control.interrupted() {
-            return "[interrupted]".into();
-        }
-        if Instant::now() >= self.deadline {
-            return format!(
-                "run_code: timed out after {}s; the script was aborted.",
-                self.timeout
-            );
-        }
         match e {
             CaughtError::Exception(ex) => {
                 let obj = ex.as_object();
                 let name: String = obj.get("name").unwrap_or_else(|_| "Error".into());
                 let msg = ex.message().unwrap_or_default();
+                if let Some(said) = self.interrupt(&name, &msg) {
+                    return said;
+                }
                 let stack = ex.stack().unwrap_or_default();
                 let frames: Vec<&str> = stack.lines().take(STACK_FRAMES).collect();
                 format!("{name}: {msg}\n{}", frames.join("\n"))
@@ -474,6 +468,25 @@ impl Job {
             CaughtError::Value(v) => format!("uncaught: {}", render(ctx, v, false)),
             CaughtError::Error(e) => format!("run_code: {e}"),
         }
+    }
+
+    /// What to report when the caught exception is an interrupt: the
+    /// engine's uncatchable `InternalError: interrupted` (user interrupt or
+    /// deadline), or a sub-call refused because the user interrupted.
+    /// `None` = a real exception, reported as itself.
+    fn interrupt(&self, name: &str, msg: &str) -> Option<String> {
+        let engine = name == "InternalError" && msg == "interrupted";
+        let refused = msg == "[interrupted]";
+        if (engine || refused) && self.control.interrupted() {
+            return Some("[interrupted]".into());
+        }
+        if engine && Instant::now() >= self.deadline {
+            return Some(format!(
+                "run_code: timed out after {}s; the script was aborted.",
+                self.timeout
+            ));
+        }
+        None
     }
 
     /// Globals: `print(...xs)` and the `tools` object.
@@ -1169,6 +1182,57 @@ mod tests {
         flip.join().unwrap();
         assert_eq!(out.text, "[interrupted]");
         assert!(out.is_error && t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A real exception thrown after the deadline is reported as itself,
+    /// not as a timeout: only the engine's interrupt is a timeout.
+    #[test]
+    fn an_exception_past_the_deadline_is_not_a_timeout() {
+        let dir = tmpdir();
+        let mut r = reg(Policy::allow_all());
+        let out = r.call(
+            "run_code",
+            &json!({"code": "tools.bash({command: 'sleep 1.5'});
+tools.glob({pattern: '*'});", "timeout_s": 1}),
+            &mut ctx(&dir),
+        );
+        assert!(out.is_error, "{}", out.text);
+        assert!(
+            out.text
+                .starts_with("Error: run_code: deadline passed; no further sub-calls."),
+            "{}",
+            out.text
+        );
+        let out = r.call(
+            "run_code",
+            &json!({"code": "tools.bash({command: 'sleep 1.5'});
+throw 'boom';", "timeout_s": 1}),
+            &mut ctx(&dir),
+        );
+        assert_eq!(out.text, "uncaught: \"boom\"");
+    }
+
+    /// Likewise after a user interrupt: an exception the script raised
+    /// itself is reported, `[interrupted]` only for the interrupt.
+    #[test]
+    fn an_exception_after_a_user_interrupt_is_reported() {
+        let dir = tmpdir();
+        let mut r = reg(Policy::allow_all());
+        let control = Control::default();
+        r.set_control(control.clone());
+        let flip = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            control.interrupt();
+        });
+        let out = run_in(
+            &mut r,
+            &dir,
+            "tools.bash({command: 'sleep 1'});
+null.x;",
+        );
+        flip.join().unwrap();
+        assert!(out.is_error, "{}", out.text);
+        assert!(out.text.starts_with("TypeError: "), "{}", out.text);
     }
 
     #[test]
