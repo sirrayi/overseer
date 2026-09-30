@@ -1195,7 +1195,9 @@ impl Policy {
             // Memory v2 remember/forget: the layer bar is keyed by the
             // input's `layer` (forget: the target name's layer), combined
             // with the lane default exactly like the file-write arm below.
-            // Untrusted content never Asks here — the tool quarantines it.
+            // Untrusted content never Asks for `remember` — the tool
+            // quarantines it — but a `forget` has no quarantine, so the
+            // Rule-of-Two latch Asks for it (headless ⇒ Deny).
             "memory" => {
                 let need = crate::memory::layer_bar_for_input(input);
                 let lane_default = match class {
@@ -1207,12 +1209,20 @@ impl Policy {
                     .get(Self::domain(class))
                     .copied()
                     .unwrap_or(lane_default);
+                let forget = input.get("op").and_then(Value::as_str) == Some("forget");
                 match need.min(level) {
                     Autonomy::Observe => Verdict::Deny {
                         reason: format!("memory: layer needs approval (class {class:?})"),
                     },
                     Autonomy::Suggest | Autonomy::ActWithApproval => Verdict::Ask {
                         reason: format!("memory: layer needs approval (class {class:?})"),
+                    },
+                    _ if forget && self.taint_untrusted() => Verdict::Ask {
+                        reason: format!(
+                            "memory forget: untrusted content in context (via {}) — \
+                             expiring a note needs approval",
+                            self.untrusted_via().unwrap_or_else(|| "context".into())
+                        ),
                     },
                     Autonomy::ActAndReport | Autonomy::ActSilently => Verdict::Allow,
                 }
@@ -2836,6 +2846,25 @@ mod tests {
         assert!(deny(
             &ro,
             json!({"op": "remember", "layer": "semantic", "text": "x"})
+        ));
+    }
+
+    /// Rule-of-Two on `forget`: with untrusted content in context an
+    /// expiry needs a human (headless ⇒ Deny); `remember` stays Allow
+    /// because the tool itself quarantines it.
+    #[test]
+    fn tainted_forget_asks_and_headless_denies() {
+        let p = pol();
+        let forget = json!({"op": "forget", "name": "project:semantic/x.md", "text": "r"});
+        let remember = json!({"op": "remember", "layer": "semantic", "text": "x"});
+        assert_eq!(p.check("memory", &forget), Verdict::Allow);
+        assert!(p.arm_untrusted("web_fetch").is_some());
+        assert!(matches!(p.check("memory", &forget), Verdict::Ask { .. }));
+        assert!(matches!(p.gate("memory", &forget), Gate::Deny(_)));
+        assert_eq!(p.check("memory", &remember), Verdict::Allow);
+        assert!(matches!(
+            p.check("memory", &json!({"op": "search", "query": "x"})),
+            Verdict::Allow
         ));
     }
 }
