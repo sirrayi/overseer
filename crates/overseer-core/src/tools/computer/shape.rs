@@ -106,6 +106,8 @@ pub fn windows(result: &Value) -> String {
 
 /// One parsed AX element — fields are cua-driver's (verified 0.26.1);
 /// `element_token` is the driver's preferred act-addressing token.
+/// `frame` is the driver's reported `{x,y,w,h}` bounds (not rendered in
+/// the observe text — it exists for coordinate acts and the live test).
 #[derive(Debug, Default)]
 pub struct Element {
     pub index: i64,
@@ -116,6 +118,10 @@ pub struct Element {
     pub actions: Vec<String>,
     pub depth: usize,
     pub parent: Option<i64>,
+    /// (x, y, w, h) window-local bounds when AT-SPI reports usable ones.
+    /// Only test code reads it today (the live coordinate proof).
+    #[cfg(test)]
+    pub frame: Option<(f64, f64, f64, f64)>,
 }
 
 /// Parse `structuredContent.elements[]` defensively: missing fields become
@@ -157,6 +163,19 @@ pub fn parse_elements(result: &Value) -> Vec<Element> {
                         .get("parent_index")
                         .or_else(|| e.get("parent"))
                         .and_then(Value::as_i64),
+                    #[cfg(test)]
+                    frame: e.get("frame").and_then(|f| {
+                        Some((
+                            f.get("x").and_then(Value::as_f64)?,
+                            f.get("y").and_then(Value::as_f64)?,
+                            f.get("w")
+                                .or_else(|| f.get("width"))
+                                .and_then(Value::as_f64)?,
+                            f.get("h")
+                                .or_else(|| f.get("height"))
+                                .and_then(Value::as_f64)?,
+                        ))
+                    }),
                 })
                 .collect()
         })
