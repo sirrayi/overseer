@@ -39,8 +39,12 @@ architecture.
   provenance-wrapped. `repomap.rs` builds a bounded (~1K token)
   ranked symbol index (one header per file) behind `repo_map`/`symbol`
   tools. `task` has
-  read/write/background modes — writers isolate into git worktrees,
-  background results land via SubagentDone notices (max 4 in flight).
+  read/write/verify/consult modes on light/standard/heavy tiers —
+  writers isolate into git worktrees, verify returns a parsed verdict,
+  consult is one no-tools call; each run's cap is carved from the
+  parent's remaining budget and its spend settles into the parent
+  ledger; background results land via SubagentDone notices (max
+  `max_bg_subagents`, default 4, in flight).
   Rule-of-Two (perm.rs): untrusted-content + sensitive-data latches
   arm the exfil gate (side effects force Ask); tool results enter the
   model view provenance-wrapped. Bash calls run
