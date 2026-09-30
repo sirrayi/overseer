@@ -19,7 +19,9 @@
 //! sub-calls and 8 MB of sub-call results per run, 16,000 printed chars.
 //! The interrupt handler only fires while JS runs: a sub-call is refused
 //! once the deadline has passed, but one already in flight can overrun
-//! the deadline by up to its own timeout (e.g. a long `bash`).
+//! the deadline by up to its own timeout (e.g. a long `bash`). An engine
+//! that has not stopped 5 s past the deadline (or past the last sub-call
+//! reply, if later) is abandoned: the call errors and the worker detaches.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -77,6 +79,9 @@ const DEFAULT_TIMEOUT_S: u64 = 30;
 /// Stack frames kept in an error result (enough to locate the line).
 const STACK_FRAMES: usize = 4;
 const MAX_TIMEOUT_S: u64 = 120;
+/// How long past its deadline the engine gets to stop before the tool
+/// thread abandons it.
+const ENGINE_GRACE: Duration = Duration::from_secs(5);
 
 pub fn spec() -> ToolSpec {
     ToolSpec {
@@ -174,23 +179,66 @@ pub fn run(input: &Json, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutpu
         Ok(w) => w,
         Err(e) => return ToolOutput::err(format!("run_code: could not start the engine: {e}")),
     };
-    let mut budget = SubcallBudget::default();
-    let outcome = loop {
-        match from_worker.recv() {
-            Ok(Msg::Call(name, args)) => {
-                let reply = sub_call(reg, ctx, &name, &args, deadline, &control, &mut budget);
-                if to_worker.send(reply).is_err() {
-                    break engine_died();
-                }
-            }
-            Ok(Msg::Done(outcome)) => break outcome,
-            Err(_) => break engine_died(),
-        }
-    };
-    let _ = worker.join();
+    let (outcome, finished) = serve(
+        reg,
+        ctx,
+        &from_worker,
+        &to_worker,
+        deadline,
+        &control,
+        ENGINE_GRACE,
+    );
+    if finished {
+        let _ = worker.join();
+    } else {
+        // Detached, never joined: the JS thread holds no lock or `&mut`,
+        // and what it leaks is bounded by the heap and stack caps.
+        drop(worker);
+    }
     ToolOutput {
         is_error: outcome.is_error,
         ..ToolOutput::ok(outcome.text)
+    }
+}
+
+/// Serve the worker's sub-calls until it reports its outcome. The worker
+/// gets `grace` past the deadline (or past the last sub-call reply, if
+/// that came later) to stop; a wedge on a C path that never polls the
+/// interrupt is abandoned with an error. Sub-calls run on this thread and
+/// are bounded by their own tool timeouts (an Ask waits for the human),
+/// not by this. `false` = the worker was abandoned, not finished.
+fn serve(
+    reg: &mut ToolRegistry,
+    ctx: &mut ToolCtx,
+    from_worker: &mpsc::Receiver<Msg>,
+    to_worker: &mpsc::Sender<Reply>,
+    deadline: Instant,
+    control: &Control,
+    grace: Duration,
+) -> (Outcome, bool) {
+    let mut budget = SubcallBudget::default();
+    let mut floor = deadline;
+    loop {
+        let wait = (floor + grace).saturating_duration_since(Instant::now());
+        match from_worker.recv_timeout(wait) {
+            Ok(Msg::Call(name, args)) => {
+                let reply = sub_call(reg, ctx, &name, &args, deadline, control, &mut budget);
+                floor = floor.max(Instant::now());
+                if to_worker.send(reply).is_err() {
+                    return (engine_died(), true);
+                }
+            }
+            Ok(Msg::Done(outcome)) => return (outcome, true),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return (engine_died(), true),
+            Err(mpsc::RecvTimeoutError::Timeout) => return (engine_abandoned(), false),
+        }
+    }
+}
+
+fn engine_abandoned() -> Outcome {
+    Outcome {
+        text: "run_code: the script engine did not stop at its deadline; it was abandoned.".into(),
+        is_error: true,
     }
 }
 
@@ -703,6 +751,65 @@ mod tests {
             recs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             ["glob"]
         );
+    }
+
+    /// A worker that never reports (a wedge on a non-polling C path) is
+    /// abandoned `grace` past the deadline instead of hanging the agent.
+    #[test]
+    fn a_wedged_engine_is_abandoned_after_the_grace() {
+        let dir = tmpdir();
+        let mut r = reg(Policy::allow_all());
+        let (_wedged, from_worker) = mpsc::channel::<Msg>();
+        let (to_worker, _replies) = mpsc::channel::<Reply>();
+        let t = Instant::now();
+        let (out, finished) = serve(
+            &mut r,
+            &mut ctx(&dir),
+            &from_worker,
+            &to_worker,
+            Instant::now() + Duration::from_millis(100),
+            &Control::default(),
+            Duration::from_millis(200),
+        );
+        assert!(!finished);
+        assert!(out.is_error);
+        assert_eq!(
+            out.text,
+            "run_code: the script engine did not stop at its deadline; it was abandoned."
+        );
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    /// The grace restarts after a sub-call that overran it: the engine
+    /// still gets to stop on the reply.
+    #[test]
+    fn a_sub_call_past_the_grace_does_not_abandon_the_engine() {
+        let dir = tmpdir();
+        let mut r = reg(Policy::allow_all());
+        let (to_host, from_worker) = mpsc::channel::<Msg>();
+        let (to_worker, from_host) = mpsc::channel::<Reply>();
+        let worker = std::thread::spawn(move || {
+            to_host
+                .send(Msg::Call("bash".into(), json!({"command": "sleep 0.5"})))
+                .unwrap();
+            let reply = from_host.recv().unwrap();
+            let _ = to_host.send(Msg::Done(Outcome {
+                text: format!("{}", reply.is_ok()),
+                is_error: false,
+            }));
+        });
+        let (out, finished) = serve(
+            &mut r,
+            &mut ctx(&dir),
+            &from_worker,
+            &to_worker,
+            Instant::now() + Duration::from_millis(100),
+            &Control::default(),
+            Duration::from_millis(200),
+        );
+        worker.join().unwrap();
+        assert!(finished, "{}", out.text);
+        assert_eq!(out.text, "true");
     }
 
     #[test]
