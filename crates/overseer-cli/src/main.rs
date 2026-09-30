@@ -52,6 +52,12 @@ fn real_main() -> i32 {
     }
 
     let rest = &args[1..];
+    // `-h`/`--help` after any subcommand prints the same usage — the
+    // shared arg parser would otherwise reject it as an unknown flag.
+    if rest.iter().any(|a| a == "--help" || a == "-h") {
+        usage();
+        return 0;
+    }
     match args[0].as_str() {
         "tui" => cmd::tui::cmd_tui(rest),
         "web" => cmd::tui::cmd_web(rest),
