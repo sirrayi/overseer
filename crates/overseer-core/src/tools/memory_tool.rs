@@ -355,12 +355,9 @@ impl MemoryState {
         if quarantine.is_some() {
             let pdir = dir.join("proposals");
             crate::harden::ensure_private_dir(&pdir).map_err(|e| e.to_string())?;
-            let name = crate::memory::unique_name(&pdir, &base);
-            std::fs::write(
-                pdir.join(format!("{name}.md")),
-                format!("---\n{meta}---\n{text}\n"),
-            )
-            .map_err(|e| e.to_string())?;
+            let name =
+                crate::memory::create_unique(&pdir, &base, &format!("---\n{meta}---\n{text}\n"))
+                    .map_err(|e| e.to_string())?;
             return Ok(ToolOutput::ok(format!(
                 "memory: quarantined for human review as {}:proposals/{name}.md — untrusted \
                  content is in context, so this note is not indexed, recalled or resident.",

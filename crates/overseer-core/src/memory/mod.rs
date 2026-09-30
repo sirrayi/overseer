@@ -1576,14 +1576,31 @@ pub(crate) fn sha_hex(bytes: &[u8], n: usize) -> String {
         .collect()
 }
 
-pub(crate) fn unique_name(dir: &Path, base: &str) -> String {
-    let mut name = base.to_string();
+/// Create `dir/<base>.md` (else `<base>-2.md`, `-3`, …) holding `text`,
+/// claiming the name with `create_new` so a concurrent writer can never
+/// be overwritten. Returns the name without `.md`.
+pub(crate) fn create_unique(dir: &Path, base: &str, text: &str) -> std::io::Result<String> {
+    use std::io::Write;
     let mut n = 1;
-    while dir.join(format!("{name}.md")).exists() {
-        n += 1;
-        name = format!("{base}-{n}");
+    loop {
+        let name = if n == 1 {
+            base.to_string()
+        } else {
+            format!("{base}-{n}")
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(format!("{name}.md")))
+        {
+            Ok(mut f) => {
+                f.write_all(text.as_bytes())?;
+                return Ok(name);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e),
+        }
     }
-    name
 }
 
 /// ADD a new note `layer/<unique base>.md` to store `dir` with frontmatter
@@ -1598,11 +1615,7 @@ pub(crate) fn add_note(
 ) -> std::io::Result<String> {
     let ldir = dir.join(layer.name());
     crate::harden::ensure_private_dir(&ldir)?;
-    let name = unique_name(&ldir, base);
-    std::fs::write(
-        ldir.join(format!("{name}.md")),
-        format!("---\n{meta}---\n{text}\n"),
-    )?;
+    let name = create_unique(&ldir, base, &format!("---\n{meta}---\n{text}\n"))?;
     let rel = format!("{}/{name}.md", layer.name());
     append_pointer(dir, &format!("{rel} — {}", pointer_title(text)))?;
     Ok(rel)
@@ -2157,6 +2170,34 @@ mod tests {
             "proposals/db.md",
         ] {
             assert_eq!(q(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn create_unique_never_overwrites_under_a_race() {
+        let dir = tmpdir();
+        std::fs::write(dir.join("n.md"), "first\n").unwrap();
+        let names: Vec<String> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..16)
+                .map(|i| {
+                    let dir = &dir;
+                    s.spawn(move || create_unique(dir, "n", &format!("body {i}\n")).unwrap())
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 16, "{names:?}");
+        assert!(!names.contains(&"n".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("n.md")).unwrap(),
+            "first\n"
+        );
+        for (i, name) in names.iter().enumerate() {
+            let body = std::fs::read_to_string(dir.join(format!("{name}.md"))).unwrap();
+            assert_eq!(body, format!("body {i}\n"));
         }
     }
 
