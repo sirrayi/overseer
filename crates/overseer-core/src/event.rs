@@ -630,6 +630,50 @@ pub fn clear_stale_tool_results(messages: &mut [crate::ir::Message], keep: usize
     stale
 }
 
+/// Placeholder that replaces an elided image block. Fixed text so the
+/// transform is idempotent.
+pub const ELIDED_IMAGE: &str = "[screenshot elided — take a new one if needed]";
+
+/// F5: keep at most the `keep` most recent `Image` blocks in the model
+/// view; older ones become [`ELIDED_IMAGE`] text. Every image in the
+/// view is a computer capture (the only producer is
+/// `tools::computer::image_block`), and each still rides its own
+/// tool-result's envelope text — tool_use/tool_result pairing is
+/// untouched.
+///
+/// Same view-transform contract as [`clear_stale_tool_results`]: events
+/// are never mutated, so a resumed session's rebuilt view behaves
+/// identically (images never rehydrate — only their envelopes do, which
+/// the `(image not persisted across resume)` note in the envelope
+/// already says).
+pub fn cap_image_blocks(messages: &mut [crate::ir::Message], keep: usize) -> usize {
+    let total = messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter(|b| matches!(b, crate::ir::Block::Image { .. }))
+        .count();
+    let stale = total.saturating_sub(keep);
+    if stale == 0 {
+        return 0;
+    }
+    let mut seen = 0usize;
+    for m in messages.iter_mut() {
+        for b in m.content.iter_mut() {
+            if seen < stale {
+                if let crate::ir::Block::Image { .. } = b {
+                    *b = crate::ir::Block::Text {
+                        text: ELIDED_IMAGE.to_string(),
+                    };
+                    seen += 1;
+                }
+            } else {
+                return stale;
+            }
+        }
+    }
+    stale
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,6 +683,66 @@ mod tests {
         let d = std::env::temp_dir().join(format!("overseer-test-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn img() -> crate::ir::Block {
+        crate::ir::Block::Image {
+            media_type: "image/png".into(),
+            data_b64: "aGVsbG8=".into(),
+            px_w: 2560,
+            px_h: 1600,
+            sent_w: 1280,
+            sent_h: 800,
+        }
+    }
+
+    #[test]
+    fn cap_image_blocks_keeps_the_last_two_and_preserves_pairing() {
+        // Five captures across five tool-result messages (as the agent
+        // loop pushes them: ToolResult then sibling Image).
+        let mut messages: Vec<crate::ir::Message> = (0..5)
+            .map(|i| {
+                crate::ir::Message::tool_results(vec![
+                    crate::ir::Block::ToolResult {
+                        tool_use_id: format!("toolu_{i}"),
+                        content: format!("envelope-{i}"),
+                        is_error: false,
+                    },
+                    img(),
+                ])
+            })
+            .collect();
+        assert_eq!(cap_image_blocks(&mut messages, 2), 3);
+        // Only the last two image blocks remain; older ones are the
+        // fixed placeholder text — and every ToolResult survived.
+        let mut images = 0;
+        let mut tool_results = 0;
+        let mut elided = 0;
+        for (i, m) in messages.iter().enumerate() {
+            for b in &m.content {
+                match b {
+                    crate::ir::Block::Image { .. } => {
+                        images += 1;
+                        assert!(i >= 3, "image {i} should have been elided");
+                    }
+                    crate::ir::Block::ToolResult { tool_use_id, .. } => {
+                        tool_results += 1;
+                        assert_eq!(tool_use_id, &format!("toolu_{i}"), "pairing intact");
+                    }
+                    crate::ir::Block::Text { text } => {
+                        assert_eq!(text, ELIDED_IMAGE);
+                        elided += 1;
+                    }
+                    _ => panic!("unexpected block"),
+                }
+            }
+        }
+        assert_eq!((images, tool_results, elided), (2, 5, 3));
+        // Idempotent — a second pass is a byte-identical no-op.
+        assert_eq!(cap_image_blocks(&mut messages, 2), 0);
+        // Under the cap, nothing changes.
+        let mut few = vec![crate::ir::Message::tool_results(vec![img()])];
+        assert_eq!(cap_image_blocks(&mut few, 2), 0);
     }
 
     #[test]

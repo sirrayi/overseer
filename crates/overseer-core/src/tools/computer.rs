@@ -149,6 +149,18 @@ pub struct Backends {
     pub pixel: Option<PathBuf>,
 }
 
+/// An env-var driver path must be absolute: a relative one resolves
+/// against the agent's cwd, where a workspace file could pose as the
+/// driver and get spawned unsandboxed (F1). The surviving path is
+/// canonicalized so `..`/symlinks collapse to the real file.
+fn driver_env_path(raw: Option<String>) -> Option<PathBuf> {
+    let p = PathBuf::from(raw?.trim());
+    if !p.is_absolute() || !p.is_file() {
+        return None;
+    }
+    p.canonicalize().ok()
+}
+
 impl Backends {
     /// Read the operator's backend config. A variable pointing at a
     /// non-existent helper counts as unset — a stale env var must not look
@@ -162,7 +174,7 @@ impl Backends {
                 .filter(|p| p.is_file())
         };
         Backends {
-            driver: helper(ENV_DRIVER)
+            driver: driver_env_path(std::env::var(ENV_DRIVER).ok())
                 .or_else(|| super::struct_search::find_on_path(&["cua-driver"])),
             structured: helper(ENV_STRUCTURED),
             a11y: helper(ENV_A11Y),
@@ -597,7 +609,7 @@ fn run_capture(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Valu
         "sent_h": sent_h,
         "pre": pre,
         "post": sha,
-        "note": "send coordinates in the sent frame (sent_w x sent_h); they are scaled to native pixels",
+        "note": "send coordinates in the sent frame (sent_w x sent_h); they are scaled to native pixels (image not persisted across resume)",
     }))
 }
 
@@ -653,7 +665,9 @@ fn run_act(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Value, S
             req["text"] = json!(keys);
         }
     }
-    for key in ["text", "button"] {
+    // Named targeting is helper vocabulary: api/name/role ride along
+    // verbatim so the structured/a11y tiers can resolve the act (F4).
+    for key in ["text", "button", "api", "name", "role"] {
         copy_str(input, &mut req, key);
     }
     for key in ["dy", "dx", "to_x", "to_y", "count"] {
@@ -724,6 +738,13 @@ fn run_batch(input: &Value, ctx: &ToolCtx, st: &mut ComputerState) -> Result<Val
         if action == "batch" {
             return Err(format!(
                 "computer: actions[{i}] is a nested batch — not allowed"
+            ));
+        }
+        // A capture's pixels can't ride a batch result envelope.
+        if matches!(action.as_str(), "screenshot" | "zoom") {
+            return Err(format!(
+                "computer: actions[{i}] is a capture — captures can't be batched — call \
+                 screenshot on its own"
             ));
         }
         validate(a).map_err(|e| format!("computer: actions[{i}] — {e}"))?;
@@ -819,8 +840,18 @@ fn validate(input: &Value) -> Result<String, String> {
         "zoom" if !(pair("x1", "y1") && pair("x2", "y2")) => {
             return Err("'zoom' needs the region 'x1','y1','x2','y2'".into());
         }
-        "click" if input.get("element").is_none() && !pair("x", "y") => {
-            return Err("'click' needs an 'element' index or 'x'/'y' coordinates".into());
+        // api/name/role are helper-vocabulary targeting — under a driver
+        // cua::click refuses them with a pointer at element/x,y (F4).
+        "click"
+            if input.get("element").is_none()
+                && !pair("x", "y")
+                && input.get("api").is_none()
+                && input.get("name").is_none()
+                && input.get("role").is_none() =>
+        {
+            return Err(
+                "'click' needs an 'element' index, 'x'/'y' coordinates, or a name/role".into(),
+            );
         }
         "type" if !has_text(input, "text") => {
             return Err("'type' needs 'text'".into());
@@ -991,11 +1022,11 @@ pub fn spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
         name: "computer".into(),
         description: concat!(
-            "Drive the user's screen: 'apps'/'windows' find targets, 'observe' lists elements ",
-            "(index via 'element') or 'screenshot'; 'click'/'type'/'key'/'set'/'scroll'/'drag'/'menu'",
-            "/'launch' act; 'verify' checks predicates; 'browser'/'browser_click'/'browser_type'/'navigate' ",
-            "drive Chrome/Edge tabs via 'tab'/'ref'. 'zoom' crops a region; 'batch' runs ≤32 actions. ",
-            "x/y are screenshot pixels, scaled for you; no implicit screenshots."
+            "Drive the user's screen: 'apps'/'windows' find targets; 'observe' lists elements ",
+            "(index as 'element'); 'screenshot'/'zoom' image it; 'click'/'type'/'key'/'set'/'scroll'",
+            "/'drag'/'menu'/'launch' act; 'verify' checks predicates; 'browser*'/'navigate' drive ",
+            "Chrome/Edge tabs via 'tab'/'ref'; 'batch' runs ≤32 actions. x/y are pixels of the ",
+            "image you saw (crop space after 'zoom'); nothing is screenshotted implicitly."
         )
         .into(),
         input_schema: schema(
@@ -1006,10 +1037,10 @@ pub fn spec() -> crate::provider::ToolSpec {
                 },
                 "pid": {"type": "integer", "description": "target app"},
                 "window_id": {"type": "integer", "description": "target window"},
-                "app": {"type": "string"},
-                "query": {"type": "string", "description": "observe/browser filter"},
+                "app": {"type": "string", "description": "name to launch"},
+                "query": {"type": "string"},
                 "limit": {"type": "integer", "description": "observe cap (150)"},
-                "max": {"type": "integer", "description": "screenshot max px (1280)"},
+                "max": {"type": "integer"},
                 "element": {"type": "integer", "description": "index from observe"},
                 "x": {"type": "number"}, "y": {"type": "number"},
                 "to_x": {"type": "number"}, "to_y": {"type": "number"},
@@ -1019,15 +1050,15 @@ pub fn spec() -> crate::provider::ToolSpec {
                 "button": {"type": "string", "description": "left|right"},
                 "count": {"type": "integer", "description": "1|2"},
                 "text": {"type": "string"},
-                "keys": {"type": "string", "description": "\"cmd+s\" or \"return\""},
+                "keys": {"type": "string", "description": "\"cmd+s\"|\"return\""},
                 "value": {},
-                "path": {"type": "array", "items": {"type": "string"}, "description": "menu path"},
-                "expect": {"description": "verify predicates"},
-                "tab": {"type": "string", "description": "browser tab handle"},
+                "path": {"type": "array", "items": {"type": "string"}},
+                "expect": {},
+                "tab": {"type": "string", "description": "bound browser tab"},
                 "ref": {"type": "string", "description": "browser element ref"},
                 "url": {"type": "string"},
-                "cred_field": {"type": "boolean", "description": "Target is a credential field"},
-                "actions": {"type": "array", "items": {"type": "object"}, "description": "batch members (≤32)"},
+                "cred_field": {"type": "boolean", "description": "target is a credential field"},
+                "actions": {"type": "array", "items": {"type": "object"}},
             }),
             &["action"],
         ),
@@ -1067,6 +1098,35 @@ mod tests {
     /// never detected in tests.
     fn st(b: &Backends) -> ComputerState {
         ComputerState::new(b.clone())
+    }
+
+    #[test]
+    fn driver_env_path_requires_an_absolute_path() {
+        // F1: a relative env path resolves against the agent's cwd — a
+        // workspace `./cua-driver` would be spawned unsandboxed.
+        let dir = tmpdir("driverenv");
+        let real = dir.join("cua-driver");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        let rel = std::path::Path::new(&real)
+            .strip_prefix(std::env::current_dir().unwrap())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| PathBuf::from("./cua-driver"));
+        assert_eq!(
+            driver_env_path(Some(rel.display().to_string())),
+            None,
+            "relative path must be refused"
+        );
+        assert_eq!(driver_env_path(Some("./cua-driver".into())), None);
+        assert_eq!(driver_env_path(Some("cua-driver".into())), None);
+        assert_eq!(driver_env_path(None), None);
+        // Absolute paths survive — canonicalized (no `..`).
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let dotted = format!("{}/sub/../cua-driver", dir.display());
+        assert_eq!(driver_env_path(Some(dotted)), Some(real.clone()));
+        assert_eq!(
+            driver_env_path(Some(format!("  {}  ", real.display()))),
+            Some(real)
+        );
     }
 
     /// Write an executable helper script and return its path. The helper
@@ -1274,6 +1334,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("actions[1]"), "got: {err}");
+        // Captures can't be batched — their pixels would be dropped.
+        let err = run_with(
+            &json!({"action": "batch", "actions": [{"action": "screenshot"}]}),
+            &mut c,
+            &mut st(&backends),
+        )
+        .unwrap_err();
+        assert!(err.contains("captures can't be batched"), "got: {err}");
         // Empty / oversized batches are refused before any backend runs.
         let empty = run_with(
             &json!({"action": "batch", "actions": []}),
@@ -1281,6 +1349,40 @@ mod tests {
             &mut st(&backends),
         );
         assert!(empty.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn named_act_forwards_api_name_and_role_to_the_helper() {
+        // F4: api/name/role are helper vocabulary — they ride the request
+        // verbatim so a11y/structured tiers can resolve named acts.
+        let dir = tmpdir("named");
+        let log = dir.join("req.log");
+        let a11y = helper(
+            &dir,
+            "a11y.sh",
+            &format!(
+                "cat >> {log}\nprintf '%s' '{{\"ok\":true,\"detail\":\"done\"}}'",
+                log = log.display()
+            ),
+        );
+        let backends = Backends {
+            driver: None,
+            structured: None,
+            a11y: Some(a11y),
+            pixel: None,
+        };
+        let mut c = ctx(&dir);
+        run_with(
+            &json!({"action": "click", "api": "App.press", "name": "OK", "role": "button"}),
+            &mut c,
+            &mut st(&backends),
+        )
+        .unwrap();
+        let req: Value =
+            serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
+        assert_eq!(req["api"], "App.press");
+        assert_eq!(req["name"], "OK");
+        assert_eq!(req["role"], "button");
     }
 
     #[test]

@@ -73,15 +73,67 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 
 use super::super::ToolCtx;
-use super::{
-    action_of, cred_field, digest_short, read_obs, scale_coords, shape, write_owner_only, ObsState,
-};
+use super::{action_of, cred_field, digest_short, read_obs, shape, write_owner_only, ObsState};
 
 use crate::mcp::{StdioClient, CALL_TIMEOUT};
 
 /// `end_session` gets a short leash: it is best-effort teardown, and a wedged
 /// driver must not hold the registry's drop for the full call timeout.
 const END_SESSION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The one coordinate rule for driver acts (F2): the model sends x/y in
+/// the frame of the image it was shown (`sent`); `driver` is the space
+/// the driver's x/y acts expect; `origin` is where sent's (0,0) sits in
+/// driver space (nonzero only for region views).
+///
+/// Default: `driver == sent` — NO local scaling. That trusts
+/// cua-driver's own contract (click doc, verified on 0.26.1
+/// tools/list): x/y are "window-local screenshot pixels" — the space
+/// `get_window_state` itself returns, i.e. the delivered image, not the
+/// native framebuffer.
+// DEFERRED(owner): confirm on macOS with computer_live; flip to
+// window_bounds×scale if clicks land off.
+struct CoordFrame {
+    sent: (u32, u32),
+    driver: (u32, u32),
+    origin: (f64, f64),
+}
+
+impl CoordFrame {
+    fn sent_only(w: u32, h: u32) -> Self {
+        CoordFrame {
+            sent: (w, h),
+            driver: (w, h),
+            origin: (0.0, 0.0),
+        }
+    }
+
+    /// `origin + v × driver/sent`, clamped into the driver frame; a
+    /// zero-sided frame passes the value through rounded.
+    fn map(&self, x: f64, y: f64) -> (i64, i64) {
+        let conv = |v: f64, sent: u32, drv: u32, o: f64| -> i64 {
+            if sent == 0 || drv == 0 {
+                return v.round() as i64;
+            }
+            let out = o + v * f64::from(drv) / f64::from(sent);
+            if !out.is_finite() {
+                return 0;
+            }
+            (out.round() as i64).clamp(0, i64::from(drv) - 1)
+        };
+        (
+            conv(x, self.sent.0, self.driver.0, self.origin.0),
+            conv(y, self.sent.1, self.driver.1, self.origin.1),
+        )
+    }
+}
+
+/// Driver tools whose schema carries `from_zoom` (verified on 0.26.1
+/// tools/list): after a `zoom`, x/y in the crop's pixel space ride
+/// `from_zoom:true` and the driver translates them back to full-window
+/// space — the only correct mapping, since the crop carries the
+/// driver's own 20% padding we cannot reproduce locally (F3).
+const FROM_ZOOM_TOOLS: &[&str] = &["click", "right_click", "double_click", "drag"];
 
 /// Live driver session: the stdio client plus the per-window snapshot and
 /// browser-tab bookkeeping later calls need.
@@ -91,6 +143,11 @@ pub struct Live {
     session: String,
     /// One `check_permissions` probe per client lifetime (D6).
     perm_checked: bool,
+    /// The frame the last screenshot established — the model's x/y.
+    frame: Option<CoordFrame>,
+    /// The last observation was a `zoom` crop: pointer x/y acts ride
+    /// `from_zoom:true` until the next `screenshot` or `observe` (F3).
+    zoomed: bool,
     /// (pid, window_id) → the last observation's snapshot handle and
     /// element-index → element_token map. A bare element_index is refused
     /// by the driver, so the token (preferred) or the snapshot id rides
@@ -103,6 +160,10 @@ pub struct Live {
 struct Snap {
     id: Option<String>,
     tokens: HashMap<i64, String>,
+    /// element_index → {x,y,w,h} bounds — only the live coordinate test
+    /// reads centres off this.
+    #[cfg(test)]
+    frames: HashMap<i64, (f64, f64, f64, f64)>,
 }
 
 /// How a driver call failed — the distinction that decides whether the
@@ -128,13 +189,23 @@ pub fn spawn(path: &Path, ctx: &ToolCtx) -> Result<Live, String> {
     let program = path.display().to_string();
     let mut client = StdioClient::spawn_with_env("cua-driver", &program, &["mcp".to_string()], &[])
         .map_err(|e| format!("computer: {e}"))?;
-    client
-        .initialize("overseer", env!("CARGO_PKG_VERSION"))
-        .map_err(|e| format!("computer: {e}"))?;
+    if let Err(e) = client.initialize("overseer", env!("CARGO_PKG_VERSION")) {
+        // F7: whatever the driver complained about on stderr rides the
+        // init error — its own messages are where TCC/daemon refusals go.
+        let tail = client.stderr_tail();
+        let tail = tail.trim();
+        return Err(if tail.is_empty() {
+            format!("computer: {e}")
+        } else {
+            format!("computer: {e} — driver stderr: {tail}")
+        });
+    }
     Ok(Live {
         client,
         session: session_label(ctx),
         perm_checked: false,
+        frame: None,
+        zoomed: false,
         snaps: HashMap::new(),
         tabs: HashMap::new(),
     })
@@ -339,27 +410,72 @@ fn need(input: &Value, action: &str, keys: &[&str]) -> Result<(), CallErr> {
     Ok(())
 }
 
-/// Copy an integer-ish field to driver args verbatim (no key when absent).
-fn put(args: &mut Map<String, Value>, key: &str, input: &Value) {
-    if let Some(v) = input.get(key).filter(|v| v.is_number()) {
-        args.insert(key.into(), v.clone());
+/// Copy an integer field to driver args: a number passes verbatim, a
+/// numeric STRING is coerced, anything else that is present but
+/// wrong-typed is refused instead of silently dropped (F7).
+fn put(args: &mut Map<String, Value>, key: &str, input: &Value) -> Result<(), CallErr> {
+    match input.get(key) {
+        None => Ok(()),
+        Some(v) if v.is_number() => {
+            if v.as_f64().is_some_and(|f| f.is_finite() && f >= 0.0) {
+                args.insert(key.into(), v.clone());
+                Ok(())
+            } else {
+                Err(CallErr::Refused(format!(
+                    "computer: '{key}' must be a non-negative number, got {v}"
+                )))
+            }
+        }
+        Some(Value::String(s)) => match s.trim().parse::<u64>() {
+            Ok(n) => {
+                args.insert(key.into(), json!(n));
+                Ok(())
+            }
+            Err(_) => Err(CallErr::Refused(format!(
+                "computer: '{key}' must be a number, got \"{s}\""
+            ))),
+        },
+        Some(v) => Err(CallErr::Refused(format!(
+            "computer: '{key}' must be a number, got {v}"
+        ))),
     }
 }
 
+/// Non-negative integral value only — a negative or fractional number
+/// used to wrap through `as u64` (F7); strings are NOT parsed here
+/// (put() handles the driver's argument path).
 fn u64_of(input: &Value, key: &str) -> Option<u64> {
-    input
-        .get(key)
-        .and_then(Value::as_u64)
-        .or_else(|| input.get(key).and_then(Value::as_i64).map(|v| v as u64))
-        .or_else(|| input.get(key).and_then(Value::as_f64).map(|v| v as u64))
+    input.get(key).and_then(|v| match v {
+        Value::Number(n) => n.as_u64().or_else(|| {
+            n.as_f64().and_then(|f| {
+                if f.is_finite() && f >= 0.0 && f.fract() == 0.0 {
+                    Some(f as u64)
+                } else {
+                    None
+                }
+            })
+        }),
+        _ => None,
+    })
 }
 
 /// Element addressing (D3): the driver refuses a bare `element_index`, so
 /// the last observation's `element_token` (preferred) or `snapshot_id` +
-/// `element_index` rides along. Coordinates go through `scale_coords` —
-/// the model speaks in the frame it was shown.
-fn target(d: &Live, input: &Value, ctx: &ToolCtx, args: &mut Map<String, Value>) {
-    if let Some(el) = u64_of(input, "element") {
+/// `element_index` rides along. Coordinates map through the recorded
+/// [`CoordFrame`] — and after a `zoom`, pointer acts carry `from_zoom`
+/// verbatim so the driver translates the crop space itself (F2/F3).
+fn target(
+    d: &Live,
+    input: &Value,
+    args: &mut Map<String, Value>,
+    tool: &str,
+) -> Result<(), CallErr> {
+    if let Some(el) = input.get("element") {
+        let Some(el) = u64_of(input, "element") else {
+            return Err(CallErr::Refused(format!(
+                "computer: 'element' must be a non-negative integer, got {el}"
+            )));
+        };
         let pid = u64_of(input, "pid").unwrap_or(0);
         let wid = u64_of(input, "window_id").unwrap_or(0);
         match d.snaps.get(&(pid, wid)) {
@@ -376,21 +492,35 @@ fn target(d: &Live, input: &Value, ctx: &ToolCtx, args: &mut Map<String, Value>)
                 args.insert("element_index".into(), json!(el));
             }
         }
-        return;
+        return Ok(());
     }
     if let (Some(x), Some(y)) = (
         input.get("x").and_then(Value::as_f64),
         input.get("y").and_then(Value::as_f64),
     ) {
-        let obs = read_obs(ctx);
-        let (native, sent) = obs
+        if d.zoomed {
+            if !FROM_ZOOM_TOOLS.contains(&tool) {
+                return Err(CallErr::Refused(format!(
+                    "computer: x/y in a zoom crop can't be translated for '{tool}' — take a fresh \
+                     'screenshot' first"
+                )));
+            }
+            // The driver owns the crop geometry (20% padding) — pass the
+            // crop pixels through and let it translate (F3).
+            args.insert("x".into(), json!(x));
+            args.insert("y".into(), json!(y));
+            args.insert("from_zoom".into(), json!(true));
+            return Ok(());
+        }
+        let (nx, ny) = d
+            .frame
             .as_ref()
-            .map(|o| (o.native(), o.sent()))
-            .unwrap_or(((0, 0), (0, 0)));
-        let (nx, ny) = scale_coords(x, y, native, sent);
+            .map(|f| f.map(x, y))
+            .unwrap_or_else(|| (x.round() as i64, y.round() as i64));
         args.insert("x".into(), json!(nx));
         args.insert("y".into(), json!(ny));
     }
+    Ok(())
 }
 
 /// Dispatch the validated action to its driver call.
@@ -403,7 +533,7 @@ fn run_live(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr
         }
         "windows" => {
             let mut a = Map::new();
-            put(&mut a, "pid", input);
+            put(&mut a, "pid", input)?;
             let r = call(d, "list_windows", a, input)?;
             Ok(obs_envelope("windows", shape::windows(&r)))
         }
@@ -419,20 +549,20 @@ fn run_live(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr
         "type" => {
             need(input, "type", &["pid"])?;
             let mut a = Map::new();
-            put(&mut a, "pid", input);
-            put(&mut a, "window_id", input);
+            put(&mut a, "pid", input)?;
+            put(&mut a, "window_id", input)?;
             a.insert("text".into(), input["text"].clone());
-            target(d, input, ctx, &mut a);
+            target(d, input, &mut a, "type_text")?;
             act(d, "type_text", a, input, ctx)
         }
         "key" => key(d, input, ctx),
         "set" => {
             need(input, "set", &["pid", "window_id"])?;
             let mut a = Map::new();
-            put(&mut a, "pid", input);
-            put(&mut a, "window_id", input);
+            put(&mut a, "pid", input)?;
+            put(&mut a, "window_id", input)?;
             a.insert("value".into(), input["value"].clone());
-            target(d, input, ctx, &mut a);
+            target(d, input, &mut a, "set_value")?;
             act(d, "set_value", a, input, ctx)
         }
         "scroll" => scroll(d, input, ctx),
@@ -440,8 +570,8 @@ fn run_live(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr
         "menu" => {
             need(input, "menu", &["pid", "window_id"])?;
             let mut a = Map::new();
-            put(&mut a, "pid", input);
-            put(&mut a, "window_id", input);
+            put(&mut a, "pid", input)?;
+            put(&mut a, "window_id", input)?;
             a.insert("path".into(), input["path"].clone());
             act(d, "invoke_menu", a, input, ctx)
         }
@@ -463,8 +593,8 @@ fn observe(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
         .unwrap_or(150)
         .clamp(1, 2000) as usize;
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     a.insert("include_screenshot".into(), json!(false));
     a.insert("max_elements".into(), json!(limit));
     if let Some(q) = input.get("query").and_then(Value::as_str) {
@@ -473,6 +603,8 @@ fn observe(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
         }
     }
     let r = call(d, "get_window_state", a, input)?;
+    // A fresh full observation ends the zoom frame (F3).
+    d.zoomed = false;
     // Remember the snapshot: `element` acts address through element_token
     // (preferred) or snapshot_id — a bare index is refused by the driver.
     let els = shape::parse_elements(&r);
@@ -490,6 +622,11 @@ fn observe(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
             tokens: els
                 .iter()
                 .filter_map(|e| e.token.clone().map(|t| (e.index, t)))
+                .collect(),
+            #[cfg(test)]
+            frames: els
+                .iter()
+                .filter_map(|e| e.frame.map(|f| (e.index, f)))
                 .collect(),
         },
     );
@@ -550,8 +687,8 @@ fn screenshot(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallE
         return suppressed_envelope("screenshot", ctx, reason, true);
     }
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     a.insert("include_accessibility_tree".into(), json!(false));
     let max = input
         .get("max")
@@ -560,38 +697,48 @@ fn screenshot(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallE
         .clamp(1, 8192);
     a.insert("max_dimension".into(), json!(max));
     let r = call(d, "get_window_state", a, input)?;
-    capture_envelope(ctx, "screenshot", &r, true)
+    capture_envelope(d, ctx, "screenshot", &r)
 }
 
-/// `zoom` — crop a window region (D3). Its coords are window-local; the
-/// returned crop is a view, so the observation frame is NOT replaced (the
-/// next click still belongs to the last full screenshot's frame).
+/// `zoom` — crop a window region (D3/F3). The crop becomes the model's
+/// coordinate frame until the next `screenshot` or `observe`: pointer
+/// acts then carry `from_zoom:true` so the driver translates crop pixels
+/// back to full-window space itself (the crop has 20% padding only the
+/// driver knows). The envelope tells the model which frame it is in.
 fn zoom(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
     need(input, "zoom", &["pid", "window_id"])?;
     if is_suppressed(input, ctx) {
         return suppressed_envelope("zoom", ctx, "credential-field focus", true);
     }
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     for k in ["x1", "y1", "x2", "y2"] {
         if let Some(v) = input.get(k).filter(|v| v.is_number()) {
             a.insert(k.into(), v.clone());
         }
     }
     let r = call(d, "zoom", a, input)?;
-    capture_envelope(ctx, "zoom", &r, false)
+    let mut env = capture_envelope(d, ctx, "zoom", &r)?;
+    env["frame"] = json!(
+        "zoom crop of the window — x/y acts take crop pixels (translated via from_zoom); \
+         screenshot or observe returns to window space"
+    );
+    Ok(env)
 }
 
 /// A driver result's first image part → a persisted capture + the same
 /// envelope shape the legacy path produced (`image_file`, sent/native
 /// frame, pre/post digests) — so `image_block` and the audit event see no
-/// difference (D4/D7).
+/// difference (D4/D7). `px_*`/`sent_*` are the image's own dimensions —
+/// the model sees what the driver returned, delivered unscaled (F2: the
+/// `window_bounds` merge is gone; the window's native size rides along
+/// only as informational `window_*`).
 fn capture_envelope(
+    d: &mut Live,
     ctx: &ToolCtx,
     action: &str,
     r: &Value,
-    record_frame: bool,
 ) -> Result<Value, CallErr> {
     let sc = r.get("structuredContent").cloned().unwrap_or(Value::Null);
     let img = r
@@ -625,17 +772,16 @@ fn capture_envelope(
             u32_sc(&["screenshot_height"]),
         )
     };
-    let (px_w, px_h) = (
-        u32_sc(&["width"]).max(
-            sc.pointer("/window_bounds/width")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
-        ),
-        u32_sc(&["height"]).max(
-            sc.pointer("/window_bounds/height")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
-        ),
+    // The delivered image's real pixel size — no window_bounds merge:
+    // under the driver==sent rule the two are the same space (F2).
+    let (px_w, px_h) = (sent_w, sent_h);
+    let (window_w, window_h) = (
+        sc.pointer("/window_bounds/width")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        sc.pointer("/window_bounds/height")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
     );
     let Some(data) = data else {
         return suppressed_envelope(
@@ -647,7 +793,14 @@ fn capture_envelope(
     };
     let sha = digest_short(data);
     let pre = read_obs(ctx).and_then(|o| o.sha256);
-    if record_frame {
+    if action == "zoom" {
+        // The crop becomes the model's frame until the next full
+        // observation; pointer acts ride from_zoom (F3).
+        d.zoomed = true;
+    } else {
+        // A fresh full screenshot: driver coords ARE sent coords (F2).
+        d.frame = Some(CoordFrame::sent_only(sent_w, sent_h));
+        d.zoomed = false;
         super::write_obs(
             ctx,
             &ObsState {
@@ -698,9 +851,12 @@ fn capture_envelope(
         "px_h": px_h,
         "sent_w": sent_w,
         "sent_h": sent_h,
+        "window_w": window_w,
+        "window_h": window_h,
         "pre": pre,
         "post": sha,
-        "note": "send coordinates in the sent frame (sent_w x sent_h); they are scaled to native pixels",
+        "note": "send x/y in sent_w x sent_h pixels — the driver takes the same space \
+         (image not persisted across resume)",
     }))
 }
 
@@ -722,10 +878,19 @@ fn click(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
         (_, 2) => "double_click",
         _ => "click",
     };
+    // api/name/role are helper vocabulary — the driver addresses by
+    // element token or x/y only (F4).
+    if input.get("element").is_none() && input.get("x").is_none() {
+        return Err(CallErr::Refused(
+            "computer: click by 'api'/'name'/'role' is helper vocabulary — under cua-driver \
+             pass 'element' (from observe) or 'x'/'y'"
+                .into(),
+        ));
+    }
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
-    target(d, input, ctx, &mut a);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
+    target(d, input, &mut a, tool)?;
     if tool == "click" {
         if button != "left" {
             a.insert("button".into(), json!(button));
@@ -745,8 +910,8 @@ fn key(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
         .unwrap_or("")
         .trim();
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     let (tool, a) = if keys.contains('+') {
         a.insert(
             "keys".into(),
@@ -779,42 +944,55 @@ fn scroll(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> 
         (if dx < 0.0 { "left" } else { "right" }, dx.abs())
     };
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     a.insert("direction".into(), json!(direction));
     a.insert(
         "amount".into(),
         json!(amount.round().clamp(1.0, 50.0) as u64),
     );
-    target(d, input, ctx, &mut a);
+    target(d, input, &mut a, "scroll")?;
     act(d, "scroll", a, input, ctx)
 }
 
 fn drag(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
     need(input, "drag", &["pid", "window_id"])?;
-    let obs = read_obs(ctx);
-    let (native, sent) = obs
-        .as_ref()
-        .map(|o| (o.native(), o.sent()))
-        .unwrap_or(((0, 0), (0, 0)));
     let num = |k: &str| input.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-    let (fx, fy) = scale_coords(num("x"), num("y"), native, sent);
-    let (tx, ty) = scale_coords(num("to_x"), num("to_y"), native, sent);
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
-    a.insert("from_x".into(), json!(fx));
-    a.insert("from_y".into(), json!(fy));
-    a.insert("to_x".into(), json!(tx));
-    a.insert("to_y".into(), json!(ty));
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
+    if d.zoomed {
+        // drag carries from_zoom — pass both endpoints in crop pixels and
+        // let the driver translate (F3).
+        a.insert("from_x".into(), json!(num("x")));
+        a.insert("from_y".into(), json!(num("y")));
+        a.insert("to_x".into(), json!(num("to_x")));
+        a.insert("to_y".into(), json!(num("to_y")));
+        a.insert("from_zoom".into(), json!(true));
+    } else {
+        let (fx, fy) = d
+            .frame
+            .as_ref()
+            .map(|f| f.map(num("x"), num("y")))
+            .unwrap_or_else(|| (num("x").round() as i64, num("y").round() as i64));
+        let (tx, ty) = d
+            .frame
+            .as_ref()
+            .map(|f| f.map(num("to_x"), num("to_y")))
+            .unwrap_or_else(|| (num("to_x").round() as i64, num("to_y").round() as i64));
+        a.insert("from_x".into(), json!(fx));
+        a.insert("from_y".into(), json!(fy));
+        a.insert("to_x".into(), json!(tx));
+        a.insert("to_y".into(), json!(ty));
+    }
     act(d, "drag", a, input, ctx)
 }
 
 fn verify(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
     need(input, "verify", &["pid", "window_id"])?;
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     // The driver's `expect` is a *list* of predicates; a bare object wraps.
     let expect = match input.get("expect") {
         Some(v @ Value::Array(_)) => v.clone(),
@@ -848,8 +1026,8 @@ fn browser(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
     }
     need(input, "browser", &["pid", "window_id"])?;
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     let r = call(d, "get_browser_state", a, input)?;
     let Some((target, tab)) = shape::target_and_tab(&r) else {
         return Err(CallErr::Refused(
@@ -1061,6 +1239,9 @@ while IFS= read -r line; do
               ;;
           esac
           ;;
+        zoom)
+          r='{{"content":[{{"type":"image","data":"aGVsbG8=","mimeType":"image/jpeg"}}],"structuredContent":{{"format":"jpeg","width":300,"height":200,"mime_type":"image/jpeg","window_id":101,"pid":11}}}}'
+          ;;
         verify_state)
           r='{{"content":[{{"type":"text","text":"verify_state: unknown after 1 sample(s) in 5 ms"}}],"structuredContent":{{"status":"unknown","predicates":[{{"index":0,"status":"unknown","observed_json":null,"unknown_reason":"untrusted_source"}}],"samples":1,"stable":false,"elapsed_ms":5}}}}'
           ;;
@@ -1115,6 +1296,19 @@ done
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
         (path, log)
+    }
+
+    /// A driver that writes to stderr then answers garbage — the init
+    /// failure must carry the captured stderr tail (F7).
+    fn stderr_driver(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("noisy-cua.sh");
+        let script = "#!/bin/sh\necho 'TCC denied: com.trycua.driver lacks accessibility' >&2\nsleep 0.3\nwhile IFS= read -r line; do\n  printf 'not json\\n'\ndone\n";
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
     }
 
     /// A driver that dies after answering ONE tools/call — the next call
@@ -1291,15 +1485,18 @@ done
         .unwrap();
         assert_eq!(out["computer"], "screenshot");
         assert_eq!(out["tier"], "cua");
+        // F2: px_* is the delivered image's real size — sent == driver
+        // space; the native window dims are informational only.
         assert_eq!(out["sent_w"], 1280);
-        assert_eq!(out["px_w"], 2560);
+        assert_eq!(out["px_w"], 1280);
+        assert_eq!(out["window_w"], 2560);
         let file = out["image_file"].as_str().unwrap().to_string();
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(saved["data_b64"], "aGVsbG8=");
         // The frame is remembered — and the agent-side image block decodes
         // the same file.
         let obs = read_obs(&c).unwrap();
-        assert_eq!((obs.px_w, obs.sent_w), (2560, 1280));
+        assert_eq!((obs.px_w, obs.sent_w), (1280, 1280));
         let block = super::super::image_block(&out.to_string()).expect("image block");
         match block {
             crate::ir::Block::Image {
@@ -1311,7 +1508,7 @@ done
             } => {
                 assert_eq!(media_type, "image/png");
                 assert_eq!(data_b64, "aGVsbG8=");
-                assert_eq!((sent_w, px_w), (1280, 2560));
+                assert_eq!((sent_w, px_w), (1280, 1280));
             }
             other => panic!("expected image block, got {other:?}"),
         }
@@ -1355,12 +1552,66 @@ done
     }
 
     #[test]
-    fn click_by_xy_scales_into_the_native_frame() {
+    fn numeric_params_are_coerced_or_refused_never_dropped() {
+        // F7: a numeric string coerces; a wrong-typed value is a type
+        // error rather than a silently-missing pid/window_id; negatives
+        // never wrap through `as u64`.
+        let dir = tmpdir("nums");
+        let (driver, log) = fake_driver(&dir, "fake.sh", "");
+        let mut st = state(&driver);
+        let c = ctx(&dir);
+        run_ok(
+            &json!({"action": "screenshot", "pid": "11", "window_id": "101"}),
+            &c,
+            &mut st,
+        )
+        .unwrap();
+        let last = req_lines(&log).last().unwrap().clone();
+        assert!(last.contains("\"pid\":11"), "string coerced: {last}");
+        let err = run(
+            &json!({"action": "screenshot", "pid": "abc", "window_id": 101}),
+            &c,
+            &mut st,
+        )
+        .unwrap_err();
+        assert!(err.contains("'pid' must be a number"), "{err}");
+        let err = run(
+            &json!({"action": "screenshot", "pid": -1, "window_id": 101}),
+            &c,
+            &mut st,
+        )
+        .unwrap_err();
+        assert!(err.contains("non-negative"), "{err}");
+        // A negative element index is refused, not wrapped.
+        let err = run(
+            &json!({"action": "click", "pid": 11, "window_id": 101, "element": -1}),
+            &c,
+            &mut st,
+        )
+        .unwrap_err();
+        assert!(err.contains("non-negative"), "{err}");
+    }
+
+    #[test]
+    fn init_failure_carries_the_driver_stderr_tail() {
+        let dir = tmpdir("stderr");
+        let driver = stderr_driver(&dir);
+        let mut st = state(&driver);
+        let c = ctx(&dir);
+        let err = run(&json!({"action": "apps"}), &c, &mut st).unwrap_err();
+        assert!(err.contains("driver stderr"), "{err}");
+        assert!(err.contains("TCC denied"), "{err}");
+    }
+
+    #[test]
+    fn click_by_xy_passes_sent_frame_coords_verbatim() {
+        // F2: the driver's x/y space IS the delivered screenshot's pixel
+        // space — a click at (640,400) on the 1280x800 image is sent
+        // verbatim even though the window is 2560x1600 natively.
         let dir = tmpdir("click-xy");
         let (driver, log) = fake_driver(&dir, "fake.sh", "");
         let mut st = state(&driver);
         let c = ctx(&dir);
-        // The model was shown a 1280x800 downscale of a 2560x1600 window.
         run_ok(
             &json!({"action": "screenshot", "pid": 11, "window_id": 101}),
             &c,
@@ -1374,9 +1625,10 @@ done
         )
         .unwrap();
         let last = req_lines(&log).last().unwrap().clone();
-        assert!(last.contains("\"x\":1280"), "{last}");
-        assert!(last.contains("\"y\":800"), "{last}");
-        // No obs recorded → 1:1 pass-through.
+        assert!(last.contains("\"x\":640"), "no local scaling: {last}");
+        assert!(last.contains("\"y\":400"), "no local scaling: {last}");
+        assert!(!last.contains("from_zoom"), "{last}");
+        // No observation recorded → still 1:1 pass-through.
         let dir2 = tmpdir("click-raw");
         let (driver2, log2) = fake_driver(&dir2, "fake.sh", "");
         let mut st2 = state(&driver2);
@@ -1389,6 +1641,94 @@ done
         .unwrap();
         let last = req_lines(&log2).last().unwrap().clone();
         assert!(last.contains("\"x\":64"), "{last}");
+    }
+
+    #[test]
+    fn zoom_then_pointer_acts_ride_from_zoom() {
+        // F3: after zoom, x/y acts pass the crop pixels through with
+        // from_zoom — the driver translates back to full-window space.
+        let dir = tmpdir("zoom");
+        let (driver, log) = fake_driver(&dir, "fake.sh", "");
+        let mut st = state(&driver);
+        let c = ctx(&dir);
+        let out = run(
+            &json!({"action": "zoom", "pid": 11, "window_id": 101,
+                    "x1": 10.0, "y1": 10.0, "x2": 50.0, "y2": 40.0}),
+            &c,
+            &mut st,
+        )
+        .unwrap();
+        assert_eq!(out["computer"], "screenshot");
+        assert_eq!(out["sent_w"], 300, "crop dims are the sent frame");
+        assert!(
+            out["frame"].as_str().unwrap().contains("from_zoom"),
+            "envelope names the frame: {}",
+            out["frame"]
+        );
+        // A click in crop pixels rides from_zoom verbatim.
+        run_ok(
+            &json!({"action": "click", "pid": 11, "window_id": 101, "x": 30.0, "y": 15.0}),
+            &c,
+            &mut st,
+        )
+        .unwrap();
+        let last = req_lines(&log).last().unwrap().clone();
+        assert!(last.contains("\"from_zoom\":true"), "{last}");
+        assert!(last.contains("\"x\":30"), "crop coords verbatim: {last}");
+        // Element acts are unaffected — the token path needs no coords.
+        run_ok(
+            &json!({"action": "observe", "pid": 11, "window_id": 101}),
+            &c,
+            &mut st,
+        )
+        .unwrap();
+        run_ok(
+            &json!({"action": "click", "pid": 11, "window_id": 101, "element": 2}),
+            &c,
+            &mut st,
+        )
+        .unwrap();
+        let last = req_lines(&log).last().unwrap().clone();
+        assert!(last.contains("element_token"), "{last}");
+    }
+
+    #[test]
+    fn zoom_frame_ends_at_the_next_full_observation() {
+        let dir = tmpdir("zoomend");
+        let (driver, log) = fake_driver(&dir, "fake.sh", "");
+        let mut st = state(&driver);
+        let c = ctx(&dir);
+        run_ok(
+            &json!({"action": "zoom", "pid": 11, "window_id": 101,
+                    "x1": 10.0, "y1": 10.0, "x2": 50.0, "y2": 40.0}),
+            &c,
+            &mut st,
+        )
+        .unwrap();
+        // A non-pointer x/y act cannot translate the crop: refused.
+        let err = run(
+            &json!({"action": "type", "pid": 11, "text": "a", "x": 5.0, "y": 5.0}),
+            &c,
+            &mut st,
+        )
+        .unwrap_err();
+        assert!(err.contains("fresh 'screenshot'"), "{err}");
+        // A fresh screenshot returns the frame to window space.
+        run_ok(
+            &json!({"action": "screenshot", "pid": 11, "window_id": 101}),
+            &c,
+            &mut st,
+        )
+        .unwrap();
+        run_ok(
+            &json!({"action": "click", "pid": 11, "window_id": 101, "x": 30.0, "y": 15.0}),
+            &c,
+            &mut st,
+        )
+        .unwrap();
+        let last = req_lines(&log).last().unwrap().clone();
+        assert!(!last.contains("from_zoom"), "{last}");
+        assert!(last.contains("\"x\":30"), "{last}");
     }
 
     #[test]
@@ -1674,6 +2014,29 @@ done
             &json!({"action": "verify", "pid": pid, "window_id": wid,
                     "expect": {"element": {"selector": {"role": "AXTextArea"},
                                 "value_equals": "overseer"}}}),
+            &c,
+            &mut st,
+        )
+        .unwrap();
+        assert_eq!(v["satisfied"], true, "{v}");
+        // F2 empirical check: an element's frame centre clicked by x/y
+        // lands in the element — proving driver coords == sent coords.
+        let (cx, cy) = {
+            let d = st.driver.as_ref().unwrap();
+            let snap = d.snaps.get(&(pid, wid)).expect("snapshot stored");
+            let &(x, y, w, h) = snap.frames.values().next().expect("an element frame");
+            (x + w / 2.0, y + h / 2.0)
+        };
+        run_ok(
+            &json!({"action": "click", "pid": pid, "window_id": wid, "x": cx, "y": cy}),
+            &c,
+            &mut st,
+        )
+        .unwrap();
+        let v = run(
+            &json!({"action": "verify", "pid": pid, "window_id": wid,
+                    "expect": {"element": {"selector": {"role": "AXTextArea"},
+                                "exists": true, "value_equals": "overseer"}}}),
             &c,
             &mut st,
         )

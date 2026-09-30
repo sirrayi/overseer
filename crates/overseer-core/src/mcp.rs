@@ -56,9 +56,10 @@
 //! answer inside its timeout is killed, so a hung server cannot block
 //! forever.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -544,15 +545,46 @@ pub fn trim_description(desc: &str, cap: usize) -> String {
     out
 }
 
+/// Cap on the shared stderr tail (bytes, kept tail-end so the freshest
+/// diagnostics survive).
+const STDERR_TAIL_CAP: usize = 2 * 1024;
+
+/// Pump a child's stderr until EOF, keeping only the newest
+/// [`STDERR_TAIL_CAP`] bytes of UTF-8-lossy text in the shared buffer.
+/// Runs for the child's whole life on its own thread — the pipe can
+/// never fill, so a logging-heavy server cannot deadlock the client.
+fn drain_stderr(mut pipe: impl Read, tail: Arc<Mutex<String>>) {
+    let mut buf = [0u8; 1024];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let chunk = String::from_utf8_lossy(&buf[..n]);
+                let Ok(mut t) = tail.lock() else { return };
+                t.push_str(&chunk);
+                if t.len() > STDERR_TAIL_CAP {
+                    let mut start = t.len() - STDERR_TAIL_CAP;
+                    while !t.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    t.drain(..start);
+                }
+            }
+        }
+    }
+}
+
 /// A live MCP server process speaking newline-delimited JSON-RPC on stdio.
 ///
 /// Invariants: stdout is read one line per request and every response's `id`
 /// must match the request just written ([`decode_response`]) — a stale or
 /// interleaved line is an error, never accepted as this call's answer; ids
 /// start at 1 and are never reused, even when a write fails, so a late reply
-/// to a failed call can never be mistaken for a fresh one; `stderr` is
-/// `Stdio::null()`, so a chatty server cannot fill a pipe buffer and deadlock
-/// the client while we wait on stdout; a child that exits (or closes stdout)
+/// to a failed call can never be mistaken for a fresh one; `stderr` is drained by a
+/// daemon thread into a bounded (≤2 KiB) tail, so a chatty server cannot fill
+/// a pipe buffer and deadlock the client while we wait on stdout — and a
+/// crash still leaves a diagnostic crumb ([`StdioClient::stderr_tail`]); a
+/// child that exits (or closes stdout)
 /// is reported as an error naming the server and the method — a hang is never
 /// papered over as an empty success; a server that never answers is killed
 /// after [`CALL_TIMEOUT`] (see [`StdioClient::call_with_timeout`]).
@@ -574,11 +606,15 @@ pub struct StdioClient {
     stdout: Option<BufReader<ChildStdout>>,
     next_id: u64,
     server: String,
+    /// The ≤2 KiB most recent stderr bytes — kept by the drainer thread so
+    /// spawn/init/transport failures can name what the server said.
+    stderr_tail: Arc<Mutex<String>>,
 }
 
 impl StdioClient {
     /// Spawn an MCP server program and wire its stdio: our writes go to its
-    /// stdin, its stdout is read line by line, its stderr is discarded.
+    /// stdin, its stdout is read line by line, its stderr is drained into a
+    /// bounded tail ([`StdioClient::stderr_tail`]).
     ///
     /// `server` is the short id this server is registered under (used in
     /// errors and by [`namespaced`]); the program and its arguments are the
@@ -643,7 +679,7 @@ impl StdioClient {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(pairs) = env {
             command.env_clear();
             for key in ["PATH", "HOME"] {
@@ -664,13 +700,34 @@ impl StdioClient {
         let stdout = child.stdout.take().ok_or_else(|| {
             format!("mcp server `{server}`: `{program}` did not give us a stdout pipe")
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            format!("mcp server `{server}`: `{program}` did not give us a stderr pipe")
+        })?;
+        // The drainer owns the pipe for the child's whole life and keeps
+        // only the newest ≤2 KiB — the tail, not the stream, is bounded.
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        std::thread::spawn({
+            let tail = Arc::clone(&stderr_tail);
+            move || drain_stderr(stderr, tail)
+        });
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
             stdout: Some(BufReader::new(stdout)),
             next_id: 1,
             server: server.to_string(),
+            stderr_tail,
         })
+    }
+
+    /// The last ≤2 KiB the server wrote to stderr — empty when it stayed
+    /// quiet. Diagnostics only (appended to spawn/init errors); never
+    /// parsed for protocol state.
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|t| t.clone())
+            .unwrap_or_default()
     }
 
     /// Send one request and return the **decoded response envelope** (which
