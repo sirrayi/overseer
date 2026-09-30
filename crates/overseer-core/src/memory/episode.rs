@@ -35,6 +35,7 @@ pub fn derive(events: &[Event]) -> Option<Episode> {
         } => Some((e.ts_ms, session_id.as_str(), Path::new(cwd), model.as_str())),
         _ => None,
     })?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut prompts = Vec::new();
     let mut calls: HashMap<&str, &str> = HashMap::new();
     let mut changed: Vec<String> = Vec::new();
@@ -60,8 +61,7 @@ pub fn derive(events: &[Event]) -> Option<Episode> {
                 call_id, is_error, ..
             } => {
                 if let (false, Some(p)) = (*is_error, calls.remove(call_id.as_str())) {
-                    let p = Path::new(p);
-                    let rel = p.strip_prefix(cwd).unwrap_or(p).display().to_string();
+                    let rel = display_path(Path::new(p), cwd, home.as_deref());
                     if !changed.contains(&rel) {
                         changed.push(rel);
                     }
@@ -122,6 +122,43 @@ pub fn derive(events: &[Event]) -> Option<Episode> {
         title,
         text,
     })
+}
+
+/// A changed file as the episode names it: cwd-relative inside the
+/// workspace, `~`-relative under `$HOME`, else `…/<basename>` — never an
+/// absolute path.
+fn display_path(p: &Path, cwd: &Path, home: Option<&Path>) -> String {
+    use std::path::Component;
+    let tail = || {
+        p.file_name()
+            .map_or_else(|| "…".into(), |f| format!("…/{}", f.to_string_lossy()))
+    };
+    let shown = |rel: &Path| {
+        if rel.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            rel.display().to_string()
+        }
+    };
+    if p.is_relative() {
+        if p.components().any(|c| c == Component::ParentDir) {
+            return tail();
+        }
+        let p = p.strip_prefix(".").unwrap_or(p);
+        return shown(p);
+    }
+    if let Ok(rel) = p.strip_prefix(cwd) {
+        return shown(rel);
+    }
+    let home = home.filter(|h| h.is_absolute() && h.parent().is_some());
+    if let Some(rel) = home.and_then(|h| p.strip_prefix(h).ok()) {
+        return if rel.as_os_str().is_empty() {
+            "~".into()
+        } else {
+            format!("~/{}", rel.display())
+        };
+    }
+    tail()
 }
 
 /// Write (rewrite in place) the session's episode into project store
@@ -506,6 +543,42 @@ mod tests {
              Later prompts: 1\nFiles changed: src/a.rs\nBash calls: 1\n\
              Outcome: completed after 2 steps, $0.2500, model m2\n"
         );
+    }
+
+    #[test]
+    fn episode_paths_are_never_absolute() {
+        let (cwd, home) = (Path::new("/w/proj"), Some(Path::new("/h/me")));
+        for (p, want) in [
+            ("/w/proj/src/a.rs", "src/a.rs"),
+            ("src/a.rs", "src/a.rs"),
+            ("./src/a.rs", "src/a.rs"),
+            ("/h/me/.config/x.toml", "~/.config/x.toml"),
+            ("/etc/hosts", "…/hosts"),
+            ("../other/b.rs", "…/b.rs"),
+            ("/w/project2/c.rs", "…/c.rs"),
+        ] {
+            assert_eq!(display_path(Path::new(p), cwd, home), want, "{p}");
+        }
+        assert_eq!(
+            display_path(Path::new("/h/me/x"), cwd, Some(Path::new("/"))),
+            "…/x",
+            "a root HOME is no anchor"
+        );
+        let mut kinds: Vec<EventKind> = Vec::new();
+        kinds.extend(call(
+            "a",
+            "write",
+            json!({"path": "/opt/elsewhere/notes.txt"}),
+            false,
+        ));
+        kinds.push(run_end(1));
+        let ep = derive(&session(kinds)).unwrap();
+        assert!(
+            ep.text.contains("Files changed: …/notes.txt\n"),
+            "{}",
+            ep.text
+        );
+        assert!(!ep.text.contains("/opt/"), "{}", ep.text);
     }
 
     #[test]
