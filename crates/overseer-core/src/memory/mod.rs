@@ -30,9 +30,9 @@ pub const INDEX_NAME: &str = "INDEX.md";
 /// pointer table that grows, CORE.md is the fixed handful of lines that
 /// must never be paged out — identity and standing instructions.
 pub const CORE_NAME: &str = "CORE.md";
-/// Hard cap on the resident core block (2KB ≈ 500 tokens). Over the cap the
-/// block is truncated *with a repair note*, never silently.
-const CORE_CAP: usize = 2_048;
+/// Hard cap on each resident core block (1,500 bytes ≈ 375 tokens). Over
+/// the cap the block is truncated *with a repair note*, never silently.
+const CORE_CAP: usize = 1_500;
 /// Routing hint (LightRAG pattern, arsenal B2): level-aware retrieval is a
 /// prompt contract, not code — tell the model which layer answers which
 /// kind of question, and the local/global split falls out of the files.
@@ -731,38 +731,80 @@ fn is_proposal_pointer(line: &str) -> bool {
 /// silently. The dir is named relative to the workspace (see
 /// `prompt_path`) so the cached prefix carries no machine-specific path.
 pub fn index_segment(dir: &Path) -> String {
+    index_segment_within(dir, RESIDENT_CAP)
+}
+
+/// [`index_segment`] under a total of `cap` bytes: pointer lines are kept
+/// in index order while they fit, the rest become `… N more — memory
+/// search`.
+fn index_segment_within(dir: &Path, cap: usize) -> String {
     let idx = dir.join(INDEX_NAME);
     let text = std::fs::read_to_string(&idx).unwrap_or_default();
     // RT-3: drop proposal pointers (unreviewed) + expired/superseded (F9).
-    let text: String = text
+    let lines: Vec<&str> = text
         .lines()
         .filter(|l| !is_proposal_pointer(l) && pointer_live(dir, l))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let (body, note) = if text.len() > INDEX_CAP {
-        // Largest char-boundary byte offset still within the cap.
-        let cut = text
-            .char_indices()
-            .map(|(i, c)| i + c.len_utf8())
-            .take_while(|end| *end <= INDEX_CAP)
-            .last()
-            .unwrap_or(0);
-        (
-            &text[..cut],
-            "\n\n[overseer] INDEX.md exceeds 25KB — prune it: keep only \
-             one-line pointers and move detail into topic files.",
-        )
+        .collect();
+    let note = if text.len() > INDEX_CAP {
+        "\n\n[overseer] INDEX.md exceeds 25KB — prune it: keep only \
+         one-line pointers and move detail into topic files."
     } else {
-        (text.as_str(), "")
+        ""
     };
-    format!(
+    let head = format!(
         "## Memory index\n\
          `{}/` is your persistent memory — read and update it with ordinary \
          file tools. {INDEX_NAME} holds one-line pointers (≤25KB); details \
-         live in topic files you create there.\n\n{ROUTING_HINT}\n\n{body}{note}\n\n{MEMORY_LEGEND}{core}",
+         live in topic files you create there.\n\n{ROUTING_HINT}\n\n",
         prompt_path(dir),
-        core = core_block(dir)
-    )
+    );
+    let tail = format!("{note}\n\n{MEMORY_LEGEND}{}", core_block(dir));
+    let budget = cap.saturating_sub(head.len() + tail.len());
+    let mut body = String::new();
+    let mut shown = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let sep = usize::from(!body.is_empty());
+        if body.len() + sep + line.len() + more_len(lines.len() - i - 1) > budget {
+            break;
+        }
+        if sep == 1 {
+            body.push('\n');
+        }
+        body.push_str(line);
+        shown += 1;
+    }
+    if shown < lines.len() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&more_line(lines.len() - shown));
+    }
+    hard_cap(format!("{head}{body}{tail}"), cap)
+}
+
+fn more_line(n: usize) -> String {
+    format!("… {n} more — memory search")
+}
+
+/// Bytes the `\n… N more` tail takes (0 when nothing is left over).
+fn more_len(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        1 + more_line(n).len()
+    }
+}
+
+/// `text` cut to at most `cap` bytes on a char boundary.
+fn hard_cap(mut text: String, cap: usize) -> String {
+    if text.len() > cap {
+        let mut cut = cap;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    text
 }
 
 /// `dir` as the prompt names it: relative to the workspace (the process
@@ -1654,8 +1696,11 @@ pub fn consolidate_stores(
     Ok(out.join("\n"))
 }
 
-/// Hard cap on the v2 resident memory segment.
-pub const RESIDENT_CAP: usize = 10_000;
+/// Hard cap on the resident memory segment, bytes (≈1K tokens), legacy
+/// `--memory` text included.
+pub const RESIDENT_CAP: usize = 4_000;
+/// At most this many ranked index lines are resident.
+pub const RESIDENT_LINES: usize = 24;
 
 const CONTRACT: &str = "Use the memory tool: search before asking what you may \
     already know; remember durable facts, preferences and outcomes.";
@@ -1682,20 +1727,22 @@ pub fn resident_segment(config: &crate::agent::AgentConfig) -> Option<String> {
         .into_iter()
         .filter(|(s, _)| *s == Scope::User)
         .collect();
-    Some(format!(
-        "{}\n\n{}",
-        index_segment(dir),
-        resident(&user, now_secs())
-    ))
+    let user = resident_within(&user, now_secs(), RESIDENT_CAP / 2);
+    let legacy = index_segment_within(dir, RESIDENT_CAP - user.len() - 2);
+    Some(format!("{legacy}\n\n{user}"))
 }
 
 /// The resident memory text over `stores` at clock `now`: the contract,
-/// each store's CORE.md (v1 cap and repair note), then every live INDEX
-/// pointer as `scope:layer/name.md — …`, ranked by activation (desc, ties
-/// by name). Hard-capped at [`RESIDENT_CAP`] bytes with a `… N more`
-/// tail. Deterministic: same stores + same `now` →
-/// same bytes. No absolute paths.
+/// each store's CORE.md (≤[`CORE_CAP`], repair note beyond), then at most
+/// [`RESIDENT_LINES`] live INDEX pointers as `scope:layer/name.md — …`,
+/// ranked by activation (desc, ties by name). Hard-capped at
+/// [`RESIDENT_CAP`] bytes with a `… N more` tail. Deterministic: same
+/// stores + same `now` → same bytes. No absolute paths.
 pub fn resident(stores: &[(Scope, PathBuf)], now: u64) -> String {
+    resident_within(stores, now, RESIDENT_CAP)
+}
+
+fn resident_within(stores: &[(Scope, PathBuf)], now: u64, cap: usize) -> String {
     let head = format!("## Memory\n{CONTRACT}");
     let mut cores = String::new();
     for (scope, dir) in stores {
@@ -1741,21 +1788,20 @@ pub fn resident(stores: &[(Scope, PathBuf)], now: u64) -> String {
         out.push_str("\n\n## Memory index");
     }
     let total = ranked.len();
-    for (i, (_, line)) in ranked.iter().enumerate() {
-        let more = total - i - 1;
-        let tail = if more == 0 {
-            0
-        } else {
-            format!("\n… {more} more — memory search").len()
-        };
-        if out.len() + 1 + line.len() + tail > RESIDENT_CAP {
-            out.push_str(&format!("\n… {} more — memory search", total - i));
+    let mut shown = 0;
+    for (i, (_, line)) in ranked.iter().take(RESIDENT_LINES).enumerate() {
+        if out.len() + 1 + line.len() + more_len(total - i - 1) > cap {
             break;
         }
         out.push('\n');
         out.push_str(line);
+        shown += 1;
     }
-    out
+    if shown < total {
+        out.push('\n');
+        out.push_str(&more_line(total - shown));
+    }
+    hard_cap(out, cap)
 }
 
 /// INDEX pointers of one store as `(resolved rel path, rest of the line)`:
@@ -1883,7 +1929,7 @@ mod tests {
         std::fs::write(&idx, "x".repeat(INDEX_CAP + 100)).unwrap();
         let seg = index_segment(&dir);
         assert!(seg.contains("exceeds 25KB"));
-        assert!(seg.len() < INDEX_CAP + 1_000);
+        assert!(seg.len() <= RESIDENT_CAP, "{}", seg.len());
     }
 
     #[test]
@@ -2328,7 +2374,7 @@ mod tests {
         std::fs::write(dir.join(CORE_NAME), "y".repeat(CORE_CAP + 500)).unwrap();
         let seg = index_segment(&dir);
         assert!(seg.contains("exceeds"), "{seg}");
-        assert!(seg.len() < INDEX_CAP + CORE_CAP + 2_000, "{}", seg.len());
+        assert!(seg.len() <= RESIDENT_CAP, "{}", seg.len());
 
         // CORE.md is not a topic: it must never be reconciled as one.
         std::fs::write(dir.join(CORE_NAME), "core\n").unwrap();
@@ -2897,9 +2943,9 @@ mod tests {
     }
 
     #[test]
-    fn resident_caps_at_10k_with_a_more_tail() {
+    fn resident_keeps_24_lines_under_4k_with_a_more_tail() {
         let stores = v2_stores("cap");
-        let project = &stores[1].1;
+        let (user, project) = (&stores[0].1, &stores[1].1);
         for i in 0..400 {
             std::fs::write(project.join(format!("semantic/n{i:03}.md")), "x\n").unwrap();
             append_pointer(
@@ -2910,8 +2956,50 @@ mod tests {
         }
         let r = resident(&stores, 1_790_000_000);
         assert!(r.len() <= RESIDENT_CAP, "{}", r.len());
-        let tail = r.lines().last().unwrap();
         let shown = r.lines().filter(|l| l.starts_with("project:")).count();
-        assert_eq!(tail, format!("… {} more — memory search", 400 - shown));
+        assert_eq!(shown, RESIDENT_LINES);
+        assert_eq!(r.lines().last().unwrap(), "… 376 more — memory search");
+        // Both cores over budget: each capped with its repair note, and
+        // the byte cap still holds with the line tail.
+        std::fs::write(user.join(CORE_NAME), "u".repeat(3_000)).unwrap();
+        std::fs::write(project.join(CORE_NAME), "p".repeat(3_000)).unwrap();
+        let r = resident(&stores, 1_790_000_000);
+        assert!(r.len() <= RESIDENT_CAP, "{}", r.len());
+        assert_eq!(r.matches("exceeds 1500 bytes").count(), 2, "{r}");
+        assert!(r.matches('u').count() >= CORE_CAP && r.matches('p').count() >= CORE_CAP);
+        let shown = r.lines().filter(|l| l.starts_with("project:")).count();
+        assert!(shown < RESIDENT_LINES, "{shown}");
+        assert_eq!(
+            r.lines().last().unwrap(),
+            format!("… {} more — memory search", 400 - shown)
+        );
+    }
+
+    /// Legacy `--memory` (store inside the workspace) text obeys the same
+    /// total cap, with the same `… N more` tail.
+    #[test]
+    fn legacy_resident_text_shares_the_cap() {
+        let root = tmpdir();
+        let (ws, user) = (root.join("ws"), root.join("user"));
+        let mem = ws.join(".overseer/memory");
+        ensure(&mem).unwrap();
+        ensure(&user).unwrap();
+        std::fs::write(user.join(CORE_NAME), "u".repeat(1_400)).unwrap();
+        std::fs::write(mem.join(CORE_NAME), "c".repeat(1_400)).unwrap();
+        for i in 0..300 {
+            std::fs::write(mem.join(format!("t{i}.md")), "x\n").unwrap();
+            append_pointer(&mem, &format!("t{i}.md — legacy topic {i} with words")).unwrap();
+        }
+        let cfg = crate::agent::AgentConfig {
+            cwd: ws.clone(),
+            memory_dir: Some(mem.clone()),
+            user_memory_dir: Some(user),
+            ..crate::agent::AgentConfig::default()
+        };
+        let seg = resident_segment(&cfg).unwrap();
+        assert!(seg.len() <= RESIDENT_CAP, "{}", seg.len());
+        assert!(seg.contains("## Memory index") && seg.contains("t0.md — legacy topic 0"));
+        assert!(seg.contains("more — memory search"), "{seg}");
+        assert!(seg.contains("## user core"), "{seg}");
     }
 }
