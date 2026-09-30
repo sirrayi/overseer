@@ -16,7 +16,7 @@ expression: s
   ● bash  cargo test
   ● read  src/app.rs
     permission denied
-                                      2 steps · 0s · $0.042
+                         2 steps · 0s · $0.042 · 42% cached
   ⠹ grep  todo src
 ⠹ running grep  0s  0 tok  (esc to interrupt)
 ❯

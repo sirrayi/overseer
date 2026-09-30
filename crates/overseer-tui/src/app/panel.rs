@@ -95,9 +95,20 @@ impl App {
                     kv("state", state),
                     kv("tokens", self.tokens.to_string()),
                     kv("cost", format!("${:.4}", self.cost)),
-                    // DEFERRED(owner): real `87% · 41.2K read` once
-                    // Agent::cache_stats()/CacheStats::hit_rate lands.
-                    kv("cache", "—".to_string()),
+                    // Sum of RunEnd deltas (live + replay); `—` until
+                    // a run bills input tokens.
+                    kv(
+                        "cache",
+                        if self.cache.input_total() > 0 {
+                            format!(
+                                "{:.0}% · {} read",
+                                self.cache.hit_rate() * 100.0,
+                                human_tokens(self.cache.cache_read)
+                            )
+                        } else {
+                            "—".to_string()
+                        },
+                    ),
                 ]
             }
             1 => {
@@ -164,6 +175,17 @@ impl App {
             ],
             _ => keys_rows(),
         }
+    }
+}
+
+/// `41234` → `41.2K` — compact token counts for the cache row.
+fn human_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1e3)
+    } else {
+        n.to_string()
     }
 }
 
@@ -247,4 +269,17 @@ fn keys_rows() -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human_tokens;
+
+    #[test]
+    fn human_tokens_compacts() {
+        assert_eq!(human_tokens(0), "0");
+        assert_eq!(human_tokens(999), "999");
+        assert_eq!(human_tokens(41234), "41.2K");
+        assert_eq!(human_tokens(1_500_000), "1.5M");
+    }
 }

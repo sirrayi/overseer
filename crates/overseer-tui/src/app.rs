@@ -227,6 +227,9 @@ pub struct App {
     agents: Vec<AgentEnt>,
     tokens: u64,
     cost: f64,
+    /// Sum of every RunEnd's per-run cache delta (live + replayed) —
+    /// the dashboard `cache` row renders hit rate + read volume.
+    cache: overseer_core::ledger::CacheStats,
     show_help: bool,
     show_plan: bool,
     tick: usize,
@@ -286,6 +289,7 @@ impl App {
             agents: Vec::new(),
             tokens: 0,
             cost: 0.0,
+            cache: overseer_core::ledger::CacheStats::default(),
             show_help: false,
             show_plan: false,
             tick: 0,
@@ -465,8 +469,17 @@ impl App {
         if let EventKind::ModelResponse { usage, .. } = ev.kind {
             self.tokens += usage.total_input() + usage.output;
         }
-        if let EventKind::RunEnd { total_cost_usd, .. } = ev.kind {
+        if let EventKind::RunEnd {
+            total_cost_usd,
+            cache,
+            ..
+        } = ev.kind
+        {
             self.cost = total_cost_usd;
+            self.cache.fresh_input += cache.fresh_input;
+            self.cache.cache_read += cache.cache_read;
+            self.cache.cache_write += cache.cache_write;
+            self.cache.output += cache.output;
         }
         if let EventKind::ToolCallStart {
             call_id,
@@ -1020,6 +1033,47 @@ mod tests {
             .collect();
         assert_eq!(statuses, vec![ToolStatus::Ok, ToolStatus::Err]);
         assert!(app.live.is_empty());
+    }
+
+    #[test]
+    fn runend_cache_sums_across_live_and_replay() {
+        use overseer_core::event::EventKind;
+        use overseer_core::ledger::CacheStats;
+        let ev = |kind| Event {
+            id: 0,
+            parent_id: None,
+            ts_ms: 0,
+            prev_hash: 0,
+            hash: 0,
+            kind,
+        };
+        let run_end = |read: u64| EventKind::RunEnd {
+            stop_reason: "end_turn".into(),
+            steps: 1,
+            total_cost_usd: 0.01,
+            cache: CacheStats {
+                fresh_input: 100,
+                cache_read: read,
+                cache_write: 10,
+                output: 5,
+            },
+        };
+        let mut app = test_app("/tmp");
+        app.on_event(&ev(run_end(300))); // live
+        app.seed(&ev(run_end(200))); // replayed
+        assert_eq!(app.cache.cache_read, 500);
+        assert_eq!(app.cache.fresh_input, 200);
+        assert_eq!(app.cache.input_total(), 720);
+        assert!((app.cache.hit_rate() - 500.0 / 720.0).abs() < 1e-9);
+        // A pre-extension RunEnd (zero cache) leaves the row at `—`.
+        let mut app2 = test_app("/tmp");
+        app2.on_event(&ev(EventKind::RunEnd {
+            stop_reason: "end_turn".into(),
+            steps: 1,
+            total_cost_usd: 0.0,
+            cache: Default::default(),
+        }));
+        assert_eq!(app2.cache.input_total(), 0);
     }
 
     #[test]

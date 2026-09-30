@@ -480,18 +480,23 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
             stop_reason,
             steps,
             total_cost_usd,
+            cache,
         } => Feed::NewCells(vec![Cell::End {
-            text: run_summary(*steps, run_elapsed, *total_cost_usd),
+            text: run_summary(*steps, run_elapsed, *total_cost_usd, cache),
             warn: abnormal_stop(stop_reason),
         }]),
         EventKind::TurnEnd { .. } => Feed::Ignore,
     }
 }
 
-/// `19 steps · 1m 12s · $0.042` — segments append only when known.
-/// DEFERRED(owner): `· NN% cached` once Agent::cache_stats() /
-/// CacheStats::hit_rate lands on the run path (per AGENTS.md).
-fn run_summary(steps: u32, elapsed: Option<std::time::Duration>, cost: f64) -> String {
+/// `19 steps · 1m 12s · $0.042 · 87% cached` — segments append only
+/// when known. `cache` is the run's delta (RunEnd); zero input = silent.
+fn run_summary(
+    steps: u32,
+    elapsed: Option<std::time::Duration>,
+    cost: f64,
+    cache: &overseer_core::ledger::CacheStats,
+) -> String {
     let mut s = format!("{steps} step{}", if steps == 1 { "" } else { "s" });
     if let Some(d) = elapsed {
         let secs = d.as_secs();
@@ -507,6 +512,9 @@ fn run_summary(steps: u32, elapsed: Option<std::time::Duration>, cost: f64) -> S
     }
     if cost >= 0.0005 {
         s.push_str(&format!(" · ${cost:.3}"));
+    }
+    if cache.input_total() > 0 {
+        s.push_str(&format!(" · {:.0}% cached", cache.hit_rate() * 100.0));
     }
     s
 }
@@ -598,6 +606,35 @@ mod tests {
     fn tool_summary_bash() {
         let s = tool_summary("bash", &serde_json::json!({"command": "cargo test"}));
         assert_eq!(s, "cargo test");
+    }
+
+    #[test]
+    fn run_summary_shows_cache_only_when_input_billed() {
+        use overseer_core::ledger::CacheStats;
+        let zero = CacheStats::default();
+        assert_eq!(
+            run_summary(2, None, 0.042, &zero),
+            "2 steps · $0.042",
+            "old-shape RunEnd (empty cache) keeps the L2 text"
+        );
+        let c = CacheStats {
+            fresh_input: 41200,
+            cache_read: 30400,
+            cache_write: 1200,
+            output: 800,
+        };
+        assert_eq!(
+            run_summary(2, None, 0.042, &c),
+            "2 steps · $0.042 · 42% cached"
+        );
+        // Input billed but zero reads still shows — 0% is honest.
+        let c = CacheStats {
+            fresh_input: 100,
+            cache_read: 0,
+            cache_write: 0,
+            output: 5,
+        };
+        assert!(run_summary(1, None, 0.0, &c).ends_with("· 0% cached"));
     }
 
     #[test]

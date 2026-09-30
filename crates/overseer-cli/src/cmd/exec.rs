@@ -75,7 +75,13 @@ pub(crate) fn cmd_exec(args: &[String]) -> i32 {
 
     let json_mode = flags.json;
     let stdout = std::io::stdout();
+    // The run's cache delta rides its RunEnd; the final human summary
+    // line appends the hit rate when the run billed input tokens.
+    let mut run_cache = overseer_core::ledger::CacheStats::default();
     let mut sink = |e: &Event| {
+        if let overseer_core::event::EventKind::RunEnd { cache, .. } = &e.kind {
+            run_cache = *cache;
+        }
         if json_mode {
             let line = serde_json::to_string(e).unwrap_or_default();
             let mut h = stdout.lock();
@@ -86,10 +92,16 @@ pub(crate) fn cmd_exec(args: &[String]) -> i32 {
         }
     };
 
-    match agent.run_turn(&prompt, &mut sink) {
+    let outcome = agent.run_turn(&prompt, &mut sink);
+    let cache_tail = if run_cache.input_total() > 0 {
+        format!(", {:.0}% cached", run_cache.hit_rate() * 100.0)
+    } else {
+        String::new()
+    };
+    match outcome {
         Ok(RunOutcome::Completed { steps, cost_usd }) => {
             eprintln!(
-                "done: {steps} step(s), ${cost_usd:.4} — session {}",
+                "done: {steps} step(s), ${cost_usd:.4}{cache_tail} — session {}",
                 session_dir.display()
             );
             0

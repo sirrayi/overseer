@@ -86,6 +86,25 @@ impl CacheStats {
         }
     }
 
+    /// `self - earlier` per field, clamped at zero — the per-run slice a
+    /// RunEnd event reports when `earlier` is the run-start snapshot.
+    pub fn saturating_delta(&self, earlier: &CacheStats) -> CacheStats {
+        CacheStats {
+            fresh_input: self.fresh_input.saturating_sub(earlier.fresh_input),
+            cache_read: self.cache_read.saturating_sub(earlier.cache_read),
+            cache_write: self.cache_write.saturating_sub(earlier.cache_write),
+            output: self.output.saturating_sub(earlier.output),
+        }
+    }
+
+    /// Total input side (fresh + read + write) — the `> 0` test frontends
+    /// use before showing a hit rate.
+    pub fn input_total(&self) -> u64 {
+        self.fresh_input
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+    }
+
     fn add(&mut self, r: &UsageRecord) {
         self.fresh_input = self.fresh_input.saturating_add(r.fresh_input);
         self.cache_read = self.cache_read.saturating_add(r.cache_read);
@@ -237,6 +256,44 @@ mod tests {
             0,
             0.0,
         )
+    }
+
+    #[test]
+    fn cache_stats_delta_is_per_run_and_clamped() {
+        let end = CacheStats {
+            fresh_input: 100,
+            cache_read: 500,
+            cache_write: 40,
+            output: 20,
+        };
+        let start = CacheStats {
+            fresh_input: 30,
+            cache_read: 200,
+            cache_write: 40,
+            output: 8,
+        };
+        assert_eq!(
+            end.saturating_delta(&start),
+            CacheStats {
+                fresh_input: 70,
+                cache_read: 300,
+                cache_write: 0,
+                output: 12,
+            }
+        );
+        // A ledger reopen anomaly (end < start) clamps to zero, never
+        // wraps around to a huge count.
+        assert_eq!(
+            start.saturating_delta(&end),
+            CacheStats {
+                fresh_input: 0,
+                cache_read: 0,
+                cache_write: 0,
+                output: 0,
+            }
+        );
+        assert_eq!(start.input_total(), 270);
+        assert_eq!(CacheStats::default().input_total(), 0);
     }
 
     #[test]

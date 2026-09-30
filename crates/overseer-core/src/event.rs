@@ -74,6 +74,12 @@ pub enum EventKind {
         stop_reason: String,
         steps: u32,
         total_cost_usd: f64,
+        /// Cache tokens billed inside this run only (end-of-run
+        /// `Agent::cache_stats()` minus the run-start snapshot) — the
+        /// session ledger keeps the cumulative totals. Absent on
+        /// pre-extension logs, hence `default`.
+        #[serde(default)]
+        cache: crate::ledger::CacheStats,
     },
     /// A background subagent finished (P3.4 fire-and-notify): its bounded
     /// digest is injected as a user message at the next step boundary;

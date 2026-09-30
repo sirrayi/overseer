@@ -322,6 +322,9 @@ pub struct Agent {
     /// Provider prompt-cache routing key: the session id, stable across
     /// resumes of the same session.
     cache_key: Option<String>,
+    /// CacheStats snapshot at the current run's start — RunEnd reports
+    /// the delta so a run summary shows ITS hit rate, not the session's.
+    run_cache_start: crate::ledger::CacheStats,
 }
 
 /// A stop gate's verdict: let the stop through, block it (a nudge was
@@ -380,6 +383,7 @@ impl Agent {
             control: Control::default(),
             system: Vec::new(),
             cache_key: Some(session_id.clone()),
+            run_cache_start: crate::ledger::CacheStats::default(),
         };
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
@@ -493,6 +497,7 @@ impl Agent {
             control: Control::default(),
             system,
             cache_key,
+            run_cache_start: crate::ledger::CacheStats::default(),
         })
     }
 
@@ -623,6 +628,8 @@ impl Agent {
     ) -> std::io::Result<RunOutcome> {
         self.messages.push(Message::user_text(input));
         self.emit(EventKind::UserInput { text: input.into() }, on_event)?;
+        // Per-run cache baseline — RunEnd emits the delta against this.
+        self.run_cache_start = self.ledger.cache_stats();
 
         // P1.9 checkpointing: open a fresh checkpoint per user prompt,
         // named by the input's event id — that id is also the conversation
@@ -1498,6 +1505,10 @@ impl Agent {
                 stop_reason: stop.into(),
                 steps,
                 total_cost_usd: self.ledger.total_cost_usd,
+                cache: self
+                    .ledger
+                    .cache_stats()
+                    .saturating_delta(&self.run_cache_start),
             },
             on_event,
         )?;
