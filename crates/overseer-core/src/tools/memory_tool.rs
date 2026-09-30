@@ -111,6 +111,9 @@ impl MemoryState {
         self.stores = stores::of_config(config);
         self.subagent = config.is_subagent;
         self.recall = config.memory_recall && !config.is_subagent;
+        if self.stores.is_empty() {
+            return;
+        }
         let events =
             crate::event::EventLog::replay(session_dir.join("events.jsonl")).unwrap_or_default();
         self.session8 = events
@@ -494,6 +497,48 @@ mod tests {
 
     fn call(st: &mut MemoryState, input: Value) -> ToolOutput {
         st.run(&input, None, NOW)
+    }
+
+    /// `--no-memory`/`--bare` (no stores): init never replays the log.
+    #[test]
+    fn init_without_stores_skips_the_event_log() {
+        let root = tmp("off");
+        let session = root.join("session-0192aabbccdd");
+        std::fs::create_dir_all(&session).unwrap();
+        let mut log = crate::event::EventLog::create(session.join("events.jsonl")).unwrap();
+        log.append(crate::event::EventKind::SessionStart {
+            session_id: "1790000000123".into(),
+            cwd: root.display().to_string(),
+            model: "m".into(),
+            harness_version: "0".into(),
+            parent: None,
+        })
+        .unwrap();
+        log.append(crate::event::EventKind::MemoryNotice {
+            kind: "recall".into(),
+            notes: vec!["project:semantic/x.md".into()],
+            text: "t".into(),
+        })
+        .unwrap();
+        let off = AgentConfig {
+            cwd: root.clone(),
+            ..AgentConfig::default()
+        };
+        let mut st = MemoryState::default();
+        st.init(&off, &session);
+        assert!(st.stores.is_empty() && st.recalled.is_empty() && st.session8.is_empty());
+        assert!(st.on_input("anything", NOW).is_empty());
+        // Control: with a store the same log seeds the recalled set.
+        let project = root.join("project");
+        crate::memory::ensure(&project).unwrap();
+        let on = AgentConfig {
+            memory_dir: Some(project),
+            ..off
+        };
+        let mut st = MemoryState::default();
+        st.init(&on, &session);
+        assert_eq!(st.session8, "00000123");
+        assert!(st.recalled.contains("project:semantic/x.md"));
     }
 
     #[test]
