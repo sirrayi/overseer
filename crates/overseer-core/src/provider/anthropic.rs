@@ -352,6 +352,7 @@ mod tests {
             thinking_budget: None,
             effort: None,
             cache_breakpoints: true,
+            cache_key: None,
         }
     }
 

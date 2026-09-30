@@ -329,6 +329,7 @@ mod tests {
             thinking_budget: None,
             effort: None,
             cache_breakpoints: false,
+            cache_key: None,
         };
         assert!(
             p.complete(&req).is_err(),

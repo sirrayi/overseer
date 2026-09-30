@@ -76,6 +76,7 @@ const OPENAI_PARAMS: &[&str] = &[
     "presence_penalty",
     "max_tokens",
     "reasoning_effort",
+    "prompt_cache_key",
 ];
 
 /// Full Gemini set (generationConfig-spelled). Same note as OPENAI_PARAMS.
@@ -90,8 +91,9 @@ const GEMINI_PARAMS: &[&str] = &[
 
 /// Conservative gateway subset (opencode / vLLM-style servers) for the
 /// hosted open-model rows: sampling knobs
-/// only. vLLM ignores unknown fields, but reasoning_effort is
-/// gateway-specific — stripped fail-closed until the gateway documents it.
+/// only. vLLM ignores unknown fields, but reasoning_effort and
+/// prompt_cache_key are OpenAI-specific — stripped fail-closed until the
+/// gateway documents them.
 const GATEWAY_PARAMS: &[&str] = &[
     "temperature",
     "top_p",
@@ -111,6 +113,7 @@ const FALLBACK_PARAMS: &[&str] = &[
     "presence_penalty",
     "max_tokens",
     "reasoning_effort",
+    "prompt_cache_key",
     "topP",
     "topK",
     "maxOutputTokens",

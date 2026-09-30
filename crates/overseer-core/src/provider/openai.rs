@@ -109,6 +109,9 @@ impl OpenAiCompatible {
                 super::Effort::High | super::Effort::Max => "high",
             });
         }
+        if let Some(k) = &req.cache_key {
+            body["prompt_cache_key"] = json!(k);
+        }
         // Param filter (Ch.7 §2.2): the conservative gateway profile
         // rejects reasoning_effort, so it is stripped there while
         // unknown/OpenAI models keep it. Core keys are never stripped.
@@ -121,6 +124,7 @@ impl OpenAiCompatible {
                 "frequency_penalty",
                 "presence_penalty",
                 "reasoning_effort",
+                "prompt_cache_key",
             ],
         );
         body
@@ -478,6 +482,7 @@ mod tests {
             thinking_budget: None,
             effort: None,
             cache_breakpoints: false,
+            cache_key: None,
         };
         let body = OpenAiCompatible::build_body(&req);
         assert_eq!(body["messages"][0]["role"], "system");
@@ -524,6 +529,7 @@ mod tests {
             thinking_budget: None,
             effort: None,
             cache_breakpoints: false,
+            cache_key: None,
         };
         let provider = OpenAiCompatible::new("k", format!("http://127.0.0.1:{port}/v1"))
             .with_header("x-opencode-session", "overseer-test");
@@ -535,6 +541,32 @@ mod tests {
                 .contains("x-opencode-session: overseer-test"),
             "session header missing from request head: {head}"
         );
+    }
+
+    /// K4: official OpenAI profiles carry `prompt_cache_key`; the
+    /// conservative gateway profile (opencode / vLLM) never does.
+    #[test]
+    fn prompt_cache_key_only_on_openai_profiles() {
+        let system: Vec<SystemSegment> = vec![];
+        let tools: Vec<ToolSpec> = vec![];
+        let msgs = vec![Message::user_text("hi")];
+        let body_for = |model| {
+            OpenAiCompatible::build_body(&Request {
+                model,
+                system: &system,
+                tools: &tools,
+                messages: &msgs,
+                max_tokens: 100,
+                thinking_budget: None,
+                effort: None,
+                cache_breakpoints: false,
+                cache_key: Some("sess-1".into()),
+            })
+        };
+        assert_eq!(body_for("gpt-5.5")["prompt_cache_key"], "sess-1");
+        assert!(body_for("deepseek-v4.1-flash")
+            .get("prompt_cache_key")
+            .is_none());
     }
 
     #[test]
@@ -553,6 +585,7 @@ mod tests {
             thinking_budget: None,
             effort: Some(super::super::Effort::High),
             cache_breakpoints: false,
+            cache_key: None,
         };
         let body = OpenAiCompatible::build_body(&req);
         assert!(body.get("reasoning_effort").is_none());
@@ -577,6 +610,7 @@ mod tests {
             thinking_budget: None,
             effort: Some(super::super::Effort::High),
             cache_breakpoints: false,
+            cache_key: None,
         };
         let b1 = OpenAiCompatible::build_body(&req);
         assert_eq!(b1["reasoning_effort"], "high");
@@ -633,6 +667,7 @@ mod tests {
             thinking_budget: None,
             effort: None,
             cache_breakpoints: false,
+            cache_key: None,
         };
         let err = p.complete(&req).unwrap_err();
         assert!(matches!(err, ProviderError::Transport(_)));
@@ -683,6 +718,7 @@ mod tests {
             thinking_budget: None,
             effort: None,
             cache_breakpoints: false,
+            cache_key: None,
         };
         let body = OpenAiCompatible::build_body(&req);
         let wire = body["messages"].as_array().unwrap();

@@ -385,6 +385,7 @@ mod tests {
             thinking_budget: None,
             effort: None,
             cache_breakpoints: false,
+            cache_key: None,
         }
     }
 
@@ -568,6 +569,7 @@ mod tests {
             thinking_budget: Some(777),
             effort: None,
             cache_breakpoints: false,
+            cache_key: None,
         };
         let body = Gemini::build_body(&req);
         assert_eq!(
@@ -600,6 +602,7 @@ mod tests {
             thinking_budget: Some(777),
             effort: None,
             cache_breakpoints: false,
+            cache_key: None,
         };
         let b1 = Gemini::build_body(&req);
         assert_eq!(

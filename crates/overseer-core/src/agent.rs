@@ -319,6 +319,9 @@ pub struct Agent {
     /// memory INDEX/CORE, skills or persona reach the model through its
     /// tools, not by rewriting these bytes (which would bust the cache).
     system: Vec<crate::provider::SystemSegment>,
+    /// Provider prompt-cache routing key: the session id, stable across
+    /// resumes of the same session.
+    cache_key: Option<String>,
 }
 
 /// A stop gate's verdict: let the stop through, block it (a nudge was
@@ -376,6 +379,7 @@ impl Agent {
             checkpoint: None,
             control: Control::default(),
             system: Vec::new(),
+            cache_key: Some(session_id.clone()),
         };
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
@@ -448,6 +452,17 @@ impl Agent {
                 _ => None,
             })
             .collect();
+        let cache_key = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::SessionStart { session_id, .. } => Some(session_id.clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                session_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            });
         let log = EventLog::open(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::open(session_dir.join("ledger.jsonl"))?;
         let tools = Self::registry(&config);
@@ -477,6 +492,7 @@ impl Agent {
             checkpoint: None,
             control: Control::default(),
             system,
+            cache_key,
         })
     }
 
@@ -773,6 +789,7 @@ impl Agent {
             thinking_budget: self.config.thinking_budget,
             effort: Some(self.effort_now()),
             cache_breakpoints: true,
+            cache_key: self.cache_key.clone(),
         };
 
         // B1-2 (Instructor retry): on a Malformed response only, re-issue
@@ -1188,6 +1205,7 @@ impl Agent {
             thinking_budget: None,
             effort: Some(crate::provider::Effort::Min),
             cache_breakpoints: false,
+            cache_key: None,
         };
         let critique = match self.provider.complete(&req) {
             Ok(r) => {
@@ -1262,6 +1280,7 @@ impl Agent {
                 thinking_budget: None,
                 effort: Some(crate::provider::Effort::Min),
                 cache_breakpoints: false,
+                cache_key: None,
             };
             // Small tier first; empty text or a provider error escalates.
             if let Ok(r) = self.provider.complete(&req) {
@@ -1287,6 +1306,7 @@ impl Agent {
             thinking_budget: None,
             effort: Some(crate::provider::Effort::Min),
             cache_breakpoints: false,
+            cache_key: None,
         };
         let r = self.provider.complete(&req)?;
         Ok(r.blocks
@@ -1620,6 +1640,7 @@ mod tests {
         responses: Mutex<VecDeque<Response>>,
         seen_systems: Mutex<Vec<Vec<String>>>,
         seen_models: Mutex<Vec<String>>,
+        seen_cache_keys: Mutex<Vec<Option<String>>>,
         /// Models that always error — drives the aux-call escalation path.
         fail_models: Vec<String>,
         /// Fail the next N calls with Malformed, then serve responses.
@@ -1633,6 +1654,7 @@ mod tests {
                 responses: Mutex::new(VecDeque::from(responses)),
                 seen_systems: Mutex::new(Vec::new()),
                 seen_models: Mutex::new(Vec::new()),
+                seen_cache_keys: Mutex::new(Vec::new()),
                 fail_models: Vec::new(),
                 malformed_first: Mutex::new(0),
             }
@@ -1658,6 +1680,10 @@ mod tests {
                 .unwrap()
                 .push(req.system.iter().map(|s| s.text.clone()).collect());
             self.seen_models.lock().unwrap().push(req.model.to_string());
+            self.seen_cache_keys
+                .lock()
+                .unwrap()
+                .push(req.cache_key.clone());
             if self.fail_models.iter().any(|m| m == req.model) {
                 return Err(ProviderError::Transport("mock fail".into()));
             }
@@ -3205,5 +3231,38 @@ mod tests {
             "system bytes moved mid-session"
         );
         assert!(seen[0].iter().any(|s| s.contains("v1")));
+    }
+
+    /// K4: every main-loop request carries the session id as its
+    /// prompt-cache key, and a resume keeps the same key.
+    #[test]
+    fn cache_key_is_session_id_across_resume() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        let provider = Arc::new(Mock::new(vec![done()]));
+        let sdir = dir.join("s");
+        let mut sink = |_: &Event| {};
+        {
+            let mut agent = Agent::start(
+                provider.clone(),
+                cfg.clone(),
+                sdir.clone(),
+                "sess-42".into(),
+            )
+            .unwrap();
+            agent.run_turn("one", &mut sink).unwrap();
+        }
+        let mut agent = Agent::resume(provider.clone(), cfg, sdir).unwrap();
+        agent.run_turn("two", &mut sink).unwrap();
+        let keys = provider.seen_cache_keys.lock().unwrap();
+        assert!(keys.len() >= 2);
+        assert!(
+            keys.iter().all(|k| k.as_deref() == Some("sess-42")),
+            "{keys:?}"
+        );
     }
 }

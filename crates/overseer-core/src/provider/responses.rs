@@ -126,6 +126,11 @@ impl ResponsesApi {
         } else if let Some(e) = req.effort {
             body["reasoning"] = json!({"effort": Self::effort_str(e)});
         }
+        if let Some(k) = &req.cache_key {
+            if crate::profile::supports_param(req.model, "prompt_cache_key") {
+                body["prompt_cache_key"] = json!(k);
+            }
+        }
         body
     }
 
@@ -384,7 +389,22 @@ mod tests {
             thinking_budget: None,
             effort: None,
             cache_breakpoints: false,
+            cache_key: None,
         }
+    }
+
+    /// K4: `prompt_cache_key` only where the profile accepts it — official
+    /// OpenAI models, never the gateway-hosted muse rows.
+    #[test]
+    fn prompt_cache_key_only_on_openai_profiles() {
+        let msgs = vec![Message::user_text("hi")];
+        let mut req = bare_req(&[], &[], &msgs);
+        req.cache_key = Some("sess-1".into());
+        assert!(ResponsesApi::build_body(&req)
+            .get("prompt_cache_key")
+            .is_none());
+        req.model = "gpt-5.5";
+        assert_eq!(ResponsesApi::build_body(&req)["prompt_cache_key"], "sess-1");
     }
 
     #[test]

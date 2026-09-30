@@ -767,6 +767,7 @@ fn gemini_1k_messages_full_path() {
         thinking_budget: None,
         effort: Some(Effort::High),
         cache_breakpoints: false,
+        cache_key: None,
     };
     let t = Instant::now();
     let resp = g.complete(&req).unwrap();

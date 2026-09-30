@@ -112,6 +112,10 @@ pub struct Request<'a> {
     pub effort: Option<Effort>,
     /// Attach provider cache breakpoints to the prefix tail.
     pub cache_breakpoints: bool,
+    /// Stable per-session prompt-cache routing key. OpenAI-family adapters
+    /// send it as `prompt_cache_key` where the model profile accepts it;
+    /// the other adapters ignore it.
+    pub cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
