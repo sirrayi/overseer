@@ -1538,6 +1538,88 @@ mod tests {
         );
     }
 
+    /// Resident token report (`--nocapture` prints it): the exact
+    /// advertised tool array and static system prompt of a default session
+    /// with every optional tool on, a skill and an MCP server present, and
+    /// empty memory stores.
+    #[test]
+    fn resident_token_report() {
+        let dir = tmpdir();
+        let ws = dir.join("ws");
+        let skill = ws.join(".overseer/skills/demo");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: demo\ndescription: demo skill\n---\nbody\n",
+        )
+        .unwrap();
+        let (user, project) = (dir.join("home/memory"), dir.join("home/projects/ws/memory"));
+        crate::memory::ensure(&user).unwrap();
+        crate::memory::ensure(&project).unwrap();
+        let server = crate::mcp_config::McpServer {
+            name: "s".into(),
+            command: "/bin/false".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            trust: crate::mcp_config::Trust::Ask,
+        };
+        let cfg = crate::agent::AgentConfig {
+            cwd: ws.clone(),
+            memory_dir: Some(project),
+            user_memory_dir: Some(user),
+            mcp_servers: vec![server],
+            ..Default::default()
+        };
+        assert!(Optional::detect(&ws).skill, "the skill is detected");
+        let reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL)
+            .with_mcp(cfg.mcp_servers.clone());
+        let array: Vec<Value> = reg
+            .specs
+            .iter()
+            .map(|s| json!({"name": s.name, "description": s.description, "input_schema": s.input_schema}))
+            .collect();
+        println!("TOOLS {}", serde_json::to_string_pretty(&array).unwrap());
+        let tools: usize = reg.specs.iter().map(spec_chars).sum();
+        for s in &reg.specs {
+            println!("spec {:<10} {:>5} chars", s.name, spec_chars(s));
+        }
+        let mut want = vec![
+            "bash", "edit", "glob", "grep", "memory", "read", "skill", "task", "tools", "write",
+        ];
+        if cfg!(feature = "code-mode") {
+            want.push("run_code");
+            want.sort_unstable();
+        }
+        assert_eq!(
+            reg.specs
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            want
+        );
+
+        let segs = crate::prompt::assemble(&cfg);
+        let prompt = segs
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        println!("PROMPT <<<\n{prompt}\n>>>");
+        for s in &segs {
+            println!("segment {:<9} {:>5} chars", s.name, s.text.chars().count());
+        }
+        let memory = segs.iter().find(|s| s.name == "memory").expect("memory");
+        assert!(memory.text.contains("No notes yet"), "{}", memory.text);
+        let p = prompt.chars().count();
+        println!(
+            "REPORT tools {tools} chars (~{} tok) + prompt {p} chars (~{} tok) = {} chars (~{} tok)",
+            tools / 4,
+            p / 4,
+            tools + p,
+            (tools + p) / 4
+        );
+    }
+
     #[cfg(not(feature = "code-mode"))]
     #[test]
     fn run_code_is_refused_without_code_mode() {
