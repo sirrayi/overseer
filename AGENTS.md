@@ -55,10 +55,27 @@ architecture.
   refuses to overwrite a file not read this session; write/edit resolve
   a contained canonical target (parent canonicalized + checked) and open
   it with `O_NOFOLLOW`; semgrep runs offline (`--metrics=off`, local
-  configs inside cwd only). Optional tools (`computer`, `struct_search`,
-  `diagnostics`) are advertised only when usable — computed once per
-  registry, so the spec array stays byte-stable and name-sorted; a
-  startup-token test pins the resident spec + static prompt sizes.
+  configs inside cwd only). Resident specs: `bash`, `read`, `write`,
+  `edit`, `grep`, `glob`, `task`, `tools`, `run_code` (code-mode builds),
+  and `skill` only when a skill exists (one file-existence detector
+  shared with the prompt's skills segment). Deferred tools (`computer`,
+  `struct_search`, `diagnostics` when usable; `repo_map`, `symbol`,
+  `plan`; every MCP tool) stay in `base_specs` — modes, `--no-tools` and
+  `check_args` see them — but not in the advertised `specs`; they are
+  found and called through `tools` (`tools/tools_tool.rs`: `op=search`
+  → schemas, `op=call` re-enters `ToolRegistry::call` under the inner
+  name, so the whole pipeline and the gate key on the inner tool;
+  `tools::effective_call` unwraps it wherever a name drives behaviour,
+  while events keep the outer call). `run_code` (`tools/run_code.rs`,
+  core feature `code-mode`, on by default) runs a JavaScript function
+  body in embedded QuickJS with no `std`/`os` modules or module loader;
+  every effect is a `tools.*` sub-call re-entering `call` with the script
+  flag set (read dedup off, 1 MB inline cap, no spill; everything else
+  identical), bounded by heap/stack/deadline/sub-call/byte/print caps,
+  and audited as `ScriptCall` events that never enter the model view.
+  All of this is computed once per registry, so the spec array stays
+  byte-stable and name-sorted; a startup-token test pins the resident
+  spec + static prompt sizes.
   `harden.rs` is the startup posture: the CLI calls `harden_startup()`
   first (umask 0o077 + proxy-env scrub) and session/daemon roots are
   pinned owner-only via `ensure_private_dir`. The injection-ASR corpus
@@ -84,17 +101,18 @@ architecture.
   `ConsentGranted` — but rate/window enforcement is not wired);
   `mcp.rs` (minimal stdio JSON-RPC client) plus `mcp_config.rs` (the
   `~/.overseer/mcp.json` server list: `${VAR}` env expansion, per-server
-  `trust: read|ask`). The client is wired in as exactly **one** resident
-  op tool, `mcp` (`tools/mcp_tool.rs`): `op=search` finds a tool,
-  `op=call` runs a namespaced `mcp__<server>__<tool>` one. Servers spawn
+  `trust: read|ask`). The client is wired in as the internal, never
+  advertised op tool `mcp` (`tools/mcp_tool.rs`); the model reaches MCP
+  tools through `tools` by their `mcp__<server>__<tool>` names, which
+  re-enter `mcp op=call` so its trust/taint lanes apply unchanged (old
+  logs' direct `mcp` calls still dispatch). Servers spawn
   lazily on first use and are dropped when a call fails (next use
   respawns); a name that would shadow a resident tool is skipped, never
   callable; children get an env allowlist (PATH/HOME + the pairs the
   config declares — never the parent's keys); a `trust: read` server's
   calls skip the approval ladder, everything else rides the
   external-comms lane. Discovered definitions never enter
-  `ToolRegistry.specs` — the `mcp` spec appears only when a server is
-  configured, so the advertised array is byte-stable. `bash` honours
+  `ToolRegistry.specs`, so the advertised array is byte-stable. `bash` honours
   `--runtime <native|seatbelt|bubblewrap|gvisor>`: a pinned runtime that is
   unavailable FAILS the call with the requirement named (never a silent
   downgrade to unsandboxed exec); unset keeps the platform default.
