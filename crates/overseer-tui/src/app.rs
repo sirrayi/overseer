@@ -974,8 +974,7 @@ mod tests {
         // `$$` is the `sh` pid, which is also the process-group id.
         let cmd = format!("echo $$ > {}; sleep 30 | cat", pgid_file.display());
         let t = Instant::now();
-        let (code, out) =
-            shell_capture_timeout(&cmd, ".", Duration::from_secs(1)).unwrap();
+        let (code, out) = shell_capture_timeout(&cmd, ".", Duration::from_secs(1)).unwrap();
         assert_eq!(code, -1);
         assert!(out.contains("timed out"));
         assert!(
