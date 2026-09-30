@@ -760,6 +760,7 @@ fn handle_conn(mut stream: TcpStream, ctx: Arc<Ctx>) {
                 // PWA assets — all embedded, all unauthenticated.
                 "/mark.svg" => ("mark.svg", "image/svg+xml"),
                 "/favicon.svg" => ("favicon.svg", "image/svg+xml"),
+                "/favicon.ico" => ("favicon.ico", "image/x-icon"),
                 "/manifest.webmanifest" => ("manifest.webmanifest", "application/manifest+json"),
                 "/icon-192.png" => ("icon-192.png", "image/png"),
                 "/icon-512.png" => ("icon-512.png", "image/png"),
@@ -896,6 +897,7 @@ fn embedded_asset(name: &str) -> &'static [u8] {
         "style.css" => include_bytes!("../web/style.css"),
         "mark.svg" => include_bytes!("../web/mark.svg"),
         "favicon.svg" => include_bytes!("../web/favicon.svg"),
+        "favicon.ico" => include_bytes!("../web/favicon.ico"),
         "manifest.webmanifest" => include_bytes!("../web/manifest.webmanifest"),
         "icon-192.png" => include_bytes!("../web/icon-192.png"),
         "icon-512.png" => include_bytes!("../web/icon-512.png"),
@@ -1105,6 +1107,21 @@ mod tests {
         assert_eq!(
             exchange(port, &format!("GET / HTTP/1.1\r\n{}\r\n", host(port))),
             "HTTP/1.1 200 OK"
+        );
+        // The raster favicon serves as image/x-icon; lookalike paths 404.
+        assert_eq!(
+            exchange(
+                port,
+                &format!("GET /favicon.ico HTTP/1.1\r\n{}\r\n", host(port))
+            ),
+            "HTTP/1.1 200 OK"
+        );
+        assert_eq!(
+            exchange(
+                port,
+                &format!("GET /favicon.icox HTTP/1.1\r\n{}\r\n", host(port))
+            ),
+            "HTTP/1.1 404 Not Found"
         );
     }
 
