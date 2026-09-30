@@ -1399,10 +1399,16 @@ impl Agent {
     /// ledger replays what it settled) — and drop its reservation. Dead
     /// background tasks are reaped first so their slots free.
     fn reconcile_subagents(&mut self) -> std::io::Result<()> {
-        use crate::tools::task::sidecar;
+        use crate::tools::task::{budget::MIN_CAP_USD, sidecar};
         let dir = self.session_dir.join("subagents");
         sidecar::reap_dead(&dir);
         for (_, sc) in sidecar::all(&dir) {
+            if sc.is_live() {
+                // Still running in this process: a rebuilt agent re-holds
+                // its cap (a no-op when the reservation already exists).
+                self.spend.restore(&sc.id, sc.cap_usd, MIN_CAP_USD);
+                continue;
+            }
             if sc.state == sidecar::State::Running {
                 continue;
             }
@@ -2944,6 +2950,50 @@ mod tests {
             .drain_bg_notices(&mut |e: &Event| again.push(e.kind.clone()))
             .unwrap();
         assert!(again.is_empty(), "{again:?}");
+    }
+
+    /// A same-process rebuild (TUI session switch / rewind) while tasks
+    /// run: the new agent re-holds their caps instead of starting free.
+    #[test]
+    fn rebuilt_agent_re_reserves_live_tasks() {
+        let dir = tmpdir();
+        let cfg = || AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            max_cost_usd: 1.0,
+            ..AgentConfig::default()
+        };
+        let provider = Arc::new(Mock::new(vec![done()]));
+        drop(Agent::start(provider.clone(), cfg(), dir.clone(), "s".into()).unwrap());
+        let nonce = crate::tools::task::sidecar::process_nonce();
+        for (id, cap, nonce) in [
+            ("task-1", 0.40, nonce),
+            ("task-2", 0.90, nonce),
+            ("task-3", 0.25, nonce),
+            ("task-4", 0.50, "gone"),
+        ] {
+            let bg = dir.join("subagents").join(id);
+            std::fs::create_dir_all(&bg).unwrap();
+            std::fs::write(
+                bg.join("task.json"),
+                serde_json::json!({"id": id, "mode": "read", "tier": "light",
+                    "model": "m", "background": true, "worktree": null, "branch": null,
+                    "cap_usd": cap, "process_nonce": nonce, "state": "running",
+                    "cost_usd": 0.0})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let resumed = Agent::resume(provider, cfg(), dir.clone()).unwrap();
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // $0.40 whole, $0.60 clamped, $0.25 over the top; task-4's
+        // process is gone, so it is reaped and settled, not re-held.
+        assert!(
+            near(resumed.spend.reserved_usd(), 1.25),
+            "{}",
+            resumed.spend.reserved_usd()
+        );
+        assert!(resumed.spend.reserved_usd() >= resumed.config.max_cost_usd);
     }
 
     fn task_call(n: usize, input: serde_json::Value) -> Response {

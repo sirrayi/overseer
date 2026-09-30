@@ -89,6 +89,26 @@ impl SpendAccount {
         Ok(cap)
     }
 
+    /// Re-hold the cap of a task that is still running but has no
+    /// reservation here (a rebuilt agent: a session switch or rewind while
+    /// it runs). Clamped to what remains; when that is below `floor` the
+    /// full cap is recorded anyway, so the cost check sees the overshoot
+    /// instead of an account that looks free. Returns what is now held.
+    pub fn restore(&self, id: &str, cap: f64, floor: f64) -> f64 {
+        let mut g = self.lock();
+        if let Some(held) = g.reserved.get(id) {
+            return *held;
+        }
+        let remaining = g.remaining(self.max_usd);
+        let held = if cap.min(remaining) >= floor {
+            cap.min(remaining)
+        } else {
+            cap
+        };
+        g.reserved.insert(id.to_string(), held);
+        held
+    }
+
     /// Drop `id`'s reservation without settling (the spawn never ran).
     pub fn release(&self, id: &str) {
         self.lock().reserved.remove(id);
@@ -111,6 +131,21 @@ impl SpendAccount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_clamps_then_records_the_overshoot() {
+        let acct = SpendAccount::new(1.00, 0.20);
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(near(acct.restore("task-1", 0.50, MIN_CAP_USD), 0.50));
+        // Idempotent: a held reservation is left as is.
+        assert!(near(acct.restore("task-1", 0.90, MIN_CAP_USD), 0.50));
+        // Partly covered: clamped to the $0.30 left.
+        assert!(near(acct.restore("task-2", 1.00, MIN_CAP_USD), 0.30));
+        // Nothing left: the full cap still counts against the parent.
+        assert!(near(acct.restore("task-3", 0.25, MIN_CAP_USD), 0.25));
+        assert!(near(acct.reserved_usd(), 1.05));
+        assert!(0.20 + acct.reserved_usd() > 1.00, "overshoot visible");
+    }
 
     /// Worked example of the arithmetic (run with --nocapture to see it).
     #[test]
