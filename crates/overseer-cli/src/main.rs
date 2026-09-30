@@ -136,6 +136,8 @@ fn usage() {
          \x20 --provider <name>   anthropic | openai | opencode | gemini (default: anthropic)\n\
          \x20 --effort <level>    min | low | medium | high | max (default: medium)\n\
          \x20 --small-model <id>  small-tier model for aux calls (titles, consolidation)\n\
+         \x20                    and light subagents\n\
+         \x20 --heavy-model <id>  model for heavy subagents (consult, escalation)\n\
          \x20 --base-url <url>    API base URL for openai-compatible providers\n\
          \x20 --max-steps <n>     Step budget (default: 100)\n\
          \x20 --max-cost <usd>    Cost budget in USD (default: 5.0)\n\

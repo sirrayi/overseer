@@ -64,6 +64,8 @@ pub(crate) fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConf
         thinking_budget: flags.thinking,
         effort: flags.effort,
         small_model: flags.small_model.clone(),
+        heavy_model: flags.heavy_model.clone(),
+        max_bg_subagents: overseer_core::agent::AgentConfig::default().max_bg_subagents,
         // Canonicalize once: every subsystem (snapshots, read dedup, the
         // permission gate's containment check) assumes an absolute root —
         // a relative --cwd like "." would silently leak relative paths
