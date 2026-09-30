@@ -463,7 +463,10 @@ impl Index {
         let stamp = fingerprint(&snaps);
         let mut docs: Vec<Doc> = Vec::new();
         let mut vocab: FxMap<Box<str>, u32> = FxMap::default();
-        let mut postings: Vec<Vec<(u32, [u16; 4])>> = Vec::new();
+        // Postings accumulate flat and in doc order, then scatter once into
+        // exactly-sized per-term lists: no growth, no scattered pushes.
+        let mut df: Vec<u32> = Vec::new();
+        let mut flat: Vec<(u32, u32, [u16; 4])> = Vec::new();
         let mut tf: FxMap<u32, [u16; 4]> = FxMap::default();
         let mut scratch = String::new();
         let mut total = [0f64; 4];
@@ -506,9 +509,9 @@ impl Index {
                         let id = match vocab.get(t) {
                             Some(&id) => id,
                             None => {
-                                let id = postings.len() as u32;
+                                let id = df.len() as u32;
                                 vocab.insert(t.into(), id);
-                                postings.push(Vec::new());
+                                df.push(0);
                                 id
                             }
                         };
@@ -527,7 +530,8 @@ impl Index {
                     *t += f64::from(l);
                 }
                 for (t, counts) in tf.drain() {
-                    postings[t as usize].push((doc, counts));
+                    df[t as usize] += 1;
+                    flat.push((t, doc, counts));
                 }
                 let prospective = w.rel.starts_with("prospective/");
                 let trigger = meta
@@ -553,8 +557,11 @@ impl Index {
             }
             index_text.push((snap.index, text));
         }
-        // Postings were pushed in doc order per term; drain order across
-        // terms does not matter.
+        let mut postings: Vec<Vec<(u32, [u16; 4])>> =
+            df.iter().map(|&n| Vec::with_capacity(n as usize)).collect();
+        for (t, doc, counts) in flat {
+            postings[t as usize].push((doc, counts));
+        }
         let n = docs.len().max(1) as f64;
         let avg = total.map(|t| t / n);
         let mut by_id: Vec<u32> = (0..docs.len() as u32).collect();
