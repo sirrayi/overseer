@@ -1501,7 +1501,7 @@ impl Agent {
                 }
                 Err(_) => {
                     let lost = format!("[subagent {} finished but its digest was lost]", sc.id);
-                    let _ = std::fs::write(&marker, &lost);
+                    let _ = sidecar::write_marker(&marker, &lost);
                     lost
                 }
             };

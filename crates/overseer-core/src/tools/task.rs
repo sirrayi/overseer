@@ -1030,8 +1030,9 @@ fn spawn(prompt: &str, input: &Value, ctx: &mut ToolCtx) -> Result<String, Strin
         let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(&env, &job)))
             .unwrap_or_else(|p| panicked(&env, &job, p.as_ref()));
         // Marker last (after the sidecar went `done`): it is the parent
-        // loop's notification.
-        let _ = std::fs::write(dir.join(done_marker(run)), text);
+        // loop's notification. Atomic — the drain reads it as soon as it
+        // exists.
+        let _ = sidecar::write_marker(&dir.join(done_marker(run)), &text);
     });
     Ok(format!(
         "Background task {id} started. Its digest arrives as a notice at a \

@@ -63,6 +63,19 @@ pub fn process_nonce() -> &'static str {
     NONCE.get_or_init(|| uuid::Uuid::now_v7().simple().to_string())
 }
 
+/// Write a marker file atomically — temp file in the same dir, then
+/// rename — so a reader that polls for it sees either no file or the
+/// whole content, never a torn write.
+pub fn write_marker(path: &Path, text: &str) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "marker".into());
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::now_v7().simple()));
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// The background notice file for run `run` of a task.
 pub fn done_marker(run: u32) -> String {
     if run <= 1 {
@@ -212,9 +225,9 @@ pub fn reap_dead(subagents_dir: &Path) {
         }
         let marker = dir.join(done_marker(sc.run));
         if sc.background && !marker.exists() {
-            let _ = std::fs::write(
+            let _ = write_marker(
                 &marker,
-                format!("[subagent {} died with its process]", sc.id),
+                &format!("[subagent {} died with its process]", sc.id),
             );
         }
         let _ = sc.finish(&dir, State::Dead);
@@ -273,6 +286,25 @@ mod tests {
         }
         assert_eq!(done_marker(1), "done.txt");
         assert_eq!(done_marker(3), "done-3.txt");
+    }
+
+    #[test]
+    fn write_marker_lands_whole_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join(format!("overseer-sc-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("done.txt");
+        write_marker(&marker, "[subagent task-1 finished]\ndigest").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "[subagent task-1 finished]\ndigest"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "{leftover:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A `running` dir left by a previous process must not wedge the cap.
