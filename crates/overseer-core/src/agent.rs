@@ -1429,8 +1429,17 @@ impl Agent {
             if !sc.background || self.bg_noticed.get(&sc.id).is_some_and(|r| *r >= sc.run) {
                 continue;
             }
-            let Ok(digest) = std::fs::read_to_string(path.join(done_marker(sc.run))) else {
-                continue;
+            let marker = path.join(done_marker(sc.run));
+            let digest = match std::fs::read_to_string(&marker) {
+                Ok(d) => d,
+                Err(_) if sc.state == sidecar::State::Running || sidecar::delivering(&path) => {
+                    continue;
+                }
+                Err(_) => {
+                    let lost = format!("[subagent {} finished but its digest was lost]", sc.id);
+                    let _ = std::fs::write(&marker, &lost);
+                    lost
+                }
             };
             self.bg_noticed.insert(sc.id.clone(), sc.run);
             let footer = Footer::parse(&digest);
@@ -2950,6 +2959,57 @@ mod tests {
             .drain_bg_notices(&mut |e: &Event| again.push(e.kind.clone()))
             .unwrap();
         assert!(again.is_empty(), "{again:?}");
+    }
+
+    /// A finished background task whose marker is missing still lands as
+    /// a notice — unless its thread is still writing that marker.
+    #[test]
+    fn lost_digest_is_noticed_not_skipped() {
+        use crate::tools::task::sidecar::Delivery;
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        let provider = Arc::new(Mock::new(vec![done()]));
+        let mut agent = Agent::start(provider, cfg, dir.clone(), "s".into()).unwrap();
+        for id in ["task-9", "task-10"] {
+            let bg = dir.join("subagents").join(id);
+            std::fs::create_dir_all(&bg).unwrap();
+            std::fs::write(
+                bg.join("task.json"),
+                serde_json::json!({"id": id, "mode": "read", "tier": "light",
+                    "model": "m", "background": true, "worktree": null, "branch": null,
+                    "cap_usd": 0.25, "process_nonce": "x", "state": "done", "cost_usd": 0.0})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let delivering = Delivery::new(&dir.join("subagents/task-10"));
+        let mut events = Vec::new();
+        agent
+            .drain_bg_notices(&mut |e: &Event| events.push(e.kind.clone()))
+            .unwrap();
+        let noticed = |events: &[EventKind], id: &str| {
+            events
+                .iter()
+                .any(|k| matches!(k, EventKind::SubagentDone { task_id, .. } if task_id == id))
+        };
+        assert!(noticed(&events, "task-9"), "{events:?}");
+        assert!(!noticed(&events, "task-10"), "still delivering");
+        assert!(agent.messages().iter().any(|m| m
+            .text()
+            .contains("[subagent task-9 finished but its digest was lost]")));
+        drop(delivering);
+        let mut again = Vec::new();
+        agent
+            .drain_bg_notices(&mut |e: &Event| again.push(e.kind.clone()))
+            .unwrap();
+        assert!(
+            noticed(&again, "task-10") && !noticed(&again, "task-9"),
+            "{again:?}"
+        );
     }
 
     /// A same-process rebuild (TUI session switch / rewind) while tasks

@@ -961,7 +961,9 @@ fn spawn(prompt: &str, input: &Value, ctx: &mut ToolCtx) -> Result<String, Strin
         verdict: None,
         trace: dir.display().to_string(),
     };
+    let delivery = sidecar::Delivery::new(&dir);
     std::thread::spawn(move || {
+        let _delivery = delivery;
         let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(&env, &job)))
             .unwrap_or_else(|p| panicked(&env, &job, p.as_ref()));
         // Marker last (after the sidecar went `done`): it is the parent

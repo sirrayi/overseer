@@ -109,6 +109,36 @@ fn unstored() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Sidecar>> {
         .unwrap_or_else(|p| p.into_inner())
 }
 
+/// Task dirs whose background thread has not written its done marker
+/// yet: a `done` sidecar there without a marker is still delivering, not
+/// a lost digest.
+fn delivering_set() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<PathBuf>> {
+    static SET: OnceLock<Mutex<std::collections::BTreeSet<PathBuf>>> = OnceLock::new();
+    SET.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Held by a background thread from spawn until its marker is written.
+pub struct Delivery(PathBuf);
+
+impl Delivery {
+    pub fn new(dir: &Path) -> Self {
+        delivering_set().insert(dir.to_path_buf());
+        Delivery(dir.to_path_buf())
+    }
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        delivering_set().remove(&self.0);
+    }
+}
+
+pub fn delivering(dir: &Path) -> bool {
+    delivering_set().contains(dir)
+}
+
 impl Sidecar {
     pub fn load(dir: &Path) -> Option<Self> {
         if let Some(sc) = unstored().get(dir) {
