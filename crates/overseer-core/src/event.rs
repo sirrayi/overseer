@@ -1077,4 +1077,26 @@ mod tests {
         let events = EventLog::replay(&path).unwrap();
         assert_eq!(events.len(), 2);
     }
+
+    /// K6 guard: a pre-extension `run_end` line (no cache fields) must keep
+    /// replaying once RunEnd grows `#[serde(default)]` fields.
+    #[test]
+    fn old_shape_run_end_replays() {
+        let old = r#"{"type":"run_end","stop_reason":"end_turn","steps":3,"total_cost_usd":0.0}"#;
+        let kind: EventKind = serde_json::from_str(old).unwrap();
+        assert!(matches!(kind, EventKind::RunEnd { steps: 3, .. }));
+        let dir = tmpdir();
+        let path = dir.join("events.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                old.replacen('{', r#"{"id":1,"parent_id":null,"ts_ms":0,"#, 1)
+            ),
+        )
+        .unwrap();
+        let events = EventLog::replay(&path).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].kind, EventKind::RunEnd { steps: 3, .. }));
+    }
 }

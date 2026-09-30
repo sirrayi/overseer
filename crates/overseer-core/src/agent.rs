@@ -562,6 +562,11 @@ impl Agent {
         self.tools.mode
     }
 
+    /// Session token totals by cache class (see [`crate::ledger::CacheStats`]).
+    pub fn cache_stats(&self) -> crate::ledger::CacheStats {
+        self.ledger.cache_stats()
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
