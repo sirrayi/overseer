@@ -1413,22 +1413,6 @@ mod tests {
         assert!(s.base.is_some());
     }
 
-    /// Records the tool names of every request it answers.
-    struct Seen {
-        tools: Arc<Mutex<Vec<Vec<String>>>>,
-    }
-
-    impl Provider for Seen {
-        fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
-            let names = req.tools.iter().map(|t| t.name.clone()).collect();
-            self.tools.lock().unwrap().push(names);
-            Ok(done_text("digest body"))
-        }
-        fn name(&self) -> &'static str {
-            "seen"
-        }
-    }
-
     /// A full-access writer's policy root is `/`, but its skills live in
     /// its worktree: the registry must look there, like the prompt does.
     #[test]
@@ -1463,20 +1447,16 @@ mod tests {
                 .status;
             assert!(st.success());
         }
-        let tools = Arc::new(Mutex::new(Vec::new()));
-        let mut c = ctx(&dir);
-        c.provider = Some(Arc::new(Seen {
-            tools: tools.clone(),
-        }));
+        let (mut c, mock) = ctx_with(&dir, vec![done_text("digest body")], cfg(&dir));
         let out = run(&json!({"prompt": "write stuff", "mode": "write"}), &mut c);
         assert!(!out.is_error, "{}", out.text);
         assert!(dir
             .join("session/subagents/wt-1/wt/.overseer/skills/demo/SKILL.md")
             .is_file());
-        let seen = tools.lock().unwrap();
+        let seen = mock.seen.lock().unwrap();
         assert!(!seen.is_empty());
         assert!(
-            seen.iter().all(|names| names.iter().any(|n| n == "skill")),
+            seen.iter().all(|s| s.tools.iter().any(|n| n == "skill")),
             "{seen:?}"
         );
     }
