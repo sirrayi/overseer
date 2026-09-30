@@ -490,14 +490,21 @@ fn panicked(env: &Env, job: &Job, payload: &(dyn std::any::Any + Send)) -> Strin
     format!("[subagent {} panicked: {msg}]", job.id)
 }
 
-fn record(env: &Env, id: &str, mode: TaskMode, route: &Route, cap: f64, job: &Job) -> Sidecar {
+fn record(
+    parent_cwd: &Path,
+    id: &str,
+    mode: TaskMode,
+    route: &Route,
+    cap: f64,
+    job: &Job,
+) -> Sidecar {
     Sidecar {
         id: id.to_string(),
         mode,
         tier: route.tier,
         model: route.model.clone(),
         background: false,
-        worktree: (job.cwd != env.parent_cwd).then(|| job.cwd.clone()),
+        worktree: (job.cwd != parent_cwd).then(|| job.cwd.clone()),
         branch: job.branch.clone(),
         base: job.base.clone(),
         cap_usd: cap,
@@ -536,7 +543,7 @@ fn execute(env: &Env, job: &Job) -> String {
             match env.account.grant(&rid, want, want) {
                 Ok(cap) => {
                     let r2 = route::resolve(next, &env.parent);
-                    match open_dir(env, &record(env, &rid, job.mode, &r2, cap, job)) {
+                    match open_dir(env, &record(&env.parent_cwd, &rid, job.mode, &r2, cap, job)) {
                         Ok(rdir) => {
                             if let Some(mut sc) = Sidecar::load(&dir) {
                                 sc.escalated_to = Some(rid.clone());
@@ -603,7 +610,7 @@ fn execute(env: &Env, job: &Job) -> String {
             MIN_CAP_USD,
         ) {
             Ok(vcap) => {
-                let sc = record(env, vid, TaskMode::Verify, &vroute, vcap, job);
+                let sc = record(&env.parent_cwd, vid, TaskMode::Verify, &vroute, vcap, job);
                 match open_dir(env, &sc) {
                     Ok(vdir) => {
                         let va = run_once(
