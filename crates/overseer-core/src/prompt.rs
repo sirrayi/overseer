@@ -43,14 +43,6 @@ const SAFETY: &str = "\
 Never claim a file was edited, created, or verified unless a tool call \
 actually did it. If a tool errors, read the error before retrying differently.";
 
-/// Computer use (P7-3). Static — backend state is deliberately absent
-/// (it would be a cache killer); the tool reports an unconfigured backend
-/// itself when it is called.
-const COMPUTER: &str = "\
-Computer use is tiered: a structured API first, then element lookups by name/role, then pixel acts.\n\
-Captures report the sent and native frame sizes — give coordinates in the frame you were shown; they are scaled for you.\n\
-A suppressed capture returns metadata only, and credential fields are never typed into.";
-
 /// Assemble the ordered system segments for a request. Section order is the
 /// wire order — reordering a cacheable section is a cache-breaking change
 /// and must be deliberate.
@@ -97,18 +89,23 @@ pub fn assemble(config: &AgentConfig) -> Vec<SystemSegment> {
         }
     }
     // MCP (R7): one line naming the configured servers, so the model knows
-    // the `mcp` tool has somewhere to go. Present only when servers are
-    // configured AND the tool is resident (an ablated arm must not advertise
-    // a tool the model cannot call — same rule as `task`/`computer`). Sorted
+    // `tools` op=search has somewhere to go. Present only when servers are
+    // configured AND both `mcp` and `tools` are resident (an ablated arm must not advertise
+    // a tool the model cannot call — same rule as `task`). Sorted
     // names: the config's own order must not move a byte of the prefix.
     // DEFERRED(owner): a TUI `/mcp` panel (browse connected servers, toggle trust per server, see spawn failures live) — needs the frontend state machine to own MCP session state — gate: TUI panel work.
-    if !config.mcp_servers.is_empty() && !config.disabled_tools.iter().any(|t| t == "mcp") {
+    if !config.mcp_servers.is_empty()
+        && !config
+            .disabled_tools
+            .iter()
+            .any(|t| t == "mcp" || t == "tools")
+    {
         let mut names: Vec<&str> = config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
         names.sort_unstable();
         segments.push(SystemSegment {
             name: "mcp",
             text: format!(
-                "MCP servers (use the mcp tool, op=search first): {}",
+                "MCP servers (find their tools with `tools` op=search): {}",
                 names.join(", ")
             ),
             cacheable: true,
@@ -117,20 +114,14 @@ pub fn assemble(config: &AgentConfig) -> Vec<SystemSegment> {
     // Persona (P6-5): the approved identity/relationship/preference files,
     // or a one-line pending notice while onboarding is unapproved — draft
     // text never reaches the prompt. Static and cacheable: approval is a
-    // deliberate, rare event, and the slot sits between skills and computer
-    // in the frozen ORDER.
+    // deliberate, rare event, and the slot sits after skills and mcp in the
+    // frozen ORDER.
     if let Some(dir) = &config.persona_dir {
         segments.push(SystemSegment {
             name: "persona",
             text: crate::onboard::persona_body(dir),
             cacheable: true,
         });
-    }
-    // Computer use (P7-3): advertised only while the `computer` tool is
-    // resident — an ablated arm must not describe a tool the model cannot
-    // call (P4.3 confound). Last static slot, after `skills`.
-    if !config.disabled_tools.iter().any(|t| t == "computer") {
-        segments.push(seg("computer", COMPUTER));
     }
     // --- DYNAMIC boundary: non-cacheable per-turn sections go below. ---
     segments
@@ -235,12 +226,13 @@ fn has_user_path(text: &str) -> bool {
 
 /// Frozen static section order — the P6/P7/R7 union (R1-F2): the static
 /// sections assemble identity→contract→safety→memory→skills, with each
-/// branch adding only its own segment (`mcp` on R7, `persona` on P6,
-/// `computer` on P7). Absent optionals are skipped; order among the present
+/// branch adding only its own segment (`mcp` on R7, `persona` on P6; P7's
+/// `computer` guidance now lives in that tool's own description). Absent
+/// optionals are skipped; order among the present
 /// must be preserved. Reordering a cacheable section breaks prefix-cache
 /// hits and must be deliberate.
 pub const ORDER: &[&str] = &[
-    "identity", "contract", "safety", "memory", "skills", "mcp", "persona", "computer",
+    "identity", "contract", "safety", "memory", "skills", "mcp", "persona",
 ];
 /// Boundary lint used by tests: every cacheable segment must precede
 /// every non-cacheable one.
@@ -331,13 +323,7 @@ mod tests {
             "names sorted, not config order: {}",
             mcp.text
         );
-        // Position: after skills, before persona/computer.
-        let names: Vec<&str> = segs.iter().map(|s| s.name).collect();
-        let rank = |n: &str| names.iter().position(|x| *x == n);
-        assert!(
-            rank("mcp").unwrap() < rank("computer").unwrap(),
-            "{names:?}"
-        );
+        // Position: after skills, before persona.
         let order_rank = |n: &str| ORDER.iter().position(|x| *x == n).unwrap();
         assert!(order_rank("skills") < order_rank("mcp"));
         assert!(order_rank("mcp") < order_rank("persona"));
@@ -468,9 +454,10 @@ mod tests {
         // Union-safe shape check (replaces the branch-local `segs.len()==4`
         // pin): the memory index is present, every static section is named
         // in the frozen union ORDER, and the boundary holds. P6 adds
-        // `persona`, P7 adds `computer` — neither branch may pin a count.
+        // `persona` — no branch may pin a count. Computer guidance rides
+        // the (deferred) tool's description, never the static prefix.
         assert!(segs.iter().any(|s| s.name == "memory"));
-        assert!(segs.iter().any(|s| s.name == "computer"));
+        assert!(segs.iter().all(|s| s.name != "computer"));
         for s in &segs {
             if s.cacheable {
                 assert!(
@@ -525,9 +512,8 @@ mod tests {
         assert!(p.cacheable, "persona is a static section");
         assert!(!p.text.contains("DRAFT_ONLY_INSIGHT"), "{}", p.text);
         assert_eq!(p.text.lines().count(), 1);
-        // Slot in ORDER-rank form (P8-A): persona ranks below computer and
-        // every present cacheable section is an ORDER member — no positional
-        // pin, so the computer arm can coexist in the union.
+        // Slot in ORDER-rank form (P8-A): persona ranks below mcp and every
+        // present cacheable section is an ORDER member — no positional pin.
         let names: Vec<&str> = segs.iter().map(|s| s.name).collect();
         for s in segs.iter().filter(|s| s.cacheable) {
             assert!(
@@ -537,8 +523,8 @@ mod tests {
             );
         }
         let persona_rank = ORDER.iter().position(|n| *n == "persona").unwrap();
-        let computer_rank = ORDER.iter().position(|n| *n == "computer").unwrap();
-        assert!(persona_rank < computer_rank, "{names:?}");
+        let mcp_rank = ORDER.iter().position(|n| *n == "mcp").unwrap();
+        assert!(mcp_rank < persona_rank, "{names:?}");
         assert!(boundary_ok(&segs), "{names:?}");
 
         // Approved → the real content renders, still boundary-clean.
@@ -583,5 +569,28 @@ mod tests {
             chars * 100 <= BASELINE_CHARS * 105,
             "static prompt grew to {chars} chars (baseline {BASELINE_CHARS} + 5%)"
         );
+    }
+
+    /// Tool-economy budget: the base static prompt (no memory, skills,
+    /// persona or MCP) is at most 1,000 chars — tool guidance lives in the
+    /// tool descriptions, not the prefix.
+    #[test]
+    fn base_static_prompt_fits_1000_chars() {
+        let cfg = AgentConfig {
+            cwd: std::env::temp_dir().join("overseer-k7-no-workspace"),
+            ..Default::default()
+        };
+        let segs = assemble(&cfg);
+        assert!(segs
+            .iter()
+            .all(|s| !matches!(s.name, "memory" | "skills" | "persona" | "mcp")));
+        let chars: usize = segs
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+            .chars()
+            .count();
+        assert!(chars <= 1_000, "base static prompt is {chars} chars");
     }
 }

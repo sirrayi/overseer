@@ -1961,7 +1961,11 @@ done
         );
         without.computer = super::super::ComputerState::new(super::super::Backends::default());
         let spec_of = |reg: &super::super::super::ToolRegistry| {
-            let spec = reg.specs.iter().find(|s| s.name == "computer").unwrap();
+            let spec = reg
+                .base_specs
+                .iter()
+                .find(|s| s.name == "computer")
+                .unwrap();
             format!(
                 "{}{}",
                 spec.description,

@@ -920,6 +920,13 @@ impl Policy {
         if let Some(v) = self.draft_deny(tool, input) {
             return v;
         }
+        // `tools` is a pure dispatcher: it runs nothing itself and
+        // re-enters `ToolRegistry::call` under the inner name, where the
+        // real gating happens — so ReadOnly/Plan still deny a mutating
+        // inner call. Deliberately not in READ_TOOLS.
+        if tool == "tools" {
+            return Verdict::Allow;
+        }
         // Read-only tools are allowed under every preset — `task` is safe
         // at the gate (its own read-only registry + step ceiling enforce
         // inside the tool); `plan` writes only to the engine session dir.

@@ -42,9 +42,8 @@ pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "task".into(),
         description: concat!(
-            "Spawn a subagent for a self-contained subtask in an isolated ",
-            "context. Returns a compact digest (~2K tokens) plus the path to ",
-            "its full trace."
+            "Run a self-contained subtask in a subagent with an isolated context. ",
+            "Returns a ~2K-token digest plus the path to its full trace."
         )
         .into(),
         input_schema: schema(
@@ -56,11 +55,11 @@ pub fn spec() -> ToolSpec {
                 "mode": {
                     "type": "string",
                     "enum": ["read", "write"],
-                    "description": "read (default): read/grep/glob only, cannot modify files. write: full tools in an isolated git worktree; changes land on a scratch branch, never your checkout."
+                    "description": "read (default): read/grep/glob only, no file changes. write: full tools in an isolated git worktree; changes land on a scratch branch, never your checkout."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Return immediately; the digest arrives as a notice when done (max 4 in flight). Default false."
+                    "description": "Return now; the digest arrives as a notice when done (max 4 in flight). Default false."
                 },
                 "max_steps": {
                     "type": "integer",

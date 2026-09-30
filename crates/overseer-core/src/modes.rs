@@ -91,7 +91,7 @@ pub static MODES: &[Mode] = &[
         name: "architect",
         prompt_frag: "Plan before acting; do not modify files in this mode.",
         allowed_tools: &[
-            "read", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol",
+            "read", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol", "tools",
         ],
         model: None,
         edit_globs: &[],
@@ -99,7 +99,9 @@ pub static MODES: &[Mode] = &[
     Mode {
         name: "ask",
         prompt_frag: "Answer questions about this repository; make no changes.",
-        allowed_tools: &["read", "grep", "glob", "skill", "repo_map", "symbol"],
+        allowed_tools: &[
+            "read", "grep", "glob", "skill", "repo_map", "symbol", "tools",
+        ],
         model: None,
         edit_globs: &[],
     },
@@ -109,7 +111,7 @@ pub static MODES: &[Mode] = &[
             "Reproduce the failure first, then fix it; keep the repro as a regression test.",
         allowed_tools: &[
             "read", "grep", "glob", "bash", "edit", "write", "plan", "task", "skill", "repo_map",
-            "symbol",
+            "symbol", "tools",
         ],
         model: None,
         edit_globs: &[],
@@ -117,7 +119,9 @@ pub static MODES: &[Mode] = &[
     Mode {
         name: "docs",
         prompt_frag: "Edit documentation only; leave code untouched.",
-        allowed_tools: &["read", "grep", "glob", "edit", "write", "skill", "repo_map"],
+        allowed_tools: &[
+            "read", "grep", "glob", "edit", "write", "skill", "repo_map", "tools",
+        ],
         model: None,
         edit_globs: &["**/*.md", "**/*.mdx", "**/*.txt"],
     },
@@ -125,7 +129,7 @@ pub static MODES: &[Mode] = &[
         name: "orchestrator",
         prompt_frag: "Coordinate via task; make no direct edits.",
         allowed_tools: &[
-            "read", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol",
+            "read", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol", "tools",
         ],
         model: None,
         edit_globs: &[],

@@ -1022,11 +1022,15 @@ pub fn spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
         name: "computer".into(),
         description: concat!(
-            "Drive the user's screen: 'apps'/'windows' find targets; 'observe' lists elements ",
-            "(index as 'element'); 'screenshot'/'zoom' image it; 'click'/'type'/'key'/'set'/'scroll'",
-            "/'drag'/'menu'/'launch' act; 'verify' checks predicates; 'browser*'/'navigate' drive ",
-            "Chrome/Edge tabs via 'tab'/'ref'; 'batch' runs ≤32 actions. x/y are pixels of the ",
-            "image you saw (crop space after 'zoom'); nothing is screenshotted implicitly."
+            "Drive the user's screen and Chrome/Edge tabs. Tiered: the structured API first, then ",
+            "element lookups by name/role, then pixel acts. 'apps'/'windows' find targets; ",
+            "'observe' lists elements (index as 'element'); 'screenshot'/'zoom' image it; ",
+            "'click'/'type'/'key'/'set'/'scroll'/'drag'/'menu'/'launch' act; 'verify' checks ",
+            "predicates; 'browser*'/'navigate' drive tabs via 'tab'/'ref'; 'batch' runs ≤32 actions. ",
+            "x/y are pixels of the image you saw, passed verbatim in the driver's frame; after ",
+            "'zoom' they are crop pixels the driver maps back (from_zoom). Nothing is screenshotted ",
+            "implicitly; a suppressed capture returns metadata only; credential fields are never ",
+            "typed into."
         )
         .into(),
         input_schema: schema(
@@ -1551,16 +1555,17 @@ mod tests {
     }
 
     #[test]
-    fn order_union_segment_present_boundary_ok() {
-        // P7-3 ORDER-union: the `computer` segment rides the frozen union
-        // order and the static/dynamic boundary still holds.
+    fn guidance_rides_the_spec_not_the_static_prompt() {
+        // The computer tool is deferred, so its guidance lives in its own
+        // description (seen via `tools` op=search), never the static prefix.
         let mut cfg = crate::agent::AgentConfig::default();
         let segs = crate::prompt::assemble(&cfg);
-        let computer = segs
-            .iter()
-            .find(|s| s.name == "computer")
-            .expect("computer segment present");
-        assert!(computer.cacheable);
+        assert!(segs.iter().all(|s| s.name != "computer"));
+        let desc = spec().description;
+        for needle in ["structured API", "from_zoom", "credential"] {
+            assert!(desc.contains(needle), "{needle} missing: {desc}");
+        }
+        assert!(!desc.contains("scaled for you"), "{desc}");
         assert!(crate::prompt::boundary_ok(&segs));
         for s in &segs {
             if s.cacheable {
@@ -1571,8 +1576,7 @@ mod tests {
                 );
             }
         }
-        // An ablated arm is absent-skipped (no advertisement for an arm
-        // the model cannot call).
+        // An ablated arm stays absent too.
         cfg.disabled_tools.push("computer".into());
         assert!(crate::prompt::assemble(&cfg)
             .iter()

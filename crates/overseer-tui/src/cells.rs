@@ -389,17 +389,21 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
             call_id,
             name,
             input,
-        } => Feed::NewCells(vec![Cell::Tool {
-            id: call_id.clone(),
-            name: name.clone(),
-            summary: tool_summary(name, input),
-            status: ToolStatus::Running,
-            output: None,
-            link: input
-                .get("path")
-                .and_then(|v| v.as_str())
-                .map(std::path::PathBuf::from),
-        }]),
+        } => {
+            // `tools op=call` shows the tool it ran, not the dispatcher.
+            let (name, input) = overseer_core::tools::effective_call(name, input);
+            Feed::NewCells(vec![Cell::Tool {
+                id: call_id.clone(),
+                name: name.to_string(),
+                summary: tool_summary(name, input),
+                status: ToolStatus::Running,
+                output: None,
+                link: input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(std::path::PathBuf::from),
+            }])
+        }
         EventKind::ToolResult {
             call_id,
             name,
@@ -647,6 +651,38 @@ mod tests {
         assert_eq!(truncate("hi", 5), "hi");
         // A full-width tail gives up a column for the marker.
         assert_eq!(truncate("あいう", 4), "あ…");
+    }
+
+    #[test]
+    fn a_tools_call_cell_shows_the_inner_tool() {
+        let ev = overseer_core::event::Event {
+            id: 1,
+            parent_id: None,
+            ts_ms: 0,
+            prev_hash: 0,
+            hash: 0,
+            kind: EventKind::ToolCallStart {
+                call_id: "c1".into(),
+                name: "tools".into(),
+                input: serde_json::json!({"op": "call", "name": "repo_map", "args": {"path": "src"}}),
+            },
+        };
+        match feed(&ev, None) {
+            Feed::NewCells(c) => match &c[0] {
+                Cell::Tool {
+                    name,
+                    summary,
+                    link,
+                    ..
+                } => {
+                    assert_eq!(name, "repo_map");
+                    assert_eq!(summary, r#"{"path":"src"}"#);
+                    assert_eq!(link.as_deref(), Some(std::path::Path::new("src")));
+                }
+                _ => panic!(),
+            },
+            _ => panic!(),
+        }
     }
 
     #[test]

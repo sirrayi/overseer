@@ -71,6 +71,7 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
     let mut errors: Vec<String> = Vec::new();
     let mut pending: Option<String> = None;
     let mut n_compactions = 0u32;
+    let mut deferred: Vec<String> = Vec::new();
 
     for e in covered {
         match &e.kind {
@@ -80,6 +81,15 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
                 }
             }
             EventKind::ToolCallStart { name, input, .. } => {
+                // Deferred tools the model called through `tools` — their
+                // schemas were loaded by an op=search now condensed away.
+                if name == "tools" && crate::tools::tools_tool::op_is(input, "call") {
+                    if let Some(inner) = input.get("name").and_then(|n| n.as_str()) {
+                        if !deferred.iter().any(|d| d == inner) {
+                            deferred.push(inner.to_string());
+                        }
+                    }
+                }
                 if let Some(path) = input.get("path").and_then(|p| p.as_str()) {
                     let list = match name.as_str() {
                         "write" | "edit" => &mut modified,
@@ -149,6 +159,12 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
     if !read_only.is_empty() {
         out.push_str("\n## Files read\n");
         out.push_str(&file_list_block(&read_only));
+    }
+    if !deferred.is_empty() {
+        out.push_str(&format!(
+            "\n## Deferred tools used (search `tools` again for their schemas)\n{}\n",
+            deferred.join(", ")
+        ));
     }
     if !notes.is_empty() {
         out.push_str("\n## Recent assistant notes (verbatim)\n");
@@ -297,6 +313,64 @@ mod tests {
         assert_eq!(tail_anchor(&events[..8], 2, 0), None);
         // Floor excludes earlier anchors: only turn 40 survives it.
         assert_eq!(tail_anchor(&events, 2, 30), None);
+    }
+
+    #[test]
+    fn summary_lists_deferred_tools_called_through_tools() {
+        let start = |id: u64, name: &str, input: serde_json::Value| {
+            ev(
+                id,
+                EventKind::ToolCallStart {
+                    call_id: format!("c{id}"),
+                    name: name.into(),
+                    input,
+                },
+            )
+        };
+        let events = vec![
+            ev(1, EventKind::UserInput { text: "go".into() }),
+            start(
+                2,
+                "tools",
+                serde_json::json!({"op": "search", "query": "struct"}),
+            ),
+            // A search result naming a tool is never parsed (Invariant 8).
+            ev(
+                3,
+                EventKind::ToolResult {
+                    call_id: "c2".into(),
+                    name: "tools".into(),
+                    content: "{\"name\":\"struct_search\"}".into(),
+                    is_error: false,
+                    raw_bytes: 1,
+                    spilled_to: None,
+                    denied: false,
+                },
+            ),
+            start(
+                4,
+                "tools",
+                serde_json::json!({"op": "call", "name": "repo_map", "args": {}}),
+            ),
+            start(
+                5,
+                "tools",
+                serde_json::json!({"op": "call", "name": "mcp__gh__issue", "args": {}}),
+            ),
+            start(
+                6,
+                "tools",
+                serde_json::json!({"op": "call", "name": "repo_map", "args": {}}),
+            ),
+        ];
+        let s = summarize(&events, 100);
+        assert!(
+            s.contains("## Deferred tools used (search `tools` again for their schemas)\nrepo_map, mcp__gh__issue\n"),
+            "{s}"
+        );
+        assert!(!s.contains("struct_search"), "{s}");
+        let none = summarize(&events[..3], 100);
+        assert!(!none.contains("Deferred tools"), "{none}");
     }
 
     #[test]
