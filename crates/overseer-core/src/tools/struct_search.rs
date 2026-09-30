@@ -816,8 +816,20 @@ fn from_env_value(raw: Option<&str>) -> Option<PathBuf> {
 /// First of `names` that exists as a file on `PATH`, in the given order.
 pub(crate) fn find_on_path(names: &[&str]) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    find_in_dirs(names, std::env::split_paths(&path))
+}
+
+/// First of `names` that exists as a file in any dir of `dirs`. Only
+/// ABSOLUTE dirs are searched: relative PATH entries (`.`, `""`) resolve
+/// against the process cwd, where a workspace file could pose as a
+/// system binary and get spawned unsandboxed (F1).
+fn find_in_dirs(names: &[&str], dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = dirs
+        .into_iter()
+        .filter(|d| d.is_absolute())
+        .collect();
     for name in names {
-        for dir in std::env::split_paths(&path) {
+        for dir in &dirs {
             let candidate = dir.join(name);
             if candidate.is_file() {
                 return Some(candidate);
@@ -1489,6 +1501,32 @@ mod tests {
         assert_eq!(from_env_value(Some(&raw)), Some(real));
         // Discovery order is a constant, never a directory listing order.
         assert_eq!(AST_GREP_NAMES, ["ast-grep", "sg"]);
+    }
+
+    #[test]
+    fn path_probe_ignores_relative_entries() {
+        // F1: a `.` or `""` PATH entry resolves against the process cwd —
+        // a workspace file could pose as the binary. Only absolute dirs
+        // are searched.
+        let dir = tmpdir("pathprobe");
+        let real = dir.join("cua-driver");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let bait = cwd.join("overseer-find-in-dirs-bait");
+        std::fs::write(&bait, "#!/bin/sh\n").unwrap();
+        // "." and "" entries must not match the cwd bait; the absolute
+        // dir still resolves.
+        let dirs = vec![
+            PathBuf::from("."),
+            PathBuf::from(""),
+            PathBuf::from("relative/dir"),
+            dir.clone(),
+        ];
+        assert_eq!(find_in_dirs(&["cua-driver"], dirs.clone()), Some(real));
+        // The bait exists in cwd, but "." is not a searchable dir.
+        let cwd_hit = find_in_dirs(&["overseer-find-in-dirs-bait"], dirs);
+        assert_eq!(cwd_hit, None, "cwd bait must not be found");
+        let _ = std::fs::remove_file(&bait);
     }
 
     #[test]

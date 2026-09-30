@@ -149,6 +149,18 @@ pub struct Backends {
     pub pixel: Option<PathBuf>,
 }
 
+/// An env-var driver path must be absolute: a relative one resolves
+/// against the agent's cwd, where a workspace file could pose as the
+/// driver and get spawned unsandboxed (F1). The surviving path is
+/// canonicalized so `..`/symlinks collapse to the real file.
+fn driver_env_path(raw: Option<String>) -> Option<PathBuf> {
+    let p = PathBuf::from(raw?.trim());
+    if !p.is_absolute() || !p.is_file() {
+        return None;
+    }
+    p.canonicalize().ok()
+}
+
 impl Backends {
     /// Read the operator's backend config. A variable pointing at a
     /// non-existent helper counts as unset — a stale env var must not look
@@ -162,7 +174,7 @@ impl Backends {
                 .filter(|p| p.is_file())
         };
         Backends {
-            driver: helper(ENV_DRIVER)
+            driver: driver_env_path(std::env::var(ENV_DRIVER).ok())
                 .or_else(|| super::struct_search::find_on_path(&["cua-driver"])),
             structured: helper(ENV_STRUCTURED),
             a11y: helper(ENV_A11Y),
@@ -1067,6 +1079,35 @@ mod tests {
     /// never detected in tests.
     fn st(b: &Backends) -> ComputerState {
         ComputerState::new(b.clone())
+    }
+
+    #[test]
+    fn driver_env_path_requires_an_absolute_path() {
+        // F1: a relative env path resolves against the agent's cwd — a
+        // workspace `./cua-driver` would be spawned unsandboxed.
+        let dir = tmpdir("driverenv");
+        let real = dir.join("cua-driver");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        let rel = std::path::Path::new(&real)
+            .strip_prefix(std::env::current_dir().unwrap())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| PathBuf::from("./cua-driver"));
+        assert_eq!(
+            driver_env_path(Some(rel.display().to_string())),
+            None,
+            "relative path must be refused"
+        );
+        assert_eq!(driver_env_path(Some("./cua-driver".into())), None);
+        assert_eq!(driver_env_path(Some("cua-driver".into())), None);
+        assert_eq!(driver_env_path(None), None);
+        // Absolute paths survive — canonicalized (no `..`).
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let dotted = format!("{}/sub/../cua-driver", dir.display());
+        assert_eq!(driver_env_path(Some(dotted)), Some(real.clone()));
+        assert_eq!(
+            driver_env_path(Some(format!("  {}  ", real.display()))),
+            Some(real)
+        );
     }
 
     /// Write an executable helper script and return its path. The helper
