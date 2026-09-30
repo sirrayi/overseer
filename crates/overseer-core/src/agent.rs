@@ -660,6 +660,11 @@ impl Agent {
                     self.config.keep_tool_results,
                 );
             }
+            // F5: keep only the last two computer images in the view —
+            // each capture's envelope text stays on its ToolResult, so
+            // eliding pixels never breaks tool pairing. Same view-only,
+            // idempotent contract as the clearing above.
+            crate::event::cap_image_blocks(&mut self.messages, 2);
 
             // System segments assemble per turn via the section pipeline:
             // the static sections are byte-stable; the memory index sits in
