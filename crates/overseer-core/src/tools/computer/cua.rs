@@ -189,9 +189,17 @@ pub fn spawn(path: &Path, ctx: &ToolCtx) -> Result<Live, String> {
     let program = path.display().to_string();
     let mut client = StdioClient::spawn_with_env("cua-driver", &program, &["mcp".to_string()], &[])
         .map_err(|e| format!("computer: {e}"))?;
-    client
-        .initialize("overseer", env!("CARGO_PKG_VERSION"))
-        .map_err(|e| format!("computer: {e}"))?;
+    if let Err(e) = client.initialize("overseer", env!("CARGO_PKG_VERSION")) {
+        // F7: whatever the driver complained about on stderr rides the
+        // init error — its own messages are where TCC/daemon refusals go.
+        let tail = client.stderr_tail();
+        let tail = tail.trim();
+        return Err(if tail.is_empty() {
+            format!("computer: {e}")
+        } else {
+            format!("computer: {e} — driver stderr: {tail}")
+        });
+    }
     Ok(Live {
         client,
         session: session_label(ctx),
@@ -402,19 +410,53 @@ fn need(input: &Value, action: &str, keys: &[&str]) -> Result<(), CallErr> {
     Ok(())
 }
 
-/// Copy an integer-ish field to driver args verbatim (no key when absent).
-fn put(args: &mut Map<String, Value>, key: &str, input: &Value) {
-    if let Some(v) = input.get(key).filter(|v| v.is_number()) {
-        args.insert(key.into(), v.clone());
+/// Copy an integer field to driver args: a number passes verbatim, a
+/// numeric STRING is coerced, anything else that is present but
+/// wrong-typed is refused instead of silently dropped (F7).
+fn put(args: &mut Map<String, Value>, key: &str, input: &Value) -> Result<(), CallErr> {
+    match input.get(key) {
+        None => Ok(()),
+        Some(v) if v.is_number() => {
+            if v.as_f64().is_some_and(|f| f.is_finite() && f >= 0.0) {
+                args.insert(key.into(), v.clone());
+                Ok(())
+            } else {
+                Err(CallErr::Refused(format!(
+                    "computer: '{key}' must be a non-negative number, got {v}"
+                )))
+            }
+        }
+        Some(Value::String(s)) => match s.trim().parse::<u64>() {
+            Ok(n) => {
+                args.insert(key.into(), json!(n));
+                Ok(())
+            }
+            Err(_) => Err(CallErr::Refused(format!(
+                "computer: '{key}' must be a number, got \"{s}\""
+            ))),
+        },
+        Some(v) => Err(CallErr::Refused(format!(
+            "computer: '{key}' must be a number, got {v}"
+        ))),
     }
 }
 
+/// Non-negative integral value only — a negative or fractional number
+/// used to wrap through `as u64` (F7); strings are NOT parsed here
+/// (put() handles the driver's argument path).
 fn u64_of(input: &Value, key: &str) -> Option<u64> {
-    input
-        .get(key)
-        .and_then(Value::as_u64)
-        .or_else(|| input.get(key).and_then(Value::as_i64).map(|v| v as u64))
-        .or_else(|| input.get(key).and_then(Value::as_f64).map(|v| v as u64))
+    input.get(key).and_then(|v| match v {
+        Value::Number(n) => n.as_u64().or_else(|| {
+            n.as_f64().and_then(|f| {
+                if f.is_finite() && f >= 0.0 && f.fract() == 0.0 {
+                    Some(f as u64)
+                } else {
+                    None
+                }
+            })
+        }),
+        _ => None,
+    })
 }
 
 /// Element addressing (D3): the driver refuses a bare `element_index`, so
@@ -491,7 +533,7 @@ fn run_live(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr
         }
         "windows" => {
             let mut a = Map::new();
-            put(&mut a, "pid", input);
+            put(&mut a, "pid", input)?;
             let r = call(d, "list_windows", a, input)?;
             Ok(obs_envelope("windows", shape::windows(&r)))
         }
@@ -507,8 +549,8 @@ fn run_live(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr
         "type" => {
             need(input, "type", &["pid"])?;
             let mut a = Map::new();
-            put(&mut a, "pid", input);
-            put(&mut a, "window_id", input);
+            put(&mut a, "pid", input)?;
+            put(&mut a, "window_id", input)?;
             a.insert("text".into(), input["text"].clone());
             target(d, input, &mut a, "type_text")?;
             act(d, "type_text", a, input, ctx)
@@ -517,8 +559,8 @@ fn run_live(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr
         "set" => {
             need(input, "set", &["pid", "window_id"])?;
             let mut a = Map::new();
-            put(&mut a, "pid", input);
-            put(&mut a, "window_id", input);
+            put(&mut a, "pid", input)?;
+            put(&mut a, "window_id", input)?;
             a.insert("value".into(), input["value"].clone());
             target(d, input, &mut a, "set_value")?;
             act(d, "set_value", a, input, ctx)
@@ -528,8 +570,8 @@ fn run_live(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr
         "menu" => {
             need(input, "menu", &["pid", "window_id"])?;
             let mut a = Map::new();
-            put(&mut a, "pid", input);
-            put(&mut a, "window_id", input);
+            put(&mut a, "pid", input)?;
+            put(&mut a, "window_id", input)?;
             a.insert("path".into(), input["path"].clone());
             act(d, "invoke_menu", a, input, ctx)
         }
@@ -551,8 +593,8 @@ fn observe(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
         .unwrap_or(150)
         .clamp(1, 2000) as usize;
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     a.insert("include_screenshot".into(), json!(false));
     a.insert("max_elements".into(), json!(limit));
     if let Some(q) = input.get("query").and_then(Value::as_str) {
@@ -645,8 +687,8 @@ fn screenshot(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallE
         return suppressed_envelope("screenshot", ctx, reason, true);
     }
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     a.insert("include_accessibility_tree".into(), json!(false));
     let max = input
         .get("max")
@@ -669,8 +711,8 @@ fn zoom(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
         return suppressed_envelope("zoom", ctx, "credential-field focus", true);
     }
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     for k in ["x1", "y1", "x2", "y2"] {
         if let Some(v) = input.get(k).filter(|v| v.is_number()) {
             a.insert(k.into(), v.clone());
@@ -846,8 +888,8 @@ fn click(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
         ));
     }
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     target(d, input, &mut a, tool)?;
     if tool == "click" {
         if button != "left" {
@@ -868,8 +910,8 @@ fn key(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
         .unwrap_or("")
         .trim();
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     let (tool, a) = if keys.contains('+') {
         a.insert(
             "keys".into(),
@@ -902,8 +944,8 @@ fn scroll(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> 
         (if dx < 0.0 { "left" } else { "right" }, dx.abs())
     };
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     a.insert("direction".into(), json!(direction));
     a.insert(
         "amount".into(),
@@ -917,8 +959,8 @@ fn drag(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
     need(input, "drag", &["pid", "window_id"])?;
     let num = |k: &str| input.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     if d.zoomed {
         // drag carries from_zoom — pass both endpoints in crop pixels and
         // let the driver translate (F3).
@@ -949,8 +991,8 @@ fn drag(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
 fn verify(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
     need(input, "verify", &["pid", "window_id"])?;
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     // The driver's `expect` is a *list* of predicates; a bare object wraps.
     let expect = match input.get("expect") {
         Some(v @ Value::Array(_)) => v.clone(),
@@ -984,8 +1026,8 @@ fn browser(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
     }
     need(input, "browser", &["pid", "window_id"])?;
     let mut a = Map::new();
-    put(&mut a, "pid", input);
-    put(&mut a, "window_id", input);
+    put(&mut a, "pid", input)?;
+    put(&mut a, "window_id", input)?;
     let r = call(d, "get_browser_state", a, input)?;
     let Some((target, tab)) = shape::target_and_tab(&r) else {
         return Err(CallErr::Refused(
@@ -1256,6 +1298,19 @@ done
         (path, log)
     }
 
+    /// A driver that writes to stderr then answers garbage — the init
+    /// failure must carry the captured stderr tail (F7).
+    fn stderr_driver(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("noisy-cua.sh");
+        let script = "#!/bin/sh\necho 'TCC denied: com.trycua.driver lacks accessibility' >&2\nsleep 0.3\nwhile IFS= read -r line; do\n  printf 'not json\\n'\ndone\n";
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
     /// A driver that dies after answering ONE tools/call — the next call
     /// hits a closed transport and must respawn (D2).
     fn flaky_driver(dir: &Path) -> (PathBuf, PathBuf) {
@@ -1494,6 +1549,58 @@ done
             !last.contains("\"x\":"),
             "element click must not send coords: {last}"
         );
+    }
+
+    #[test]
+    fn numeric_params_are_coerced_or_refused_never_dropped() {
+        // F7: a numeric string coerces; a wrong-typed value is a type
+        // error rather than a silently-missing pid/window_id; negatives
+        // never wrap through `as u64`.
+        let dir = tmpdir("nums");
+        let (driver, log) = fake_driver(&dir, "fake.sh", "");
+        let mut st = state(&driver);
+        let c = ctx(&dir);
+        run_ok(
+            &json!({"action": "screenshot", "pid": "11", "window_id": "101"}),
+            &c,
+            &mut st,
+        )
+        .unwrap();
+        let last = req_lines(&log).last().unwrap().clone();
+        assert!(last.contains("\"pid\":11"), "string coerced: {last}");
+        let err = run(
+            &json!({"action": "screenshot", "pid": "abc", "window_id": 101}),
+            &c,
+            &mut st,
+        )
+        .unwrap_err();
+        assert!(err.contains("'pid' must be a number"), "{err}");
+        let err = run(
+            &json!({"action": "screenshot", "pid": -1, "window_id": 101}),
+            &c,
+            &mut st,
+        )
+        .unwrap_err();
+        assert!(err.contains("non-negative"), "{err}");
+        // A negative element index is refused, not wrapped.
+        let err = run(
+            &json!({"action": "click", "pid": 11, "window_id": 101, "element": -1}),
+            &c,
+            &mut st,
+        )
+        .unwrap_err();
+        assert!(err.contains("non-negative"), "{err}");
+    }
+
+    #[test]
+    fn init_failure_carries_the_driver_stderr_tail() {
+        let dir = tmpdir("stderr");
+        let driver = stderr_driver(&dir);
+        let mut st = state(&driver);
+        let c = ctx(&dir);
+        let err = run(&json!({"action": "apps"}), &c, &mut st).unwrap_err();
+        assert!(err.contains("driver stderr"), "{err}");
+        assert!(err.contains("TCC denied"), "{err}");
     }
 
     #[test]

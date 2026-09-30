@@ -609,7 +609,7 @@ fn run_capture(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Valu
         "sent_h": sent_h,
         "pre": pre,
         "post": sha,
-        "note": "send coordinates in the sent frame (sent_w x sent_h); they are scaled to native pixels",
+        "note": "send coordinates in the sent frame (sent_w x sent_h); they are scaled to native pixels (image not persisted across resume)",
     }))
 }
 
@@ -1022,11 +1022,11 @@ pub fn spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
         name: "computer".into(),
         description: concat!(
-            "Drive the user's screen: 'apps'/'windows' find targets, 'observe' lists elements ",
-            "(index via 'element') or 'screenshot'; 'click'/'type'/'key'/'set'/'scroll'/'drag'/'menu'",
-            "/'launch' act; 'verify' checks predicates; 'browser'/'browser_click'/'browser_type'/'navigate' ",
-            "drive Chrome/Edge tabs via 'tab'/'ref'. 'zoom' crops a region; 'batch' runs ≤32 actions. ",
-            "x/y are screenshot pixels, scaled for you; no implicit screenshots."
+            "Drive the user's screen: 'apps'/'windows' find targets; 'observe' lists elements ",
+            "(index as 'element'); 'screenshot'/'zoom' image it; 'click'/'type'/'key'/'set'/'scroll'",
+            "/'drag'/'menu'/'launch' act; 'verify' checks predicates; 'browser*'/'navigate' drive ",
+            "Chrome/Edge tabs via 'tab'/'ref'; 'batch' runs ≤32 actions. x/y are pixels of the ",
+            "image you saw (crop space after 'zoom'); nothing is screenshotted implicitly."
         )
         .into(),
         input_schema: schema(
@@ -1037,10 +1037,10 @@ pub fn spec() -> crate::provider::ToolSpec {
                 },
                 "pid": {"type": "integer", "description": "target app"},
                 "window_id": {"type": "integer", "description": "target window"},
-                "app": {"type": "string"},
-                "query": {"type": "string", "description": "observe/browser filter"},
+                "app": {"type": "string", "description": "name to launch"},
+                "query": {"type": "string"},
                 "limit": {"type": "integer", "description": "observe cap (150)"},
-                "max": {"type": "integer", "description": "screenshot max px (1280)"},
+                "max": {"type": "integer"},
                 "element": {"type": "integer", "description": "index from observe"},
                 "x": {"type": "number"}, "y": {"type": "number"},
                 "to_x": {"type": "number"}, "to_y": {"type": "number"},
@@ -1050,15 +1050,15 @@ pub fn spec() -> crate::provider::ToolSpec {
                 "button": {"type": "string", "description": "left|right"},
                 "count": {"type": "integer", "description": "1|2"},
                 "text": {"type": "string"},
-                "keys": {"type": "string", "description": "\"cmd+s\" or \"return\""},
+                "keys": {"type": "string", "description": "\"cmd+s\"|\"return\""},
                 "value": {},
-                "path": {"type": "array", "items": {"type": "string"}, "description": "menu path"},
-                "expect": {"description": "verify predicates"},
-                "tab": {"type": "string", "description": "browser tab handle"},
+                "path": {"type": "array", "items": {"type": "string"}},
+                "expect": {},
+                "tab": {"type": "string", "description": "bound browser tab"},
                 "ref": {"type": "string", "description": "browser element ref"},
                 "url": {"type": "string"},
-                "cred_field": {"type": "boolean", "description": "Target is a credential field"},
-                "actions": {"type": "array", "items": {"type": "object"}, "description": "batch members (≤32)"},
+                "cred_field": {"type": "boolean", "description": "target is a credential field"},
+                "actions": {"type": "array", "items": {"type": "object"}},
             }),
             &["action"],
         ),

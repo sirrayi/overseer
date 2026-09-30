@@ -1322,12 +1322,12 @@ mod tests {
     }
 
     /// Startup-token guard: every resident spec with every optional tool
-    /// forced on (plus the `mcp` op tool). Post-trim measurement: 10,042
-    /// chars (~2,510 tokens at ~4 chars/token); the S5 computer vocabulary
-    /// grew the computer spec from 1,102 to 1,984 chars. +5% headroom.
+    /// forced on (plus the `mcp` op tool). Post-trim measurement: 9,886
+    /// chars (~2,471 tokens at ~4 chars/token); the S5 computer vocabulary
+    /// grew the computer spec from 1,102 to 1,828 chars. +5% headroom.
     #[test]
     fn resident_tool_specs_stay_within_the_startup_budget() {
-        const POST_TRIM_CHARS: usize = 10_042;
+        const POST_TRIM_CHARS: usize = 9_886;
         let mut reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
         reg.specs.push(mcp_tool::spec());
         for s in &reg.specs {
