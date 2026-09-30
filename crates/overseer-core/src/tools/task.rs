@@ -426,6 +426,35 @@ fn finish(dir: &Path) {
     }
 }
 
+/// Every dir a job can hold `running`: its own, the one a resume
+/// continues, its escalation attempt and its chained verifier.
+fn job_dirs(env: &Env, job: &Job) -> Vec<PathBuf> {
+    let mut ids = vec![job.id.clone(), format!("{}-r1", job.id)];
+    ids.extend(job.resume.clone());
+    ids.extend(job.verify_id.clone());
+    ids.sort();
+    ids.dedup();
+    ids.iter().map(|id| env.subagents_dir.join(id)).collect()
+}
+
+/// A background job's thread panicked: everything it left `running`
+/// goes `dead` with its ledger total — the parent's next reconcile
+/// settles that and drops the reservations — and the returned died-marker
+/// text still reaches the parent as a notice.
+fn panicked(env: &Env, job: &Job, payload: &(dyn std::any::Any + Send)) -> String {
+    let msg = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".into());
+    for dir in job_dirs(env, job) {
+        if let Some(mut sc) = Sidecar::load(&dir).filter(|sc| sc.state == State::Running) {
+            let _ = sc.finish(&dir, State::Dead);
+        }
+    }
+    format!("[subagent {} panicked: {msg}]", job.id)
+}
+
 fn record(env: &Env, id: &str, mode: TaskMode, route: &Route, cap: f64, job: &Job) -> Sidecar {
     Sidecar {
         id: id.to_string(),
@@ -909,7 +938,8 @@ fn spawn(prompt: &str, input: &Value, ctx: &mut ToolCtx) -> Result<String, Strin
         trace: dir.display().to_string(),
     };
     std::thread::spawn(move || {
-        let text = execute(&env, &job);
+        let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(&env, &job)))
+            .unwrap_or_else(|p| panicked(&env, &job, p.as_ref()));
         // Marker last (after the sidecar went `done`): it is the parent
         // loop's notification.
         let _ = std::fs::write(dir.join(done_marker(run)), text);
@@ -941,10 +971,15 @@ mod tests {
     struct Mock {
         responses: Mutex<VecDeque<Response>>,
         seen: Mutex<Vec<Seen>>,
+        /// Runs at the start of every call — injects panics and faults.
+        hook: Option<Box<dyn Fn() + Send + Sync>>,
     }
 
     impl Provider for Mock {
         fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
+            if let Some(h) = &self.hook {
+                h();
+            }
             self.seen.lock().unwrap().push(Seen {
                 model: req.model.to_string(),
                 tools: req.tools.iter().map(|t| t.name.clone()).collect(),
@@ -1017,9 +1052,19 @@ mod tests {
         responses: Vec<Response>,
         cfg: AgentConfig,
     ) -> (ToolCtx<'static>, Arc<Mock>) {
+        ctx_hooked(dir, responses, cfg, None)
+    }
+
+    fn ctx_hooked(
+        dir: &Path,
+        responses: Vec<Response>,
+        cfg: AgentConfig,
+        hook: Option<Box<dyn Fn() + Send + Sync>>,
+    ) -> (ToolCtx<'static>, Arc<Mock>) {
         let mock = Arc::new(Mock {
             responses: Mutex::new(VecDeque::from(responses)),
             seen: Mutex::new(Vec::new()),
+            hook,
         });
         let c = ToolCtx {
             cwd: dir.to_path_buf(),
@@ -1147,6 +1192,39 @@ mod tests {
         // The sidecar goes `done` before the marker: the slot is free.
         assert_eq!(sidecar::in_flight(&dir.join("session/subagents")), 0);
         assert!(sc(&dir, "task-1").background);
+    }
+
+    /// A panicking background thread must not strand a live-looking
+    /// sidecar: it goes `dead` with its ledger total (the next drain
+    /// settles it and drops the reservation) and its notice still lands.
+    #[test]
+    fn background_panic_marks_dead_and_leaves_a_notice() {
+        let dir = tmpdir();
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        let (mut c, _) = ctx_hooked(
+            &dir,
+            vec![done_text("never")],
+            cfg(&dir),
+            Some(Box::new(move || {
+                if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    panic!("boom");
+                }
+            })),
+        );
+        let out = run(&json!({"prompt": "bg", "background": true}), &mut c);
+        assert!(!out.is_error, "{}", out.text);
+        let marker = dir.join("session/subagents/task-1/done.txt");
+        wait_for(&marker);
+        let note = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(note, "[subagent task-1 panicked: boom]");
+        let s = sc(&dir, "task-1");
+        assert_eq!(s.state, State::Dead);
+        assert!(!s.is_live());
+        let subs = dir.join("session/subagents");
+        assert_eq!(sidecar::in_flight(&subs), 0, "slot freed");
+        // Resume is allowed again (it gets past the liveness check).
+        let out = run(&json!({"prompt": "again", "resume": "task-1"}), &mut c);
+        assert!(!out.text.contains("still running"), "{}", out.text);
     }
 
     /// The bound counts live background tasks only; dirs a dead process
