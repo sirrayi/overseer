@@ -173,7 +173,22 @@ impl Sidecar {
     }
 }
 
-/// Every sidecar under `subagents_dir`, in name order.
+/// Sort key: `task-N` (and its `task-N-r1` attempt) by N, then name.
+fn seq_key(path: &Path) -> (u64, String) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let n = name
+        .strip_prefix("task-")
+        .map(|r| r.split('-').next().unwrap_or(r))
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(u64::MAX);
+    (n, name)
+}
+
+/// Every sidecar under `subagents_dir`, in task order (`task-2` before
+/// `task-10`).
 pub fn all(subagents_dir: &Path) -> Vec<(PathBuf, Sidecar)> {
     let mut v: Vec<(PathBuf, Sidecar)> = std::fs::read_dir(subagents_dir)
         .map(|d| {
@@ -182,7 +197,7 @@ pub fn all(subagents_dir: &Path) -> Vec<(PathBuf, Sidecar)> {
                 .collect()
         })
         .unwrap_or_default();
-    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v.sort_by_cached_key(|(p, _)| seq_key(p));
     v
 }
 
@@ -235,6 +250,18 @@ mod tests {
             run: 1,
             escalated_to: None,
         }
+    }
+
+    #[test]
+    fn all_orders_by_task_number() {
+        let dir = std::env::temp_dir().join(format!("overseer-sc-{}", uuid::Uuid::now_v7()));
+        for id in ["task-10", "task-2", "task-3-r1", "task-3", "task-1"] {
+            let d = dir.join(id);
+            std::fs::create_dir_all(&d).unwrap();
+            sample(id).store(&d).unwrap();
+        }
+        let ids: Vec<String> = all(&dir).into_iter().map(|(_, sc)| sc.id).collect();
+        assert_eq!(ids, ["task-1", "task-2", "task-3", "task-3-r1", "task-10"]);
     }
 
     #[test]
