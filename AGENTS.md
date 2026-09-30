@@ -99,6 +99,8 @@ architecture.
   unavailable FAILS the call with the requirement named (never a silent
   downgrade to unsandboxed exec); unset keeps the platform default.
   Deferred sites are marked `// DEFERRED(owner)` in each module header.
+
+Computer use: `tools/computer.rs` + `tools/computer/{cua,shape}.rs` — a cua-driver MCP backend (`OVERSEER_COMPUTER_DRIVER` or `cua-driver` on PATH; `cua-driver mcp` over stdio so macOS TCC attributes to CuaDriver.app; session label `ovs-<8>`; lazy spawn, drop-and-respawn on transport failure; env PATH+HOME only) serves every action: apps/windows/launch/observe (AX tree, no screenshot)/screenshot/zoom/click/type/key/set/scroll/drag/menu/verify and browser/browser_click/browser_type/navigate (Chromium via CDP refs; other browsers via the window's AX tree). Observations always latch the untrusted taint; acts are InternalWrite; `navigate` is ExternalComms. The `OVERSEER_COMPUTER_{STRUCTURED,A11Y,PIXEL}` helper protocol is a fallback only (DEFERRED for removal).
 - `crates/overseer-cli` — `overseer exec` headless/CI surface; bare
   `overseer` / `overseer tui` launches the interactive TUI (same flags).
   `--continue`/`-c` resumes the newest session recorded for the cwd,
@@ -221,6 +223,8 @@ architecture.
 ## Invariants (do not violate)
 
 1. Events are immutable; session state is a view over `events.jsonl`.
+
+   The event hash chain is structural — it covers (id, parent_id, type tag, prev hash), not payload bytes: it detects reordered/inserted/dropped/re-typed events, not edited payloads.
 2. Stable prompt prefixes — nothing volatile (timestamps, session ids, git
    status) above the cache boundary.
 3. Engine enforces budgets (steps, cost), never the model.
