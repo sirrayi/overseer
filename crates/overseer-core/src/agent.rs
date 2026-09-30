@@ -45,8 +45,16 @@ pub struct AgentConfig {
     /// `thinking_budget` wins where the API takes tokens.
     pub effort: Option<crate::provider::Effort>,
     /// Small-tier model for aux calls (P3.2): titles, consolidation,
-    /// guardrails. None → aux calls use the main model.
+    /// guardrails. None → aux calls use the main model. Also the light
+    /// subagent tier when it shares the main model's transport.
     pub small_model: Option<String>,
+    /// Heavy subagent tier (consult, escalation) when it shares the main
+    /// model's transport. None → the family's priciest profile row.
+    pub heavy_model: Option<String>,
+    /// Background subagents allowed in flight at once. Bounded because
+    /// every one shares the provider's rate limit and each returns a
+    /// digest the lead must review — unbounded fan-out buys neither.
+    pub max_bg_subagents: usize,
     pub cwd: PathBuf,
     /// Benchmark mode: disable the permission gate entirely. Only valid when
     /// the environment itself is the sandbox (per-task container).
@@ -209,6 +217,8 @@ impl Default for AgentConfig {
             thinking_budget: None,
             effort: None,
             small_model: None,
+            heavy_model: None,
+            max_bg_subagents: 4,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             full_access: false,
             policy_preset: crate::perm::Preset::WorkspaceWrite,
@@ -295,8 +305,8 @@ pub struct Agent {
     /// Adaptive-effort escalations (P3.2): each stuck trip bumps the
     /// request effort one notch for the rest of the run.
     effort_boost: u8,
-    /// Background subagent ids already noticed this run (P3.4).
-    bg_noticed: std::collections::HashSet<String>,
+    /// Background subagent id → last run already noticed (P3.4).
+    bg_noticed: std::collections::HashMap<String, u32>,
     /// Compact at the next loop boundary (set by the context-budget trigger
     /// or a provider context-window stop).
     pending_compact: bool,
@@ -307,6 +317,13 @@ pub struct Agent {
     /// agent (not per-turn ToolCtx) so output-N.txt names never collide
     /// across turns.
     spill_seq: u64,
+    /// Session-monotonic `task-N` counter — same reason as `spill_seq`:
+    /// a per-batch counter reused ids across steps.
+    subagent_seq: u64,
+    /// This agent's cap composed with its subagents': settled spend is in
+    /// the ledger, in-flight caps are reserved here. Shared with the
+    /// `task` tool and its background threads.
+    spend: Arc<crate::tools::task::SpendAccount>,
     /// Consecutive verification-gate blocks this session (P1.10).
     verify_blocks: u32,
     /// Active checkpoint for the current user prompt (P1.9): created at
@@ -361,6 +378,8 @@ impl Agent {
         crate::harden::ensure_private_dir(&session_dir)?;
         let log = EventLog::create(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::create(session_dir.join("ledger.jsonl"))?;
+        let subagents_dir = session_dir.join("subagents");
+        let max_cost_usd = config.max_cost_usd;
         let tools = Self::registry(&config);
         let mut agent = Agent {
             provider,
@@ -374,10 +393,12 @@ impl Agent {
             stuck_nudged: false,
             empty_responses: 0,
             effort_boost: 0,
-            bg_noticed: std::collections::HashSet::new(),
+            bg_noticed: std::collections::HashMap::new(),
             pending_compact: false,
             ctx_wall_stop: false,
             spill_seq: 0,
+            subagent_seq: crate::tools::task::sidecar::max_seq(&subagents_dir),
+            spend: Arc::new(crate::tools::task::SpendAccount::new(max_cost_usd, 0.0)),
             verify_blocks: 0,
             checkpoint: None,
             control: Control::default(),
@@ -385,6 +406,7 @@ impl Agent {
             cache_key: Some(session_id.clone()),
             run_cache_start: crate::ledger::CacheStats::default(),
         };
+        agent.reconcile_subagents()?;
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
         }
@@ -449,13 +471,13 @@ impl Agent {
         let messages = rehydrate_messages(&events);
         // Background tasks already noticed before the resume must not be
         // re-injected (their SubagentDone rehydrated above).
-        let bg_noticed = events
-            .iter()
-            .filter_map(|e| match &e.kind {
-                EventKind::SubagentDone { task_id, .. } => Some(task_id.clone()),
-                _ => None,
-            })
-            .collect();
+        let mut bg_noticed = std::collections::HashMap::new();
+        for e in &events {
+            if let EventKind::SubagentDone { task_id, run, .. } = &e.kind {
+                let seen = bg_noticed.entry(task_id.clone()).or_insert(0);
+                *seen = (*seen).max(*run);
+            }
+        }
         // The LAST SessionStart is this session's own id — a fork's log
         // begins with the parent's SessionStart, so first-match would
         // hand the resumed fork its parent's prompt-cache key.
@@ -480,7 +502,12 @@ impl Agent {
         let spill_seq = std::fs::read_dir(session_dir.join("tool-outputs"))
             .map(|d| d.count() as u64)
             .unwrap_or(0);
-        Ok(Agent {
+        let subagent_seq = crate::tools::task::sidecar::max_seq(&session_dir.join("subagents"));
+        let spend = Arc::new(crate::tools::task::SpendAccount::new(
+            config.max_cost_usd,
+            ledger.total_cost_usd,
+        ));
+        let mut agent = Agent {
             provider,
             config,
             log,
@@ -496,13 +523,17 @@ impl Agent {
             pending_compact: false,
             ctx_wall_stop: false,
             spill_seq,
+            subagent_seq,
+            spend,
             verify_blocks: 0,
             checkpoint: None,
             control: Control::default(),
             system,
             cache_key,
             run_cache_start: crate::ledger::CacheStats::default(),
-        })
+        };
+        agent.reconcile_subagents()?;
+        Ok(agent)
     }
 
     /// Swap the tool registry — used to spawn read-only subagents with a
@@ -744,7 +775,9 @@ impl Agent {
             self.end_run("max_steps", steps, on_event)?;
             return Ok(Some(out));
         }
-        if self.ledger.total_cost_usd >= self.config.max_cost_usd {
+        // Own + settled subagent spend (both in the ledger) + caps still
+        // reserved for subagents in flight.
+        if self.ledger.total_cost_usd + self.spend.reserved_usd() >= self.config.max_cost_usd {
             let out = RunOutcome::CostBudgetExceeded {
                 steps,
                 cost_usd: self.ledger.total_cost_usd,
@@ -859,6 +892,7 @@ impl Agent {
             count_tool_calls(&resp.blocks) as u32,
             cost,
         ))?;
+        self.spend.sync(self.ledger.total_cost_usd);
 
         // Effective-window budget (playbook Ch.3 §9.2): trigger on the
         // *measured* prompt size from the last call, not an estimate.
@@ -992,7 +1026,7 @@ impl Agent {
                 spill_seq: 0,
                 provider: None,
                 agent_config: Some(self.config.clone()),
-                subagent_seq: 0,
+                subagents: Default::default(),
                 checkpoint: None,
                 sandbox: self.config.sandbox_bash,
                 broker: None,
@@ -1045,7 +1079,10 @@ impl Agent {
             spill_seq: self.spill_seq,
             provider: Some(self.provider.clone()),
             agent_config: Some(self.config.clone()),
-            subagent_seq: 0,
+            subagents: crate::tools::task::SubagentCtx {
+                seq: self.subagent_seq,
+                spend: Some(self.spend.clone()),
+            },
             checkpoint: checkpoint.as_mut(),
             sandbox: self.config.sandbox_bash,
             broker: Some(self.config.broker.clone()),
@@ -1158,6 +1195,7 @@ impl Agent {
         // Carry the session-monotonic spill counter forward; hand the
         // checkpoint back for the next iteration.
         self.spill_seq = ctx.spill_seq;
+        self.subagent_seq = ctx.subagents.seq;
         self.checkpoint = checkpoint;
         Ok(stuck_hit)
     }
@@ -1356,36 +1394,57 @@ impl Agent {
             .collect())
     }
 
-    /// Fire-and-notify delivery (P3.4): scan subagents/bg-*/ for newly
-    /// written done.txt markers; each becomes a user message + a
-    /// SubagentDone event so resumes replay it identically.
-    fn drain_bg_notices(&mut self, on_event: &mut dyn FnMut(&Event)) -> std::io::Result<()> {
+    /// Bring every finished subagent's spend into this ledger — one
+    /// settlement row per unsettled delta, idempotent across resumes (the
+    /// ledger replays what it settled) — and drop its reservation. Dead
+    /// background tasks are reaped first so their slots free.
+    fn reconcile_subagents(&mut self) -> std::io::Result<()> {
+        use crate::tools::task::sidecar;
         let dir = self.session_dir.join("subagents");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Ok(());
-        };
-        let mut done: Vec<(String, PathBuf)> = entries
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("bg-"))
-            .filter_map(|e| {
-                let p = e.path();
-                p.join("done.txt")
-                    .exists()
-                    .then(|| (e.file_name().to_string_lossy().to_string(), p))
-            })
-            .collect();
-        done.sort(); // deterministic injection order
-        for (id, path) in done {
-            if !self.bg_noticed.insert(id.clone()) {
+        sidecar::reap_dead(&dir);
+        for (_, sc) in sidecar::all(&dir) {
+            if sc.state == sidecar::State::Running {
                 continue;
             }
-            let digest = std::fs::read_to_string(path.join("done.txt"))
-                .unwrap_or_else(|_| "(digest missing)".into());
-            let text = format!("[subagent {id} finished]\n{digest}");
+            self.ledger.settle(&sc.id, &sc.model, sc.cost_usd)?;
+            self.spend.settle(&sc.id, self.ledger.total_cost_usd);
+        }
+        self.spend.sync(self.ledger.total_cost_usd);
+        Ok(())
+    }
+
+    /// Fire-and-notify delivery (P3.4): settle finished subagents, then
+    /// turn each background run's new done marker into a user message +
+    /// a SubagentDone event so resumes replay it identically.
+    fn drain_bg_notices(&mut self, on_event: &mut dyn FnMut(&Event)) -> std::io::Result<()> {
+        use crate::tools::task::{done_marker, sidecar, Footer};
+        self.reconcile_subagents()?;
+        for (path, sc) in sidecar::all(&self.session_dir.join("subagents")) {
+            if !sc.background || self.bg_noticed.get(&sc.id).is_some_and(|r| *r >= sc.run) {
+                continue;
+            }
+            let Ok(digest) = std::fs::read_to_string(path.join(done_marker(sc.run))) else {
+                continue;
+            };
+            self.bg_noticed.insert(sc.id.clone(), sc.run);
+            let footer = Footer::parse(&digest);
+            let text = format!("[subagent {} finished]\n{digest}", sc.id);
             self.messages.push(Message::user_text(text));
             self.emit(
                 EventKind::SubagentDone {
-                    task_id: id,
+                    cost_usd: footer
+                        .as_ref()
+                        .and_then(|f| f.cost_usd)
+                        .unwrap_or(sc.cost_usd),
+                    tier: footer
+                        .as_ref()
+                        .map_or(sc.tier.as_str().to_string(), |f| f.tier.clone()),
+                    model: footer
+                        .as_ref()
+                        .map_or(sc.model.clone(), |f| f.model.clone()),
+                    verdict: footer.and_then(|f| f.verdict),
+                    run: sc.run,
+                    task_id: sc.id,
                     trace: path.display().to_string(),
                 },
                 on_event,
@@ -1522,11 +1581,13 @@ impl Agent {
         steps: u32,
         on_event: &mut dyn FnMut(&Event),
     ) -> std::io::Result<()> {
+        self.reconcile_subagents()?;
         self.emit(
             EventKind::RunEnd {
                 stop_reason: stop.into(),
                 steps,
                 total_cost_usd: self.ledger.total_cost_usd,
+                subagent_cost_usd: self.ledger.subagent_cost_usd,
                 cache: self
                     .ledger
                     .cache_stats()
@@ -2133,7 +2194,7 @@ mod tests {
             })
             .collect();
         assert!(result_text.contains("the needle is needle-data"));
-        assert!(result_text.contains("full trace:"));
+        assert!(result_text.contains("trace: "));
 
         // The subagent's isolated session log exists and is self-contained.
         let sub_log = dir.join("subagents/task-1/events.jsonl");
@@ -2562,7 +2623,7 @@ mod tests {
             spill_seq: 0,
             provider: None,
             agent_config: Some(AgentConfig::default()),
-            subagent_seq: 0,
+            subagents: Default::default(),
             checkpoint: None,
             sandbox: false,
             broker: None,
@@ -2810,7 +2871,8 @@ mod tests {
     }
 
     /// P3.4: a finished background subagent lands as a SubagentDone
-    /// event + a user message at the next step boundary.
+    /// event + a user message at the next step boundary; one left
+    /// `running` by a dead process is reaped and noticed too.
     #[test]
     fn bg_notice_drains_into_context() {
         let dir = tmpdir();
@@ -2821,28 +2883,211 @@ mod tests {
         };
         let provider = Arc::new(Mock::new(vec![tool_turn(1), done()]));
         let mut agent = Agent::start(provider.clone(), cfg, dir.clone(), "s".into()).unwrap();
-        // Pre-seed a finished bg task before the turn.
-        let bg = dir.join("subagents/bg-7");
-        std::fs::create_dir_all(&bg).unwrap();
-        std::fs::write(bg.join("done.txt"), "bg digest here").unwrap();
+        // Pre-seed a finished bg task and a dead one before the turn.
+        for (id, state, nonce) in [("task-7", "done", "x"), ("task-8", "running", "old")] {
+            let bg = dir.join("subagents").join(id);
+            std::fs::create_dir_all(&bg).unwrap();
+            std::fs::write(
+                bg.join("task.json"),
+                serde_json::json!({"id": id, "mode": "read", "tier": "light",
+                    "model": "m", "background": true, "worktree": null, "branch": null,
+                    "cap_usd": 0.25, "process_nonce": nonce, "state": state, "cost_usd": 0.0})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("subagents/task-7/done.txt"), "bg digest here").unwrap();
 
         let mut events = Vec::new();
         let mut sink = |e: &Event| events.push(e.kind.clone());
         let out = agent.run_turn("go", &mut sink).unwrap();
         assert!(matches!(out, RunOutcome::Completed { .. }));
-        assert!(events.iter().any(|k| matches!(
-            k,
-            EventKind::SubagentDone { task_id, .. } if task_id == "bg-7"
-        )));
+        for id in ["task-7", "task-8"] {
+            assert!(
+                events.iter().any(|k| matches!(
+                    k,
+                    EventKind::SubagentDone { task_id, .. } if task_id == id
+                )),
+                "{id}"
+            );
+        }
         assert!(agent
             .messages()
             .iter()
             .any(|m| m.text().contains("bg digest here")));
+        assert!(agent
+            .messages()
+            .iter()
+            .any(|m| m.text().contains("task-8 died with its process")));
 
-        // Resume replays the notice identically from the event log.
+        // Resume replays the notice identically from the event log and
+        // does not drain it again.
         let events2 = EventLog::replay(dir.join("events.jsonl")).unwrap();
         let msgs = rehydrate_messages(&events2);
         assert!(msgs.iter().any(|m| m.text().contains("bg digest here")));
+        let mut resumed = Agent::resume(
+            provider,
+            AgentConfig {
+                cwd: dir.clone(),
+                full_access: true,
+                ..AgentConfig::default()
+            },
+            dir.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.subagent_seq, 8,
+            "counter seeds past existing task dirs"
+        );
+        let mut again = Vec::new();
+        resumed
+            .drain_bg_notices(&mut |e: &Event| again.push(e.kind.clone()))
+            .unwrap();
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    fn task_call(n: usize, input: serde_json::Value) -> Response {
+        Response {
+            blocks: vec![Block::ToolCall {
+                id: format!("t{n}"),
+                name: "task".into(),
+                input,
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        }
+    }
+
+    fn text_costing(model: &str, text: &str, usd: f64) -> Response {
+        let price = crate::profile::lookup(model).price.input;
+        Response {
+            blocks: vec![Block::Text { text: text.into() }],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                fresh_input: (usd * 1_000_000.0 / price).round() as u64,
+                ..Usage::default()
+            },
+            request_bytes: 0,
+            latency_ms: 0,
+        }
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Binding correction 1: the spawn counter lives on the agent, so two
+    /// writers spawned in different steps get distinct dirs and branches.
+    #[test]
+    fn task_ids_are_session_monotonic_across_steps() {
+        let repo = tmpdir();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["commit", "-qm", "x", "--allow-empty"]);
+        let session = repo.join("session");
+        let cfg = AgentConfig {
+            cwd: repo.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        let provider = Arc::new(Mock::new(vec![
+            task_call(1, serde_json::json!({"prompt": "w1", "mode": "write"})),
+            done(),
+            task_call(2, serde_json::json!({"prompt": "w2", "mode": "write"})),
+            done(),
+            done(),
+        ]));
+        let mut agent = Agent::start(provider, cfg, session.clone(), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        agent.run_turn("go", &mut sink).unwrap();
+        for n in [1, 2] {
+            assert!(session
+                .join(format!("subagents/task-{n}/task.json"))
+                .exists());
+            assert!(session.join(format!("subagents/wt-{n}/wt")).exists());
+        }
+        let branches = git(&repo, &["branch", "--list", "overseer-task-*"]);
+        assert!(branches.contains("overseer-task-1") && branches.contains("overseer-task-2"));
+        let results: Vec<String> = agent
+            .messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                Block::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(results.iter().all(|r| !r.contains("task: ")), "{results:?}");
+    }
+
+    /// Budget composition: subagent spend settles into the parent's ledger
+    /// and stops the parent; a resume does not settle it twice.
+    #[test]
+    fn subagent_spend_composes_into_the_parent_cap() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            model: "claude-fable-5".into(),
+            max_cost_usd: 0.10,
+            ..AgentConfig::default()
+        };
+        let light = crate::tools::task::route::resolve(crate::profile::Tier::Light, &cfg).model;
+        let provider = Arc::new(Mock::new(vec![
+            task_call(1, serde_json::json!({"prompt": "a"})),
+            text_costing(&light, "sub a", 0.06),
+            task_call(2, serde_json::json!({"prompt": "b"})),
+            text_costing(&light, "sub b", 0.06),
+            done(),
+        ]));
+        let mut agent =
+            Agent::start(provider.clone(), cfg.clone(), dir.clone(), "s".into()).unwrap();
+        let mut events = Vec::new();
+        let out = agent
+            .run_turn("go", &mut |e: &Event| events.push(e.kind.clone()))
+            .unwrap();
+        // task-2 was capped at what was left ($0.04) but its one call cost
+        // $0.06: spend is only known after a call, so the parent stops.
+        let RunOutcome::CostBudgetExceeded { cost_usd, .. } = out else {
+            panic!("{out:?}");
+        };
+        assert!((cost_usd - 0.12).abs() < 1e-3, "{cost_usd}");
+        let caps: Vec<f64> = [1, 2]
+            .iter()
+            .map(|n| {
+                crate::tools::task::sidecar::Sidecar::load(&dir.join(format!("subagents/task-{n}")))
+                    .unwrap()
+                    .cap_usd
+            })
+            .collect();
+        assert!(
+            (caps[0] - 0.10).abs() < 1e-9 && (caps[1] - 0.04).abs() < 1e-3,
+            "{caps:?}"
+        );
+        assert!(events.iter().any(|k| matches!(k,
+            EventKind::RunEnd { total_cost_usd, subagent_cost_usd, .. }
+                if (total_cost_usd - 0.12).abs() < 1e-3 && (subagent_cost_usd - 0.12).abs() < 1e-3)));
+        let settlements = |d: &std::path::Path| {
+            Ledger::read_all(d.join("ledger.jsonl"))
+                .iter()
+                .filter(|r| r.subagent.is_some())
+                .count()
+        };
+        assert_eq!(settlements(&dir), 2);
+        drop(agent);
+        let resumed = Agent::resume(provider, cfg, dir.clone()).unwrap();
+        assert!((resumed.ledger.total_cost_usd - 0.12).abs() < 1e-3);
+        assert_eq!(settlements(&dir), 2, "resume must not settle again");
+        assert_eq!(resumed.subagent_seq, 2);
     }
 
     /// P3.2: effort bumps one notch per stuck-detector trip.
@@ -3199,8 +3444,16 @@ mod tests {
         {
             let provider = Arc::new(Mock::new(vec![tool_turn(1), done()]));
             let mut agent = Agent::start(provider, cfg.clone(), dir.clone(), "s".into()).unwrap();
-            let bg = dir.join("subagents/bg-1");
+            let bg = dir.join("subagents/task-1");
             std::fs::create_dir_all(&bg).unwrap();
+            std::fs::write(
+                bg.join("task.json"),
+                serde_json::json!({"id": "task-1", "mode": "read", "tier": "light",
+                    "model": "m", "background": true, "worktree": null, "branch": null,
+                    "cap_usd": 0.25, "process_nonce": "x", "state": "done", "cost_usd": 0.0})
+                .to_string(),
+            )
+            .unwrap();
             std::fs::write(bg.join("done.txt"), "bg-1 digest").unwrap();
             let mut sink = |_: &Event| {};
             agent.run_turn("go", &mut sink).unwrap();

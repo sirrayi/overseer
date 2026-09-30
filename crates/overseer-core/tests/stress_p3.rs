@@ -73,7 +73,7 @@ fn task_ctx_at(cwd: &Path, session_dir: PathBuf, delay_ms: u64) -> ToolCtx<'stat
             full_access: true,
             ..Default::default()
         }),
-        subagent_seq: 0,
+        subagents: Default::default(),
         checkpoint: None,
         sandbox: false,
         broker: None,
@@ -81,14 +81,7 @@ fn task_ctx_at(cwd: &Path, session_dir: PathBuf, delay_ms: u64) -> ToolCtx<'stat
 }
 
 fn bg_in_flight(subagents_dir: &Path) -> usize {
-    std::fs::read_dir(subagents_dir)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("bg-"))
-                .filter(|e| !e.path().join("done.txt").exists())
-                .count()
-        })
-        .unwrap_or(0)
+    tools::task::sidecar::in_flight(subagents_dir)
 }
 
 // ── 3.7 repomap ─────────────────────────────────────────────────────────
@@ -336,13 +329,14 @@ fn bg_fanout_storm_8_attempts_4_slots() {
         }
     }
     eprintln!("fanout: {started} started / {refused} refused");
-    assert_eq!(started, tools::task::MAX_CONCURRENT_BG);
-    assert_eq!(refused, 8 - tools::task::MAX_CONCURRENT_BG);
+    let limit = AgentConfig::default().max_bg_subagents;
+    assert_eq!(started, limit);
+    assert_eq!(refused, 8 - limit);
     // All started tasks finish and free their slots.
     let deadline = Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let done = (1..=started).all(|i| {
-            dir.join(format!("session/subagents/bg-{i}/done.txt"))
+            dir.join(format!("session/subagents/task-{i}/done.txt"))
                 .exists()
         });
         if done || Instant::now() > deadline {
@@ -352,7 +346,7 @@ fn bg_fanout_storm_8_attempts_4_slots() {
     }
     for i in 1..=started {
         assert!(dir
-            .join(format!("session/subagents/bg-{i}/done.txt"))
+            .join(format!("session/subagents/task-{i}/done.txt"))
             .exists());
     }
     assert_eq!(bg_in_flight(&dir.join("session/subagents")), 0);
@@ -392,7 +386,7 @@ fn write_worktree_storm_isolation() {
     let t = Instant::now();
     for i in 1..=4u64 {
         let mut c = task_ctx_at(&dir, sess.join(format!("s{i}")), 0);
-        c.subagent_seq = i - 1;
+        c.subagents.seq = i - 1;
         let out = tools::task::run(&json!({"prompt": "w", "mode": "write"}), &mut c);
         assert!(!out.is_error, "iter {i}: {}", out.text);
         assert!(sess.join(format!("s{i}/subagents/wt-{i}/wt")).exists());
@@ -471,8 +465,13 @@ fn event_log_30k_mixed_kinds_replay() {
         match i % 7 {
             0 => {
                 log.append(EventKind::SubagentDone {
-                    task_id: format!("bg-{i}"),
+                    task_id: format!("task-{i}"),
                     trace: format!("/trace/{i}"),
+                    cost_usd: 0.0,
+                    tier: "light".into(),
+                    model: "m".into(),
+                    verdict: None,
+                    run: 1,
                 })
                 .unwrap();
             }
@@ -577,8 +576,13 @@ fn fork_storm_60_over_p3_log() {
         })
         .unwrap();
         log.append(EventKind::SubagentDone {
-            task_id: format!("bg-{i}"),
+            task_id: format!("task-{i}"),
             trace: "t".into(),
+            cost_usd: 0.0,
+            tier: "light".into(),
+            model: "m".into(),
+            verdict: None,
+            run: 1,
         })
         .unwrap();
         log.append(EventKind::Tainted { detail: "x".into() })
@@ -624,7 +628,7 @@ fn spill_1mb_tool_output() {
         spill_seq: 0,
         provider: None,
         agent_config: None,
-        subagent_seq: 0,
+        subagents: Default::default(),
         checkpoint: None,
         sandbox: false,
         broker: None,

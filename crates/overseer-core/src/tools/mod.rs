@@ -52,8 +52,8 @@ pub struct ToolCtx<'a> {
     pub provider: Option<std::sync::Arc<dyn crate::provider::Provider>>,
     /// Parent agent config for subagent inheritance (model, cwd, budgets).
     pub agent_config: Option<crate::agent::AgentConfig>,
-    /// Subagent spawn counter for session-dir naming.
-    pub subagent_seq: u64,
+    /// Session-monotonic spawn counter + the parent's spend account.
+    pub subagents: task::SubagentCtx,
     /// Active checkpoint for this user prompt (P1.9): write/edit snapshot
     /// files here before touching them. None = checkpointing off.
     pub checkpoint: Option<&'a mut Checkpoint>,
@@ -357,6 +357,17 @@ impl ToolRegistry {
             unavailable: Vec::new(),
             computer: computer::ComputerState::detect(),
         }
+    }
+
+    /// Verifier registry: the read-only tools plus `bash` (normal sandbox)
+    /// so a verify subagent can run the project's checks. Still no
+    /// `write`/`edit`/`task`; the engine's tamper check covers bash writes.
+    pub fn readonly_with_bash(policy: crate::perm::Policy) -> Self {
+        let mut r = Self::readonly(policy);
+        r.base_specs.push(bash::spec());
+        r.base_specs.sort_by(|a, b| a.name.cmp(&b.name));
+        r.specs = r.base_specs.clone();
+        r
     }
 
     /// Plan-mode registry (P1.4 capability removal): mutating tools aren't
@@ -1076,7 +1087,7 @@ mod tests {
             spill_seq: 0,
             provider: None,
             agent_config: None,
-            subagent_seq: 0,
+            subagents: Default::default(),
             checkpoint: None,
             sandbox: false,
             broker: None,
@@ -1324,10 +1335,11 @@ mod tests {
     /// Startup-token guard: every resident spec with every optional tool
     /// forced on (plus the `mcp` op tool). Post-trim measurement: 9,886
     /// chars (~2,471 tokens at ~4 chars/token); the S5 computer vocabulary
-    /// grew the computer spec from 1,102 to 1,828 chars. +5% headroom.
+    /// grew the computer spec from 1,102 to 1,828 chars. Subagent tiers
+    /// grew the task spec from 768 to 909 chars: 10,027. +5% headroom.
     #[test]
     fn resident_tool_specs_stay_within_the_startup_budget() {
-        const POST_TRIM_CHARS: usize = 9_886;
+        const POST_TRIM_CHARS: usize = 10_027;
         let mut reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL);
         reg.specs.push(mcp_tool::spec());
         for s in &reg.specs {
@@ -1629,7 +1641,7 @@ mod tests {
             spill_seq: 0,
             provider: None,
             agent_config: None,
-            subagent_seq: 0,
+            subagents: Default::default(),
             checkpoint: Some(&mut cp),
             sandbox: false,
             broker: None,
