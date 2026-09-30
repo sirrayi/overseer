@@ -104,10 +104,9 @@ The research behind every choice is in `docs/research/`:
 
 ## Local state
 
-- **Web app** on `127.0.0.1:8641` runs this checkout's `./target/debug/overseer` and resumes the demo session in `notes/2026-09-30-session/demo-session/`. The **logo sheet** on `127.0.0.1:8650` serves `notes/2026-09-30-session/brand/`.
-  - Find the processes: `lsof -nP -iTCP:8641 -iTCP:8650 -sTCP:LISTEN`.
-  - Stop them with `kill <pid>`.
-  - The tokenized URL for the web app is in `/tmp/overseer-web.log`, and the token itself is in `~/.overseer/web/token`.
+- **No local servers are running.** Both were stopped when the session ended.
+  - **Web app:** `cargo run -p overseer-cli -- web`. It prints a tokenized `http://127.0.0.1:<port>/#t=…` URL and opens it; the token is in `~/.overseer/web/token`. To reopen the demo session, add `--resume notes/2026-09-30-session/demo-session/1789920214220`.
+  - **Logo sheet:** `cd notes/2026-09-30-session/brand && python3 -m http.server 8650 --bind 127.0.0.1`.
 - **Leftovers outside this folder.** All are clean, fully pushed, and safe to delete whenever:
   - worktrees `~/.cache/overseer-{integrate,te,st,next}` (remove them with `git worktree remove`);
   - `~/.cache/overseer-cloud-launch`, an old clone used only to launch cloud sessions;
