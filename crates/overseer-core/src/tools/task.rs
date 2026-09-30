@@ -382,7 +382,12 @@ fn run_once(
         TaskMode::Verify if continuing => format!("{prompt}\n\n{}", verify::CONTRACT),
         TaskMode::Verify => match verify::brief(prompt, cwd, base.unwrap_or("HEAD")) {
             Ok(b) => b,
-            Err(e) => return Attempt::failed(e),
+            Err(e) => {
+                return Attempt {
+                    verdict: Some(verify::parse("")),
+                    ..Attempt::failed(e)
+                }
+            }
         },
         _ => prompt.to_string(),
     };
@@ -1737,6 +1742,30 @@ mod tests {
             out.is_error && out.text.contains("not write"),
             "{}",
             out.text
+        );
+    }
+
+    /// A verify that cannot even build its brief still carries the
+    /// uniform verdict line.
+    #[test]
+    fn verify_whose_brief_fails_reports_unknown() {
+        let dir = repo();
+        let mut c = ctx(&dir);
+        let out = run(&json!({"prompt": "w", "mode": "write"}), &mut c);
+        assert!(!out.is_error, "{}", out.text);
+        let wdir = dir.join("session/subagents/task-1");
+        let mut w = sc(&dir, "task-1");
+        w.base = Some("no-such-ref".into());
+        w.store(&wdir).unwrap();
+        let out = run(
+            &json!({"prompt": "check", "mode": "verify", "target": "task-1"}),
+            &mut c,
+        );
+        assert!(out.text.starts_with("verdict: unknown\n"), "{}", out.text);
+        assert!(out.text.contains("no-such-ref"), "{}", out.text);
+        assert_eq!(
+            Footer::parse(&out.text).unwrap().verdict.as_deref(),
+            Some("unknown")
         );
     }
 
