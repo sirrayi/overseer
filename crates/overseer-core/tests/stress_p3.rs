@@ -73,7 +73,13 @@ fn task_ctx_at(cwd: &Path, session_dir: PathBuf, delay_ms: u64) -> ToolCtx<'stat
             full_access: true,
             ..Default::default()
         }),
-        subagents: Default::default(),
+        subagents: tools::task::SubagentCtx {
+            seq: 0,
+            spend: Some(Arc::new(tools::task::SpendAccount::new(
+                AgentConfig::default().max_cost_usd,
+                0.0,
+            ))),
+        },
         checkpoint: None,
         sandbox: false,
         broker: None,

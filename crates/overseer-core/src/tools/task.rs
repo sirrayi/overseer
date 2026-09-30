@@ -783,8 +783,8 @@ fn spawn(prompt: &str, input: &Value, ctx: &mut ToolCtx) -> Result<String, Strin
     let account = ctx
         .subagents
         .spend
-        .get_or_insert_with(|| Arc::new(SpendAccount::new(parent.max_cost_usd, 0.0)))
-        .clone();
+        .clone()
+        .ok_or("no spend account in this tool context")?;
 
     let prior = str_arg("resume")
         .map(|id| load_task(&subagents_dir, id, "resume"))
@@ -1071,8 +1071,11 @@ mod tests {
             session_dir: dir.join("session"),
             spill_seq: 0,
             provider: Some(mock.clone()),
+            subagents: SubagentCtx {
+                seq: 0,
+                spend: Some(Arc::new(SpendAccount::new(cfg.max_cost_usd, 0.0))),
+            },
             agent_config: Some(cfg),
-            subagents: Default::default(),
             checkpoint: None,
             sandbox: false,
             broker: None,
@@ -1192,6 +1195,20 @@ mod tests {
         // The sidecar goes `done` before the marker: the slot is free.
         assert_eq!(sidecar::in_flight(&dir.join("session/subagents")), 0);
         assert!(sc(&dir, "task-1").background);
+    }
+
+    /// No spend account means no budget to draw from: refused, never a
+    /// fresh account that treats the parent's spend as zero.
+    #[test]
+    fn spawn_without_a_spend_account_is_refused() {
+        let dir = tmpdir();
+        let (mut c, mock) = ctx_with(&dir, vec![done_text("x")], cfg(&dir));
+        c.subagents.spend = None;
+        let out = run(&json!({"prompt": "p"}), &mut c);
+        assert!(out.is_error);
+        assert!(out.text.contains("no spend account"), "{}", out.text);
+        assert!(mock.seen.lock().unwrap().is_empty(), "nothing ran");
+        assert!(!dir.join("session/subagents/task-1").exists());
     }
 
     /// A panicking background thread must not strand a live-looking
