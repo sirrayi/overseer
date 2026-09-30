@@ -456,8 +456,12 @@ impl Agent {
                 _ => None,
             })
             .collect();
+        // The LAST SessionStart is this session's own id — a fork's log
+        // begins with the parent's SessionStart, so first-match would
+        // hand the resumed fork its parent's prompt-cache key.
         let cache_key = events
             .iter()
+            .rev()
             .find_map(|e| match &e.kind {
                 EventKind::SessionStart { session_id, .. } => Some(session_id.clone()),
                 _ => None,
@@ -3213,6 +3217,34 @@ mod tests {
             .filter(|m| m.text().contains("bg-1 digest"))
             .count();
         assert_eq!(copies, 1, "the notice appears exactly once in the view");
+    }
+
+    /// S1-review: a fork's log opens with the parent's SessionStart —
+    /// resume must take the LAST one or the fork borrows the parent's
+    /// prompt-cache key.
+    #[test]
+    fn resume_keys_prompt_cache_on_last_session_start() {
+        let parent = tmpdir();
+        let cfg = AgentConfig {
+            cwd: parent.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        {
+            let p = Arc::new(Mock::new(vec![done()]));
+            let mut a = Agent::start(p, cfg.clone(), parent.clone(), "parent-id".into()).unwrap();
+            let mut sink = |_: &Event| {};
+            a.run_turn("go", &mut sink).unwrap();
+        }
+        let fork_dir = tmpdir();
+        crate::session::fork(&parent, None, &fork_dir).unwrap();
+        let a = Agent::resume(Arc::new(Mock::new(vec![])), cfg, fork_dir.clone()).unwrap();
+        let want = fork_dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            a.cache_key.as_deref(),
+            Some(want.as_str()),
+            "resumed fork must not reuse the parent's cache key"
+        );
     }
 
     /// C2: a dirty memory dir at the turn boundary emits MemoryUpdated

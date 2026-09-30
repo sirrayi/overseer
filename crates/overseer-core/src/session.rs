@@ -281,6 +281,9 @@ pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::i
     };
     crate::harden::ensure_private_dir(new_dir)?;
     std::fs::write(new_dir.join("events.jsonl"), kept.join("\n") + "\n")?;
+    // A fork is a NEW session — fresh ledger (spend starts at 0), and
+    // resume's `Ledger::open` refuses a missing file outright.
+    crate::ledger::Ledger::create(new_dir.join("ledger.jsonl"))?;
 
     // Checkpoints at or before the boundary come along so rewind still
     // works inside the fork.
