@@ -92,7 +92,7 @@ mod tests {
             spill_seq: 0,
             provider: None,
             agent_config: None,
-            subagent_seq: 0,
+            subagents: Default::default(),
             checkpoint: cp,
             sandbox: false,
             broker: None,

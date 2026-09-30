@@ -300,7 +300,19 @@ pub fn tool_summary(name: &str, input: &serde_json::Value) -> String {
                 .map(|a| a.len())
                 .unwrap_or(0)
         ),
-        "task" => s("prompt").to_string(),
+        "task" => {
+            use overseer_core::tools::task::TaskMode;
+            let mode = input
+                .get("mode")
+                .and_then(|m| m.as_str())
+                .and_then(TaskMode::parse)
+                .unwrap_or(TaskMode::Read);
+            let tier = input
+                .get("tier")
+                .and_then(|t| t.as_str())
+                .unwrap_or(mode.default_tier().as_str());
+            format!("{} · {tier}: {}", mode.as_str(), s("prompt"))
+        }
         _ => serde_json::to_string(input).unwrap_or_default(),
     }
 }
@@ -444,12 +456,30 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
             text: crate::notice::memory_line(kind, notes, text),
             link: None,
         }]),
-        EventKind::SubagentDone { task_id: id, trace } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::meta(),
+        EventKind::SubagentDone {
+            task_id: id,
+            trace,
+            cost_usd,
+            tier,
+            model,
+            verdict,
+            ..
+        } => {
+            let mut text = format!("  ↳ subagent {id} finished");
+            if !model.is_empty() {
+                text.push_str(&format!(" · {tier} ({model}) · ${cost_usd:.4}"));
+            }
+            if let Some(v) = verdict {
+                text.push_str(&format!(" · verdict {v}"));
+            }
             // The trace dir goes into the OSC 8 link, not the text.
-            text: format!("  ↳ subagent {id} finished · trace"),
-            link: Some(std::path::PathBuf::from(trace)),
-        }]),
+            text.push_str(" · trace");
+            Feed::NewCells(vec![Cell::Meta {
+                style: theme::meta(),
+                text,
+                link: Some(std::path::PathBuf::from(trace)),
+            }])
+        }
         EventKind::Tainted { detail } => Feed::NewCells(vec![Cell::Meta {
             style: theme::warn(),
             text: format!("  ! {detail} — side effects now ask first"),
@@ -492,9 +522,16 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
             stop_reason,
             steps,
             total_cost_usd,
+            subagent_cost_usd,
             cache,
         } => Feed::NewCells(vec![Cell::End {
-            text: run_summary(*steps, run_elapsed, *total_cost_usd, cache),
+            text: run_summary(
+                *steps,
+                run_elapsed,
+                *total_cost_usd,
+                *subagent_cost_usd,
+                cache,
+            ),
             warn: abnormal_stop(stop_reason),
         }]),
         EventKind::TurnEnd { .. } => Feed::Ignore,
@@ -507,6 +544,7 @@ fn run_summary(
     steps: u32,
     elapsed: Option<std::time::Duration>,
     cost: f64,
+    subagents: f64,
     cache: &overseer_core::ledger::CacheStats,
 ) -> String {
     let mut s = format!("{steps} step{}", if steps == 1 { "" } else { "s" });
@@ -524,6 +562,9 @@ fn run_summary(
     }
     if cost >= 0.0005 {
         s.push_str(&format!(" · ${cost:.3}"));
+        if subagents >= 0.0005 {
+            s.push_str(&format!(" (subagents ${subagents:.3})"));
+        }
     }
     if cache.input_total() > 0 {
         s.push_str(&format!(" · {:.0}% cached", cache.hit_rate() * 100.0));
@@ -625,7 +666,7 @@ mod tests {
         use overseer_core::ledger::CacheStats;
         let zero = CacheStats::default();
         assert_eq!(
-            run_summary(2, None, 0.042, &zero),
+            run_summary(2, None, 0.042, 0.0, &zero),
             "2 steps · $0.042",
             "old-shape RunEnd (empty cache) keeps the L2 text"
         );
@@ -636,7 +677,7 @@ mod tests {
             output: 800,
         };
         assert_eq!(
-            run_summary(2, None, 0.042, &c),
+            run_summary(2, None, 0.042, 0.0, &c),
             "2 steps · $0.042 · 42% cached"
         );
         // Input billed but zero reads still shows — 0% is honest.
@@ -646,7 +687,7 @@ mod tests {
             cache_write: 0,
             output: 5,
         };
-        assert!(run_summary(1, None, 0.0, &c).ends_with("· 0% cached"));
+        assert!(run_summary(1, None, 0.0, 0.0, &c).ends_with("· 0% cached"));
     }
 
     #[test]

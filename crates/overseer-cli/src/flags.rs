@@ -24,6 +24,7 @@ pub(crate) struct ExecFlags {
     pub(crate) thinking: Option<u32>,
     pub(crate) effort: Option<overseer_core::provider::Effort>,
     pub(crate) small_model: Option<String>,
+    pub(crate) heavy_model: Option<String>,
     pub(crate) full_access: bool,
     pub(crate) policy: overseer_core::perm::Preset,
     pub(crate) auto_compact: bool,
@@ -75,6 +76,7 @@ pub(crate) const EXEC_FLAGS: &[Flag] = &[
     Flag::value(&["--thinking"]),
     Flag::value(&["--effort"]),
     Flag::value(&["--small-model"]),
+    Flag::value(&["--heavy-model"]),
     Flag::switch(&["--full-access"]),
     Flag::value(&["--policy"]),
     Flag::value(&["--compact-at"]),
@@ -117,6 +119,7 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
         thinking: None,
         effort: None,
         small_model: None,
+        heavy_model: None,
         full_access: false,
         policy: overseer_core::perm::Preset::WorkspaceWrite,
         auto_compact: true,
@@ -178,6 +181,7 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
                 )
             }
             "--small-model" => f.small_model = Some(v.clone()),
+            "--heavy-model" => f.heavy_model = Some(v.clone()),
             "--full-access" => f.full_access = true,
             "--policy" => {
                 f.policy = match v.as_str() {
@@ -269,6 +273,17 @@ mod tests {
             dir.starts_with(std::env::temp_dir()),
             "bare session must live in temp: {}",
             dir.display()
+        );
+    }
+
+    #[test]
+    fn heavy_model_flag_reaches_agent_config() {
+        let f =
+            parse_exec(&["--heavy-model".into(), "claude-opus-4-8".into(), "x".into()]).unwrap();
+        assert_eq!(f.heavy_model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(
+            agent_config(&f).heavy_model.as_deref(),
+            Some("claude-opus-4-8")
         );
     }
 

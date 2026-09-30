@@ -3,7 +3,7 @@
 //! fairness feature depends on this table. Re-verify prices at build time —
 //! the appendix flags all pricing as volatile (monthly churn).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Prices in USD per 1M tokens.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -123,6 +123,9 @@ const FALLBACK_PARAMS: &[&str] = &[
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelProfile {
     pub id: &'static str,
+    /// Provider family (`anthropic`, `deepseek`, `muse`; `unknown` for the
+    /// fallback) — subagent tiers only route within one family.
+    pub family: &'static str,
     /// Aliases/prefixes that resolve to this profile (snapshot IDs, short names).
     pub match_prefixes: &'static [&'static str],
     pub context_in: u32,
@@ -159,6 +162,7 @@ impl ModelProfile {
 static PROFILES: &[ModelProfile] = &[
     ModelProfile {
         id: "claude-fable-5",
+        family: "anthropic",
         match_prefixes: &["claude-fable-5", "claude-mythos-5"],
         context_in: 200_000,
         max_output: 64_000,
@@ -174,6 +178,7 @@ static PROFILES: &[ModelProfile] = &[
     },
     ModelProfile {
         id: "claude-opus-4-8",
+        family: "anthropic",
         match_prefixes: &[
             "claude-opus-4-8",
             "claude-opus-4-7",
@@ -194,6 +199,7 @@ static PROFILES: &[ModelProfile] = &[
     },
     ModelProfile {
         id: "claude-sonnet-5",
+        family: "anthropic",
         match_prefixes: &["claude-sonnet-5"],
         context_in: 200_000,
         max_output: 64_000,
@@ -209,6 +215,7 @@ static PROFILES: &[ModelProfile] = &[
     },
     ModelProfile {
         id: "claude-sonnet-4-5",
+        family: "anthropic",
         match_prefixes: &["claude-sonnet-4-5", "claude-sonnet-4-6"],
         context_in: 200_000,
         max_output: 64_000,
@@ -228,6 +235,7 @@ static PROFILES: &[ModelProfile] = &[
     // reason → max_output keeps headroom for thinking traces.
     ModelProfile {
         id: "deepseek-v4.1-flash",
+        family: "deepseek",
         match_prefixes: &["deepseek-v4.1-flash", "deepseek-v4-flash"],
         context_in: 131_072,
         max_output: 16_384,
@@ -245,6 +253,7 @@ static PROFILES: &[ModelProfile] = &[
     // the opencode provider arm routes muse-* to provider/responses.rs.
     ModelProfile {
         id: "muse-spark-1.3-contributor",
+        family: "muse",
         match_prefixes: &["muse-spark-1.3-contributor", "muse-spark-1.2-contributor"],
         context_in: 131_072,
         max_output: 16_384,
@@ -260,6 +269,7 @@ static PROFILES: &[ModelProfile] = &[
     },
     ModelProfile {
         id: "claude-haiku-4-5",
+        family: "anthropic",
         match_prefixes: &["claude-haiku-4-5"],
         context_in: 200_000,
         max_output: 64_000,
@@ -279,6 +289,7 @@ static PROFILES: &[ModelProfile] = &[
 /// priced at a mid-tier estimate, flagged for re-verification.
 static FALLBACK: ModelProfile = ModelProfile {
     id: "unknown",
+    family: "unknown",
     match_prefixes: &[],
     context_in: 200_000,
     max_output: 32_000,
@@ -292,6 +303,80 @@ static FALLBACK: ModelProfile = ModelProfile {
         output: 15.0,
     },
 };
+
+/// Subagent model tier (light < standard < heavy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    Light,
+    Standard,
+    Heavy,
+}
+
+impl Tier {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "light" => Some(Tier::Light),
+            "standard" => Some(Tier::Standard),
+            "heavy" => Some(Tier::Heavy),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Light => "light",
+            Tier::Standard => "standard",
+            Tier::Heavy => "heavy",
+        }
+    }
+
+    /// One tier up; `None` at the top.
+    pub fn up(self) -> Option<Self> {
+        match self {
+            Tier::Light => Some(Tier::Standard),
+            Tier::Standard => Some(Tier::Heavy),
+            Tier::Heavy => None,
+        }
+    }
+}
+
+/// The table's light (lowest input price) or heavy (highest) row for
+/// `family`; ties go to the earlier row. `None` for `Standard` (that tier
+/// is the parent's own model) and for families with fewer than two priced
+/// (input > 0) rows.
+pub fn tier_model(family: &str, tier: Tier) -> Option<&'static str> {
+    let priced: Vec<&ModelProfile> = PROFILES
+        .iter()
+        .filter(|p| p.family == family && p.price.input > 0.0)
+        .collect();
+    if priced.len() < 2 {
+        return None;
+    }
+    let pick = |better: fn(f64, f64) -> bool| {
+        priced.iter().copied().reduce(|best, p| {
+            if better(p.price.input, best.price.input) {
+                p
+            } else {
+                best
+            }
+        })
+    };
+    match tier {
+        Tier::Light => pick(|a, b| a < b),
+        Tier::Heavy => pick(|a, b| a > b),
+        Tier::Standard => None,
+    }
+    .map(|p| p.id)
+}
+
+/// True when `a` and `b` can share one provider instance: same profile
+/// family AND the same wire transport — the opencode provider picks its
+/// adapter from the model id (`muse-*` → Responses, else chat
+/// completions), so a muse/non-muse pair never shares a transport.
+pub fn same_transport(a: &str, b: &str) -> bool {
+    lookup(a).family == lookup(b).family && a.starts_with("muse-") == b.starts_with("muse-")
+}
 
 /// True when `model` accepts the optional wire param `param` (wire-spelled:
 /// Anthropic snake_case, Gemini camelCase). Unknown models consult FALLBACK
@@ -365,6 +450,32 @@ pub fn edit_format(model: &str) -> EditFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier_model_pins_anthropic_rows_and_skips_thin_families() {
+        assert_eq!(
+            tier_model("anthropic", Tier::Light),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(tier_model("anthropic", Tier::Heavy), Some("claude-fable-5"));
+        assert_eq!(tier_model("anthropic", Tier::Standard), None);
+        for fam in ["deepseek", "muse", "unknown"] {
+            assert_eq!(tier_model(fam, Tier::Light), None, "{fam}");
+            assert_eq!(tier_model(fam, Tier::Heavy), None, "{fam}");
+        }
+        assert_eq!(lookup("gpt-9").family, "unknown");
+        assert_eq!(Tier::Light.up(), Some(Tier::Standard));
+        assert_eq!(Tier::Heavy.up(), None);
+    }
+
+    #[test]
+    fn same_transport_needs_family_and_wire_class() {
+        assert!(same_transport("claude-sonnet-5", "claude-haiku-4-5"));
+        assert!(!same_transport("claude-sonnet-5", "deepseek-v4.1-flash"));
+        // Both `unknown`, but muse-* rides Responses on opencode.
+        assert!(!same_transport("gpt-9", "muse-next"));
+        assert!(same_transport("gpt-9", "gpt-9-mini"));
+    }
     use crate::ir::Usage;
 
     #[test]

@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::ir::{Block, Usage};
 
+fn first_run() -> u32 {
+    1
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -81,6 +85,10 @@ pub enum EventKind {
         /// pre-extension logs, hence `default`.
         #[serde(default)]
         cache: crate::ledger::CacheStats,
+        /// Settled subagent share of `total_cost_usd` (session-cumulative
+        /// like it). Absent on pre-extension logs.
+        #[serde(default)]
+        subagent_cost_usd: f64,
     },
     /// A background subagent finished (P3.4 fire-and-notify): its bounded
     /// digest is injected as a user message at the next step boundary;
@@ -90,6 +98,21 @@ pub enum EventKind {
         /// serde flatten.
         task_id: String,
         trace: String,
+        /// This run's spend, model tier and model; the parent ledger's
+        /// settlement row is the accounting record, these are for display.
+        #[serde(default)]
+        cost_usd: f64,
+        #[serde(default)]
+        tier: String,
+        #[serde(default)]
+        model: String,
+        /// Verify verdict (verify tasks and verified writers).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verdict: Option<String>,
+        /// Which run of the task this notice closes (a resumed task runs
+        /// again); picks the run's done marker. Pre-extension logs: 1.
+        #[serde(default = "first_run")]
+        run: u32,
     },
     /// A Rule-of-Two taint latch flipped (P3.10): untrusted content or
     /// sensitive data entered context. Audit-only — does not rehydrate
@@ -591,9 +614,15 @@ pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
             }
             // Background-subagent notices rehydrate as user text — same
             // pairing position as the live drain (after tool results).
-            EventKind::SubagentDone { task_id: id, trace } => {
+            EventKind::SubagentDone {
+                task_id: id,
+                trace,
+                run,
+                ..
+            } => {
                 flush_results(&mut pending_results, &mut messages);
-                let digest = std::fs::read_to_string(std::path::Path::new(trace).join("done.txt"))
+                let marker = crate::tools::task::done_marker(*run);
+                let digest = std::fs::read_to_string(std::path::Path::new(trace).join(marker))
                     .unwrap_or_else(|_| "(digest missing)".into());
                 messages.push(Message::user_text(format!(
                     "[subagent {id} finished]\n{digest}"

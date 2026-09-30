@@ -56,8 +56,8 @@ pub struct ToolCtx<'a> {
     pub provider: Option<std::sync::Arc<dyn crate::provider::Provider>>,
     /// Parent agent config for subagent inheritance (model, cwd, budgets).
     pub agent_config: Option<crate::agent::AgentConfig>,
-    /// Subagent spawn counter for session-dir naming.
-    pub subagent_seq: u64,
+    /// Session-monotonic spawn counter + the parent's spend account.
+    pub subagents: task::SubagentCtx,
     /// Active checkpoint for this user prompt (P1.9): write/edit snapshot
     /// files here before touching them. None = checkpointing off.
     pub checkpoint: Option<&'a mut Checkpoint>,
@@ -442,6 +442,17 @@ impl ToolRegistry {
             script_calls: Vec::new(),
             control: Default::default(),
         }
+    }
+
+    /// Verifier registry: the read-only tools plus `bash` (normal sandbox)
+    /// so a verify subagent can run the project's checks. Still no
+    /// `write`/`edit`/`task`; the engine's tamper check covers bash writes.
+    pub fn readonly_with_bash(policy: crate::perm::Policy) -> Self {
+        let mut r = Self::readonly(policy);
+        r.base_specs.push(bash::spec());
+        r.base_specs.sort_by(|a, b| a.name.cmp(&b.name));
+        r.specs = r.base_specs.clone();
+        r
     }
 
     /// Plan-mode registry (P1.4 capability removal): mutating tools aren't
@@ -1240,7 +1251,7 @@ mod tests {
             spill_seq: 0,
             provider: None,
             agent_config: None,
-            subagent_seq: 0,
+            subagents: Default::default(),
             checkpoint: None,
             sandbox: false,
             broker: None,
@@ -1488,9 +1499,10 @@ mod tests {
     /// Startup-token guard: the advertised array with every optional tool
     /// available, MCP configured and skills present. The deferred tools
     /// ride behind `tools`, so only the resident set counts: 9,886 chars
-    /// before deferral; tool economy measured 5,375 and memory v2's
-    /// `memory` spec adds 552 (5,927). ≤ 6,000 is the budget, and the exact total
-    /// is pinned with +5% headroom.
+    /// before deferral; tool economy measured 5,375, memory v2's `memory`
+    /// spec adds 552 and subagent tiers' `task` spec nets RESIDENT_CHARS.
+    /// ≤ 6,000 is the budget, and the exact total is pinned with +5%
+    /// headroom.
     #[test]
     fn resident_tool_specs_stay_within_the_startup_budget() {
         const BUDGET_CHARS: usize = 6_000;
@@ -1824,7 +1836,7 @@ mod tests {
             spill_seq: 0,
             provider: None,
             agent_config: None,
-            subagent_seq: 0,
+            subagents: Default::default(),
             checkpoint: Some(&mut cp),
             sandbox: false,
             broker: None,
