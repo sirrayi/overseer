@@ -609,7 +609,7 @@ fn run_capture(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Valu
         "sent_h": sent_h,
         "pre": pre,
         "post": sha,
-        "note": "send coordinates in the sent frame (sent_w x sent_h); they are scaled to native pixels (image not persisted across resume)",
+        "note": "give x/y in the frame you were shown (sent_w x sent_h); they are mapped to native pixels (px_w x px_h) (image not persisted across resume)",
     }))
 }
 
@@ -1027,8 +1027,8 @@ pub fn spec() -> crate::provider::ToolSpec {
             "'observe' lists elements (index as 'element'); 'screenshot'/'zoom' image it; ",
             "'click'/'type'/'key'/'set'/'scroll'/'drag'/'menu'/'launch' act; 'verify' checks ",
             "predicates; 'browser*'/'navigate' drive tabs via 'tab'/'ref'; 'batch' runs ≤32 actions. ",
-            "x/y are pixels of the image you saw, passed verbatim in the driver's frame; after ",
-            "'zoom' they are crop pixels the driver maps back (from_zoom). Nothing is screenshotted ",
+            "give x/y in the frame you were shown; they are mapped into the driver's pixel space. ",
+            "After 'zoom', x/y are crop pixels the driver maps back (from_zoom). Nothing is screenshotted ",
             "implicitly; a suppressed capture returns metadata only; credential fields are never ",
             "typed into."
         )
@@ -1566,6 +1566,11 @@ mod tests {
             assert!(desc.contains(needle), "{needle} missing: {desc}");
         }
         assert!(!desc.contains("scaled for you"), "{desc}");
+        assert!(!desc.contains("verbatim"), "{desc}");
+        assert!(
+            desc.contains("give x/y in the frame you were shown; they are mapped into the driver's pixel space"),
+            "{desc}"
+        );
         assert!(crate::prompt::boundary_ok(&segs));
         for s in &segs {
             if s.cacheable {
