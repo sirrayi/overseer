@@ -924,10 +924,14 @@ fn valid_pointer(name: &str) -> bool {
 /// in the memory root first, then each layer subdir. None when the
 /// pointer is invalid or no backing file exists.
 fn resolve_pointer(dir: &Path, name: &str) -> Option<String> {
+    resolve_pointer_with(name, |rel| dir.join(rel).is_file())
+}
+
+fn resolve_pointer_with(name: &str, is_file: impl Fn(&str) -> bool) -> Option<String> {
     if !valid_pointer(name) {
         return None;
     }
-    if dir.join(name).is_file() {
+    if is_file(name) {
         return Some(name.to_string());
     }
     if name.contains('/') {
@@ -936,7 +940,7 @@ fn resolve_pointer(dir: &Path, name: &str) -> Option<String> {
     Layer::ALL
         .iter()
         .map(|l| format!("{}/{name}", l.name()))
-        .find(|rel| dir.join(rel).is_file())
+        .find(|rel| is_file(rel))
 }
 
 /// Identity of a pointer for "same topic?" comparisons: its resolved
@@ -1823,6 +1827,15 @@ fn resident_within(stores: &[(Scope, PathBuf)], now: u64, cap: usize) -> String 
 /// kept. Liveness is the caller's call.
 pub(crate) fn pointer_lines(dir: &Path) -> Vec<(String, String)> {
     let index = std::fs::read_to_string(dir.join(INDEX_NAME)).unwrap_or_default();
+    pointer_lines_in(&index, |rel| dir.join(rel).is_file())
+}
+
+/// [`pointer_lines`] over INDEX text `index`, with `is_topic(rel)` saying
+/// which store-relative topic files exist.
+pub(crate) fn pointer_lines_in(
+    index: &str,
+    is_topic: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for line in index.lines() {
@@ -1832,7 +1845,7 @@ pub(crate) fn pointer_lines(dir: &Path) -> Vec<(String, String)> {
         let Some(name) = topic_name(line) else {
             continue;
         };
-        let Some(rel) = resolve_pointer(dir, name) else {
+        let Some(rel) = resolve_pointer_with(name, &is_topic) else {
             continue;
         };
         if !seen.insert(rel.clone()) {

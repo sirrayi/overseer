@@ -156,15 +156,8 @@ impl MemoryState {
         if self.recall {
             if let Some(n) = notice::recall(idx, text, &self.recalled, now) {
                 for id in &n.notes {
-                    if let Some(d) = idx.find(id) {
-                        let dir = self
-                            .stores
-                            .iter()
-                            .find(|(s, _)| *s == d.scope)
-                            .map(|(_, p)| p);
-                        if let Some(dir) = dir {
-                            let _ = activation::record(dir, &d.rel, now);
-                        }
+                    if let Some(i) = idx.position(id) {
+                        let _ = idx.record_use(i, now);
                     }
                 }
                 self.recalled.extend(n.notes.iter().cloned());
@@ -266,11 +259,12 @@ impl MemoryState {
 
     fn get(&mut self, name: &str, now: u64) -> ToolOutput {
         let idx = fresh(&mut self.index, &self.stores, now);
-        let Some(d) = idx.find(name) else {
+        let Some(i) = idx.position(name) else {
             return ToolOutput::err(format!(
                 "memory: no current note named `{name}` — search first."
             ));
         };
+        let d = &idx.docs[i];
         let Ok(text) = std::fs::read_to_string(&d.path) else {
             return ToolOutput::err(format!("memory: cannot read {}", d.id()));
         };
@@ -278,10 +272,8 @@ impl MemoryState {
         if body.len() < text.len() {
             body.push_str(&format!("\n… [truncated at {GET_CAP} chars]"));
         }
-        let (id, scope, rel) = (d.id(), d.scope, d.rel.clone());
-        if let Some(dir) = self.dir(scope) {
-            let _ = activation::record(dir, &rel, now);
-        }
+        let id = d.id();
+        let _ = idx.record_use(i, now);
         ToolOutput::ok(format!("{id}\n{body}"))
     }
 

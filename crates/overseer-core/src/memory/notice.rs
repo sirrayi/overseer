@@ -34,7 +34,7 @@ pub struct Notice {
 }
 
 /// A prospective note's `trigger:`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Trigger {
     /// `at:<rfc3339>` — due once now ≥ t (checked on user input).
     At(u64),
@@ -156,11 +156,11 @@ pub fn due(idx: &Index, ev: &Event, now: u64) -> Vec<usize> {
         .enumerate()
         .filter(|(_, d)| d.layer() == Some(Layer::Prospective) && d.meta.fired.is_none())
         .filter(|(_, d)| {
-            let Some(Ok(trigger)) = d.meta.trigger.as_deref().map(Trigger::parse) else {
+            let Some(trigger) = &d.trigger else {
                 return false;
             };
             match (trigger, ev) {
-                (Trigger::At(t), Event::Input(_)) => now >= t,
+                (Trigger::At(t), Event::Input(_)) => now >= *t,
                 (Trigger::Kw(terms), Event::Input(_)) => terms.iter().any(|t| tokens.contains(t)),
                 (Trigger::Path(glob), Event::Path(p)) => glob.is_match(p),
                 _ => false,

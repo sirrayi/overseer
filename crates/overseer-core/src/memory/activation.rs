@@ -41,7 +41,7 @@ impl Uses {
         }
     }
 
-    fn add(&mut self, t: u64) {
+    pub(crate) fn add(&mut self, t: u64) {
         self.n += 1;
         self.first = self.first.min(t);
         let at = self
