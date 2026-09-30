@@ -1263,6 +1263,7 @@ pub fn consolidate(
         thinking_budget: None,
         effort: Some(crate::provider::Effort::Min),
         cache_breakpoints: false,
+        cache_key: None,
     };
     let resp = provider
         .complete(&req)

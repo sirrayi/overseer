@@ -15,14 +15,6 @@ pub struct PriceTable {
     pub output: f64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct ReasoningSpec {
-    /// Whether the model supports a thinking/reasoning budget at all.
-    pub supported: bool,
-    /// Provider-specific max for thinking budget_tokens; must stay < max_output.
-    pub min_budget: u32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum EditFormat {
     /// Anchored search/replace (the harness `edit` tool's native form).
@@ -84,6 +76,7 @@ const OPENAI_PARAMS: &[&str] = &[
     "presence_penalty",
     "max_tokens",
     "reasoning_effort",
+    "prompt_cache_key",
 ];
 
 /// Full Gemini set (generationConfig-spelled). Same note as OPENAI_PARAMS.
@@ -96,10 +89,12 @@ const GEMINI_PARAMS: &[&str] = &[
     "thinkingConfig",
 ];
 
-/// Conservative vLLM subset for the hosted open-model rows: sampling knobs
-/// only. vLLM ignores unknown fields, but reasoning_effort is
-/// gateway-specific — stripped fail-closed until the gateway documents it.
-const FLEET_PARAMS: &[&str] = &[
+/// Conservative gateway subset (opencode / vLLM-style servers) for the
+/// hosted open-model rows: sampling knobs
+/// only. vLLM ignores unknown fields, but reasoning_effort and
+/// prompt_cache_key are OpenAI-specific — stripped fail-closed until the
+/// gateway documents them.
+const GATEWAY_PARAMS: &[&str] = &[
     "temperature",
     "top_p",
     "frequency_penalty",
@@ -118,6 +113,7 @@ const FALLBACK_PARAMS: &[&str] = &[
     "presence_penalty",
     "max_tokens",
     "reasoning_effort",
+    "prompt_cache_key",
     "topP",
     "topK",
     "maxOutputTokens",
@@ -131,10 +127,6 @@ pub struct ModelProfile {
     pub match_prefixes: &'static [&'static str],
     pub context_in: u32,
     pub max_output: u32,
-    pub vision: bool,
-    pub parallel_calls: bool,
-    /// Reasoning/thinking support for the Anthropic family regime.
-    pub reasoning: ReasoningSpec,
     /// Compaction trigger as a fraction of `context_in` — the *effective*
     /// window, not the advertised one (playbook Ch.3 §9.2: Claude ~0.83,
     /// Codex ~0.9–0.95, Gemini 0.5; tune down for weak-retrieval models).
@@ -170,12 +162,6 @@ static PROFILES: &[ModelProfile] = &[
         match_prefixes: &["claude-fable-5", "claude-mythos-5"],
         context_in: 200_000,
         max_output: 64_000,
-        vision: true,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 1024,
-        },
         compact_at: 0.83,
         edit_format: EditFormat::SearchReplace,
         accepted_params: ANTHROPIC_PARAMS,
@@ -196,12 +182,6 @@ static PROFILES: &[ModelProfile] = &[
         ],
         context_in: 200_000,
         max_output: 64_000,
-        vision: true,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 1024,
-        },
         compact_at: 0.83,
         edit_format: EditFormat::SearchReplace,
         accepted_params: ANTHROPIC_PARAMS,
@@ -217,12 +197,6 @@ static PROFILES: &[ModelProfile] = &[
         match_prefixes: &["claude-sonnet-5"],
         context_in: 200_000,
         max_output: 64_000,
-        vision: true,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 1024,
-        },
         compact_at: 0.83,
         edit_format: EditFormat::SearchReplace,
         accepted_params: ANTHROPIC_PARAMS,
@@ -238,12 +212,6 @@ static PROFILES: &[ModelProfile] = &[
         match_prefixes: &["claude-sonnet-4-5", "claude-sonnet-4-6"],
         context_in: 200_000,
         max_output: 64_000,
-        vision: true,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 1024,
-        },
         compact_at: 0.83,
         edit_format: EditFormat::SearchReplace,
         accepted_params: ANTHROPIC_PARAMS,
@@ -254,7 +222,7 @@ static PROFILES: &[ModelProfile] = &[
             output: 15.0,
         },
     },
-    // --- opencode Go fleet (opencode.ai/zen/go, subscription, Sept 2026) ---
+    // --- opencode Go gateway (opencode.ai/zen/go, subscription, Sept 2026) ---
     // Context windows unpublished → conservative defaults, $0 cost
     // (subscription-included; the endpoint reports cost "0"). Both rows
     // reason → max_output keeps headroom for thinking traces.
@@ -263,15 +231,9 @@ static PROFILES: &[ModelProfile] = &[
         match_prefixes: &["deepseek-v4.1-flash", "deepseek-v4-flash"],
         context_in: 131_072,
         max_output: 16_384,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
         compact_at: 0.70,
         edit_format: EditFormat::Diff,
-        accepted_params: FLEET_PARAMS,
+        accepted_params: GATEWAY_PARAMS,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -286,15 +248,9 @@ static PROFILES: &[ModelProfile] = &[
         match_prefixes: &["muse-spark-1.3-contributor", "muse-spark-1.2-contributor"],
         context_in: 131_072,
         max_output: 16_384,
-        vision: false,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 0,
-        },
         compact_at: 0.70,
         edit_format: EditFormat::Diff,
-        accepted_params: FLEET_PARAMS,
+        accepted_params: GATEWAY_PARAMS,
         price: PriceTable {
             input: 0.0,
             cache_read: 0.0,
@@ -307,12 +263,6 @@ static PROFILES: &[ModelProfile] = &[
         match_prefixes: &["claude-haiku-4-5"],
         context_in: 200_000,
         max_output: 64_000,
-        vision: true,
-        parallel_calls: true,
-        reasoning: ReasoningSpec {
-            supported: true,
-            min_budget: 1024,
-        },
         compact_at: 0.83,
         edit_format: EditFormat::SearchReplace,
         accepted_params: ANTHROPIC_PARAMS,
@@ -332,12 +282,6 @@ static FALLBACK: ModelProfile = ModelProfile {
     match_prefixes: &[],
     context_in: 200_000,
     max_output: 32_000,
-    vision: false,
-    parallel_calls: true,
-    reasoning: ReasoningSpec {
-        supported: true,
-        min_budget: 1024,
-    },
     compact_at: 0.80,
     edit_format: EditFormat::SearchReplace,
     accepted_params: FALLBACK_PARAMS,

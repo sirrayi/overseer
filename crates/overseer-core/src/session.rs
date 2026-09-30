@@ -33,31 +33,47 @@ pub struct SessionInfo {
 /// activity first. Tolerates torn/missing logs — a directory without a
 /// readable events.jsonl is skipped, not fatal.
 pub fn list(root: &Path) -> Vec<SessionInfo> {
+    list_with_warnings(root).0
+}
+
+/// [`list`], plus one warning per session skipped because its
+/// `events.jsonl` has a corrupt non-final line (the logs
+/// `EventLog::replay` refuses to resume). A corrupt session never fails
+/// the whole listing; frontends decide whether to print the warnings.
+pub fn list_with_warnings(root: &Path) -> (Vec<SessionInfo>, Vec<String>) {
     let mut out = Vec::new();
+    let mut warnings = Vec::new();
     let Ok(dirs) = std::fs::read_dir(root) else {
-        return out;
+        return (out, warnings);
     };
     for entry in dirs.flatten() {
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
         }
-        if let Some(info) = summarize(&dir) {
-            out.push(info);
+        match summarize(&dir) {
+            Ok(Some(info)) => out.push(info),
+            Ok(None) => {}
+            Err(w) => warnings.push(w),
         }
     }
     out.sort_by_key(|s| std::cmp::Reverse(s.last_ms));
-    out
+    (out, warnings)
 }
 
-/// Sessions whose recorded cwd matches `cwd` exactly (canonicalized
-/// comparison — both sides already absolute in practice).
+/// Sessions whose recorded cwd matches `cwd` (canonicalized comparison
+/// on both sides, falling back to the raw path when canonicalize fails —
+/// e.g. a workspace that no longer exists).
 pub fn for_cwd(root: &Path, cwd: &Path) -> Vec<SessionInfo> {
-    let want = cwd.to_string_lossy();
+    let want = canonical_or_raw(cwd);
     list(root)
         .into_iter()
-        .filter(|s| s.cwd == want.as_ref())
+        .filter(|s| canonical_or_raw(Path::new(&s.cwd)) == want)
         .collect()
+}
+
+fn canonical_or_raw(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// The `/tree` navigator's ordering: DFS over the fork forest —
@@ -95,11 +111,10 @@ pub fn tree(root: &Path) -> Vec<(SessionInfo, usize)> {
 /// The most recently active session dir — `--last` (any cwd) or
 /// `--continue` (scoped to cwd).
 pub fn most_recent(root: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
-    let mut candidates = list(root);
-    if let Some(cwd) = cwd {
-        let want = cwd.to_string_lossy().into_owned();
-        candidates.retain(|s| s.cwd == want);
-    }
+    let candidates = match cwd {
+        Some(cwd) => for_cwd(root, cwd),
+        None => list(root),
+    };
     candidates.into_iter().next().map(|s| s.dir)
 }
 
@@ -122,20 +137,34 @@ pub fn checkpoints(session_dir: &Path) -> Vec<u64> {
     cps
 }
 
-fn summarize(dir: &Path) -> Option<SessionInfo> {
+/// `Ok(None)`: no readable log (skipped silently, as before). `Err`: a
+/// warning naming a corrupt non-final line.
+fn summarize(dir: &Path) -> Result<Option<SessionInfo>, String> {
     let events_path = dir.join("events.jsonl");
     // Cap the parse work: sessions can grow large; the header + a tail
     // slice cover everything the picker needs.
     const CAP: u64 = 4 * 1024 * 1024;
-    let meta = std::fs::metadata(&events_path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let text = if meta.len() <= CAP {
-        std::fs::read_to_string(&events_path).ok()?
-    } else {
-        head_and_tail(&events_path)?
+    let Ok(meta) = std::fs::metadata(&events_path) else {
+        return Ok(None);
     };
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let sliced = meta.len() > CAP;
+    let text = if sliced {
+        head_and_tail(&events_path)
+    } else {
+        std::fs::read_to_string(&events_path).ok()
+    };
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    let last_nonempty = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .map(|(i, _)| i)
+        .last();
     let mut info = SessionInfo {
         dir: dir.to_path_buf(),
         id: dir
@@ -151,8 +180,17 @@ fn summarize(dir: &Path) -> Option<SessionInfo> {
         checkpoints: checkpoints(dir),
         parent: None,
     };
-    for line in text.lines() {
+    for (i, line) in text.lines().enumerate() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            // Only a full read can prove a corrupt middle line — a sliced
+            // read cuts lines at its seams; a torn tail is tolerated.
+            if !sliced && !line.trim().is_empty() && Some(i) != last_nonempty {
+                return Err(format!(
+                    "skipping session {}: corrupt events.jsonl line {}",
+                    dir.display(),
+                    i + 1
+                ));
+            }
             continue;
         };
         info.events += 1;
@@ -195,9 +233,9 @@ fn summarize(dir: &Path) -> Option<SessionInfo> {
         }
     }
     if info.events == 0 {
-        return None;
+        return Ok(None);
     }
-    Some(info)
+    Ok(Some(info))
 }
 
 /// First 32 KiB + last 32 KiB of a large log — enough for SessionStart,
@@ -259,7 +297,7 @@ pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::i
     // A fork is a new session: append a fresh SessionStart (the parent's
     // stays in the copied history as provenance). The id comes from the
     // new dirname; cwd/model inherit the parent's last SessionStart.
-    let events = EventLog::replay(new_dir.join("events.jsonl")).unwrap_or_default();
+    let events = EventLog::replay(new_dir.join("events.jsonl"))?;
     // The parent's identity comes from ITS LAST SessionStart — in a
     // previously-forked log, earlier starts belong to grandparents.
     let parent_start = events.iter().rev().find_map(|e| match &e.kind {
@@ -271,25 +309,24 @@ pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::i
         } => Some((session_id.clone(), cwd.clone(), model.clone())),
         _ => None,
     });
-    if let Ok(mut log) = EventLog::open(new_dir.join("events.jsonl")) {
-        let (parent_id, cwd, model) =
-            parent_start.unwrap_or_else(|| (String::new(), String::new(), String::new()));
-        let id = new_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "fork".into());
-        let _ = log.append(EventKind::SessionStart {
-            session_id: id,
-            cwd,
-            model,
-            harness_version: env!("CARGO_PKG_VERSION").to_string(),
-            parent: if parent_id.is_empty() {
-                None
-            } else {
-                Some(parent_id)
-            },
-        });
-    }
+    let mut log = EventLog::open(new_dir.join("events.jsonl"))?;
+    let (parent_id, cwd, model) =
+        parent_start.unwrap_or_else(|| (String::new(), String::new(), String::new()));
+    let id = new_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "fork".into());
+    log.append(EventKind::SessionStart {
+        session_id: id,
+        cwd,
+        model,
+        harness_version: env!("CARGO_PKG_VERSION").to_string(),
+        parent: if parent_id.is_empty() {
+            None
+        } else {
+            Some(parent_id)
+        },
+    })?;
     Ok(())
 }
 
@@ -309,7 +346,8 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Rehydrate-check used by tests and the worker's post-fork resume.
+/// Rehydrate-check used by tests.
+#[cfg(test)]
 pub fn event_count(session_dir: &Path) -> usize {
     EventLog::replay(session_dir.join("events.jsonl"))
         .map(|e| e.len())
@@ -568,6 +606,44 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].0.id, "kid");
         assert_eq!(t[0].1, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C11: a symlinked cwd resolves to the same session.
+    #[cfg(unix)]
+    #[test]
+    fn for_cwd_matches_through_symlink() {
+        let root = tmpdir("symlink");
+        let real = root.join("real-ws");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("link-ws");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        mk_session(&sessions, "aaa", &real.display().to_string(), &["x"]);
+        assert_eq!(for_cwd(&sessions, &link).len(), 1, "link → real");
+        mk_session(&sessions, "bbb", &link.display().to_string(), &["y"]);
+        assert_eq!(for_cwd(&sessions, &real).len(), 2, "real → both");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C6 audit: a session with a corrupt middle line is skipped with a
+    /// warning; the rest of the listing survives.
+    #[test]
+    fn corrupt_session_skipped_with_warning() {
+        let root = tmpdir("corrupt");
+        mk_session(&root, "good", "/work/a", &["x"]);
+        let bad = mk_session(&root, "bad", "/work/b", &["y"]);
+        let path = bad.join("events.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.insert(1, "{garbage");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let (rows, warnings) = list_with_warnings(&root);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "good");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("line 2"), "{warnings:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
