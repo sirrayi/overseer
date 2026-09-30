@@ -1050,6 +1050,7 @@ impl Agent {
             sandbox: self.config.sandbox_bash,
             broker: Some(self.config.broker.clone()),
         };
+        self.tools.set_control(self.control.clone());
         let mut results = Vec::new();
         for (idx, (call_id, name, input)) in calls.iter().enumerate() {
             // Tool-launch boundary (P2.4): an interrupt or a queued
@@ -1129,6 +1130,20 @@ impl Agent {
                 },
                 on_event,
             )?;
+            // Audit-only record of each `run_code` sub-call.
+            for rec in self.tools.take_script_calls() {
+                self.emit(
+                    EventKind::ScriptCall {
+                        parent_call_id: call_id.clone(),
+                        name: rec.name,
+                        input_digest: rec.input_digest,
+                        is_error: rec.is_error,
+                        denied: rec.denied,
+                        raw_bytes: rec.raw_bytes,
+                    },
+                    on_event,
+                )?;
+            }
 
             if stuck_hit.is_none() {
                 stuck_hit = self
@@ -3063,6 +3078,73 @@ mod tests {
     /// Screenshots taken through `tools op=call computer` still ride the
     /// conversation as image siblings (last-2 rule intact) and still emit
     /// the computer audit event; the events keep the outer `tools` call.
+    #[cfg(feature = "code-mode")]
+    #[test]
+    fn run_code_sub_calls_are_audited_but_never_replayed() {
+        let dir = tmpdir();
+        std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+        let script = Response {
+            blocks: vec![Block::ToolCall {
+                id: "r1".into(),
+                name: "run_code".into(),
+                input: serde_json::json!({"code":
+                    "tools.read({path: 'a.txt'});\nreturn tools.glob({pattern: '*.txt'}).length > 0;"}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            request_bytes: 0,
+            latency_ms: 0,
+        };
+        let provider = Arc::new(Mock::new(vec![script, done()]));
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let mut agent = Agent::start(provider.clone(), cfg, dir.clone(), "s".into())
+            .unwrap()
+            .with_tools(ToolRegistry::core(crate::perm::Policy::allow_all()));
+        agent.run_turn("go", &mut |_: &Event| {}).unwrap();
+
+        let events = EventLog::replay(dir.join("events.jsonl")).unwrap();
+        let calls: Vec<(&str, &str, &str)> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ScriptCall {
+                    parent_call_id,
+                    name,
+                    input_digest,
+                    ..
+                } => Some((
+                    parent_call_id.as_str(),
+                    name.as_str(),
+                    input_digest.as_str(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!((calls[0].0, calls[0].1), ("r1", "read"));
+        assert_eq!((calls[1].0, calls[1].1), ("r1", "glob"));
+        let result_at = events
+            .iter()
+            .position(|e| matches!(e.kind, EventKind::ToolResult { .. }))
+            .unwrap();
+        let first_audit = events
+            .iter()
+            .position(|e| matches!(e.kind, EventKind::ScriptCall { .. }))
+            .unwrap();
+        assert!(result_at < first_audit, "audit follows the paired result");
+
+        let digest = calls[0].2;
+        let replayed = format!("{:?}", crate::event::rehydrate_messages(&events));
+        assert!(!replayed.contains(digest), "ScriptCall must not rehydrate");
+        let seen = format!(
+            "{:?}",
+            provider.seen_messages.lock().unwrap().last().unwrap()
+        );
+        assert!(!seen.contains(digest) && seen.contains("→ true"), "{seen}");
+    }
+
     #[test]
     fn computer_through_tools_keeps_audit_and_image_siblings() {
         use std::os::unix::fs::PermissionsExt;

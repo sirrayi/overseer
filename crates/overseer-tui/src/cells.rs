@@ -452,6 +452,9 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
         }]),
         // P7-3 audit-only computer-use record — no transcript cell.
         EventKind::ComputerAct { .. } => Feed::Ignore,
+        // Audit-only `run_code` sub-call record — the run_code cell and its
+        // result already show what the script did.
+        EventKind::ScriptCall { .. } => Feed::Ignore,
         EventKind::StuckDetected { pattern } => Feed::NewCells(vec![Cell::Meta {
             style: theme::warn(),
             text: format!("  ! stuck: {pattern}"),

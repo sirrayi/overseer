@@ -24,7 +24,7 @@ pub struct Control {
 
 #[derive(Debug, Default)]
 struct Inner {
-    interrupt: AtomicBool,
+    interrupt: Arc<AtomicBool>,
     steer: Mutex<VecDeque<String>>,
 }
 
@@ -36,6 +36,12 @@ impl Control {
 
     pub fn interrupted(&self) -> bool {
         self.inner.interrupt.load(Ordering::SeqCst)
+    }
+
+    /// The bare interrupt flag, for watchers that must not hold the
+    /// whole handle (the `run_code` engine's interrupt handler).
+    pub fn interrupt_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.inner.interrupt)
     }
 
     /// Queue user input for delivery at the next boundary. Mid-run input

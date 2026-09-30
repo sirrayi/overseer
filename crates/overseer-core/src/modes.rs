@@ -92,6 +92,7 @@ pub static MODES: &[Mode] = &[
         prompt_frag: "Plan before acting; do not modify files in this mode.",
         allowed_tools: &[
             "read", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol", "tools",
+            "run_code",
         ],
         model: None,
         edit_globs: &[],
@@ -100,7 +101,7 @@ pub static MODES: &[Mode] = &[
         name: "ask",
         prompt_frag: "Answer questions about this repository; make no changes.",
         allowed_tools: &[
-            "read", "grep", "glob", "skill", "repo_map", "symbol", "tools",
+            "read", "grep", "glob", "skill", "repo_map", "symbol", "tools", "run_code",
         ],
         model: None,
         edit_globs: &[],
@@ -111,7 +112,7 @@ pub static MODES: &[Mode] = &[
             "Reproduce the failure first, then fix it; keep the repro as a regression test.",
         allowed_tools: &[
             "read", "grep", "glob", "bash", "edit", "write", "plan", "task", "skill", "repo_map",
-            "symbol", "tools",
+            "symbol", "tools", "run_code",
         ],
         model: None,
         edit_globs: &[],
@@ -120,7 +121,7 @@ pub static MODES: &[Mode] = &[
         name: "docs",
         prompt_frag: "Edit documentation only; leave code untouched.",
         allowed_tools: &[
-            "read", "grep", "glob", "edit", "write", "skill", "repo_map", "tools",
+            "read", "grep", "glob", "edit", "write", "skill", "repo_map", "tools", "run_code",
         ],
         model: None,
         edit_globs: &["**/*.md", "**/*.mdx", "**/*.txt"],
@@ -130,6 +131,7 @@ pub static MODES: &[Mode] = &[
         prompt_frag: "Coordinate via task; make no direct edits.",
         allowed_tools: &[
             "read", "grep", "glob", "plan", "task", "skill", "repo_map", "symbol", "tools",
+            "run_code",
         ],
         model: None,
         edit_globs: &[],

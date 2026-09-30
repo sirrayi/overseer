@@ -111,6 +111,23 @@ pub enum EventKind {
         #[serde(default)]
         suppressed: bool,
     },
+    /// One `run_code` sub-call: the tool a script called, a digest of its
+    /// input and how it went. Audit-only, like `ComputerAct`; never
+    /// rehydrates into messages.
+    ScriptCall {
+        #[serde(default)]
+        parent_call_id: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        input_digest: String,
+        #[serde(default)]
+        is_error: bool,
+        #[serde(default)]
+        denied: bool,
+        #[serde(default)]
+        raw_bytes: u64,
+    },
     /// Stuck detector tripped — records which of the five patterns fired.
     StuckDetected {
         pattern: String,
@@ -241,6 +258,7 @@ pub fn event_type_str(kind: &EventKind) -> &'static str {
         EventKind::SubagentDone { .. } => "subagent_done",
         EventKind::Tainted { .. } => "tainted",
         EventKind::ComputerAct { .. } => "computer_act",
+        EventKind::ScriptCall { .. } => "script_call",
         EventKind::StuckDetected { .. } => "stuck_detected",
         EventKind::Nudge { .. } => "nudge",
         EventKind::Compaction { .. } => "compaction",
