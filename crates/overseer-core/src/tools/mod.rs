@@ -336,11 +336,19 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// The full resident registry; optional tools per [`Optional::detect`]
-    /// with skills looked up under `policy.root`.
-    pub fn core(policy: crate::perm::Policy) -> Self {
-        let optional = Optional::detect(&policy.root);
-        Self::core_with(policy, optional)
+    /// The full resident registry for a session in `cwd`; optional tools
+    /// per [`Optional::detect`], skills looked up under `cwd` — the root
+    /// the prompt's skills segment indexes, not `policy.root` (`/` under
+    /// full access).
+    pub fn core_in(policy: crate::perm::Policy, cwd: &Path) -> Self {
+        Self::core_with(policy, Optional::detect(cwd))
+    }
+
+    /// [`core_in`](Self::core_in) for tests, with `policy.root` as the cwd.
+    #[cfg(test)]
+    pub(crate) fn core(policy: crate::perm::Policy) -> Self {
+        let cwd = policy.root.clone();
+        Self::core_in(policy, &cwd)
     }
 
     /// [`core`](Self::core) with the optional-tool availability given.

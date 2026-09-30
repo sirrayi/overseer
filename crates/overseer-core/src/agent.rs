@@ -1492,8 +1492,7 @@ impl Agent {
             // Skills are detected under the session cwd — the root
             // `prompt::assemble` indexes — so the `skill` spec and the
             // skills segment always agree (full access's policy root is `/`).
-            let optional = crate::tools::Optional::detect(&config.cwd);
-            ToolRegistry::core_with(policy, optional)
+            ToolRegistry::core_in(policy, &config.cwd)
         };
         if !config.disabled_tools.is_empty() {
             reg.disable(&config.disabled_tools);
