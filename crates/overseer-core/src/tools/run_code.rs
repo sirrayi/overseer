@@ -147,6 +147,8 @@ pub fn run(input: &Json, ctx: &mut ToolCtx, reg: &mut ToolRegistry) -> ToolOutpu
         .unwrap_or(DEFAULT_TIMEOUT_S)
         .clamp(1, MAX_TIMEOUT_S);
     let deadline = Instant::now() + Duration::from_secs(timeout);
+    // Records a panicked run left behind must not attach to this call.
+    reg.script_calls.clear();
     let control = reg.control.clone();
     let names: Vec<&'static str> = SCRIPT_TOOLS
         .iter()
@@ -241,24 +243,24 @@ fn sub_call(
         ));
     }
     budget.calls += 1;
-    reg.script = true;
+    let mut scope = ScriptScope::enter(reg);
     let out = if mcp {
-        reg.call(
+        scope.call(
             "mcp",
             &json!({"op": "call", "tool": name, "args": args}),
             ctx,
         )
     } else {
-        reg.call(name, args, ctx)
+        scope.call(name, args, ctx)
     };
-    reg.script = false;
-    reg.script_calls.push(ScriptRecord {
+    scope.script_calls.push(ScriptRecord {
         name: name.to_string(),
         input_digest: input_digest(args),
         is_error: out.is_error,
         denied: out.denied,
         raw_bytes: out.raw_bytes,
     });
+    drop(scope);
     budget.bytes += out.text.len();
     if budget.bytes > MAX_SUBCALL_BYTES {
         return Err(("run_code: sub-call byte cap (8 MB) reached.".into(), false));
@@ -267,6 +269,38 @@ fn sub_call(
         Err((out.text, out.denied))
     } else {
         Ok(out.text)
+    }
+}
+
+/// The registry's script flag, set for this scope's lifetime and reset
+/// on drop — also when a sub-call unwinds.
+struct ScriptScope<'a> {
+    reg: &'a mut ToolRegistry,
+}
+
+impl<'a> ScriptScope<'a> {
+    fn enter(reg: &'a mut ToolRegistry) -> Self {
+        reg.script = true;
+        ScriptScope { reg }
+    }
+}
+
+impl Drop for ScriptScope<'_> {
+    fn drop(&mut self) {
+        self.reg.script = false;
+    }
+}
+
+impl std::ops::Deref for ScriptScope<'_> {
+    type Target = ToolRegistry;
+    fn deref(&self) -> &ToolRegistry {
+        self.reg
+    }
+}
+
+impl std::ops::DerefMut for ScriptScope<'_> {
+    fn deref_mut(&mut self) -> &mut ToolRegistry {
+        self.reg
     }
 }
 
@@ -629,6 +663,45 @@ mod tests {
         assert_eq!(
             out.text, "→ \"pending\"",
             "no job queue runs, nothing resolves"
+        );
+    }
+
+    #[test]
+    fn the_script_flag_resets_when_a_sub_call_panics() {
+        let mut r = reg(Policy::allow_all());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut scope = ScriptScope::enter(&mut r);
+            assert!(scope.script);
+            scope.script_calls.push(ScriptRecord {
+                name: "read".into(),
+                input_digest: String::new(),
+                is_error: false,
+                denied: false,
+                raw_bytes: 0,
+            });
+            panic!("sub-call panicked");
+        }));
+        assert!(caught.is_err());
+        assert!(!r.script, "dedup, read logging and spill are back on");
+    }
+
+    #[test]
+    fn a_stale_script_record_never_attaches_to_the_next_run() {
+        let dir = tmpdir();
+        let mut r = reg(Policy::allow_all());
+        r.script_calls.push(ScriptRecord {
+            name: "stale".into(),
+            input_digest: String::new(),
+            is_error: false,
+            denied: false,
+            raw_bytes: 0,
+        });
+        let out = run_in(&mut r, &dir, "tools.glob({pattern: '*'});");
+        assert!(!out.is_error, "{}", out.text);
+        let recs = r.take_script_calls();
+        assert_eq!(
+            recs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["glob"]
         );
     }
 
