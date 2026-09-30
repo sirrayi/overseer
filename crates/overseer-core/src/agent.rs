@@ -975,7 +975,20 @@ impl Agent {
         // definition-of-done check first. A failure blocks the stop;
         // the failing output goes back into context as a nudge.
         if let Some(cmd) = self.config.verify_cmd.clone() {
-            if let Err(tail) = run_verify(&cmd, &self.config.cwd) {
+            // I4: verify runs through the bash sandbox wrapper with the
+            // bash child-env allowlist — no provider/broker/checkpoint.
+            let ctx = ToolCtx {
+                cwd: self.config.cwd.clone(),
+                session_dir: self.session_dir.clone(),
+                spill_seq: 0,
+                provider: None,
+                agent_config: Some(self.config.clone()),
+                subagent_seq: 0,
+                checkpoint: None,
+                sandbox: self.config.sandbox_bash,
+                broker: None,
+            };
+            if let Err(tail) = run_verify(&cmd, &ctx) {
                 self.verify_blocks += 1;
                 if self.verify_blocks >= self.config.verify_block_cap {
                     self.end_run("verify_failed", steps, on_event)?;
@@ -1571,9 +1584,15 @@ fn last_text(messages: &[Message]) -> String {
 /// kills runaway checks. `Ok(())` = exit 0; `Err(tail)` = nonzero exit,
 /// spawn failure, or timeout — the tail keeps the last ~6K chars of output
 /// so the failure stays reviewable when injected back into context.
-// DEFERRED(owner): route verify_cmd through the bash sandbox wrapper (tools/bash.rs) — needs a shared pub(crate) sandbox API
-fn run_verify(cmd: &str, cwd: &std::path::Path) -> Result<(), String> {
+// I4: `verify_cmd` goes through the same sandbox bash uses (pinned
+// --runtime when set, else the platform default — an unavailable pinned
+// backend fails closed, never a silent downgrade) and inherits only
+// bash's child-env allowlist, so parent secrets can't reach repo checks.
+fn run_verify(cmd: &str, ctx: &crate::tools::ToolCtx) -> Result<(), String> {
     use std::process::{Command, Stdio};
+
+    let argv = vec!["sh".to_string(), "-c".to_string(), cmd.to_string()];
+    let inv = crate::tools::bash::sandboxed(&argv, ctx)?;
 
     let log_path =
         std::env::temp_dir().join(format!("overseer-verify-{}.log", uuid::Uuid::now_v7()));
@@ -1582,10 +1601,11 @@ fn run_verify(cmd: &str, cwd: &std::path::Path) -> Result<(), String> {
     let err_file = file
         .try_clone()
         .map_err(|e| format!("cannot clone verify log handle: {e}"))?;
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(cwd)
+    let mut child = Command::new(&inv.program)
+        .args(&inv.args)
+        .current_dir(&ctx.cwd)
+        .env_clear()
+        .envs(crate::tools::bash::child_env())
         .stdin(Stdio::null())
         .stdout(file)
         .stderr(err_file)
@@ -2519,6 +2539,32 @@ mod tests {
             request_bytes: 0,
             latency_ms: 0,
         }
+    }
+
+    /// I4: verify_cmd runs under the bash sandbox wrapper with bash's
+    /// child-env allowlist — a secret-looking parent var is invisible to
+    /// the check, and pass/fail semantics are unchanged.
+    #[test]
+    fn verify_cmd_sandboxed_env_strips_parent_secrets() {
+        let dir = tmpdir();
+        let ctx = ToolCtx {
+            cwd: dir.clone(),
+            session_dir: dir,
+            spill_seq: 0,
+            provider: None,
+            agent_config: Some(AgentConfig::default()),
+            subagent_seq: 0,
+            checkpoint: None,
+            sandbox: false,
+            broker: None,
+        };
+        std::env::set_var("FOO_API_KEY", "sk-parent-secret");
+        let r = run_verify("test -z \"$FOO_API_KEY\"", &ctx);
+        std::env::remove_var("FOO_API_KEY");
+        assert!(r.is_ok(), "FOO_API_KEY leaked into verify child: {r:?}");
+        assert!(run_verify("true", &ctx).is_ok(), "pass behaves as before");
+        let e = run_verify("false", &ctx).unwrap_err();
+        assert!(e.contains("exit"), "fail behaves as before: {e}");
     }
 
     /// P2.4 interrupt: Esc lands at a tool-launch boundary. The call
