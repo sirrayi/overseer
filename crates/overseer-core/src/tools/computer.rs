@@ -486,7 +486,7 @@ fn run_capture(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Valu
         .as_ref()
         .map(|c| c.computer.clone())
         .unwrap_or_default();
-    let suppressed = crate::computer_obs::is_suppressed(&cfg, cred, &action);
+    let suppressed = crate::computer_obs::is_suppressed(&cfg, cred);
     let tier = choose(Need::default(), backends)?;
     let helper = backends
         .helper(tier)

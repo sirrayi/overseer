@@ -8,7 +8,7 @@
 use crate::agent::ComputerConfig;
 
 /// True when pixel capture must be suppressed (metadata-only obs).
-pub fn is_suppressed(cfg: &ComputerConfig, cred_field: bool, _action: &str) -> bool {
+pub fn is_suppressed(cfg: &ComputerConfig, cred_field: bool) -> bool {
     if cfg.watch_mode {
         return true;
     }
@@ -29,14 +29,14 @@ mod tests {
     #[test]
     fn suppression_predicate() {
         let cfg = ComputerConfig::default();
-        assert!(is_suppressed(&cfg, true, "screenshot"));
-        assert!(!is_suppressed(&cfg, false, "screenshot"));
+        assert!(is_suppressed(&cfg, true));
+        assert!(!is_suppressed(&cfg, false));
         let off = ComputerConfig {
             takeover_pause: false,
             watch_mode: false,
             egress_deny: false,
         };
-        assert!(!is_suppressed(&off, true, "screenshot"));
+        assert!(!is_suppressed(&off, true));
     }
 
     #[test]

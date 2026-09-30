@@ -498,13 +498,13 @@ fn observe(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
 
 /// The capture suppression check (credential field / watch mode) — pixels
 /// are never requested when suppressed.
-fn is_suppressed(input: &Value, ctx: &ToolCtx, action: &str) -> bool {
+fn is_suppressed(input: &Value, ctx: &ToolCtx) -> bool {
     let cfg = ctx
         .agent_config
         .as_ref()
         .map(|c| c.computer.clone())
         .unwrap_or_default();
-    crate::computer_obs::is_suppressed(&cfg, cred_field(input), action)
+    crate::computer_obs::is_suppressed(&cfg, cred_field(input))
 }
 
 /// Metadata-only envelope for a suppressed (or pixel-less) capture.
@@ -536,7 +536,7 @@ fn suppressed_envelope(
 /// `screenshot` — pixels only (no AX walk), capped at `max` (D3/D4).
 fn screenshot(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
     need(input, "screenshot", &["pid", "window_id"])?;
-    if is_suppressed(input, ctx, "screenshot") {
+    if is_suppressed(input, ctx) {
         let reason = if ctx
             .agent_config
             .as_ref()
@@ -568,7 +568,7 @@ fn screenshot(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallE
 /// next click still belongs to the last full screenshot's frame).
 fn zoom(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
     need(input, "zoom", &["pid", "window_id"])?;
-    if is_suppressed(input, ctx, "zoom") {
+    if is_suppressed(input, ctx) {
         return suppressed_envelope("zoom", ctx, "credential-field focus", true);
     }
     let mut a = Map::new();

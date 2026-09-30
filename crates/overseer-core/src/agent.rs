@@ -2998,19 +2998,11 @@ mod tests {
         // the obs carries metadata only, never pixel bytes.
         let cfg = AgentConfig::default();
         assert!(cfg.computer.takeover_pause, "fail-closed default");
-        assert!(crate::computer_obs::is_suppressed(
-            &cfg.computer,
-            true,
-            "capture"
-        ));
-        assert!(!crate::computer_obs::is_suppressed(
-            &cfg.computer,
-            false,
-            "capture"
-        ));
+        assert!(crate::computer_obs::is_suppressed(&cfg.computer, true));
+        assert!(!crate::computer_obs::is_suppressed(&cfg.computer, false));
         let mut watch = cfg.computer.clone();
         watch.watch_mode = true;
-        assert!(crate::computer_obs::is_suppressed(&watch, false, "capture"));
+        assert!(crate::computer_obs::is_suppressed(&watch, false));
         let obs = crate::computer_obs::metadata_obs(2560, 1600, 1280, 800, "cred-field focus");
         assert!(
             !obs.contains("aGVsbG8"),
