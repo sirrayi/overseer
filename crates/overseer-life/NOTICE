@@ -1,0 +1,46 @@
+Overseer Life includes code ported from Synara, which is distributed under
+the MIT License. The Synara license text follows.
+
+---
+
+MIT License
+
+Copyright (c) 2026 T3 Tools Inc.
+Copyright (c) 2026 Emanuele Di Pietro
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+Ported sources (files under src/connectors/ carry a per-file attribution
+comment naming the original path):
+
+  apps/server/src/providerUsage/providers/claude.ts
+  apps/server/src/providerUsage/providers/codex.ts
+  apps/server/src/providerUsage/providers/cursor.ts
+  apps/server/src/providerUsage/providers/devin.ts
+  apps/server/src/providerUsage/providers/opencode.ts
+  apps/server/src/providerUsage/credentials.ts
+  apps/server/src/providerUsage/http.ts
+  apps/server/src/providerUsage/parse.ts
+  apps/server/src/providerUsage/sqlite.ts
+  apps/server/src/providerUsageSnapshot.ts
+  apps/server/src/claudeTokenStats.ts (token-accounting rules only)
+  apps/server/src/provider/openCodeAuthPaths.ts
+  apps/server/src/provider/acp/DevinAcpSupport.ts (credential store only)
