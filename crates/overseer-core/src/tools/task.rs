@@ -43,12 +43,8 @@ pub fn spec() -> ToolSpec {
         name: "task".into(),
         description: concat!(
             "Spawn a subagent for a self-contained subtask in an isolated ",
-            "context. It returns a compact digest (~2K tokens) plus the path ",
-            "to its full trace. mode=read (default) has read/grep/glob only ",
-            "and cannot modify files. mode=write gets full tools inside an ",
-            "isolated git worktree (its changes land on a scratch branch, ",
-            "never your checkout). background=true returns immediately and ",
-            "the digest arrives as a notice when done (max 4 in flight)."
+            "context. Returns a compact digest (~2K tokens) plus the path to ",
+            "its full trace."
         )
         .into(),
         input_schema: schema(
@@ -60,15 +56,15 @@ pub fn spec() -> ToolSpec {
                 "mode": {
                     "type": "string",
                     "enum": ["read", "write"],
-                    "description": "read (default): read-only quarantine. write: full tools in an isolated git worktree."
+                    "description": "read (default): read/grep/glob only, cannot modify files. write: full tools in an isolated git worktree; changes land on a scratch branch, never your checkout."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "true: run on a thread and notify when done (max 4 concurrent). default: false (block for the digest)."
+                    "description": "Return immediately; the digest arrives as a notice when done (max 4 in flight). Default false."
                 },
                 "max_steps": {
                     "type": "integer",
-                    "description": "Step budget for the subagent (default 10, max 20)."
+                    "description": "Default 10, max 20."
                 }
             }),
             &["prompt"],
@@ -108,16 +104,10 @@ pub fn filtered_memory_dir(
     std::fs::create_dir_all(dest).ok()?;
     let mut kept_lines = Vec::new();
     for line in text.lines() {
-        // Preserve non-pointer lines (headers, blanks) verbatim.
-        let mut named: Option<String> = None;
-        for tok in line.split_whitespace() {
-            let t = tok.trim_matches(|c| c == '`' || c == '"' || c == '\'' || c == ',' || c == ';');
-            if t.ends_with(".md") && !t.contains('/') && !t.contains('\\') {
-                named = Some(t.to_string());
-                break;
-            }
-        }
-        let Some(name) = named else {
+        // Pointer recognition is memory's own rule: bare names AND
+        // layer-qualified ones (`semantic/x.md`); anything else is a
+        // non-pointer line preserved verbatim.
+        let Some(name) = crate::memory::topic_name(line).map(str::to_string) else {
             kept_lines.push(line.to_string());
             continue;
         };
@@ -226,6 +216,16 @@ fn worktree_diffstat(wt: &Path) -> String {
     }
 }
 
+/// The branch + diffstat block a writer subagent's result carries, so its
+/// worktree changes are visible to the parent (foreground and background).
+fn worktree_note(branch: &str, wt: &Path) -> String {
+    format!(
+        "\n\n[worktree branch `{branch}` at {} — changes:\n{}]",
+        wt.display(),
+        worktree_diffstat(wt)
+    )
+}
+
 pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     let prompt = match need_str(input, "prompt") {
         Ok(p) => p,
@@ -331,8 +331,14 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         let dir2 = dir.clone();
         let prompt = prompt.to_string();
         let id2 = id.clone();
+        let worktree = worktree_branch
+            .clone()
+            .map(|b| (b, subagents_dir.join(format!("wt-{seq}/wt"))));
         std::thread::spawn(move || {
-            let (digest, outcome) = run_subagent(provider, cfg, registry, &dir2, &id2, &prompt);
+            let (mut digest, outcome) = run_subagent(provider, cfg, registry, &dir2, &id2, &prompt);
+            if let Some((branch, wt)) = &worktree {
+                digest.push_str(&worktree_note(branch, wt));
+            }
             // Marker last: done.txt is the parent loop's notification.
             let _ = std::fs::write(
                 dir2.join("done.txt"),
@@ -349,11 +355,7 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     let (mut digest, outcome) = run_subagent(provider, cfg, registry, &dir, &id, prompt);
     if let Some(branch) = &worktree_branch {
         let wt = subagents_dir.join(format!("wt-{seq}/wt"));
-        digest.push_str(&format!(
-            "\n\n[worktree branch `{branch}` at {} — changes:\n{}]",
-            wt.display(),
-            worktree_diffstat(&wt)
-        ));
+        digest.push_str(&worktree_note(branch, &wt));
     }
     ToolOutput::ok(format!(
         "{digest}\n\n[subagent {outcome} — full trace: {}]",
@@ -509,6 +511,48 @@ mod tests {
     }
 
     #[test]
+    fn background_write_mode_reports_its_worktree_in_done_txt() {
+        let dir = tmpdir();
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "x",
+                "--allow-empty",
+            ],
+        ] {
+            let st = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(&args)
+                .output()
+                .unwrap()
+                .status;
+            assert!(st.success());
+        }
+        let mut c = ctx(&dir);
+        let out = run(
+            &json!({"prompt": "write stuff", "mode": "write", "background": true}),
+            &mut c,
+        );
+        assert!(!out.is_error, "{}", out.text);
+        let marker = dir.join("session/subagents/bg-1/done.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let done = std::fs::read_to_string(&marker).expect("done.txt");
+        assert!(done.contains("digest body"), "{done}");
+        assert!(done.contains("worktree branch `overseer-task-1`"), "{done}");
+        assert!(done.contains("changes:"), "{done}");
+    }
+
+    #[test]
     fn write_mode_fails_cleanly_outside_git() {
         let dir = tmpdir(); // not a repo
         let mut c = ctx(&dir);
@@ -565,6 +609,40 @@ mod tests {
         ] {
             assert!(!out.join(dropped).exists(), "{dropped} must not be copied");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filtered_view_keeps_layer_qualified_pointers() {
+        // `semantic/x.md` in the INDEX is a pointer too — the file must
+        // be materialized and the line kept; a qualified REGULATED
+        // topic still drops out entirely.
+        let dir = std::env::temp_dir().join(format!("overseer-submemq-{}", uuid::Uuid::now_v7()));
+        let mem = dir.join("memory");
+        std::fs::create_dir_all(mem.join("semantic")).unwrap();
+        std::fs::write(mem.join("semantic/prefs.md"), "prefers tabs\n").unwrap();
+        std::fs::write(
+            mem.join("semantic/secret.md"),
+            "---\nsensitivity: secret\n---\nhush\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem.join("INDEX.md"),
+            "# Memory Index\n\nsemantic/prefs.md — tabs\nsemantic/secret.md — hush\n",
+        )
+        .unwrap();
+
+        let dest = dir.join("filtered");
+        let out = filtered_memory_dir(&mem, crate::memory::Sensitivity::Personal, &dest)
+            .expect("filtered dir");
+        let index = std::fs::read_to_string(out.join("INDEX.md")).unwrap();
+        assert!(index.contains("semantic/prefs.md"), "{index}");
+        assert!(!index.contains("semantic/secret.md"), "{index}");
+        assert_eq!(
+            std::fs::read_to_string(out.join("semantic/prefs.md")).unwrap(),
+            "prefers tabs\n"
+        );
+        assert!(!out.join("semantic/secret.md").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

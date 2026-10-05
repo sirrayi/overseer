@@ -12,7 +12,7 @@
 //! the round-trip test below. Adding is allowed; renaming silently breaks
 //! every frontend, so it is not.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
@@ -97,12 +97,52 @@ impl CtlResponse {
     }
 }
 
+/// `sockaddr_un.sun_path` capacity: 104 on macOS/BSD, 108 on Linux.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub const SUN_PATH_MAX: usize = 104;
+#[cfg(target_os = "linux")]
+pub const SUN_PATH_MAX: usize = 108;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "linux"
+)))]
+pub const SUN_PATH_MAX: usize = 104;
+
+/// `sun_path` is fixed-size; refuse a path that can never bind with a
+/// clear message instead of libc's opaque failure.
+pub fn check_socket_path(path: &std::path::Path) -> std::io::Result<()> {
+    let n = path.as_os_str().len();
+    if n >= SUN_PATH_MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "control socket path too long ({n} bytes > {SUN_PATH_MAX}): {} — set a shorter daemon dir",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Spawn the listener thread. Requests are pushed to `tx` (the daemon
 /// loop owns all state — the socket thread is just plumbing).
 pub fn listen(
     sock_path: PathBuf,
     tx: std::sync::mpsc::Sender<(CtlRequest, std::sync::mpsc::Sender<CtlResponse>)>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
+    check_socket_path(&sock_path)?;
     let _ = std::fs::remove_file(&sock_path);
     let listener = UnixListener::bind(&sock_path)?;
     // Socket is user-only by default on macOS/Linux (0700 dir handles it).
@@ -117,27 +157,40 @@ pub fn listen(
         })
 }
 
+/// Longest accepted request line. Every legitimate request is tiny; the
+/// cap stops one client from growing the daemon's memory without bound.
+pub const MAX_REQUEST_LINE: usize = 64 * 1024;
+
+/// Read one newline-terminated request of at most [`MAX_REQUEST_LINE`]
+/// bytes. Never buffers more than the cap plus one byte.
+fn read_request_line(r: impl Read) -> Result<String, String> {
+    let mut buf = Vec::new();
+    BufReader::new(r.take(MAX_REQUEST_LINE as u64 + 1))
+        .read_until(b'\n', &mut buf)
+        .map_err(|e| format!("read: {e}"))?;
+    if buf.len() > MAX_REQUEST_LINE {
+        return Err("request line exceeds 64 KiB".into());
+    }
+    String::from_utf8(buf).map_err(|_| "request is not UTF-8".into())
+}
+
 fn handle_conn(
     s: &mut UnixStream,
     tx: std::sync::mpsc::Sender<(CtlRequest, std::sync::mpsc::Sender<CtlResponse>)>,
 ) {
-    let mut line = String::new();
-    if BufReader::new(s.try_clone().unwrap())
-        .read_line(&mut line)
-        .is_err()
-    {
-        return;
-    }
-    let resp = match serde_json::from_str::<CtlRequest>(&line) {
-        Ok(req) => {
-            let (rtx, rrx) = std::sync::mpsc::channel();
-            if tx.send((req, rtx)).is_err() {
-                CtlResponse::err("daemon loop gone")
-            } else {
-                rrx.recv().unwrap_or_else(|_| CtlResponse::err("no reply"))
+    let resp = match read_request_line(&*s) {
+        Err(e) => CtlResponse::err(e),
+        Ok(line) => match serde_json::from_str::<CtlRequest>(&line) {
+            Ok(req) => {
+                let (rtx, rrx) = std::sync::mpsc::channel();
+                if tx.send((req, rtx)).is_err() {
+                    CtlResponse::err("daemon loop gone")
+                } else {
+                    rrx.recv().unwrap_or_else(|_| CtlResponse::err("no reply"))
+                }
             }
-        }
-        Err(e) => CtlResponse::err(format!("bad request: {e}")),
+            Err(e) => CtlResponse::err(format!("bad request: {e}")),
+        },
     };
     if let Ok(mut out) = serde_json::to_string(&resp) {
         out.push('\n');
@@ -161,6 +214,72 @@ pub fn call(sock_path: &std::path::Path, req: &CtlRequest) -> Result<CtlResponse
 #[cfg(test)]
 mod ctl_serde_tests {
     use super::*;
+
+    fn serve_one(payload: Vec<u8>, close_write: bool) -> CtlResponse {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let srv = std::thread::spawn(move || handle_conn(&mut server, tx));
+        let writer = std::thread::spawn(move || {
+            let _ = client.write_all(&payload);
+            if close_write {
+                let _ = client.shutdown(std::net::Shutdown::Write);
+            }
+            let mut reply = String::new();
+            let _ = BufReader::new(&client).read_line(&mut reply);
+            reply
+        });
+        srv.join().unwrap();
+        let reply = writer.join().unwrap();
+        serde_json::from_str(&reply).unwrap_or_else(|e| panic!("reply {reply:?}: {e}"))
+    }
+
+    /// A daemon dir under a long TMPDIR (the self-hosted runner) must
+    /// fail up front with a nameable cause, not libc's opaque bind error.
+    #[test]
+    fn socket_path_longer_than_sun_path_is_refused_up_front() {
+        let long = std::path::PathBuf::from(format!("/{}", "d".repeat(SUN_PATH_MAX + 10)));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let e = listen(long, tx).unwrap_err().to_string();
+        assert!(e.contains("control socket path too long"), "{e}");
+        assert!(e.contains(&SUN_PATH_MAX.to_string()), "{e}");
+        assert!(e.contains("set a shorter daemon dir"), "{e}");
+        // A path at the limit still refuses — sun_path needs the NUL.
+        let edge = std::path::PathBuf::from(format!("/{}", "d".repeat(SUN_PATH_MAX - 2)));
+        assert!(check_socket_path(&edge).is_ok());
+        let at = std::path::PathBuf::from(format!("/{}", "d".repeat(SUN_PATH_MAX)));
+        assert!(check_socket_path(&at).is_err());
+    }
+
+    #[test]
+    fn oversized_request_line_is_refused() {
+        let resp = serve_one(vec![b'a'; MAX_REQUEST_LINE + 4096], true);
+        assert!(!resp.ok);
+        let err = resp.error.unwrap_or_default();
+        assert!(err.contains("64 KiB"), "{err}");
+    }
+
+    #[test]
+    fn a_request_that_fits_the_bound_is_still_parsed() {
+        let mut line = serde_json::to_vec(&CtlRequest::Status).unwrap();
+        line.push(b'\n');
+        // The receiver is dropped, so a parsed request reports the loop gone.
+        let resp = serve_one(line, false);
+        assert_eq!(resp.error.as_deref(), Some("daemon loop gone"));
+    }
+
+    #[test]
+    fn an_endless_line_stops_at_the_cap() {
+        // `repeat` never ends and never sends a newline; the reader must
+        // still return after consuming just past the cap.
+        let err = read_request_line(std::io::repeat(b'a')).unwrap_err();
+        assert_eq!(err, "request line exceeds 64 KiB");
+        let exact = [vec![b'a'; MAX_REQUEST_LINE - 1], vec![b'\n']].concat();
+        assert_eq!(
+            read_request_line(&exact[..]).unwrap().len(),
+            MAX_REQUEST_LINE
+        );
+    }
 
     /// Every reachable command must survive an NDJSON round-trip (one
     /// line in, one line out — the same discipline as overseer-proto).

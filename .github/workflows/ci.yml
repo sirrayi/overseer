@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# Latest push wins — stale runs on the same ref are cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,7 +19,9 @@ env:
 
 jobs:
   build-test:
-    runs-on: macos-15
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,7 +42,9 @@ jobs:
   eval-rig:
     # Offline rig self-tests only — no API keys, no paid runs. Proves the
     # matrix/scheduler/stats/store path on every PR (playbook §4.6 seed).
-    runs-on: macos-15
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -56,7 +66,9 @@ jobs:
           grep -q "FAIL" out.txt && grep -q "0.0%" out.txt
 
   budgets:
-    runs-on: macos-15
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -93,8 +105,15 @@ jobs:
     # cargo-deny per deny.toml: RustSEC advisories + yanked/unmaintained,
     # permissive-license allow-list, dup/wildcard bans, registry sources.
     # The local equivalent is `cargo audit` (.cargo/audit.toml).
-    # Linux runner: the action is a container action (no macOS support).
-    runs-on: ubuntu-latest
+    # Runs cargo-deny natively on the self-hosted macOS runner (installed on
+    # first use; the binary persists on the runner) — not a container action.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo-deny present (persists on the runner)
+        run: cargo deny --version || cargo install cargo-deny --locked
+      - name: deny check
+        run: cargo deny check

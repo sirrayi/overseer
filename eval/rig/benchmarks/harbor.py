@@ -26,7 +26,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .. import manifest, store
+from .. import keys, manifest, store
 from . import BenchmarkUnavailable, ExternalTask, has_cli, has_docker
 
 HARBOR = ["uvx", "harbor"]
@@ -133,11 +133,19 @@ class HarborAdapter:
             cmd += ["-t", task_name]
         env = dict(os.environ)
         if model and model.startswith("openai/"):
-            env.setdefault("OPENAI_API_KEY", os.environ.get("OVERSEER_API_KEY", ""))
+            env.setdefault("OPENAI_API_KEY", keys.api_key() or "")
             env.setdefault(
                 "OPENAI_BASE_URL",
                 os.environ.get("OVERSEER_BASE_URL", "https://opencode.ai/zen/go/v1"),
             )
+        # Custom agents (`-a module.path:Class`) need this dir importable —
+        # our overseer_agent module lives beside this file's sibling dir.
+        if ":" in agent:
+            agents_dir = str((Path(__file__).resolve().parent.parent
+                              / "harbor_agents").resolve())
+            env["PYTHONPATH"] = (
+                agents_dir + os.pathsep + env.get("PYTHONPATH", "")
+            ).rstrip(os.pathsep)
         proc = subprocess.run(
             cmd, env=env, capture_output=True, text=True, timeout=86400
         )
@@ -291,10 +299,14 @@ def run_cli(
     model = args.model or os.environ.get("OVERSEER_MODEL", "deepseek-v4.1-flash")
     # harbor's built-in LLM agents take openai/<model> against the
     # configured gateway; oracle/nop take no model at all.
-    model_arg = None if agent in ("oracle", "nop") else f"openai/{model}"
-    if model_arg and not os.environ.get("OVERSEER_API_KEY"):
+    model_arg = (
+        model
+        if ":" in agent  # custom import path — no litellm prefix
+        else (None if agent in ("oracle", "nop") else f"openai/{model}")
+    )
+    if model_arg and not keys.api_key():
         print(
-            f"OVERSEER_API_KEY required for {adapter.name} agent {agent!r}",
+            f"{keys.key_label()} required for {adapter.name} agent {agent!r}",
             file=sys.stderr,
         )
         return 2

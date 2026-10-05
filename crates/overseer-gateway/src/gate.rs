@@ -44,6 +44,16 @@ fn hhmm(s: &str) -> Option<u16> {
     Some(h.parse::<u16>().ok()? * 60 + m.parse::<u16>().ok()?)
 }
 
+/// Minutes east of UTC from `OVERSEER_TZ_OFFSET_MIN` (surrounding
+/// whitespace ignored); unset or unparseable means UTC. The one parser
+/// for both the quiet-hours gate and the cron clock.
+pub(crate) fn tz_offset_min() -> i64 {
+    std::env::var("OVERSEER_TZ_OFFSET_MIN")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// Local-time minutes since midnight without a chrono dep: epoch →
 /// localtime via `date +%H:%M` is too slow per tick, so compute UTC +
 /// the system TZ offset once per call using libc-free math — seconds in
@@ -52,10 +62,7 @@ fn hhmm(s: &str) -> Option<u16> {
 /// (Keeps the daemon dependency-free; accurate quiet hours land with the
 /// desktop frontend that can read real clock/DND state.)
 pub fn local_minutes(now_ms_val: u64) -> u16 {
-    let offset: i64 = std::env::var("OVERSEER_TZ_OFFSET_MIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let offset = tz_offset_min();
     let secs = (now_ms_val / 1000) as i64 + offset * 60;
     (((secs % 86_400) + 86_400) % 86_400 / 60) as u16
 }
@@ -346,6 +353,20 @@ mod tests {
             None => std::env::remove_var("OVERSEER_TZ_OFFSET_MIN"),
         }
         out
+    }
+
+    #[test]
+    fn tz_offset_is_trimmed_like_the_cron_clock() {
+        // A padded value (shell quoting, .env files) must shift quiet
+        // hours exactly as it shifts cron's civil time.
+        let (gate_min, cron) = with_tz_offset(Some(" 60 "), || {
+            (
+                local_minutes(0),
+                crate::trigger::CivilTime::from_epoch_ms(0).unwrap(),
+            )
+        });
+        assert_eq!(gate_min, 60);
+        assert_eq!(u32::from(gate_min), cron.hour * 60 + cron.minute);
     }
 
     // ── P7-6 tests ─────────────────────────────────────────────────────

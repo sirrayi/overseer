@@ -87,6 +87,9 @@ pub enum Preset {
 /// Bash deny rules — glob patterns over the whole command string
 /// (`*`/`?` wildcards, `\` escapes a literal). Ordered deny → ask → allow:
 /// a deny match short-circuits before ask/allow is even considered.
+/// Patterns match the [`normalize_bash`] form: whitespace runs collapsed
+/// to one space and every recursive+forced `rm` flag spelling (`-fr`,
+/// `-Rf`, `-r -f`, `--recursive --force`, `-rfv`, …) rewritten to `-rf`.
 const BASH_DENY: &[(&str, &str)] = &[
     // Destructive filesystem ops (playbook: fail closed).
     ("*rm -rf \\**", "recursive delete with an unqualified glob"),
@@ -105,8 +108,16 @@ const BASH_DENY: &[(&str, &str)] = &[
     ("*mkfs*", "filesystem format"),
     ("*of=/dev/*", "raw write to device node"),
     ("*:(){*", "fork bomb"),
-    // System mutation.
-    ("*sudo *", "privilege escalation"),
+    // System mutation. Privilege escalation is not a glob — see
+    // `ESCALATION_WORDS`: the words are matched as whole shell tokens,
+    // which is what catches `$(sudo)`, `` `sudo` ``, `(doas ls)` and a
+    // trailing `ls; doas` while `sudoku`/`pseudo-random` pass.
+    ("*>/dev/sd*", "raw write to a disk device"),
+    ("*> /dev/sd*", "raw write to a disk device"),
+    ("*>/dev/disk*", "raw write to a disk device"),
+    ("*> /dev/disk*", "raw write to a disk device"),
+    ("*>/dev/nvme*", "raw write to a disk device"),
+    ("*> /dev/nvme*", "raw write to a disk device"),
     ("*shutdown*", "system power control"),
     ("*reboot*", "system power control"),
     // Remote code execution pattern.
@@ -120,6 +131,13 @@ const BASH_DENY: &[(&str, &str)] = &[
     ("*git push -f*", "force push (history rewrite)"),
     ("*git push --delete*", "remote branch deletion"),
 ];
+
+/// Words that escalate privileges when a shell dispatches on them.
+/// Matched as whole tokens (see [`shell_tokens`]) — never globs — so
+/// the substitution/subshell spellings `$(sudo …)`, `` `sudo …` ``,
+/// `(doas …)` and `(pkexec …)`, and a bare word at end of command
+/// (`ls; doas`), are all caught while lookalikes pass.
+const ESCALATION_WORDS: &[&str] = &["sudo", "doas", "pkexec"];
 
 /// Bash ask rules — destructive-ish but sometimes legitimate. Headless
 /// mode collapses Ask to a denied ToolOutput (fail-closed), but the
@@ -194,7 +212,6 @@ const SENSITIVE_PATHS: &[&str] = &[
 ];
 
 /// Content markers that mark a result as carrying secret material.
-/// Content markers that mark a result as carrying secret material.
 /// Lowercase: compared against lowercased text (RT-1: uppercase markers
 /// were dead code — lowercased text can never contain them).
 const SENSITIVE_CONTENT: &[&str] = &["-----begin", "private key-----"];
@@ -253,8 +270,9 @@ pub enum Autonomy {
 }
 
 /// External-communication markers for the bash classifier: networked
-/// sends, publishes, and message-sending CLIs. Conservative substring
-/// match (first wall, like BASH_DENY) — the sandbox is the real boundary.
+/// sends, publishes, and message-sending CLIs. Word-boundary match
+/// ([`has_marker`]: `gh` fires on `gh pr`, not inside `through`); first
+/// wall, like BASH_DENY — the sandbox is the real boundary.
 const EXTERNAL_MARKERS: &[&str] = &[
     "curl",
     "wget",
@@ -305,12 +323,25 @@ const IDENTITY_MARKERS: &[&str] = &[
 
 /// Classify a tool call into the irreversibility taxonomy (P5-B).
 /// Pure function of (tool, input) — deterministic, zero deps.
-/// P7-1 computer-use arms: `computer` dispatches on `action` —
-/// screenshot observes (Read); click/move/scroll mutate local UI state
-/// (InternalWrite); type/submit/send emit content outward
-/// (ExternalComms); any credential-field focus escalates to Identity.
+/// P7-1/S5 computer-use arms: `computer` dispatches on `action` — the
+/// observation set (apps/windows/observe/screenshot/zoom/verify/browser)
+/// reads (Read); side-effect acts (click/type/key/set/scroll/drag/menu/
+/// launch/browser_click/browser_type) mutate local UI state
+/// (InternalWrite); `navigate` emits a URL outward (ExternalComms — a URL
+/// can exfiltrate); any credential-field focus escalates to Identity.
 /// Unknown actions default up (InternalWrite), never down.
+/// R6 MCP arm: the `mcp` op tool declares its own class — `search` reads
+/// third-party tool *metadata* (Read); `call` runs a third-party tool, which
+/// is external communication until an operator says otherwise. The operator's
+/// `trust: "read"` allow lives in [`Policy::check`] (it needs the config);
+/// this pure function must not guess it, and an unknown op defaults up.
 pub fn classify(tool: &str, input: &Value) -> Irreversibility {
+    if tool == "mcp" {
+        return match input.get("op").and_then(Value::as_str) {
+            Some(op) if op.eq_ignore_ascii_case("search") => Irreversibility::Read,
+            _ => Irreversibility::ExternalComms,
+        };
+    }
     if tool == "computer" {
         let action = input
             .get("action")
@@ -328,16 +359,23 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
         {
             return Irreversibility::Identity;
         }
-        if action == "screenshot" || action == "observe" {
+        if [
+            "apps",
+            "windows",
+            "observe",
+            "screenshot",
+            "zoom",
+            "verify",
+            "browser",
+        ]
+        .contains(&action.as_str())
+        {
             return Irreversibility::Read;
         }
-        if ["click", "move", "scroll", "drag", "hover", "focus"].contains(&action.as_str()) {
-            return Irreversibility::InternalWrite;
-        }
-        if ["type", "key", "submit", "send", "paste"].contains(&action.as_str()) {
+        if action == "navigate" {
             return Irreversibility::ExternalComms;
         }
-        return Irreversibility::InternalWrite; // future actions default up
+        return Irreversibility::InternalWrite; // side-effect acts + future actions default up
     }
     match tool {
         t if READ_TOOLS.contains(&t) => Irreversibility::Read,
@@ -352,7 +390,7 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
                 Irreversibility::Identity
             } else if MONEY_MARKERS.iter().any(|m| cmd.contains(m)) {
                 Irreversibility::Money
-            } else if EXTERNAL_MARKERS.iter().any(|m| cmd.contains(m)) {
+            } else if EXTERNAL_MARKERS.iter().any(|m| has_marker(&cmd, m)) {
                 Irreversibility::ExternalComms
             } else {
                 Irreversibility::InternalWrite
@@ -389,73 +427,77 @@ pub fn classify_batch(tool: &str, input: &Value) -> Irreversibility {
     }
     classify(tool, input)
 }
-/// Risk class of an MCP server/tool (awesome-mcp-servers taxonomy, arsenal
-/// B2). Used when deciding how much trust a server listing earns before any
-/// of its tools are exposed: a filesystem or shell server is not the same
-/// proposition as a read-only docs server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Risk {
-    /// Reads data, changes nothing.
-    Low,
-    /// Network or filesystem reach with bounded blast radius.
-    Medium,
-    /// Writes outside a sandbox, or mutates a datastore.
-    High,
-    /// Arbitrary execution or credential access.
-    Critical,
+
+/// Whether `marker` occurs in `cmd` as a whole word: a marker edge that is
+/// a word character (alphanumeric or `_`) must sit next to a non-word
+/// character or the string edge. Trailing spaces in a marker are dropped —
+/// the boundary check replaces them.
+fn has_marker(cmd: &str, marker: &str) -> bool {
+    let m = marker.trim_end();
+    if m.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let first_word = m.chars().next().is_some_and(is_word);
+    let last_word = m.chars().next_back().is_some_and(is_word);
+    cmd.match_indices(m).any(|(at, _)| {
+        let before_ok = !first_word || !cmd[..at].chars().next_back().is_some_and(is_word);
+        let after_ok = !last_word || !cmd[at + m.len()..].chars().next().is_some_and(is_word);
+        before_ok && after_ok
+    })
 }
 
-impl Risk {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Risk::Low => "low",
-            Risk::Medium => "medium",
-            Risk::High => "high",
-            Risk::Critical => "critical",
+/// The form [`BASH_DENY`] is matched against: whitespace runs collapsed to
+/// one space (ends trimmed), and each `rm` whose flags (`-…` words right
+/// after it) include both recursive and force rewritten as `rm -rf`.
+fn normalize_bash(cmd: &str) -> String {
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        out.push(w.to_string());
+        i += 1;
+        if w != "rm" && !w.ends_with("/rm") {
+            continue;
+        }
+        let flags_end = words[i..]
+            .iter()
+            .position(|f| !f.starts_with('-') || *f == "--")
+            .map_or(words.len(), |n| i + n);
+        let flags = &words[i..flags_end];
+        let has = |short: &[char], long: &str| {
+            flags.iter().any(|f| {
+                *f == long
+                    || (!f.starts_with("--") && f.chars().skip(1).any(|c| short.contains(&c)))
+            })
+        };
+        if has(&['r', 'R'], "--recursive") && has(&['f'], "--force") {
+            out.push("-rf".into());
+            i = flags_end;
         }
     }
-
-    /// Whether exposing this server's tools requires a human decision up
-    /// front (rather than only at the call site).
-    pub const fn needs_approval(self) -> bool {
-        matches!(self, Risk::High | Risk::Critical)
-    }
+    out.join(" ")
 }
 
-/// Classify a server/tool by its declared capabilities. Unknown capability
-/// strings fail **up** (High): an unrecognized claim is not evidence of
-/// safety, the same rule `classify` uses for unknown tools.
-pub fn mcp_risk(tool: &str, capabilities: &[&str]) -> Risk {
-    let mut risk = Risk::Low;
-    let mut unknown = false;
-    for cap in capabilities {
-        let c = cap.trim().to_ascii_lowercase();
-        let r = match c.as_str() {
-            "read" | "read-only" | "search" | "list" | "docs" => Risk::Low,
-            "network" | "fetch" | "http" | "browser" | "file-write" | "write" => Risk::Medium,
-            "database-write" | "sql-write" | "delete" | "admin" | "filesystem-write" => Risk::High,
-            "shell" | "exec" | "execute" | "credentials" | "secrets" | "cloud-admin" => {
-                Risk::Critical
-            }
-            _ => {
-                unknown = true;
-                Risk::High
-            }
-        };
-        risk = risk.max(r);
-    }
-    if unknown {
-        risk = risk.max(Risk::High);
-    }
-    // The tool name is evidence too: a server that calls itself a shell is
-    // one, whatever its capability list claims.
-    let name_risk = match tool.to_ascii_lowercase().as_str() {
-        n if n.contains("shell") || n.contains("exec") || n.contains("terminal") => Risk::Critical,
-        n if n.contains("filesystem") || n.contains("postgres") || n.contains("sql") => Risk::High,
-        n if n.contains("fetch") || n.contains("browser") || n.contains("http") => Risk::Medium,
-        _ => Risk::Low,
-    };
-    risk.max(name_risk)
+/// The words a shell would dispatch on, for deny matching: the
+/// normalized command split on whitespace and the separators
+/// `( ) | ; & \``. Quotes are NOT peeled — `"sudo"` is a token
+/// carrying quote bytes, not the word `sudo` — so quoted prose
+/// (`echo "use sudo"`) stays allowed at the cost of a quoted smuggle
+/// (`bash -c "sudo ls"`) passing this first wall. The sandbox is the
+/// real boundary; this list only has to be better than a glob.
+fn shell_tokens(cmd: &str) -> impl Iterator<Item = &str> {
+    cmd.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '|' | ';' | '&' | '`'))
+        .filter(|t| !t.is_empty())
+}
+
+/// The escalation word a normalized command invokes, if any.
+fn escalation_token(cmd: &str) -> Option<&'static str> {
+    ESCALATION_WORDS
+        .iter()
+        .copied()
+        .find(|w| shell_tokens(cmd).any(|t| t == *w))
 }
 
 /// One session-scoped allow (P8-B cline `expires_turns` port): the key a
@@ -548,6 +590,14 @@ pub struct Policy {
     /// persona dir to the file tools — a draft is unreadable, not merely
     /// absent from the prompt (`draft_deny`, R2-F8).
     pub persona_approved: bool,
+    /// R6: MCP servers the operator declared `trust: "read"` — **sanitized**
+    /// server ids (the segment `mcp::namespaced` builds into a tool name),
+    /// set once by `ToolRegistry::with_mcp`, empty by default. An `mcp` call
+    /// whose server segment is in here is a read and skips the ladder; every
+    /// other MCP call rides the normal path (WorkspaceWrite: external-comms
+    /// lane → Ask). This is a declaration in a file, not a discovery about
+    /// the server.
+    pub mcp_read_servers: Vec<String>,
 }
 
 impl Policy {
@@ -568,6 +618,7 @@ impl Policy {
             memory_dir: None,
             persona_dir: None,
             persona_approved: false,
+            mcp_read_servers: Vec::new(),
         }
     }
 
@@ -587,6 +638,7 @@ impl Policy {
             memory_dir: None,
             persona_dir: None,
             persona_approved: false,
+            mcp_read_servers: Vec::new(),
         }
     }
 
@@ -607,6 +659,7 @@ impl Policy {
             memory_dir: None,
             persona_dir: None,
             persona_approved: false,
+            mcp_read_servers: Vec::new(),
         }
     }
 
@@ -709,6 +762,11 @@ impl Policy {
         if !t.untrusted
             && (tool == "task"
                 || tool == "skill"
+                // R6: MCP output is third-party content by construction —
+                // a search result is descriptions the server authored, a
+                // call result is whatever the server returned — so every
+                // `mcp` result latches untrusted, marker or not.
+                || tool == "mcp"
                 || Self::is_screenshot_context(tool, input)
                 || INJECTION_MARKERS.iter().any(|m| lower.contains(m)))
         {
@@ -745,16 +803,41 @@ impl Policy {
         self.taint.lock().map(|t| t.sensitive).unwrap_or(false)
     }
 
-    /// P7-1 screenshot-context detector: the `computer` screenshot/observe
-    /// action latches regardless of result text (pixels bypass text scan).
+    /// P7-1/S5 observation-context detector: EVERY computer observation
+    /// action (apps/windows/observe/screenshot/zoom/verify/browser)
+    /// latches `untrusted` regardless of result text — screen and page
+    /// content is attacker-controllable, and pixels bypass text scanning
+    /// (D5). A `batch` latches when any member observes.
     fn is_screenshot_context(tool: &str, input: &Value) -> bool {
         if tool != "computer" {
             return false;
         }
-        matches!(
-            input.get("action").and_then(Value::as_str),
-            Some(a) if a.eq_ignore_ascii_case("screenshot") || a.eq_ignore_ascii_case("observe")
-        )
+        let action = input.get("action").and_then(Value::as_str).unwrap_or("");
+        if [
+            "apps",
+            "windows",
+            "observe",
+            "screenshot",
+            "zoom",
+            "verify",
+            "browser",
+        ]
+        .iter()
+        .any(|a| action.eq_ignore_ascii_case(a))
+        {
+            return true;
+        }
+        if action.eq_ignore_ascii_case("batch") {
+            return input
+                .get("actions")
+                .and_then(Value::as_array)
+                .is_some_and(|members| {
+                    members
+                        .iter()
+                        .any(|m| Self::is_screenshot_context("computer", m))
+                });
+        }
+        false
     }
 
     /// Both Rule-of-Two latches are set — the exfil triangle is armed.
@@ -843,6 +926,22 @@ impl Policy {
         if READ_TOOLS.contains(&tool) {
             return Verdict::Allow;
         }
+        // R6 MCP early-allow, next to the read-tool rule: `search` reads
+        // third-party tool metadata (a read under every preset), and a `call`
+        // to a server the operator declared `trust: "read"` is a read too.
+        // Everything else about `mcp` falls through to the normal path below
+        // — ReadOnly/Plan deny it, WorkspaceWrite runs the external-comms
+        // ladder (Ask by default) and ends at the `"mcp"` arm of
+        // `check_workspace`, never the unknown-tool deny.
+        if tool == "mcp" {
+            let op = input.get("op").and_then(Value::as_str).unwrap_or("");
+            if op.eq_ignore_ascii_case("search") {
+                return Verdict::Allow;
+            }
+            if op.eq_ignore_ascii_case("call") && self.mcp_call_read_trusted(input) {
+                return Verdict::Allow;
+            }
+        }
         match self.preset {
             Preset::ReadOnly | Preset::Plan => Verdict::Deny {
                 reason: format!(
@@ -852,6 +951,24 @@ impl Policy {
             },
             Preset::WorkspaceWrite => self.check_workspace(tool, input),
         }
+    }
+
+    /// R6: does this `call` name a server the operator declared
+    /// `trust: "read"`? A full name is `mcp__<san(srv)>__<san(tool)>`, and
+    /// `mcp_read_servers` holds sanitized ids (what `with_mcp` stores), so
+    /// the prefix test is exact. `mcp_config::load` refuses a config where
+    /// one sanitized id extends another on a namespace boundary, so this
+    /// cannot land on the wrong server.
+    fn mcp_call_read_trusted(&self, input: &Value) -> bool {
+        let Some(full) = input.get("tool").and_then(Value::as_str) else {
+            return false;
+        };
+        if !full.starts_with("mcp__") {
+            return false;
+        }
+        self.mcp_read_servers
+            .iter()
+            .any(|server| full.starts_with(&format!("mcp__{server}__")))
     }
 
     /// Domain of an irreversibility class (the autonomy-map key).
@@ -971,8 +1088,16 @@ impl Policy {
                         reason: "bash: missing 'command'".into(),
                     });
                 };
+                let cmd = normalize_bash(cmd);
+                // Whole-token escalation check first — no glob spelling
+                // can see `$(sudo)`, `(doas ls)` or a trailing `ls; doas`.
+                if let Some(word) = escalation_token(&cmd) {
+                    return Some(Verdict::Deny {
+                        reason: format!("bash: '{word}' denied — privilege escalation"),
+                    });
+                }
                 for (pattern, why) in BASH_DENY {
-                    if glob_match(pattern, cmd) {
+                    if glob_match(pattern, &cmd) {
                         return Some(Verdict::Deny {
                             reason: format!("bash: '{pattern}' denied — {why}"),
                         });
@@ -1023,14 +1148,24 @@ impl Policy {
             // Ask/Deny already won for side-effecting actions. Explicit
             // autonomy keeps the default ActWithApproval Ask for acts.
             "computer" => Verdict::Allow,
+            // R6 `mcp` arm — reached only after the ladder floor above, and
+            // only for a `call`: `search` and read-trust calls returned Allow
+            // from `check`. So this is a call to a not-read-trusted server
+            // whose external-comms lane forced no Ask (an explicit
+            // `external=report|silent` autonomy, or the headless
+            // `ActSilently`-style floor). Allowing it here — exactly like
+            // `computer` — keeps an autonomy that earned silence from
+            // falling into the unknown-tool deny below.
+            "mcp" => Verdict::Allow,
             // Side-effecting file tools: containment already enforced by
             // hard_deny above (deny wins). Remaining: memory LAYER bar
             // (F5) → Rule-of-Two taint Ask, else Allow.
             "write" | "edit" => {
-                // F5: WRITE_BAR enforcement — identity-layer facts need
-                // approval even in a clean session. Maps the target path to
-                // its memory Layer (None outside memory_dir) and takes the
-                // max of the layer bar and the lane default already computed.
+                // F5: layer-bar enforcement — `layer_bar_for_path` maps
+                // the target path to its memory Layer (None outside
+                // memory_dir); identity-layer facts need approval even in
+                // a clean session. The bar is the layer's floor combined
+                // with the lane default already computed.
                 if let Some(p) = input.get("path").and_then(Value::as_str) {
                     if let Some(need) =
                         crate::memory::layer_bar_for_path(self.memory_dir.as_deref(), &self.root, p)
@@ -1436,23 +1571,45 @@ mod tests {
             Irreversibility::InternalWrite
         );
         assert_eq!(
-            classify("computer", &json!({"action": "move", "x": 1, "y": 2})),
-            Irreversibility::InternalWrite
+            classify(
+                "computer",
+                &json!({"action": "zoom", "x1": 0, "y1": 0, "x2": 5, "y2": 5})
+            ),
+            Irreversibility::Read
         );
         assert_eq!(
-            classify("computer", &json!({"action": "scroll", "dy": -3})),
-            Irreversibility::InternalWrite
+            classify("computer", &json!({"action": "verify"})),
+            Irreversibility::Read
         );
         assert_eq!(
-            classify("computer", &json!({"action": "type", "text": "hello"})),
-            Irreversibility::ExternalComms
+            classify("computer", &json!({"action": "browser"})),
+            Irreversibility::Read
         );
+        // Side-effect acts mutate local UI state — InternalWrite.
+        for a in [
+            "click",
+            "type",
+            "key",
+            "set",
+            "scroll",
+            "drag",
+            "menu",
+            "launch",
+            "browser_click",
+            "browser_type",
+        ] {
+            assert_eq!(
+                classify("computer", &json!({"action": a})),
+                Irreversibility::InternalWrite,
+                "{a}"
+            );
+        }
+        // A URL can exfiltrate — navigate is ExternalComms.
         assert_eq!(
-            classify("computer", &json!({"action": "submit"})),
-            Irreversibility::ExternalComms
-        );
-        assert_eq!(
-            classify("computer", &json!({"action": "send"})),
+            classify(
+                "computer",
+                &json!({"action": "navigate", "url": "https://x"})
+            ),
             Irreversibility::ExternalComms
         );
         // Credential-field focus escalates to Identity regardless of action.
@@ -1473,21 +1630,52 @@ mod tests {
 
     #[test]
     fn screenshot_context_always_latches_untrusted() {
-        // P7-1: pixels are opaque to text scanning — ANY screenshot context
-        // latches untrusted, even with benign result text.
-        let p = pol();
-        let notice = p.note_result(
-            "computer",
-            &json!({"action": "screenshot"}),
-            "capture ok, 1280x800",
+        // P7-1/S5: pixels and page content are attacker-controllable —
+        // EVERY observation action latches untrusted, even with benign
+        // result text (D5).
+        for action in [
+            "apps",
+            "windows",
+            "observe",
+            "screenshot",
+            "zoom",
+            "verify",
+            "browser",
+        ] {
+            let p = pol();
+            let notice =
+                p.note_result("computer", &json!({"action": action}), "benign result text");
+            assert!(notice.is_some(), "{action} must latch");
+            assert!(p.taint.lock().map(|t| t.untrusted).unwrap_or(false));
+        }
+        // A batch containing an observation member latches too.
+        let pb = pol();
+        assert!(
+            pb.note_result(
+                "computer",
+                &json!({"action": "batch", "actions": [
+                    {"action": "click", "x": 1, "y": 1},
+                    {"action": "windows"},
+                ]}),
+                "batch ok",
+            )
+            .is_some(),
+            "batch with an observation member must latch"
         );
-        assert!(notice.is_some(), "benign screenshot must still latch");
-        assert!(p.taint.lock().map(|t| t.untrusted).unwrap_or(false));
-        // Non-screenshot computer actions with benign text do not latch.
+        // Acts with benign text do not latch.
         let p2 = pol();
         assert!(p2
             .note_result("computer", &json!({"action": "click"}), "clicked ok")
             .is_none());
+        assert!(
+            p2.note_result(
+                "computer",
+                &json!({"action": "batch", "actions": [{"action": "click", "x": 1, "y": 1}]}),
+                "batch ok",
+            )
+            .is_none(),
+            "act-only batch must not latch"
+        );
     }
 
     #[test]
@@ -2168,18 +2356,26 @@ mod tests {
             strict.check("computer", &json!({"action": "click", "x": 1, "y": 2})),
             Verdict::Ask { .. }
         ));
-        // Type is ExternalComms: the outbox default Asks headless.
+        // navigate is ExternalComms (a URL can exfiltrate): the outbox
+        // default Asks headless; internal acts stay allowed.
         assert!(matches!(
-            p.check("computer", &json!({"action": "type", "text": "hi"})),
+            p.check(
+                "computer",
+                &json!({"action": "navigate", "url": "https://x"}),
+            ),
             Verdict::Ask { .. }
         ));
-        // Batch max-class: a benign click beside an exfil type Asks as a whole.
+        assert_eq!(
+            p.check("computer", &json!({"action": "type", "text": "hi"})),
+            Verdict::Allow
+        );
+        // Batch max-class: a benign click beside a navigate Asks as a whole.
         assert!(matches!(
             p.check(
                 "computer",
                 &json!({"action": "batch", "actions": [
                     {"action": "click", "x": 1, "y": 2},
-                    {"action": "type", "text": "hi"},
+                    {"action": "navigate", "url": "https://x"},
                 ]}),
             ),
             Verdict::Ask { .. }
@@ -2207,7 +2403,7 @@ mod tests {
         assert_eq!(
             classify_batch(
                 "computer",
-                &json!({"actions": [{"action": "screenshot"}, {"action": "type", "text": "x"}]}),
+                &json!({"actions": [{"action": "screenshot"}, {"action": "navigate", "url": "https://x"}]}),
             ),
             Irreversibility::ExternalComms
         );
@@ -2215,27 +2411,6 @@ mod tests {
             classify_batch("computer", &json!({"actions": [{"type": "send"}]})),
             Irreversibility::ExternalComms
         );
-    }
-
-    #[test]
-    fn mcp_risk_takes_the_max_and_fails_up_on_unknowns() {
-        assert_eq!(mcp_risk("docs", &["read-only", "search"]), Risk::Low);
-        assert_eq!(mcp_risk("web", &["network"]), Risk::Medium);
-        assert_eq!(mcp_risk("db", &["read", "database-write"]), Risk::High);
-        assert_eq!(mcp_risk("ops", &["read", "shell"]), Risk::Critical);
-        assert_eq!(mcp_risk("vault", &["credentials"]), Risk::Critical);
-        // Unknown capability → High, never Low.
-        assert_eq!(mcp_risk("mystery", &["teleport"]), Risk::High);
-        // The name is evidence even with a benign capability list.
-        assert_eq!(mcp_risk("my-shell-server", &["read"]), Risk::Critical);
-        assert_eq!(mcp_risk("postgres-tools", &[]), Risk::High);
-        assert_eq!(mcp_risk("weather", &[]), Risk::Low);
-        // Approval is required exactly for the top two classes.
-        assert!(!Risk::Low.needs_approval() && !Risk::Medium.needs_approval());
-        assert!(Risk::High.needs_approval() && Risk::Critical.needs_approval());
-        assert_eq!(Risk::Critical.as_str(), "critical");
-        // Ordering is the class ladder (used by the max above).
-        assert!(Risk::Critical > Risk::High && Risk::High > Risk::Medium);
     }
 
     /// Count a shared Ask counter without unwrapping the lock (house
@@ -2298,6 +2473,88 @@ mod tests {
     }
 
     #[test]
+    fn mcp_ops_classify_and_gate_on_the_declared_trust() {
+        use serde_json::json;
+        // R6: `classify` is pure — search is a read; call and every unknown
+        // op (including a missing one) default up to external communication.
+        assert_eq!(
+            classify("mcp", &json!({"op": "search", "query": "x"})),
+            Irreversibility::Read
+        );
+        assert_eq!(
+            classify("mcp", &json!({"op": "call", "tool": "mcp__fs__read"})),
+            Irreversibility::ExternalComms
+        );
+        assert_eq!(
+            classify("mcp", &json!({"op": "nonsense"})),
+            Irreversibility::ExternalComms
+        );
+        assert_eq!(classify("mcp", &json!({})), Irreversibility::ExternalComms);
+
+        let search = json!({"op": "search", "query": "read"});
+        let call_read = json!({"op": "call", "tool": "mcp__fs__read", "args": {}});
+        let call_other = json!({"op": "call", "tool": "mcp__db__sql", "args": {}});
+
+        // Search is allowed under every preset (it reads tool metadata).
+        for preset in [Preset::WorkspaceWrite, Preset::ReadOnly, Preset::Plan] {
+            let p = Policy::preset(preset, PathBuf::from("/tmp/ws"));
+            assert_eq!(
+                p.check("mcp", &search),
+                Verdict::Allow,
+                "{preset:?}: search is a read"
+            );
+        }
+
+        // A `trust: "read"` server's calls are reads; a default server's
+        // calls ride the external-comms ladder (ActWithApproval → Ask).
+        let mut p = Policy::preset(Preset::WorkspaceWrite, PathBuf::from("/tmp/ws"));
+        p.mcp_read_servers = vec!["fs".to_string()];
+        assert_eq!(p.check("mcp", &call_read), Verdict::Allow);
+        assert!(
+            matches!(p.check("mcp", &call_other), Verdict::Ask { .. }),
+            "an untrusted server needs approval, got {:?}",
+            p.check("mcp", &call_other)
+        );
+        // ... and an explicit silent-external autonomy reaches the `"mcp"`
+        // arm instead of the unknown-tool deny.
+        let mut silent = Policy::preset(Preset::WorkspaceWrite, PathBuf::from("/tmp/ws"));
+        silent
+            .autonomy
+            .insert("external".to_string(), Autonomy::ActSilently);
+        assert_eq!(silent.check("mcp", &call_other), Verdict::Allow);
+        // A read-trust id must not match a different server's name.
+        assert!(matches!(p.check("mcp", &call_other), Verdict::Ask { .. }));
+
+        // ReadOnly/Plan deny a call (both headless Ask and unknown fall
+        // through to the preset deny).
+        for preset in [Preset::ReadOnly, Preset::Plan] {
+            let p = Policy::preset(preset, PathBuf::from("/tmp/ws"));
+            assert!(
+                matches!(p.check("mcp", &call_other), Verdict::Deny { .. }),
+                "{preset:?}: a call is a side effect"
+            );
+        }
+
+        // Any mcp result latches untrusted (third-party content, including
+        // search descriptions) — proven by arming the triangle's other half.
+        let p = Policy::headless(PathBuf::from("/tmp/ws"));
+        assert!(
+            p.note_result("mcp", &search, "mcp__fs__read — Read a file")
+                .is_some(),
+            "the mcp result must latch"
+        );
+        assert!(!p.taint_armed(), "untrusted alone is not the triangle");
+        p.mark_sensitive("test");
+        assert!(p.taint_armed(), "note_result(mcp) set the untrusted latch");
+        let q = Policy::headless(PathBuf::from("/tmp/ws"));
+        q.mark_sensitive("test");
+        assert!(
+            !q.taint_armed(),
+            "a sensitive touch alone must not arm it (control)"
+        );
+    }
+
+    #[test]
     fn rules_file_ttl_suffix_is_honored_and_malformed_ttls_drop_the_entry() {
         use serde_json::json;
         let dir = std::env::temp_dir().join(format!("overseer-rules-ttl-{}", uuid::Uuid::now_v7()));
@@ -2328,5 +2585,141 @@ mod tests {
             Verdict::Ask { .. }
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bash_deny_catches_every_spelling_of_the_same_class() {
+        let p = pol();
+        for cmd in [
+            "rm -fr /",
+            "rm -Rf ~",
+            "rm -r -f /etc",
+            "rm -f -r $HOME",
+            "rm  -rf   /",
+            "rm\t-rf /",
+            "rm -rfv ../up",
+            "rm --recursive --force /",
+            "cd x && rm -fR *",
+            "doas rm file",
+            "pkexec bash",
+            "sudo",
+            "make install && sudo",
+            "echo x;sudo",
+            "cat img > /dev/sda",
+            "cat img >/dev/sdb1",
+            "dd if=x.img >> /dev/disk2",
+            "cat x > /dev/nvme0n1",
+        ] {
+            assert!(
+                matches!(
+                    p.hard_deny("bash", &json!({"command": cmd})),
+                    Some(Verdict::Deny { .. })
+                ),
+                "{cmd:?} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn privilege_escalation_is_denied_as_a_whole_shell_token() {
+        let p = pol();
+        // Every spelling a shell would dispatch on the same word: inside
+        // command substitution and subshells, backticks, after a
+        // separator, and bare at end of command.
+        for cmd in [
+            "sudo",
+            "sudo apt install x",
+            "make install && sudo",
+            "echo x;sudo",
+            "ls; doas",
+            "(doas ls)",
+            "(sudo id)",
+            "(pkexec id)",
+            "bash -c 'x=$(sudo id)'",
+            "x=$(sudo)",
+            "echo `sudo id`",
+            "echo `sudo`",
+            "doas rm file",
+            "pkexec bash",
+        ] {
+            assert!(
+                matches!(
+                    p.hard_deny("bash", &json!({"command": cmd})),
+                    Some(Verdict::Deny { .. })
+                ),
+                "{cmd:?} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn escalation_lookalikes_and_quoted_prose_stay_allowed() {
+        let p = pol();
+        for cmd in [
+            "sudoku",
+            "echo pseudo-random",
+            "echo pseudo",
+            "cat sudoers-notes.txt",
+            // Decision: quoting is NOT peeled — `"sudo"` inside quotes is
+            // a token carrying quote bytes, not the word `sudo`. Prose
+            // stays allowed at the cost of a quoted smuggle
+            // (`bash -c "sudo ls"`) also passing this first wall; the
+            // sandbox is the real boundary, not this deny list.
+            "echo \"use sudo\"",
+            "echo 'sudo'",
+        ] {
+            assert_eq!(
+                p.hard_deny("bash", &json!({"command": cmd})),
+                None,
+                "{cmd:?} must stay allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_deny_leaves_scoped_and_lookalike_commands_alone() {
+        let p = pol();
+        for cmd in [
+            "rm -r build/",
+            "rm -rf build/",
+            "rm  -r   build/",
+            "rm -f notes.txt",
+            "rm -r -v build/",
+            "echo pseudo",
+            "ls -la",
+            "echo hi > /dev/null",
+            "cat log 2>/dev/stderr",
+            "git status",
+        ] {
+            assert_eq!(
+                p.hard_deny("bash", &json!({"command": cmd})),
+                None,
+                "{cmd:?} must stay allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn external_markers_match_whole_words_only() {
+        let class = |c: &str| classify("bash", &json!({"command": c}));
+        for cmd in [
+            "gh pr create --fill",
+            "curl https://example.com",
+            "wget -q http://x",
+            "ssh host uptime",
+            "git fetch && gh-dash",
+            "which gh",
+        ] {
+            assert_eq!(class(cmd), Irreversibility::ExternalComms, "{cmd:?}");
+        }
+        for cmd in [
+            "echo through the list",
+            "grep high scores.txt",
+            "cat curly.txt",
+            "sort uses.txt",
+            "ls slacker/",
+        ] {
+            assert_eq!(class(cmd), Irreversibility::InternalWrite, "{cmd:?}");
+        }
     }
 }

@@ -18,5 +18,3 @@ sha2 = "0.10"
 
 [features]
 default = []
-# Zero-dependency opt-in: compiles the tree-sitter grammar/query registry.
-tree-sitter = []

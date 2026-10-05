@@ -13,7 +13,13 @@ pub mod markdown;
 pub mod notify;
 pub mod probe;
 pub mod theme;
+pub mod web;
 pub mod widgets;
+
+/// The overseer mark as a terminal glyph — §10's single swap point:
+/// change this const to re-cut the text-mode mark (the web surface
+/// draws `web/mark.svg` instead; the two files must agree).
+pub(crate) const MARK_GLYPH: &str = "\u{22C8}"; // ⋈ BOWTIE
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -21,9 +27,11 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture,
 };
 use crossterm::execute;
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use overseer_core::agent::{Agent, AgentConfig};
 use overseer_core::event::EventLog;
 use overseer_core::perm::{AskDecision, AskHandler, AskRequest};
@@ -44,21 +52,66 @@ pub struct TuiConfig {
 }
 
 /// Restore-on-drop guard: a panic mid-frame must not strand the user's
-/// terminal in raw mode.
+/// terminal in raw mode (or inside the alternate screen).
 struct TermGuard;
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
         let mut out = std::io::stdout();
-        let _ = execute!(out, DisableBracketedPaste, DisableFocusChange);
+        let _ = execute!(
+            out,
+            DisableBracketedPaste,
+            DisableFocusChange,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = out.write_all(b"\n");
         let _ = out.flush();
     }
 }
 
-/// Run the interactive session. Returns the process exit code.
-pub fn run(mut cfg: TuiConfig) -> std::io::Result<i32> {
+/// Worker + app wiring shared by both surfaces: the human-verdict
+/// channel (gate Ask → UI → decision), the agent worker thread, and
+/// transcript seeding on --resume.
+fn launch(mut cfg: TuiConfig) -> (App, std::thread::JoinHandle<()>) {
+    let (engine_tx, engine_rx) = mpsc::channel::<EngineMsg>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+
+    let ask_tx = engine_tx.clone();
+    cfg.agent.ask_handler = Some(AskHandler(Arc::new(move |req: &AskRequest| {
+        let (rtx, rrx) = mpsc::channel();
+        if ask_tx.send(EngineMsg::Ask(req.clone(), rtx)).is_err() {
+            return AskDecision::Deny;
+        }
+        // Fail closed if the UI is gone.
+        rrx.recv().unwrap_or(AskDecision::Deny)
+    })));
+
+    let preset = cfg.agent.policy_preset;
+    let cwd = cfg.agent.cwd.display().to_string();
+    let model = cfg.agent.model.clone();
+    let session_dir = cfg.session_dir.clone();
+    let resume = cfg.resume;
+    let worker = spawn_worker(cfg, engine_tx, cmd_rx);
+
+    let mut app = App::new(engine_rx, cmd_tx, preset, cwd, model, session_dir.clone());
+    if resume {
+        // Replayed events seed the transcript — resume shows history.
+        if let Ok(events) = EventLog::replay(session_dir.join("events.jsonl")) {
+            for ev in &events {
+                app.seed(ev);
+            }
+        }
+    }
+    (app, worker)
+}
+
+/// Run the interactive session on the full-window surface: the
+/// transcript owns the whole terminal except a 2-row prompt hanging
+/// above the 1-row footer. On exit the transcript is handed to native
+/// scrollback. Returns the process exit code.
+pub fn run(cfg: TuiConfig) -> std::io::Result<i32> {
     if !std::io::stdout().is_terminal() {
         eprintln!("overseer: stdout is not a terminal — use `overseer exec` for pipes/CI");
         return Ok(2);
@@ -68,6 +121,59 @@ pub fn run(mut cfg: TuiConfig) -> std::io::Result<i32> {
     let _guard = TermGuard;
 
     // Capability probe through the pty — before the UI owns stdin.
+    let caps = probe::probe(std::time::Duration::from_millis(250));
+    theme::set_theme(theme::Theme::detect(&caps));
+    {
+        let mut out = std::io::stdout();
+        execute!(
+            out,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableFocusChange,
+            EnableMouseCapture
+        )?;
+    }
+
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let mut term = Terminal::new(backend)?; // Viewport::Fullscreen
+    term.clear()?;
+
+    let (mut app, worker) = launch(cfg);
+    app.osc = caps.osc;
+    app.mode = app::UiMode::Full;
+
+    let code = drive(&mut term, &caps, &mut app);
+
+    // Leave the managed surface, then hand the transcript to native
+    // scrollback — exiting must not erase the session's record.
+    {
+        let mut out = std::io::stdout();
+        let _ = execute!(
+            out,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            DisableFocusChange,
+            LeaveAlternateScreen
+        );
+    }
+    print!("{}", app.transcript_plain());
+    let _ = std::io::stdout().flush();
+    let _ = worker.join();
+    code
+}
+
+/// `--inline`: the scrollback-preserving live-strip surface. Completed
+/// cells flush to native scrollback via `insert_before`; only the
+/// bottom strip (dialog/queue/composer/status) is managed.
+pub fn run_inline(cfg: TuiConfig) -> std::io::Result<i32> {
+    if !std::io::stdout().is_terminal() {
+        eprintln!("overseer: stdout is not a terminal — use `overseer exec` for pipes/CI");
+        return Ok(2);
+    }
+
+    crossterm::terminal::enable_raw_mode()?;
+    let _guard = TermGuard;
+
     let caps = probe::probe(std::time::Duration::from_millis(250));
     theme::set_theme(theme::Theme::detect(&caps));
     {
@@ -90,37 +196,8 @@ pub fn run(mut cfg: TuiConfig) -> std::io::Result<i32> {
         },
     )?;
 
-    let (engine_tx, engine_rx) = mpsc::channel::<EngineMsg>();
-    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
-
-    // The human-verdict channel: gate Ask → UI dialog → decision.
-    let ask_tx = engine_tx.clone();
-    cfg.agent.ask_handler = Some(AskHandler(Arc::new(move |req: &AskRequest| {
-        let (rtx, rrx) = mpsc::channel();
-        if ask_tx.send(EngineMsg::Ask(req.clone(), rtx)).is_err() {
-            return AskDecision::Deny;
-        }
-        // Fail closed if the UI is gone.
-        rrx.recv().unwrap_or(AskDecision::Deny)
-    })));
-
-    let preset = cfg.agent.policy_preset;
-    let cwd = cfg.agent.cwd.display().to_string();
-    let model = cfg.agent.model.clone();
-    let session_dir = cfg.session_dir.clone();
-    let resume = cfg.resume;
-    let worker = spawn_worker(cfg, engine_tx, cmd_rx);
-
-    let mut app = App::new(engine_rx, cmd_tx, preset, cwd, model, session_dir.clone());
+    let (mut app, worker) = launch(cfg);
     app.osc = caps.osc;
-    if resume {
-        // Replayed events seed the transcript — resume shows history.
-        if let Ok(events) = EventLog::replay(session_dir.join("events.jsonl")) {
-            for ev in &events {
-                app.seed(ev);
-            }
-        }
-    }
 
     let code = drive(&mut term, &caps, &mut app);
     let _ = worker.join();
@@ -146,6 +223,7 @@ pub fn run_line(mut cfg: TuiConfig) -> std::io::Result<i32> {
         rrx.recv().unwrap_or(AskDecision::Deny)
     })));
 
+    let cwd = cfg.agent.cwd.display().to_string();
     let worker = spawn_worker(cfg, engine_tx, cmd_rx);
     std::thread::spawn(move || {
         for line in std::io::stdin().lines() {
@@ -168,7 +246,7 @@ pub fn run_line(mut cfg: TuiConfig) -> std::io::Result<i32> {
         while let Ok(msg) = engine_rx.try_recv() {
             match msg {
                 EngineMsg::Event(ev) => {
-                    if let cells::Feed::NewCells(cs) = cells::feed(&ev) {
+                    if let cells::Feed::NewCells(cs) = cells::feed(&ev, None) {
                         for c in cs {
                             print_cell(&c);
                         }
@@ -215,7 +293,7 @@ pub fn run_line(mut cfg: TuiConfig) -> std::io::Result<i32> {
                 } else if line == "/quit" || line == "/exit" {
                     break;
                 } else if let Some(cmd) = line.strip_prefix('!') {
-                    let (code, out) = app::line_shell(cmd.trim());
+                    let (code, out) = app::line_shell(cmd.trim(), &cwd);
                     println!("{out}(exit {code})");
                 } else if !line.is_empty() {
                     if let Some(c) = &control {
@@ -344,8 +422,18 @@ fn drive(
 /// Suspend the TUI, run $VISUAL/$EDITOR (fallback `vi`) on a temp file
 /// seeded with `draft`, reinstall the result as the composer buffer.
 fn edit_in_editor(draft: String, app: &mut App) -> std::io::Result<()> {
-    let file = std::env::temp_dir().join(format!("overseer-draft-{}.md", std::process::id()));
-    std::fs::write(&file, &draft)?;
+    // Unpredictable name + create_new + 0600 — a predictable
+    // `overseer-draft-{pid}.md` in the shared temp dir is a symlink/
+    // squat target.
+    let file = std::env::temp_dir().join(format!("overseer-draft-{}.md", draft_suffix()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(&file)?.write_all(draft.as_bytes())?;
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
@@ -353,13 +441,34 @@ fn edit_in_editor(draft: String, app: &mut App) -> std::io::Result<()> {
     crossterm::terminal::disable_raw_mode()?;
     {
         let mut out = std::io::stdout();
-        let _ = execute!(out, DisableBracketedPaste, DisableFocusChange);
+        if app.full() {
+            // The editor needs the main screen back.
+            let _ = execute!(
+                out,
+                DisableBracketedPaste,
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
+        } else {
+            let _ = execute!(out, DisableBracketedPaste, DisableFocusChange);
+        }
     }
     let status = std::process::Command::new(&editor).arg(&file).status();
     crossterm::terminal::enable_raw_mode()?;
     {
         let mut out = std::io::stdout();
-        let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
+        if app.full() {
+            let _ = execute!(
+                out,
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+                EnableFocusChange,
+                EnableMouseCapture
+            );
+        } else {
+            let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
+        }
     }
     match status {
         Ok(s) if s.success() => {
@@ -374,4 +483,21 @@ fn edit_in_editor(draft: String, app: &mut App) -> std::io::Result<()> {
     }
     let _ = std::fs::remove_file(&file);
     Ok(())
+}
+
+/// `/dev/urandom` when it exists, nanos otherwise — enough entropy to
+/// keep the draft filename unguessable.
+fn draft_suffix() -> String {
+    let mut raw = [0u8; 8];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut raw))
+        .is_ok()
+    {
+        return raw.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}")
 }

@@ -25,9 +25,12 @@ identical tasks so every harness change gets a paired benchmark delta.
 ## Layout
 
 - `tasks/` — public corpus (35 tasks, all oracle-verified)
-- `heldout/tasks/` — private canary-instrumented suite; `run.py
+- `heldout/tasks/` — canary-instrumented suite; `run.py
   --task-dir heldout/tasks` runs it, `--audit` scans stored runs for
-  canary leakage
+  canary leakage. **It is repo-visible, not private:** anyone (or any
+  model trained on or browsing this repo) can read these tasks and their
+  solutions. Treat it as a canary-hygiene check — it catches a run that
+  echoes canary strings — not as a contamination-proof holdout.
 - `rig/` — the rig: taskspec, graders, scheduler, store, stats, report,
   manifest, agents/, benchmarks/
 - `tests/` — pytest suite (offline, no keys)
@@ -46,5 +49,8 @@ uv run python run.py --agents oracle,fail --seeds 3
 uv run python run.py --report           # report card
 ```
 
-Paid paths (`overseer`, `mini`, τ², LCB, docker benchmarks) need
-`OVERSEER_API_KEY` and spend approval — see LEDGER.md.
+Paid paths (`overseer`, `mini`, τ², LCB, docker benchmarks) need the
+provider's own key — named by `OVERSEER_PROVIDER` via `rig/keys.py`
+(`opencode` → `OPENCODE_API_KEY`, the default; `anthropic` →
+`ANTHROPIC_API_KEY`; `openai` → `OPENAI_API_KEY`; `gemini` →
+`GOOGLE_API_KEY`) — and spend approval; see LEDGER.md.

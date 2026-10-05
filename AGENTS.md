@@ -1,7 +1,8 @@
 # Overseer — agent notes
 
-Platform core for an agentic coding engine, built per `agent-harness-playbook.pdf`
-(extracted text: `playbook.txt`). Read that file before changing architecture.
+Platform core for an agentic coding engine, built per `docs/agent-harness-playbook.pdf`.
+Read it, and the pillar refresh `docs/research/2026-09-29-pillars.md`, before changing
+architecture.
 
 ## Layout
 
@@ -23,10 +24,21 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   `small_model` covers aux calls (consolidation) with escalate-to-main;
   each stuck trip bumps effort one notch. `memory.rs` is the
   git-versioned INDEX.md store; `consolidate` dedupes it via a
-  small-tier call. `skills.rs` keeps SKILL.md metadata resident and
+  small-tier call and is ADD-only for live pointers (bare `x.md` or
+  layer-qualified `semantic/x.md` — any the model omits are restored).
+  Prompt caching: Anthropic gets explicit breakpoints on the tools tail,
+  the last cacheable system segment, and a rolling one on the last
+  eligible block of the last message; OpenAI profiles send
+  `prompt_cache_key` (the session id); DeepSeek-style
+  `prompt_cache_hit/miss_tokens` and Responses `cache_write_tokens` are
+  parsed. The static system prefix (memory INDEX/CORE, skills, persona,
+  MCP line) is assembled ONCE per Agent — mid-session edits apply from
+  the next session/resume, so a memory write never rewrites the cache.
+  `skills.rs` keeps SKILL.md metadata resident and
   loads bodies on demand through the `skill` tool,
   provenance-wrapped. `repomap.rs` builds a bounded (~1K token)
-  ranked symbol index behind `repo_map`/`symbol` tools. `task` has
+  ranked symbol index (one header per file) behind `repo_map`/`symbol`
+  tools. `task` has
   read/write/background modes — writers isolate into git worktrees,
   background results land via SubagentDone notices (max 4 in flight).
   Rule-of-Two (perm.rs): untrusted-content + sensitive-data latches
@@ -37,7 +49,16 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   temp dirs, common secret dirs (`~/.ssh` etc.) read-denied. Falls back
   to unsandboxed exec with a visible warning when no backend exists;
   `--no-sandbox` disables. A loopback egress proxy with domain
-  allowlists is still open — v1 denies all egress.
+  allowlists is still open — v1 denies all egress. `diagnostics`
+  checkers and `verify_cmd` run inside the same sandbox with the bash env
+  allowlist (no `*_API_KEY` reaches `build.rs`). File tools: `write`
+  refuses to overwrite a file not read this session; write/edit resolve
+  a contained canonical target (parent canonicalized + checked) and open
+  it with `O_NOFOLLOW`; semgrep runs offline (`--metrics=off`, local
+  configs inside cwd only). Optional tools (`computer`, `struct_search`,
+  `diagnostics`) are advertised only when usable — computed once per
+  registry, so the spec array stays byte-stable and name-sorted; a
+  startup-token test pins the resident spec + static prompt sizes.
   `harden.rs` is the startup posture: the CLI calls `harden_startup()`
   first (umask 0o077 + proxy-env scrub) and session/daemon roots are
   pinned owner-only via `ensure_private_dir`. The injection-ASR corpus
@@ -48,22 +69,38 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   previews, checkpoint lists) and implements `fork` (copied log cut at a
   boundary + surviving checkpoints + fresh SessionStart); `rewind.rs` is
   the shared restore implementation used by `overseer rewind` and the
-  TUI's `/rewind`.
-- arsenal modules (P8-B/P8-C ports — pure patterns, no servers/runtimes):
-  memory/graph (`memory.rs`, `graph.rs`, `cognee.rs`, `press.rs`,
-  `rag.rs`), retrieval (`tools/struct_search.rs` — ast-grep + semgrep
-  shell-out; `tsitter.rs`, feature `tree-sitter`, default-off, zero
-  dependencies: the grammar/query registry a real binding registers
-  against), search/scrape (`web.rs`, `extract.rs`, `crawl.rs`),
-  browser/agent surface (`browse.rs`, `webagent.rs`), sandboxes and
-  grants (`backends.rs` — e2b trait, provider enum, runtime selection,
-  toolhive grants, context-forge grants), `mcp.rs` (minimal stdio
-  JSON-RPC client), `refine.rs` (textgrad bounded loop),
-  `evalcfg.rs`/`observability.rs` (B2). `bash` honours `--runtime
-  <native|seatbelt|bubblewrap|gvisor>`: a pinned runtime that is
+  TUI's `/rewind` (manifest paths must resolve inside the workspace or
+  the restore is refused). `EventLog::replay` tolerates only a torn
+  final line; a corrupt earlier line is an error naming the line, and
+  session listing skips such a log with a warning. New fields on an
+  existing `EventKind` variant must be `#[serde(default)]` so old logs
+  replay.
+- arsenal modules (ports kept only where wired — the rest was removed and
+  lives in git history): `memory.rs`; retrieval
+  (`tools/struct_search.rs` — ast-grep + semgrep shell-out); runtime
+  selection (`backends.rs` — `SandboxRuntime::parse` + `check_runtime`);
+  `cred.rs` (credential broker: sentinels are HMAC-SHA256 under a
+  per-process key; consent grants are recorded for audit — manifest +
+  `ConsentGranted` — but rate/window enforcement is not wired);
+  `mcp.rs` (minimal stdio JSON-RPC client) plus `mcp_config.rs` (the
+  `~/.overseer/mcp.json` server list: `${VAR}` env expansion, per-server
+  `trust: read|ask`). The client is wired in as exactly **one** resident
+  op tool, `mcp` (`tools/mcp_tool.rs`): `op=search` finds a tool,
+  `op=call` runs a namespaced `mcp__<server>__<tool>` one. Servers spawn
+  lazily on first use and are dropped when a call fails (next use
+  respawns); a name that would shadow a resident tool is skipped, never
+  callable; children get an env allowlist (PATH/HOME + the pairs the
+  config declares — never the parent's keys); a `trust: read` server's
+  calls skip the approval ladder, everything else rides the
+  external-comms lane. Discovered definitions never enter
+  `ToolRegistry.specs` — the `mcp` spec appears only when a server is
+  configured, so the advertised array is byte-stable. `bash` honours
+  `--runtime <native|seatbelt|bubblewrap|gvisor>`: a pinned runtime that is
   unavailable FAILS the call with the requirement named (never a silent
   downgrade to unsandboxed exec); unset keeps the platform default.
   Deferred sites are marked `// DEFERRED(owner)` in each module header.
+
+Computer use: `tools/computer.rs` + `tools/computer/{cua,shape}.rs` — a cua-driver MCP backend (`OVERSEER_COMPUTER_DRIVER` or `cua-driver` on PATH; `cua-driver mcp` over stdio so macOS TCC attributes to CuaDriver.app; session label `ovs-<8>`; lazy spawn, drop-and-respawn on transport failure; env PATH+HOME only) serves every action: apps/windows/launch/observe (AX tree, no screenshot)/screenshot/zoom/click/type/key/set/scroll/drag/menu/verify and browser/browser_click/browser_type/navigate (Chromium via CDP refs; other browsers via the window's AX tree). Observations always latch the untrusted taint; acts are InternalWrite; `navigate` is ExternalComms. The `OVERSEER_COMPUTER_{STRUCTURED,A11Y,PIXEL}` helper protocol is a fallback only (DEFERRED for removal).
 - `crates/overseer-cli` — `overseer exec` headless/CI surface; bare
   `overseer` / `overseer tui` launches the interactive TUI (same flags).
   `--continue`/`-c` resumes the newest session recorded for the cwd,
@@ -73,11 +110,61 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   combination with `--resume`/`--continue`/`--last`/`--session`.
   `--runtime <name>` pins the bash sandbox backend (validated at parse
   time; an unavailable runtime fails the call rather than downgrading).
+  `main.rs` is dispatch + usage; subcommands live in `src/cmd/<name>.rs`
+  with one flag parser in `src/args.rs` (`--flag value` and
+  `--flag=value`; unknown flags and unknown `--provider` values are
+  errors, exit 2). `overseer web [tui flags] [--port <n>] [--no-open]` is
+  the browser surface (same as `overseer tui --web`): scans 8641–8660
+  unless a port is pinned and opens a tab unless `--no-open` / SSH /
+  headless. Provider keys use provider-specific names only
+  (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY` or
+  `GEMINI_API_KEY` / `OPENCODE_API_KEY`): env first, then the same name
+  in the credential payload. There is no project-level key (owner
+  decision 2026-09-25); core's child-env strip list keeps
+  `OVERSEER_API_KEY` only as a defensive strip.
+- `crates/overseer-gateway` — always-on daemon (`daemon.rs`, single-
+  threaded tick loop; clears its own `STOP` killswitch at start;
+  `apply_config` reload keeps trigger state by id). `ctl.rs` Unix control
+  socket (request lines capped at 64 KiB). Channels:
+  `channels/telegram.rs` (Bot API, 15 s timeout on every call) and
+  `channels/webhook.rs` (rate-limited). `inbox.rs`/`outbox.rs` durable
+  item stores (inbox journals before writing). Triage + `gate.rs`
+  attention gating (`OVERSEER_TZ_OFFSET_MIN`). Untrusted spawn floor
+  (`spawn.rs`): channel input never reaches the act tier directly.
+  Unix-only.
 - `crates/overseer-proto` — wire protocol types (request/notification)
 - `crates/overseer-tui` — ratatui/crossterm TUI (library). Agent runs on a
-  worker thread; UI renders `Event`s over a channel. Fixed-height
-  `Viewport::Inline` region (ratatui inline height is init-only) +
-  `insert_before` for scrollback handoff; DECRQM/XTVERSION probe; BSU/ESU
+  worker thread; UI renders `Event`s over a channel. Two surfaces share
+  one `App` state machine (`app.rs` + `app/{input,overlay,panel,render,
+  shell}.rs`, `UiMode`): `run` (the default)
+  owns the whole window on the alternate screen — transcript
+  region over a 2-row prompt over a 1-row footer, `tbuf` line buffer
+  with PageUp/PageDn/wheel scroll and a `↑N` footer marker, live stack
+  (dialog/overlay/queue/indicator) pinned to the region bottom, and a
+  plain-text transcript handoff into scrollback on exit. `run_inline`
+  (`--inline`) keeps the old contract: fixed-height `Viewport::Inline`
+  region (ratatui inline height is init-only) + `insert_before` for
+  scrollback handoff. `run_web_with` (`overseer web`, web.rs) draws
+  the same Full surface into a `TestBackend` and streams the buffer as
+  JSON over a std-only localhost server (SSE frames out, input in via
+  `on_ct_event`). Its security model (a shell-capable agent sits behind
+  it): a per-install token (`~/.overseer/web/token`, 0600 in a 0700 dir)
+  rides the URL fragment `#t=` into localStorage — never a request line
+  or Referer; `/events` + `/input` require it (`?t=` / `X-Overseer-Token`,
+  constant-time); every request needs a loopback `Host` (DNS-rebinding
+  defence) and cross-site `Origin`/`Sec-Fetch-Site` is refused; ≤32
+  connections (SSE included), head ≤16 KiB and body ≤64 KiB (checked
+  before allocation) under one 10 s wall-clock deadline; each SSE client
+  has its own writer thread (a stalled tab never blocks the drive loop);
+  CSP `default-src 'self'` holds because the renderer uses DOM + CSSOM,
+  never innerHTML. Debug builds serve `web/` disk-first (a refresh, not
+  a rebuild); release builds serve only embedded assets. PWA: manifest +
+  icons, so localhost installs as an app window (full-bleed in
+  standalone mode). The mark lives in ONE file, `web/mark.svg` (the
+  bowtie, bold cut) — favicon, icons, panel button, empty/locked states
+  and `MARK_GLYPH` (`⋈`) all follow it; icons are rendered from it with
+  headless Chrome (22%-radius `#17181b` tile, mark at 60% `#f5f5f6`).
+  DECRQM/XTVERSION probe; BSU/ESU
   frame batching when sync output probes positive. `Control` =
   interrupt + steer queue (checked at tool-launch boundaries only —
   skipped calls get synthetic results so tool pairing survives);
@@ -108,18 +195,36 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   `checkpoints/revert-stash`. `/approve` exits plan mode and submits
   "implement the plan". Toasts self-expire in the status area.
   Polish layer (2.8): `theme.rs` is a runtime palette
-  (`OVERSEER_THEME=mono|default|high-contrast`; NO_COLOR/TERM=dumb →
-  mono); DECSET-1004 focus tracking gates BEL+OSC 9/99/777
+  (`OVERSEER_THEME=graphite|default|mono|high-contrast`; truecolor
+  terminals and the web get `graphite`, 256-colour `default`, 16-colour
+  `ansi`, NO_COLOR/TERM=dumb `mono`). Design rule: the conversation is the
+  one primary voice — colour marks state only (tool `●` ok/err, `◌`
+  running, `!` warn), tool and meta lines are indented 2 and recede, the
+  run summary is one quiet right-aligned line (`19 steps · 1m 12s ·
+  $0.042 · 87% cached`), the active panel tab is underline + white, and
+  an empty session shows only the mark + `overseer`. Contrast on
+  `#1e1f24`: text 11.3:1, dim 4.75:1 (faint is decorative only).
+  DECSET-1004 focus tracking gates BEL+OSC 9/99/777
   notifications (unfocused only, escape-sanitized); OSC 133 prompt
   marks + OSC 8 file links emit raw into the scrollback stream (muxes
   off via `caps.osc`); REDUCE_MOTION freezes the spinner;
   `--no-tui` is a plain-text REPL sharing the same worker (`run_line`,
   asks answered by one-line replies, /quit or Ctrl+D exits).
-- `eval/` — Inspect AI evaluation rig (scaffold)
+- `eval/` — evaluation rig: local taskspecs + scheduler + run-store
+  (`rig/`), external adapters (`rig/benchmarks/` — swe_bench, tau2, lcb,
+  terminal_bench/swe_rebench via harbor, swe_live, polyglot), a custom
+  harbor agent (`rig/harbor_agents/overseer_agent.py` runs the release
+  binary inside task containers), the live memory/orch stress suite
+  (`stress/suite.py`), and the Devin-Cloud worker orchestrator
+  (`cloud/driver.py` — shard matrix + `cloud/shard_ids.py` deterministic
+  id slicing + `cloud/relay.py` localhost x-opencode-session injector
+  for clients that can't set headers).
 
 ## Invariants (do not violate)
 
 1. Events are immutable; session state is a view over `events.jsonl`.
+
+   The event hash chain is structural — it covers (id, parent_id, type tag, prev hash), not payload bytes: it detects reordered/inserted/dropped/re-typed events, not edited payloads.
 2. Stable prompt prefixes — nothing volatile (timestamps, session ids, git
    status) above the cache boundary.
 3. Engine enforces budgets (steps, cost), never the model.
@@ -146,7 +251,15 @@ Platform core for an agentic coding engine, built per `agent-harness-playbook.pd
   regenerate with `INSTA_UPDATE=always`)
 - Run: `ANTHROPIC_API_KEY=... cargo run -p overseer-cli -- exec "task"`
 - TUI: `cargo run -p overseer-cli` (bare) or `-- tui [exec flags]`
+- Web: `cargo run -p overseer-cli -- web [--port <n>] [--no-open]` (prints
+  and opens the tokenized `http://127.0.0.1:<port>/#t=…` URL)
 - JSONL event stream: add `--json`; resume: `--resume <session-dir>`
+- Heavy work (full test suite, release builds, benchmarks) runs on Devin
+  Cloud VMs, not the owner's 16 GB M1: push the branch, then
+  `devin --cloud -p --prompt-file <brief.md>` from a checkout under a
+  trusted workspace (`~` is trusted; `/tmp` is not). Local = debug builds
+  and narrow gates only. CI (`ci.yml`) runs on the self-hosted Mac runner
+  for same-repo PRs and `main` pushes — fork PRs are refused.
 
 ## Git workflow (github.com/sirrayi/overseer, private)
 

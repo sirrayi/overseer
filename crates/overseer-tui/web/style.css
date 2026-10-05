@@ -1,0 +1,176 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  /* §6: calmer graphite gradient behind the framed window. */
+  background: radial-gradient(1200px 800px at 50% 20%, #121316 0%, #0d0e10 70%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+#win {
+  background: #1e1f24;
+  border-radius: 10px;
+  box-shadow: 0 24px 80px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+#bar {
+  height: 30px;
+  background: #2a2c33;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  gap: 8px;
+  flex: 0 0 auto;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+.dot.r { background: #ff5f57; }
+.dot.y { background: #febc2e; }
+.dot.g { background: #28c840; }
+
+#title {
+  flex: 1;
+  text-align: center;
+  font: 12px/1 -apple-system, system-ui, sans-serif;
+  color: #858a94;
+  margin-right: 60px; /* balance the dots */
+}
+
+#screen {
+  position: relative;
+  font-family: "SF Mono", Menlo, ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.35;
+  color: #d4d6db; /* graphite text */
+  cursor: text;
+  outline: none;
+}
+
+.row {
+  position: absolute;
+  left: 0;
+  white-space: pre;
+  overflow: hidden;
+}
+
+#cursor {
+  position: absolute;
+  background: rgba(212,214,219,.8);
+  mix-blend-mode: difference;
+  pointer-events: none;
+}
+
+#divider {
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  height: 1px;
+  background: rgba(255,255,255,.14);
+  pointer-events: none;
+}
+
+/* §5 empty state: the server leaves the glyph row blank and paints
+   the wordmark; the client overlays ONLY the 40px mark, centred on
+   that row — top is computed per frame in app.js (#empty lives inside
+   #screen so it shares the row coordinate space). */
+#empty {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 40px;
+  display: none;
+  justify-content: center;
+  pointer-events: none;
+}
+#empty.on { display: flex; }
+#emark { color: rgba(255,255,255,.35); }
+#emark svg { width: 40px; height: 40px; display: block; }
+
+/* §10: the bottom mark is the small cut from /mark.svg, injected
+   inline so currentColor applies — a mark swap stays a one-file
+   change. It's also the panel button (click → {type:"panel"}). */
+#win { position: relative; }
+#mark {
+  position: absolute;
+  left: 50%;
+  bottom: 5px;
+  transform: translateX(-50%);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: rgba(255,255,255,.35);
+}
+#mark svg { width: 14px; height: 14px; }
+#mark:hover, #mark:focus-visible { color: rgba(255,255,255,.6); }
+#mark:focus-visible {
+  outline: 1px solid rgba(255,255,255,.35);
+  outline-offset: 3px;
+}
+
+#bye {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  font: 14px -apple-system, system-ui, sans-serif;
+  color: #a9adb6;
+  background: rgba(13,14,16,.7);
+}
+#bye.on { display: flex; }
+
+/* Locked (no/bad token): the whole window hides and one centred
+   block shows — mark, 16px, one text line. #lockmsg is a single
+   inline container so the spaces around <code> can't collapse. */
+body.locked #win { display: none; }
+#lock {
+  position: fixed;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+}
+body.locked #lock { display: flex; }
+#lockmark { color: rgba(255,255,255,.35); }
+#lockmark svg { width: 40px; height: 40px; display: block; }
+#lockmsg { color: #a9adb6; font: 14px -apple-system, system-ui, sans-serif; }
+#lockmsg code {
+  font-family: "SF Mono", Menlo, ui-monospace, monospace;
+  background: #24262b;
+  padding: 3px 6px;
+  border-radius: 4px;
+}
+
+/* Unfocused = dimmed; one click inside returns input. */
+#win { transition: opacity .12s; }
+body.blur #win { opacity: .55; }
+body.blur #title::after { content: " — click to type"; }
+
+/* §6 installed PWA: no fake chrome, no margin — the OS window IS the
+   frame. fit() matches (see app.js). */
+@media (display-mode: standalone) {
+  html, body { background: #0d0e10; }
+  #bar { display: none; }
+  #win {
+    border-radius: 0;
+    box-shadow: none;
+    width: 100%;
+    height: 100%;
+  }
+}

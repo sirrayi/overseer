@@ -15,5 +15,5 @@ expression: screen(&term)
 permission: bash — outside allowlist
   $ git push origin main
 …
-❯
- workspace  /repo                        test-model · $0.000
+❯ ask anything  ·  ↑ panel  ·  ? keys
+ workspace  /repo                       test-model · $0.0000

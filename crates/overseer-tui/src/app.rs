@@ -7,7 +7,7 @@
 //! managed, inside a dynamically-sized `Viewport::Inline`. Every frame is
 //! wrapped in BSU/ESU when the terminal probed positive for sync 2026.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,16 @@ use crate::cells::{self, Cell, Feed, ToolStatus};
 use crate::composer::Composer;
 use crate::probe::{self, Caps};
 use crate::widgets::{self, Dialog};
+
+// W3 split: same crate::app tree, so child modules still see App's
+// private fields; cross-module items are `pub(crate)`.
+mod input;
+mod overlay;
+mod panel;
+mod render;
+mod shell;
+
+pub use shell::line_shell;
 
 /// Engine → UI messages (single channel keeps ordering trivial).
 pub enum EngineMsg {
@@ -53,6 +63,16 @@ pub enum WorkerCmd {
     Shutdown,
 }
 
+/// Which surface the app renders on. `Inline` is the scrollback-
+/// preserving live strip (`Viewport::Inline` + `insert_before`);
+/// `Full` owns the entire window on the alternate screen — transcript
+/// above, a 2-row prompt, then the footer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UiMode {
+    Inline,
+    Full,
+}
+
 enum RunState {
     Idle,
     Running {
@@ -77,6 +97,9 @@ pub enum Overlay {
         /// Git branch per row's cwd (computed once at open — spawning
         /// `git` per frame would stall the picker).
         branches: Vec<Option<String>>,
+        /// Sessions skipped because their log wouldn't parse (S1 rev):
+        /// surfaced as one faint footer line, reasons go to /tmp.
+        skipped: usize,
         sel: usize,
         filter: String,
         /// false = one line per session; true = adds a preview line.
@@ -108,6 +131,34 @@ pub enum Overlay {
         /// Selected hunk within `rows[sel]` (preview mode only).
         hunk_sel: usize,
     },
+    /// Control panel — the bottom mark / ↑ on an empty composer.
+    /// Tab strip on top, the selected tab's rows listed below.
+    Panel {
+        /// Index into PANEL_TABS.
+        tab: usize,
+        /// Scroll offset into the tab's row list.
+        scroll: usize,
+    },
+}
+
+/// One `task`-tool spawn seen in the event stream — drives the panel's
+/// agents tab. Foreground spawns close on their `ToolResult`;
+/// background ones only acknowledge the spawn there and close on the
+/// later `SubagentDone` (matched via the `bg-N` dir in the ack text).
+struct AgentEnt {
+    /// `ToolCallStart.call_id` — links the spawn to its result.
+    call_id: String,
+    /// `background: true` in the call input.
+    bg: bool,
+    /// `bg-N` parsed from the spawn ack's trace path — the id
+    /// `SubagentDone` reports under.
+    bg_id: Option<String>,
+    /// "read" | "write"
+    mode: &'static str,
+    /// "running" | "done" | "failed"
+    state: &'static str,
+    /// First prompt line, shortened — the row's at-a-glance label.
+    prompt: String,
 }
 
 /// One `/diff` row: a checkpoint-tracked path vs its working-tree state.
@@ -129,8 +180,23 @@ pub struct App {
     engine_rx: mpsc::Receiver<EngineMsg>,
     worker_tx: mpsc::Sender<WorkerCmd>,
     run: RunState,
-    /// Completed cells awaiting `insert_before`.
+    /// Render surface — `run` sets Full, `run_inline` keeps Inline.
+    pub mode: UiMode,
+    /// Completed cells awaiting `insert_before` (Inline) or `tbuf`
+    /// append (Full).
     pending: Vec<Cell>,
+    /// Flattened transcript lines (Full only) — rendered from
+    /// `history` cells at `tbuf_w`; rebuilt on resize.
+    tbuf: Vec<Line<'static>>,
+    /// Width `tbuf` was rendered at — a resize mismatch triggers a
+    /// rebuild from `history`.
+    tbuf_w: u16,
+    /// Full mode: lines scrolled up from the transcript tail (0 =
+    /// follow). Applies to `tbuf` only — the live stack stays pinned.
+    scroll: usize,
+    /// Transcript region height from the last full draw — PageUp/Down
+    /// step size.
+    view_h: u16,
     /// In-flight tool cells (call_id order) rendered in the live region.
     live: Vec<Cell>,
     /// Steers that missed delivery (run ended first) — drain on idle.
@@ -158,8 +224,15 @@ pub struct App {
     cwd: String,
     model: String,
     session_dir: std::path::PathBuf,
+    /// `task` spawns in spawn order — the agents tab renders them
+    /// newest-first. Cleared on session switch (the reseed replays
+    /// the new log's task calls back in).
+    agents: Vec<AgentEnt>,
     tokens: u64,
     cost: f64,
+    /// Sum of every RunEnd's per-run cache delta (live + replayed) —
+    /// the dashboard `cache` row renders hit rate + read volume.
+    cache: overseer_core::ledger::CacheStats,
     show_help: bool,
     show_plan: bool,
     tick: usize,
@@ -167,6 +240,16 @@ pub struct App {
     /// Engine channel hit the per-frame drain cap — zero-wait polling
     /// until cleared so input echo stays under 50 ms during bursts.
     backlogged: bool,
+    /// Full mode: the control panel's bottom band (absolute rows) —
+    /// the click hit-test reads it. None when the panel is closed.
+    panel_band: Option<ratatui::layout::Rect>,
+    /// Full mode: the rendered overlay block's first absolute row +
+    /// shown line count + lines clipped off its top — click→row map.
+    overlay_block: Option<(u16, usize, usize)>,
+    /// Full mode: the prompt band's first grid row — the web frame
+    /// carries it (`"p"`) so the client can seat the prompt dip and
+    /// divider regardless of what sits below.
+    pub prompt_top: u16,
     pub quit: bool,
 }
 
@@ -183,7 +266,12 @@ impl App {
             engine_rx,
             worker_tx,
             run: RunState::Idle,
+            mode: UiMode::Inline,
             pending: Vec::new(),
+            tbuf: Vec::new(),
+            tbuf_w: 0,
+            scroll: 0,
+            view_h: 0,
             live: Vec::new(),
             pending_queue: Vec::new(),
             composer: Composer::new(),
@@ -201,19 +289,53 @@ impl App {
             cwd,
             model,
             session_dir,
+            agents: Vec::new(),
             tokens: 0,
             cost: 0.0,
+            cache: overseer_core::ledger::CacheStats::default(),
             show_help: false,
             show_plan: false,
             tick: 0,
             dirty: true,
             backlogged: false,
+            panel_band: None,
+            overlay_block: None,
+            prompt_top: 0,
             quit: false,
         }
     }
 
     fn running(&self) -> bool {
         matches!(self.run, RunState::Running { .. })
+    }
+
+    pub fn full(&self) -> bool {
+        self.mode == UiMode::Full
+    }
+
+    /// `tbuf` lines at `width`, rebuilding from `history` when the
+    /// width changed (resize) or on first fill.
+    fn tbuf_at(&mut self, width: u16) {
+        if self.tbuf_w != width {
+            self.tbuf = self.history.iter().flat_map(|c| c.lines(width)).collect();
+            self.tbuf_w = width;
+        }
+    }
+
+    /// Plain-text transcript for the exit handoff — Full mode leaves
+    /// the alternate screen, so the session's record is printed into
+    /// native scrollback on the way out (styled lines can't leave the
+    /// buffer; links/marks are an Inline-stream feature).
+    pub fn transcript_plain(&self) -> String {
+        let mut out = String::new();
+        for c in &self.history {
+            let p = c.plain();
+            if !p.is_empty() {
+                out.push_str(&p);
+                out.push('\n');
+            }
+        }
+        out
     }
 
     /// Feed one replayed event into the transcript (resume seeding).
@@ -235,7 +357,7 @@ impl App {
         self.poll_input()?;
         self.step(term, caps)?;
         if self.quit {
-            let _ = self.worker_tx.send(WorkerCmd::Shutdown);
+            self.shutdown();
         }
         Ok(())
     }
@@ -329,6 +451,7 @@ impl App {
                     self.pending.push(Cell::Meta {
                         style: crate::theme::error(),
                         text: format!("engine error: {e}"),
+                        link: None,
                     });
                 }
             }
@@ -349,15 +472,91 @@ impl App {
         if let EventKind::ModelResponse { usage, .. } = ev.kind {
             self.tokens += usage.total_input() + usage.output;
         }
-        if let EventKind::RunEnd { total_cost_usd, .. } = ev.kind {
+        if let EventKind::RunEnd {
+            total_cost_usd,
+            cache,
+            ..
+        } = ev.kind
+        {
             self.cost = total_cost_usd;
+            self.cache.fresh_input += cache.fresh_input;
+            self.cache.cache_read += cache.cache_read;
+            self.cache.cache_write += cache.cache_write;
+            self.cache.output += cache.output;
         }
-        if let EventKind::ToolCallStart { name, .. } = &ev.kind {
+        if let EventKind::ToolCallStart {
+            call_id,
+            name,
+            input,
+        } = &ev.kind
+        {
             if let RunState::Running { phase, .. } = &mut self.run {
                 *phase = format!("running {name}");
             }
+            if name == "task" {
+                let v = serde_json::Value::as_str;
+                let b = serde_json::Value::as_bool;
+                self.agents.push(AgentEnt {
+                    call_id: call_id.clone(),
+                    bg: input.get("background").and_then(b).unwrap_or(false),
+                    bg_id: None,
+                    mode: match input.get("mode").and_then(v) {
+                        Some("write") => "write",
+                        _ => "read",
+                    },
+                    state: "running",
+                    prompt: input
+                        .get("prompt")
+                        .and_then(v)
+                        .unwrap_or("")
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(48)
+                        .collect(),
+                });
+            }
         }
-        match cells::feed(ev) {
+        if let EventKind::ToolResult {
+            call_id,
+            name,
+            is_error,
+            content,
+            ..
+        } = &ev.kind
+        {
+            if name == "task" {
+                if let Some(a) = self.agents.iter_mut().rev().find(|a| a.call_id == *call_id) {
+                    if *is_error {
+                        a.state = "failed";
+                    } else if a.bg {
+                        // The ack isn't the finish — record the dir
+                        // name so `SubagentDone` can close the row.
+                        a.bg_id = bg_id_of(content);
+                    } else {
+                        a.state = "done";
+                    }
+                }
+            }
+        }
+        if let EventKind::SubagentDone { task_id, .. } = &ev.kind {
+            if let Some(a) = self
+                .agents
+                .iter_mut()
+                .rev()
+                .find(|a| a.bg_id.as_deref() == Some(task_id.as_str()))
+            {
+                a.state = "done";
+            }
+        }
+        // The run-summary cell wants the elapsed wall time — RunEnd
+        // lands while `run` is still Running.
+        let run_elapsed = match &self.run {
+            RunState::Running { started, .. } => Some(started.elapsed()),
+            _ => None,
+        };
+        match cells::feed(ev, run_elapsed) {
             Feed::NewCells(new) => {
                 for c in new {
                     if let Cell::Tool {
@@ -391,6 +590,29 @@ impl App {
                     }
                     let done = self.live.remove(pos);
                     self.pending.push(done);
+                } else {
+                    // Reseed paths drain `live` into `pending` (or
+                    // history) before the ToolResult replays —
+                    // resolve the cell wherever it landed or it
+                    // renders as `◌` forever.
+                    for c in self.pending.iter_mut().chain(self.history.iter_mut()).rev() {
+                        if let Cell::Tool {
+                            id,
+                            status: s,
+                            output: o,
+                            ..
+                        } = c
+                        {
+                            if *id == call_id {
+                                *s = status;
+                                *o = output;
+                                // `tbuf` may already hold a stale
+                                // render of this row — rebuild it.
+                                self.tbuf_w = 0;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             Feed::Ignore => {}
@@ -407,12 +629,8 @@ impl App {
             _ => "done",
         };
         self.notify("overseer", &format!("run {done_kind}"));
-        if let O::Provider(msg) = &out {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: format!("provider error: {msg}"),
-            });
-        }
+        // A provider failure already rendered as one `error:` transcript
+        // cell via the engine's own Error event — nothing extra here.
         // Undelivered steers: interrupt hands them back to the composer
         // for editing (nothing fires unattended); a normal end auto-
         // drains the queue FIFO, per the queued≠sent contract.
@@ -439,6 +657,9 @@ impl App {
         self.session_dir = dir.clone();
         self.live.clear();
         self.history.clear();
+        self.agents.clear();
+        self.tbuf.clear();
+        self.scroll = 0;
         self.tokens = 0;
         self.file_index = std::cell::OnceCell::new();
         let name = dir
@@ -448,6 +669,7 @@ impl App {
         self.pending.push(Cell::Meta {
             style: crate::theme::meta(),
             text: format!("── session {name} ──"),
+            link: None,
         });
         if let Ok(events) = overseer_core::event::EventLog::replay(dir.join("events.jsonl")) {
             for ev in &events {
@@ -493,15 +715,65 @@ impl App {
             Duration::from_millis(250)
         };
         if !event::poll(wait)? {
-            if self.running() || self.dialog.is_some() {
-                self.dirty = true; // spinner/elapsed/dialog-arming tick
-            }
+            self.wake_tick();
             return Ok(());
         }
-        match event::read()? {
+        let ev = event::read()?;
+        self.on_ct_event(ev);
+        Ok(())
+    }
+
+    /// Tell the worker thread to stop — called on quit by `pump` and
+    /// by the web loop (which has no `pump`).
+    pub fn shutdown(&self) {
+        let _ = self.worker_tx.send(WorkerCmd::Shutdown);
+    }
+
+    /// Timeout side of `poll_input`: spinner/elapsed/dialog re-arm
+    /// cadence. The web surface calls the same hook on input-idle.
+    pub fn wake_tick(&mut self) {
+        if self.running() || self.dialog.is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Input-source-agnostic event dispatch — the terminal reader and
+    /// the web server's `/input` handler both land here.
+    pub fn on_ct_event(&mut self, ev: CtEvent) {
+        match ev {
             CtEvent::Key(key) => self.on_key(key),
             CtEvent::Paste(text) => {
                 self.composer.paste(&text);
+                self.dirty = true;
+            }
+            CtEvent::Mouse(m) if self.full() => {
+                use crossterm::event::{MouseButton, MouseEventKind};
+                let in_band = self
+                    .panel_band
+                    .map(|r| m.row >= r.y && m.row < r.y + r.height)
+                    .unwrap_or(false);
+                match m.kind {
+                    // Wheel over the panel band scrolls the panel's
+                    // rows; anywhere else scrolls the transcript.
+                    MouseEventKind::ScrollUp if in_band => {
+                        if let Some(Overlay::Panel { scroll, .. }) = &mut self.overlay {
+                            *scroll = scroll.saturating_sub(1);
+                        }
+                    }
+                    MouseEventKind::ScrollDown if in_band => {
+                        if let Some(Overlay::Panel { scroll, .. }) = &mut self.overlay {
+                            *scroll = scroll.saturating_add(1);
+                        }
+                    }
+                    MouseEventKind::ScrollUp => {
+                        self.scroll = self.scroll.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.scroll = self.scroll.saturating_sub(3);
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => self.on_click(m.column, m.row),
+                    _ => {}
+                }
                 self.dirty = true;
             }
             CtEvent::FocusGained => self.focused = true,
@@ -509,564 +781,10 @@ impl App {
             CtEvent::Resize(_, _) => self.dirty = true,
             _ => {}
         }
-        Ok(())
-    }
-
-    fn on_key(&mut self, key: KeyEvent) {
-        // Modal pickers own the keyboard entirely (the sessions filter
-        // is a text input by design). Esc always closes first.
-        if self.overlay.is_some() {
-            self.on_overlay_key(key);
-            self.dirty = true;
-            return;
-        }
-        // Dialog claims only its own keys — arrows/Enter/digits/Esc.
-        // Everything else keeps flowing to the composer (no focus theft;
-        // you can keep typing while a permission prompt waits).
-        if self.dialog.is_some() {
-            let decide = match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) => Some(Some(AskDecision::Deny)),
-                (KeyCode::Enter, _) => {
-                    if self.dialog.as_ref().unwrap().0.armed() {
-                        Some(Some(self.dialog.as_ref().unwrap().0.confirm()))
-                    } else {
-                        Some(None) // grace: swallow, don't submit either
-                    }
-                }
-                (KeyCode::Left, _) | (KeyCode::Right, _) => {
-                    let (dlg, _) = self.dialog.as_mut().unwrap();
-                    if dlg.armed() {
-                        dlg.move_sel(if key.code == KeyCode::Left { -1 } else { 1 });
-                    }
-                    Some(None)
-                }
-                (KeyCode::Char(c), m) if m.is_empty() && matches!(c, '1' | '2' | '3' | '4') => {
-                    let (dlg, _) = self.dialog.as_ref().unwrap();
-                    match dlg.resolve(c) {
-                        Some(d) => Some(Some(d)),
-                        None => Some(None), // grace: swallow the digit
-                    }
-                }
-                _ => None,
-            };
-            if let Some(decision) = decide {
-                if let Some(d) = decision {
-                    if d == AskDecision::AllowAlways {
-                        self.set_toast("rule saved to ~/.overseer/rules".into());
-                    }
-                    let (_, tx) = self.dialog.take().unwrap();
-                    let _ = tx.send(d);
-                }
-                self.dirty = true;
-                return;
-            }
-        }
-
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
-                if self.composer.is_empty() {
-                    self.quit = true;
-                }
-            }
-            (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.composer.clear();
-            }
-            (KeyCode::Esc, _) => {
-                if self.running() {
-                    if let RunState::Running { control, .. } = &self.run {
-                        control.interrupt();
-                    }
-                } else {
-                    self.composer.clear();
-                    self.show_help = false;
-                }
-            }
-            (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => self.composer.newline(),
-            (KeyCode::Enter, _) => {
-                let text = self.composer.submit();
-                if !text.is_empty() {
-                    self.on_submit(text);
-                } else {
-                    self.show_help = false;
-                }
-            }
-            (KeyCode::Char('j'), m) if m.contains(KeyModifiers::CONTROL) => self.composer.newline(),
-            (KeyCode::BackTab, m) if m.contains(KeyModifiers::SHIFT) => self.cycle_mode(),
-            (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.show_plan = !self.show_plan;
-            }
-            (KeyCode::Char('p'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.open_sessions();
-            }
-            (KeyCode::Char('o'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.open_transcript();
-            }
-            (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => self.copy_last(),
-            (KeyCode::Char('e'), m) if m.contains(KeyModifiers::ALT) => {
-                self.want_editor = Some(self.composer.text());
-            }
-            (KeyCode::Tab, _) => self.complete(),
-            (KeyCode::Char('x'), m) if m.contains(KeyModifiers::CONTROL) => {
-                // Cancel the newest undelivered queue entry.
-                if let RunState::Running { control, .. } = &self.run {
-                    let n = control.queued().len();
-                    if n > 0 {
-                        let _ = control.cancel_queued(n - 1);
-                    }
-                } else {
-                    self.pending_queue.pop();
-                }
-            }
-            (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => self.composer.stash(),
-            (KeyCode::Char('_'), m) if m.contains(KeyModifiers::CONTROL) => self.composer.undo(),
-            (KeyCode::Char('k'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.composer.kill_to_eol()
-            }
-            (KeyCode::Char('a'), m) if m.contains(KeyModifiers::CONTROL) => self.composer.home(),
-            (KeyCode::Char('e'), m) if m.contains(KeyModifiers::CONTROL) => self.composer.end(),
-            (KeyCode::Char('w'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.composer.delete_word_back()
-            }
-            (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) => self.composer.word_left(),
-            (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) => self.composer.word_right(),
-            (KeyCode::Left, _) => self.composer.left(),
-            (KeyCode::Right, _) => self.composer.right(),
-            (KeyCode::Up, _) => self.composer.up(),
-            (KeyCode::Down, _) => self.composer.down(),
-            (KeyCode::Home, _) => self.composer.home(),
-            (KeyCode::End, _) => self.composer.end(),
-            (KeyCode::Backspace, _) => self.composer.backspace(),
-            (KeyCode::Delete, _) => self.composer.delete(),
-            (KeyCode::Char('?'), _) if self.composer.is_empty() => {
-                self.show_help = !self.show_help;
-            }
-            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
-                self.composer.insert_str(&c.to_string());
-            }
-            _ => return,
-        }
-        self.dirty = true;
-    }
-
-    fn on_overlay_key(&mut self, key: KeyEvent) {
-        match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
-                self.overlay = None;
-            }
-            (KeyCode::Up, _) => match &mut self.overlay {
-                Some(Overlay::Transcript { scroll, .. }) => {
-                    *scroll = scroll.saturating_sub(1);
-                }
-                Some(o) => {
-                    let (sel, len) = overlay_sel(o);
-                    *sel = sel.saturating_sub(1).min(len);
-                }
-                None => {}
-            },
-            (KeyCode::Down, _) => match &mut self.overlay {
-                Some(Overlay::Transcript { scroll, .. }) => {
-                    *scroll = scroll.saturating_add(1);
-                }
-                Some(o) => {
-                    let (sel, len) = overlay_sel(o);
-                    *sel = (*sel + 1).min(len);
-                }
-                None => {}
-            },
-            (KeyCode::PageUp, _) => {
-                if let Some(Overlay::Transcript { scroll, .. }) = &mut self.overlay {
-                    *scroll = scroll.saturating_sub(8);
-                }
-            }
-            (KeyCode::PageDown, _) => {
-                if let Some(Overlay::Transcript { scroll, .. }) = &mut self.overlay {
-                    *scroll = scroll.saturating_add(8);
-                }
-            }
-            (KeyCode::Tab, _) => match &mut self.overlay {
-                Some(Overlay::Sessions { wide, .. }) => *wide = !*wide,
-                Some(Overlay::Diff {
-                    preview, hunk_sel, ..
-                }) => {
-                    *preview = !*preview;
-                    *hunk_sel = 0;
-                }
-                Some(Overlay::Transcript { expand_tools, .. }) => {
-                    *expand_tools = !*expand_tools;
-                }
-                _ => {}
-            },
-            (KeyCode::Left, _) | (KeyCode::Right, _) => {
-                if let Some(Overlay::Diff {
-                    rows,
-                    sel,
-                    preview,
-                    hunk_sel,
-                }) = &mut self.overlay
-                {
-                    if *preview {
-                        let n = rows.get(*sel).map(|r| r.hunks.len()).unwrap_or(0);
-                        if n > 0 {
-                            if key.code == KeyCode::Left {
-                                *hunk_sel = hunk_sel.saturating_sub(1);
-                            } else {
-                                *hunk_sel = (*hunk_sel + 1).min(n - 1);
-                            }
-                        }
-                    }
-                }
-            }
-            (KeyCode::Char(' '), _) => {
-                if let Some(Overlay::Diff {
-                    rows,
-                    sel,
-                    preview,
-                    hunk_sel,
-                }) = &mut self.overlay
-                {
-                    if *preview {
-                        if let Some(r) = rows.get_mut(*sel) {
-                            if let Some(flag) = r.rejected.get_mut(*hunk_sel) {
-                                *flag = !*flag;
-                            }
-                        }
-                    }
-                }
-            }
-            (KeyCode::Enter, _) => self.overlay_confirm(),
-            (KeyCode::Backspace, _) => match &mut self.overlay {
-                Some(Overlay::Sessions { filter, sel, .. }) => {
-                    filter.pop();
-                    *sel = 0;
-                }
-                Some(Overlay::Transcript { query, scroll, .. }) => {
-                    query.pop();
-                    *scroll = 0;
-                }
-                _ => {}
-            },
-            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
-                match &mut self.overlay {
-                    Some(Overlay::Sessions { filter, sel, .. }) => {
-                        filter.push(c);
-                        *sel = 0;
-                    }
-                    Some(Overlay::Transcript { query, scroll, .. }) => {
-                        query.push(c);
-                        *scroll = 0;
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn overlay_confirm(&mut self) {
-        match self.overlay.take() {
-            Some(Overlay::Sessions {
-                rows, sel, filter, ..
-            }) => {
-                if let Some((_, info)) = filtered_sessions(&rows, &filter).get(sel) {
-                    let info = (*info).clone();
-                    if info.dir != self.session_dir {
-                        let _ = self.worker_tx.send(WorkerCmd::SwitchSession {
-                            dir: info.dir.clone(),
-                        });
-                    }
-                }
-            }
-            Some(Overlay::Rewind { rows, sel }) => {
-                if let Some(row) = rows.get(sel) {
-                    self.do_rewind(row.boundary);
-                }
-            }
-            Some(Overlay::Tree { rows, sel }) => {
-                if let Some((info, _)) = rows.get(sel) {
-                    if info.dir != self.session_dir {
-                        let _ = self.worker_tx.send(WorkerCmd::SwitchSession {
-                            dir: info.dir.clone(),
-                        });
-                    }
-                }
-            }
-            Some(Overlay::Diff { rows, sel, .. }) => {
-                if let Some(row) = rows.into_iter().nth(sel) {
-                    self.revert_file(&row);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// `/sessions` (or Ctrl+P): the picker only opens between runs —
-    /// switching mid-run would orphan its control/ask state.
-    fn open_sessions(&mut self) {
-        if self.running() {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: "finish or interrupt the run first".into(),
-            });
-            return;
-        }
-        let Some(root) = self.session_dir.parent().map(|p| p.to_path_buf()) else {
-            return;
-        };
-        let mut rows = overseer_core::session::list(&root);
-        // Current-cwd sessions first (the picker is cwd-scoped by
-        // convention, like --continue).
-        let cwd = self.cwd.clone();
-        rows.sort_by_key(|s| std::cmp::Reverse(s.cwd == cwd));
-        let branches = rows.iter().map(|s| git_branch(&s.cwd)).collect();
-        self.overlay = Some(Overlay::Sessions {
-            rows,
-            branches,
-            sel: 0,
-            filter: String::new(),
-            wide: false,
-        });
-    }
-
-    /// `/tree`: the fork forest — sessions ordered parents-first.
-    fn open_tree(&mut self) {
-        if self.running() {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: "finish or interrupt the run first".into(),
-            });
-            return;
-        }
-        let Some(root) = self.session_dir.parent().map(|p| p.to_path_buf()) else {
-            return;
-        };
-        let rows = overseer_core::session::tree(&root);
-        if rows.is_empty() {
-            return;
-        }
-        // Preselect the current session so the user sees where they are.
-        let sel = rows
-            .iter()
-            .position(|(s, _)| s.dir == self.session_dir)
-            .unwrap_or(0);
-        self.overlay = Some(Overlay::Tree { rows, sel });
-    }
-
-    /// `/rewind`: checkpoints of the current session with their labels.
-    fn open_rewind(&mut self) {
-        if self.running() {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: "finish or interrupt the run first".into(),
-            });
-            return;
-        }
-        let rows: Vec<RewindRow> = overseer_core::session::checkpoints(&self.session_dir)
-            .into_iter()
-            .rev()
-            .map(|b| RewindRow {
-                boundary: b,
-                files: manifest_files(&self.session_dir, b),
-                label: overseer_core::session::checkpoint_label(&self.session_dir, b)
-                    .unwrap_or_else(|| "(no prompt text)".into()),
-            })
-            .collect();
-        if rows.is_empty() {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::dim(),
-                text: "no checkpoints yet — checkpoints open on each prompt".into(),
-            });
-            return;
-        }
-        self.overlay = Some(Overlay::Rewind { rows, sel: 0 });
-    }
-
-    fn do_rewind(&mut self, boundary: u64) {
-        match overseer_core::rewind::restore(
-            &self.session_dir,
-            Some(boundary),
-            overseer_core::rewind::Mode::Both,
-        ) {
-            Ok(rep) => {
-                self.pending.push(Cell::Meta {
-                    style: crate::theme::meta(),
-                    text: format!(
-                        "rewound to e{} — {} file(s) restored, {} removed, {} event(s) dropped",
-                        rep.boundary, rep.restored, rep.deleted, rep.truncated
-                    ),
-                });
-                // The log changed — rebuild the agent's context too.
-                let _ = self.worker_tx.send(WorkerCmd::SwitchSession {
-                    dir: self.session_dir.clone(),
-                });
-            }
-            Err(e) => self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: format!("rewind failed: {e}"),
-            }),
-        }
-    }
-
-    /// Ctrl+O / `/search`: pager over the whole transcript. The search
-    /// query is a plain case-insensitive substring over cell text.
-    fn open_transcript(&mut self) {
-        self.overlay = Some(Overlay::Transcript {
-            query: String::new(),
-            scroll: usize::MAX, // clamped to the tail on first render
-            expand_tools: false,
-        });
-    }
-
-    /// `/diff`: every path a checkpoint manifest records, earliest
-    /// snapshot vs the working tree. Bash side effects stay invisible —
-    /// the same blind spot rewind documents.
-    fn open_diff(&mut self) {
-        if self.running() {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: "finish or interrupt the run first".into(),
-            });
-            return;
-        }
-        let rows = collect_diff_rows(&self.session_dir);
-        if rows.is_empty() {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::dim(),
-                text: "no tracked changes — checkpoints record write/edit only".into(),
-            });
-            return;
-        }
-        self.overlay = Some(Overlay::Diff {
-            rows,
-            sel: 0,
-            preview: false,
-            hunk_sel: 0,
-        });
-    }
-
-    /// Revert one `/diff` row: marked hunks (rejects) restore just their
-    /// old lines; no marks = whole file back to its earliest snapshot.
-    /// Current content is stashed under checkpoints/revert-stash first —
-    /// a revert is itself recoverable.
-    fn revert_file(&mut self, row: &DiffRow) {
-        if let Ok(cur) = std::fs::read_to_string(&row.path) {
-            let stash = self
-                .session_dir
-                .join("checkpoints/revert-stash")
-                .join(row.path.file_name().unwrap_or_default());
-            if let Some(p) = stash.parent() {
-                let _ = std::fs::create_dir_all(p);
-            }
-            let _ = std::fs::write(&stash, cur);
-        }
-        let nrej = row.rejected.iter().filter(|x| **x).count();
-        // Partial revert needs the file to exist now; a "created" row's
-        // reject-all collapses to the full revert (delete) anyway.
-        let partial = nrej > 0 && row.snapshot.is_some();
-        let ok = if partial {
-            match std::fs::read_to_string(&row.path) {
-                Ok(cur) => {
-                    let out = crate::diff::apply_rejects(&cur, &row.hunks, &row.rejected);
-                    std::fs::write(&row.path, out).is_ok()
-                }
-                Err(_) => false,
-            }
-        } else {
-            match &row.snapshot {
-                Some(snap) => {
-                    if let Some(p) = row.path.parent() {
-                        let _ = std::fs::create_dir_all(p);
-                    }
-                    std::fs::write(&row.path, snap).is_ok()
-                }
-                None => std::fs::remove_file(&row.path).is_ok(),
-            }
-        };
-        // Basename only — the diff row above already carries the path.
-        let shown = row
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| display_path(&self.cwd, &row.path));
-        if ok {
-            let what = if partial {
-                format!("rejected {nrej} hunk(s) in {shown}")
-            } else {
-                format!("reverted {shown}")
-            };
-            self.set_toast(format!("{what} (stash in revert-stash)"));
-        } else {
-            self.set_toast(format!("revert failed for {shown}"));
-        }
-    }
-
-    /// `/approve`: leave plan mode and tell the agent to implement.
-    fn approve_plan(&mut self) {
-        if self.preset != Preset::Plan {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: "not in plan mode (shift+tab to cycle)".into(),
-            });
-            return;
-        }
-        if self.running() {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: "finish or interrupt the run first".into(),
-            });
-            return;
-        }
-        if !self.session_dir.join("plan.md").exists() {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::dim(),
-                text: "no plan yet — ask the agent for one first".into(),
-            });
-            return;
-        }
-        self.preset = Preset::WorkspaceWrite;
-        let _ = self.worker_tx.send(WorkerCmd::SetPreset(self.preset));
-        self.pending.push(Cell::Meta {
-            style: crate::theme::meta(),
-            text: "plan approved — switching to workspace mode".into(),
-        });
-        self.submit("The plan is approved — implement it.".to_string());
     }
 
     fn set_toast(&mut self, text: String) {
         self.toast = Some((text, std::time::Instant::now()));
-    }
-
-    /// `/fork`: branch the session at head into a sibling dir and switch.
-    fn do_fork(&mut self) {
-        if self.running() {
-            self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: "finish or interrupt the run first".into(),
-            });
-            return;
-        }
-        let Some(root) = self.session_dir.parent().map(|p| p.to_path_buf()) else {
-            return;
-        };
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let new_dir = root.join(format!("{ts}"));
-        match overseer_core::session::fork(&self.session_dir, None, &new_dir) {
-            Ok(()) => {
-                self.pending.push(Cell::Meta {
-                    style: crate::theme::meta(),
-                    text: format!("forked → {}", new_dir.display()),
-                });
-                let _ = self
-                    .worker_tx
-                    .send(WorkerCmd::SwitchSession { dir: new_dir });
-            }
-            Err(e) => self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: format!("fork failed: {e}"),
-            }),
-        }
     }
 
     fn cycle_mode(&mut self) {
@@ -1108,89 +826,6 @@ impl App {
         }
     }
 
-    /// Tab: complete `/command` or `@path` from the current token.
-    /// One match completes fully (with trailing space); several complete
-    /// to their longest common prefix — the suggestion strip shows the
-    /// menu meanwhile.
-    fn complete(&mut self) {
-        let text = self.composer.text();
-        let (stem, frag, candidates) = if let Some(frag) = text.strip_prefix('/') {
-            if frag.contains(char::is_whitespace) {
-                return;
-            }
-            (
-                "/".to_string(),
-                frag.to_string(),
-                COMMANDS
-                    .iter()
-                    .filter(|(n, _)| subseq_match(n, frag))
-                    .map(|(n, _)| n.to_string())
-                    .collect::<Vec<_>>(),
-            )
-        } else if let Some(frag) = at_fragment(&text) {
-            (
-                text[..text.len() - frag.len()].to_string(),
-                frag.to_string(),
-                self.file_index()
-                    .iter()
-                    .filter(|p| subseq_match(p, frag))
-                    .take(8)
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            return;
-        };
-        match candidates.len() {
-            0 => {}
-            1 => self.composer.set_text(&format!("{stem}{} ", candidates[0])),
-            _ => {
-                let lcp = candidates
-                    .iter()
-                    .skip(1)
-                    .fold(candidates[0].clone(), |acc, c| common_prefix(&acc, c));
-                if lcp.len() > frag.len() {
-                    self.composer.set_text(&format!("{stem}{lcp}"));
-                }
-            }
-        }
-    }
-
-    /// Workspace files for `@` completion — recursive, skips heavy
-    /// dirs, capped. Built lazily on first use (switches reset it).
-    fn file_index(&self) -> &[String] {
-        self.file_index
-            .get_or_init(|| self.build_index())
-            .as_slice()
-    }
-
-    fn build_index(&self) -> Vec<String> {
-        const SKIP: &[&str] = &[".git", "target", "node_modules", ".overseer"];
-        let mut out = Vec::new();
-        let mut stack = vec![std::path::PathBuf::from(&self.cwd)];
-        while let Some(d) = stack.pop() {
-            if out.len() >= 4000 {
-                break;
-            }
-            let Ok(rd) = std::fs::read_dir(&d) else {
-                continue;
-            };
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let p = e.path();
-                if p.is_dir() {
-                    if !SKIP.contains(&name.as_str()) && !name.starts_with('.') {
-                        stack.push(p);
-                    }
-                } else if let Ok(rel) = p.strip_prefix(&self.cwd) {
-                    out.push(rel.display().to_string());
-                }
-            }
-        }
-        out.sort();
-        out
-    }
-
     /// `drive` polls this: the draft to round-trip through $EDITOR.
     pub fn take_editor_request(&mut self) -> Option<String> {
         self.want_editor.take()
@@ -1202,34 +837,8 @@ impl App {
         self.dirty = true;
     }
 
-    /// `!cmd`: run in the workspace shell, output lands in the
-    /// transcript — never sent to the model. 10 s cap, 8 KiB output.
-    fn run_shell(&mut self, cmd: &str) {
-        self.pending.push(Cell::Meta {
-            style: crate::theme::meta(),
-            text: format!("$ {cmd}"),
-        });
-        match shell_capture(cmd, &self.cwd) {
-            Ok((code, out)) => {
-                let tail: String = out.lines().take(24).collect::<Vec<_>>().join("\n");
-                let suffix = if out.len() > 8192 { "…" } else { "" };
-                self.pending.push(Cell::Meta {
-                    style: if code == 0 {
-                        crate::theme::dim()
-                    } else {
-                        crate::theme::error()
-                    },
-                    text: format!("{tail}{suffix}\n(exit {code})"),
-                });
-            }
-            Err(e) => self.pending.push(Cell::Meta {
-                style: crate::theme::error(),
-                text: format!("shell failed: {e}"),
-            }),
-        }
-    }
-
     fn on_submit(&mut self, text: String) {
+        self.dirty = true; // submits outside on_key (tests, /approve) still repaint
         if let Some(cmd) = text.strip_prefix('/') {
             self.slash(cmd.trim());
             return;
@@ -1238,6 +847,7 @@ impl App {
             self.run_shell(cmd.trim());
             return;
         }
+        self.scroll = 0; // submitting snaps the transcript to the tail
         match &self.run {
             RunState::Running { control, .. } => {
                 // Mid-run input steers at the next tool-launch boundary.
@@ -1273,724 +883,15 @@ impl App {
             other => self.pending.push(Cell::Meta {
                 style: crate::theme::error(),
                 text: format!("unknown command /{other} — try /help"),
+                link: None,
             }),
         }
     }
 
     // ── rendering ────────────────────────────────────────────────────
-
-    /// Flush completed cells into native scrollback.
-    fn flush_cells<B: ratatui::backend::Backend>(
-        &mut self,
-        term: &mut Terminal<B>,
-        caps: &Caps,
-    ) -> std::io::Result<()>
-    where
-        B::Error: std::fmt::Display,
-    {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let width = term
-            .size()
-            .map_err(|e| std::io::Error::other(e.to_string()))?
-            .width
-            .max(1);
-        for cell in std::mem::take(&mut self.pending) {
-            self.history.push(cell.clone());
-            let lines = cell.lines(width);
-            let h = lines.len() as u16;
-            if h == 0 {
-                continue;
-            }
-            // OSC 133 marks ride the scrollback stream: A/B bracket the
-            // user prompt, C/D bracket finished tool output — terminal
-            // "jump to prompt" and output-select features work on the
-            // transcript. Emitted raw; the live region can't carry OSC.
-            let (pre, post) = Self::osc133_marks(self.osc, &cell);
-            sync_wrap(caps, || {
-                if let Some(m) = pre {
-                    let _ = std::io::stdout().write_all(m.as_bytes());
-                }
-                term.insert_before(h, |buf| {
-                    for (y, line) in lines.iter().enumerate() {
-                        buf.set_line(0, y as u16, line, width);
-                    }
-                })
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-                if let Some(m) = post {
-                    let _ = std::io::stdout().write_all(m.as_bytes());
-                }
-                Ok(())
-            })?;
-            // OSC 8: a clickable file:// link line under the cell —
-            // styled paths can't ride the ratatui buffer, so the link
-            // is its own line.
-            if self.osc {
-                if let Some(p) = cell.link_path() {
-                    let shown = display_path(&self.cwd, p);
-                    let url = format!("file://{}", p.display());
-                    let mut out = std::io::stdout();
-                    let _ = out.write_all(
-                        format!("  ⤷ {}\n", crate::notify::osc8(&url, &shown)).as_bytes(),
-                    );
-                    let _ = out.flush();
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// (pre, post) OSC 133 mark for a cell — None when OSC is off.
-    fn osc133_marks(osc: bool, cell: &Cell) -> (Option<String>, Option<String>) {
-        if !osc {
-            return (None, None);
-        }
-        use crate::notify::osc133;
-        match cell {
-            Cell::User { .. } => (Some(osc133("A")), Some(osc133("B"))),
-            Cell::Tool { status, .. } => {
-                let code = match status {
-                    ToolStatus::Ok => 0,
-                    _ => 1,
-                };
-                (Some(osc133("C")), Some(osc133(&format!("D;{code}"))))
-            }
-            _ => (None, None),
-        }
-    }
-
-    fn live_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out: Vec<Line<'static>> = Vec::new();
-        // A modal overlay owns the whole live region — nothing else
-        // competes for its rows. An open permission dialog outranks it
-        // (the engine is blocked on that answer).
-        if self.dialog.is_none() {
-            if let Some(o) = &self.overlay {
-                out.extend(self.overlay_lines(o, width));
-                if let Some((text, _)) = &self.toast {
-                    out.push(Line::from(Span::styled(
-                        format!("◆ {text}"),
-                        crate::theme::meta(),
-                    )));
-                }
-                return out;
-            }
-        }
-        // Running tools (cap: newest few stay visible).
-        for c in self.live.iter().rev().take(4).rev() {
-            out.extend(c.lines(width));
-        }
-        if let Some((dlg, _)) = &self.dialog {
-            out.extend(dlg.lines(width));
-        }
-        let queued: Vec<String> = match &self.run {
-            RunState::Running { control, .. } => control.queued(),
-            RunState::Idle => Vec::new(),
-        };
-        out.extend(widgets::queue_strip(&queued));
-        out.extend(widgets::queue_strip(&self.pending_queue));
-        // `/` and `@` completion strip — visible while a fragment is
-        // being typed, completed by Tab.
-        out.extend(self.suggestion_lines());
-        if let RunState::Running { started, phase, .. } = &self.run {
-            out.push(widgets::indicator(
-                phase,
-                started.elapsed().as_secs(),
-                self.tokens,
-                self.tick,
-                self.reduce_motion,
-            ));
-        }
-        if let Some((text, _)) = &self.toast {
-            out.push(Line::from(Span::styled(
-                format!("◆ {text}"),
-                crate::theme::meta(),
-            )));
-        }
-        if self.show_plan {
-            if let Ok(md) = std::fs::read_to_string(self.session_dir.join("plan.md")) {
-                for l in md.lines().take(8) {
-                    out.push(Line::from(Span::styled(
-                        l.to_string(),
-                        crate::theme::meta(),
-                    )));
-                }
-            } else {
-                out.push(Line::from(Span::styled(
-                    "no plan yet".to_string(),
-                    crate::theme::dim(),
-                )));
-            }
-        }
-        if self.show_help {
-            out.extend(widgets::help_panel());
-        }
-        out
-    }
-
-    /// Completion menu above the composer: `/cmd` or `@path` fragment.
-    fn suggestion_lines(&self) -> Vec<Line<'static>> {
-        let text = self.composer.text();
-        let rows: Vec<String> = if let Some(frag) = text.strip_prefix('/') {
-            if frag.contains(char::is_whitespace) {
-                return Vec::new();
-            }
-            COMMANDS
-                .iter()
-                .filter(|(n, _)| subseq_match(n, frag))
-                .take(4)
-                .map(|(n, d)| format!("/{n} — {d}"))
-                .collect()
-        } else if let Some(frag) = at_fragment(&text) {
-            self.file_index()
-                .iter()
-                .filter(|p| subseq_match(p, frag))
-                .take(4)
-                .map(|p| format!("@{p}"))
-                .collect()
-        } else {
-            return Vec::new();
-        };
-        if rows.is_empty() {
-            return Vec::new();
-        }
-        let mut out: Vec<Line<'static>> = rows
-            .into_iter()
-            .map(|r| Line::from(Span::styled(r, crate::theme::dim())))
-            .collect();
-        out.push(Line::from(Span::styled(
-            "tab to complete",
-            crate::theme::dim(),
-        )));
-        out
-    }
-
-    fn draw<B: ratatui::backend::Backend>(
-        &mut self,
-        term: &mut Terminal<B>,
-        caps: &Caps,
-    ) -> std::io::Result<()>
-    where
-        B::Error: std::fmt::Display,
-    {
-        let width = term
-            .size()
-            .map_err(|e| std::io::Error::other(e.to_string()))?
-            .width
-            .max(1);
-        let (composer_lines, (cx, cy)) = self.composer.render(width);
-        let live = self.live_lines(width);
-        let status = widgets::status_line(self.preset, &self.cwd, &self.model, self.cost, width);
-
-        sync_wrap(caps, || {
-            term.draw(|f| {
-                // Layout is keyed off f.area() — the actual inline
-                // viewport rect, not the terminal size.
-                let area = f.area();
-                let composer_rows = composer_lines.len().clamp(1, 4);
-                let composer_clip = composer_lines.len().saturating_sub(composer_rows);
-                let live_shown = (area.height as usize).saturating_sub(composer_rows + 1);
-                let live_start = live.len().saturating_sub(live_shown);
-                let composer_top = live_shown as u16;
-                let cy_screen = composer_top
-                    + cy.saturating_sub(composer_clip as u16)
-                        .min(composer_rows as u16 - 1);
-
-                let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
-                lines.extend(live[live_start..].iter().cloned());
-                lines.extend(composer_lines[composer_clip..].iter().cloned());
-                lines.push(status.clone());
-                f.render_widget(Paragraph::new(lines), area);
-                f.set_cursor_position((area.x + cx, area.y + cy_screen));
-            })
-            .map(|_| ())
-            .map_err(|e: B::Error| std::io::Error::other(e.to_string()))
-        })?;
-        self.dirty = false;
-        Ok(())
-    }
 }
-
-/// (selection index, last valid index) for the open overlay.
-fn overlay_sel(o: &mut Overlay) -> (&mut usize, usize) {
-    match o {
-        Overlay::Sessions {
-            rows, sel, filter, ..
-        } => (sel, filtered_sessions(rows, filter).len().saturating_sub(1)),
-        Overlay::Rewind { rows, sel } => (sel, rows.len().saturating_sub(1)),
-        Overlay::Tree { rows, sel } => (sel, rows.len().saturating_sub(1)),
-        Overlay::Diff { rows, sel, .. } => (sel, rows.len().saturating_sub(1)),
-        // Transcript scrolls lines, not rows — handled by its own arms.
-        Overlay::Transcript { scroll, .. } => (scroll, usize::MAX),
-    }
-}
-
-/// Fuzzy filter: subsequence match over id + cwd + preview text.
-/// Returns (row-index, session) pairs so parallel metadata (branches)
-/// still lines up after filtering.
-fn filtered_sessions<'a>(
-    rows: &'a [overseer_core::session::SessionInfo],
-    filter: &str,
-) -> Vec<(usize, &'a overseer_core::session::SessionInfo)> {
-    rows.iter()
-        .enumerate()
-        .filter(|(_, s)| {
-            let hay = format!(
-                "{} {} {}",
-                s.id,
-                s.cwd,
-                s.first_user.as_deref().unwrap_or("")
-            );
-            subseq_match(&hay, filter)
-        })
-        .collect()
-}
-
-/// Current branch of a session's recorded cwd — `git branch
-/// --show-current`, None outside a repo or on any failure. Computed
-/// once per picker open, never per frame.
-fn git_branch(cwd: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C", cwd, "branch", "--show-current"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if b.is_empty() {
-        None
-    } else {
-        Some(b)
-    }
-}
-
-fn subseq_match(hay: &str, needle: &str) -> bool {
-    let mut it = hay.chars().flat_map(char::to_lowercase);
-    for nc in needle.chars().flat_map(char::to_lowercase) {
-        loop {
-            match it.next() {
-                Some(hc) if hc == nc => break,
-                Some(_) => continue,
-                None => return false,
-            }
-        }
-    }
-    true
-}
-
-/// `/` menu entries — canonical names + one-line docs (the help panel
-/// and the completion strip share this list).
-const COMMANDS: &[(&str, &str)] = &[
-    ("help", "keys & commands"),
-    ("quit", "exit"),
-    ("sessions", "pick a session to resume"),
-    ("tree", "session fork tree"),
-    ("rewind", "restore a checkpoint"),
-    ("fork", "branch this session"),
-    ("diff", "changed files vs checkpoints"),
-    ("approve", "accept the plan, switch to workspace mode"),
-    ("search", "transcript search"),
-    ("transcript", "transcript search"),
-    ("edit", "draft in $EDITOR"),
-    ("clear", "clear the composer"),
-];
-
-/// The `@`-fragment the cursor sits on: the tail after the last `@`,
-/// only when that `@` starts a token and the tail has no whitespace.
-fn at_fragment(text: &str) -> Option<&str> {
-    let pos = text.rfind('@')?;
-    if pos > 0 && !text[..pos].ends_with(char::is_whitespace) {
-        return None; // '@' mid-token — an email or literal, not a mention
-    }
-    let frag = &text[pos + 1..];
-    if frag.contains(char::is_whitespace) {
-        return None;
-    }
-    Some(frag)
-}
-
-fn common_prefix(a: &str, b: &str) -> String {
-    a.chars()
-        .zip(b.chars())
-        .take_while(|(x, y)| x == y)
-        .map(|(x, _)| x)
-        .collect()
-}
-
-/// `!` in line mode (`run_line`) — `shell_capture` against the cwd.
-pub fn line_shell(cmd: &str) -> (i32, String) {
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| ".".into());
-    shell_capture(cmd, &cwd).unwrap_or((-1, "shell failed\n".to_string()))
-}
-
-/// Run `sh -c cmd` in `cwd` with a 10 s cap; returns (exit, capped
-/// output). The `!` composer prefix is a local escape hatch — its
-/// output is transcript-only, never submitted to the model.
-fn shell_capture(cmd: &str, cwd: &str) -> std::io::Result<(i32, String)> {
-    // A stale cwd (deleted checkout) must not kill the shell escape —
-    // fall back to the process cwd.
-    let dir = if std::path::Path::new(cwd).is_dir() {
-        cwd
-    } else {
-        "."
-    };
-    let child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(out)) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            let err = String::from_utf8_lossy(&out.stderr).into_owned();
-            if !err.trim().is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&err);
-            }
-            Ok((
-                out.status.code().unwrap_or(-1),
-                text.chars().take(8192).collect(),
-            ))
-        }
-        Ok(Err(e)) => Err(e),
-        Err(_) => Ok((-1, "(timed out after 10s)".to_string())),
-    }
-}
-
-/// Filtered transcript lines (history + in-flight live cells), used by
-/// both the overlay's height math and its render window.
-fn transcript_lines(app: &App, query: &str, width: u16, expand_tools: bool) -> Vec<Line<'static>> {
-    let q = query.to_lowercase();
-    app.history
-        .iter()
-        .chain(app.live.iter())
-        .filter(|c| q.is_empty() || c.plain().to_lowercase().contains(&q))
-        .flat_map(|c| {
-            if expand_tools {
-                c.lines_expanded(width)
-            } else {
-                c.lines(width)
-            }
-        })
-        .collect()
-}
-
-/// Files tracked by checkpoint manifests → `/diff` rows (earliest
-/// snapshot vs current working-tree content).
-fn collect_diff_rows(session_dir: &std::path::Path) -> Vec<DiffRow> {
-    // First-seen manifest entry per path: (existed, stored, checkpoint dir).
-    let mut seen: std::collections::HashMap<
-        std::path::PathBuf,
-        (bool, String, std::path::PathBuf),
-    > = std::collections::HashMap::new();
-    for b in overseer_core::session::checkpoints(session_dir) {
-        let cp = session_dir.join("checkpoints").join(format!("e{b}"));
-        let Ok(m) = std::fs::read_to_string(cp.join("manifest.jsonl")) else {
-            continue;
-        };
-        for line in m.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let (Some(path), Some(stored)) = (
-                v.get("path").and_then(|p| p.as_str()),
-                v.get("stored").and_then(|s| s.as_str()),
-            ) else {
-                continue;
-            };
-            let existed = v.get("existed").and_then(|e| e.as_bool()).unwrap_or(false);
-            seen.entry(std::path::PathBuf::from(path)).or_insert((
-                existed,
-                stored.to_string(),
-                cp.clone(),
-            ));
-        }
-    }
-    const CAP: usize = 400; // LCS is O(n·m) — cap the compared prefix
-    let mut rows = Vec::new();
-    for (path, (existed, stored, cp)) in seen {
-        let snapshot: Option<String> = if existed {
-            std::fs::read_to_string(cp.join("files").join(&stored)).ok()
-        } else {
-            None
-        };
-        let current = std::fs::read_to_string(&path).unwrap_or_default();
-        let status = match (existed, std::path::Path::new(&path).exists()) {
-            (false, true) => "created",
-            (true, false) => "deleted",
-            (_, true) => "modified",
-            (false, false) => continue, // created then removed — no change
-        };
-        let old: String = snapshot.clone().unwrap_or_default();
-        let hs = crate::diff::hunks(
-            &old.lines().take(CAP).collect::<Vec<_>>().join("\n"),
-            &current.lines().take(CAP).collect::<Vec<_>>().join("\n"),
-            3,
-        );
-        if hs.is_empty() {
-            continue;
-        }
-        let added = hs.iter().map(|h| h.added).sum();
-        let deleted = hs.iter().map(|h| h.deleted).sum();
-        let rejected = vec![false; hs.len()];
-        rows.push(DiffRow {
-            path,
-            status,
-            snapshot,
-            hunks: hs,
-            rejected,
-            added,
-            deleted,
-        });
-    }
-    rows.sort_by(|a, b| a.path.cmp(&b.path));
-    rows
-}
-
 /// Render an open overlay picker into live-region lines.
-impl App {
-    fn overlay_lines(&self, o: &Overlay, width: u16) -> Vec<Line<'static>> {
-        use crate::theme;
-        match o {
-            Overlay::Sessions {
-                rows,
-                branches,
-                sel,
-                filter,
-                wide,
-            } => {
-                // Hint goes LAST — the region clips from the top, so the
-                // key hints survive regardless of viewport height.
-                let mut out = vec![Line::from(vec![
-                    Span::styled("> ", theme::dialog_key()),
-                    Span::styled(format!("{filter}▌"), theme::dialog()),
-                ])];
-                let shown = filtered_sessions(rows, filter);
-                if shown.is_empty() {
-                    out.push(Line::from(Span::styled(
-                        "  no matching sessions".to_string(),
-                        theme::dim(),
-                    )));
-                }
-                for (i, (idx, s)) in shown.iter().take(6).enumerate() {
-                    let cur = i == *sel;
-                    let mark = if cur { "›" } else { " " };
-                    let when = rel_time(s.last_ms);
-                    // ⤶ marks a fork (SessionStart.parent set).
-                    let fork = if s.parent.is_some() { "⤶ " } else { "" };
-                    let head = format!(
-                        "{mark} {when} · {}{} · {}",
-                        fork,
-                        short_id(&s.id),
-                        s.first_user.as_deref().unwrap_or("(no prompt)")
-                    );
-                    out.push(Line::from(Span::styled(
-                        head,
-                        if cur {
-                            theme::dialog_sel()
-                        } else {
-                            theme::dialog()
-                        },
-                    )));
-                    if *wide {
-                        let branch = branches.get(*idx).and_then(|b| b.as_deref()).unwrap_or("-");
-                        out.push(Line::from(Span::styled(
-                            format!(
-                                "    {} · {} · ⎇ {} · {} events · {} checkpoint(s)",
-                                s.cwd,
-                                s.model,
-                                branch,
-                                s.events,
-                                s.checkpoints.len()
-                            ),
-                            theme::dim(),
-                        )));
-                    }
-                }
-                out.push(Line::from(Span::styled(
-                    "type to filter · ↑↓ · tab preview · enter switch · esc",
-                    theme::dim(),
-                )));
-                out
-            }
-            Overlay::Tree { rows, sel } => {
-                let mut out = Vec::new();
-                for (i, (s, depth)) in rows.iter().take(6).enumerate() {
-                    let cur = i == *sel;
-                    let mark = if cur { "›" } else { " " };
-                    let indent = "  ".repeat((*depth).min(4));
-                    let fork_mark = if *depth > 0 { "↳ " } else { "" };
-                    let here = if s.dir == self.session_dir {
-                        " · (current)"
-                    } else {
-                        ""
-                    };
-                    out.push(Line::from(Span::styled(
-                        format!(
-                            "{mark} {indent}{fork_mark}{} · {} · {}{}",
-                            short_id(&s.id),
-                            rel_time(s.last_ms),
-                            s.first_user.as_deref().unwrap_or("(no prompt)"),
-                            here
-                        ),
-                        if cur {
-                            theme::dialog_sel()
-                        } else {
-                            theme::dialog()
-                        },
-                    )));
-                }
-                out.push(Line::from(Span::styled(
-                    "↑↓ · enter switch · esc",
-                    theme::dim(),
-                )));
-                out
-            }
-            Overlay::Rewind { rows, sel } => {
-                let mut out: Vec<Line<'static>> = rows
-                    .iter()
-                    .take(6)
-                    .enumerate()
-                    .map(|(i, r)| {
-                        let cur = i == *sel;
-                        Line::from(Span::styled(
-                            format!(
-                                "{} e{} · {} file(s) · {}",
-                                if cur { "›" } else { " " },
-                                r.boundary,
-                                r.files,
-                                r.label
-                            ),
-                            if cur {
-                                theme::dialog_sel()
-                            } else {
-                                theme::dialog()
-                            },
-                        ))
-                    })
-                    .collect();
-                out.push(Line::from(Span::styled(
-                    "↑↓ · enter restore files+conversation · esc",
-                    theme::dim(),
-                )));
-                out
-            }
-            Overlay::Transcript {
-                query,
-                scroll,
-                expand_tools,
-            } => {
-                let all = transcript_lines(self, query, width, *expand_tools);
-                let n = all.len();
-                let mut out = vec![Line::from(vec![
-                    Span::styled("/ ", theme::dialog_key()),
-                    Span::styled(format!("{query}▌"), theme::dialog()),
-                ])];
-                // Scroll is a line offset; usize::MAX (fresh open) means tail.
-                let max = n.saturating_sub(4);
-                let start = (*scroll).min(max);
-                out.extend(all.into_iter().skip(start).take(4));
-                out.push(Line::from(Span::styled(
-                    format!("{n} lines · type to filter · ↑↓/pgdn · tab expand tools · esc"),
-                    theme::dim(),
-                )));
-                out
-            }
-            Overlay::Diff {
-                rows,
-                sel,
-                preview,
-                hunk_sel,
-            } => {
-                let mut out = Vec::new();
-                for (i, r) in rows.iter().take(4).enumerate() {
-                    let cur = i == *sel;
-                    let mark = if cur { "›" } else { " " };
-                    let nrej = r.rejected.iter().filter(|x| **x).count();
-                    let rej = if nrej > 0 {
-                        format!(" · {nrej} marked reject")
-                    } else {
-                        String::new()
-                    };
-                    out.push(Line::from(Span::styled(
-                        format!(
-                            "{mark} {} +{} -{} {}{}",
-                            r.status,
-                            r.added,
-                            r.deleted,
-                            display_path(&self.cwd, &r.path),
-                            rej
-                        ),
-                        if cur {
-                            theme::dialog_sel()
-                        } else {
-                            theme::dialog()
-                        },
-                    )));
-                    if *preview && cur {
-                        for (hi, h) in r.hunks.iter().take(3).enumerate() {
-                            let hcur = hi == *hunk_sel;
-                            out.push(Line::from(Span::styled(
-                                format!(
-                                    "  {} {} hunk {} (+{} -{})",
-                                    if hcur { "›" } else { " " },
-                                    if r.rejected[hi] { "[x]" } else { "[ ]" },
-                                    hi + 1,
-                                    h.added,
-                                    h.deleted
-                                ),
-                                if hcur {
-                                    theme::dialog_sel()
-                                } else {
-                                    theme::dialog()
-                                },
-                            )));
-                            if hcur {
-                                for l in h.lines.iter().skip(1).take(4) {
-                                    let style = if l.starts_with('-') {
-                                        theme::error()
-                                    } else if l.starts_with('+') {
-                                        theme::meta()
-                                    } else {
-                                        theme::dim()
-                                    };
-                                    out.push(Line::from(Span::styled(format!("    {l}"), style)));
-                                }
-                            }
-                        }
-                        if r.hunks.len() > 3 {
-                            out.push(Line::from(Span::styled(
-                                format!("    … {} more hunk(s)", r.hunks.len() - 3),
-                                theme::dim(),
-                            )));
-                        }
-                    }
-                }
-                out.push(Line::from(Span::styled(
-                    if *preview {
-                        "↑↓ file · ←→ hunk · space reject · enter revert · esc"
-                    } else {
-                        "↑↓ file · tab diff · enter revert · esc"
-                    },
-                    theme::dim(),
-                )));
-                out
-            }
-        }
-    }
-}
+impl App {}
 
 /// `/diff` row path: relative to the workspace when possible, else the
 /// last two components — full paths rarely fit the picker.
@@ -2010,53 +911,237 @@ fn display_path(cwd: &str, path: &std::path::Path) -> String {
     }
 }
 
-fn short_id(id: &str) -> String {
-    if id.len() > 12 {
-        format!("…{}", &id[id.len() - 10..])
-    } else {
-        id.to_string()
-    }
+/// `bg-N` out of a background spawn ack — the trace dir is the id
+/// `SubagentDone` reports under ("…subagents/bg-3)").
+fn bg_id_of(content: &str) -> Option<String> {
+    let i = content.rfind("/bg-")? + 1;
+    let id: String = content[i..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    (!id.is_empty()).then_some(id)
 }
 
-fn rel_time(ts_ms: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let ago = now.saturating_sub(ts_ms) / 1000;
-    if ago < 60 {
-        format!("{ago}s")
-    } else if ago < 3600 {
-        format!("{}m", ago / 60)
-    } else if ago < 86400 {
-        format!("{}h", ago / 3600)
-    } else {
-        format!("{}d", ago / 86400)
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::overlay::short_id;
+    use super::shell::{shell_capture, shell_capture_timeout};
+    use super::*;
+    use std::path::PathBuf;
 
-/// Files recorded in checkpoint e<N>'s manifest (the picker's count).
-fn manifest_files(session_dir: &std::path::Path, boundary: u64) -> u32 {
-    let p = session_dir
-        .join("checkpoints")
-        .join(format!("e{boundary}"))
-        .join("manifest.jsonl");
-    std::fs::read_to_string(p)
-        .map(|m| m.lines().count() as u32)
-        .unwrap_or(0)
-}
+    fn test_app(cwd: &str) -> App {
+        let (_etx, erx) = mpsc::channel();
+        let (wtx, _wrx) = mpsc::channel();
+        App::new(
+            erx,
+            wtx,
+            Preset::WorkspaceWrite,
+            cwd.into(),
+            "m".into(),
+            PathBuf::from("/tmp/ovw-sess"),
+        )
+    }
 
-/// Wrap a draw/insert in synchronized-update markers when probed —
-/// the terminal holds the frame until ESU → atomic flip, no flicker.
-fn sync_wrap(caps: &Caps, f: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
-    let mut out = std::io::stdout();
-    if caps.sync_output {
-        out.write_all(probe::BSU.as_bytes())?;
+    #[test]
+    fn short_id_is_char_safe() {
+        // Byte-slicing panics mid-char; char-walk must not.
+        let id = format!("héad{}", "界".repeat(10));
+        let s = short_id(&id);
+        assert!(s.starts_with('…'));
+        assert_eq!(s.chars().count(), 11);
+        assert_eq!(short_id("abc"), "abc");
     }
-    let r = f();
-    if caps.sync_output {
-        out.write_all(probe::ESU.as_bytes())?;
-        out.flush()?;
+
+    #[test]
+    fn shell_timeout_kills_and_reaps() {
+        let t = Instant::now();
+        let (code, out) =
+            shell_capture_timeout("sleep 30", ".", Duration::from_millis(50)).unwrap();
+        assert_eq!(code, -1);
+        assert!(out.contains("timed out"));
+        // Returns promptly — the child did not run to completion.
+        assert!(t.elapsed() < Duration::from_secs(3));
     }
-    r
+
+    /// Linux/dash keeps `sleep` as a separate child under `sh -c` (and
+    /// pipelines spawn one process per side anywhere); killing only `sh`
+    /// orphans grandchildren that hold the pipe write ends and the
+    /// reader joins block for their full lifetimes. The timeout must
+    /// kill the whole process group.
+    #[test]
+    fn shell_timeout_kills_the_whole_process_group() {
+        let pgid_file = std::env::temp_dir().join(format!("ovw-pgid-{}", std::process::id()));
+        // `$$` is the `sh` pid, which is also the process-group id.
+        let cmd = format!("echo $$ > {}; sleep 30 | cat", pgid_file.display());
+        let t = Instant::now();
+        let (code, out) = shell_capture_timeout(&cmd, ".", Duration::from_secs(1)).unwrap();
+        assert_eq!(code, -1);
+        assert!(out.contains("timed out"));
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "grandchildren pinned the reader joins: {:?}",
+            t.elapsed()
+        );
+        let pgid: i32 = std::fs::read_to_string(&pgid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(&pgid_file);
+        // Brief window for init to reap the SIGKILLed group members.
+        let mut esrch = false;
+        for _ in 0..40 {
+            let rc = unsafe { libc::kill(-pgid, 0) };
+            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                esrch = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(esrch, "process group {pgid} still has live members");
+    }
+
+    #[test]
+    fn shell_capture_collects_stdout_and_stderr() {
+        let (code, out) = shell_capture("echo hi; echo err >&2", "/").unwrap();
+        assert_eq!(code, 0);
+        assert!(out.contains("hi"));
+        assert!(out.contains("err"));
+    }
+
+    #[test]
+    fn line_shell_uses_agent_cwd() {
+        let dir = std::env::temp_dir().join(format!("ovw-lineshell-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker.txt"), "marker-ok").unwrap();
+        let (code, out) = line_shell("cat marker.txt", &dir.display().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(code, 0);
+        assert!(out.contains("marker-ok"));
+    }
+
+    #[test]
+    fn seed_resolves_tool_status_from_replayed_results() {
+        use overseer_core::event::EventKind;
+        let ev = |kind| Event {
+            id: 0,
+            parent_id: None,
+            ts_ms: 0,
+            prev_hash: 0,
+            hash: 0,
+            kind,
+        };
+        let mut app = test_app("/tmp");
+        // A replayed ToolCallStart drains live→pending before its
+        // ToolResult replays — the done must find the cell wherever
+        // it landed or a resumed session renders every tool `◌`.
+        app.seed(&ev(EventKind::ToolCallStart {
+            call_id: "c1".into(),
+            name: "write".into(),
+            input: serde_json::json!({"path": "a"}),
+        }));
+        app.seed(&ev(EventKind::ToolResult {
+            call_id: "c1".into(),
+            name: "write".into(),
+            content: "ok".into(),
+            is_error: false,
+            raw_bytes: 2,
+            spilled_to: None,
+            denied: false,
+        }));
+        app.seed(&ev(EventKind::ToolCallStart {
+            call_id: "c2".into(),
+            name: "write".into(),
+            input: serde_json::json!({"path": "b"}),
+        }));
+        app.seed(&ev(EventKind::ToolResult {
+            call_id: "c2".into(),
+            name: "write".into(),
+            content: "boom".into(),
+            is_error: true,
+            raw_bytes: 4,
+            spilled_to: None,
+            denied: false,
+        }));
+        let statuses: Vec<ToolStatus> = app
+            .pending
+            .iter()
+            .chain(app.history.iter())
+            .filter_map(|c| match c {
+                Cell::Tool { status, .. } => Some(*status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses, vec![ToolStatus::Ok, ToolStatus::Err]);
+        assert!(app.live.is_empty());
+    }
+
+    #[test]
+    fn runend_cache_sums_across_live_and_replay() {
+        use overseer_core::event::EventKind;
+        use overseer_core::ledger::CacheStats;
+        let ev = |kind| Event {
+            id: 0,
+            parent_id: None,
+            ts_ms: 0,
+            prev_hash: 0,
+            hash: 0,
+            kind,
+        };
+        let run_end = |read: u64| EventKind::RunEnd {
+            stop_reason: "end_turn".into(),
+            steps: 1,
+            total_cost_usd: 0.01,
+            cache: CacheStats {
+                fresh_input: 100,
+                cache_read: read,
+                cache_write: 10,
+                output: 5,
+            },
+        };
+        let mut app = test_app("/tmp");
+        app.on_event(&ev(run_end(300))); // live
+        app.seed(&ev(run_end(200))); // replayed
+        assert_eq!(app.cache.cache_read, 500);
+        assert_eq!(app.cache.fresh_input, 200);
+        assert_eq!(app.cache.input_total(), 720);
+        assert!((app.cache.hit_rate() - 500.0 / 720.0).abs() < 1e-9);
+        // A pre-extension RunEnd (zero cache) leaves the row at `—`.
+        let mut app2 = test_app("/tmp");
+        app2.on_event(&ev(EventKind::RunEnd {
+            stop_reason: "end_turn".into(),
+            steps: 1,
+            total_cost_usd: 0.0,
+            cache: Default::default(),
+        }));
+        assert_eq!(app2.cache.input_total(), 0);
+    }
+
+    #[test]
+    fn empty_state_guard_respects_overlay() {
+        // The web `e` flag shares this guard — the client's mark
+        // must not paint over an open panel.
+        let mut app = test_app("/tmp");
+        assert!(app.empty_state_shown());
+        app.overlay = Some(Overlay::Panel { tab: 0, scroll: 0 });
+        assert!(!app.empty_state_shown());
+        app.overlay = None;
+        assert!(app.empty_state_shown());
+    }
+
+    #[test]
+    fn build_index_skips_heavy_dirs() {
+        let dir = std::env::temp_dir().join(format!("ovw-idx-{}", std::process::id()));
+        for d in ["src", "target/debug", "node_modules/m", ".git"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        std::fs::write(dir.join("target/debug/a.o"), "").unwrap();
+        std::fs::write(dir.join("node_modules/m/x.js"), "").unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "").unwrap();
+        let app = test_app(&dir.display().to_string());
+        let idx = app.build_index();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(idx, vec!["src/lib.rs".to_string()]);
+    }
 }

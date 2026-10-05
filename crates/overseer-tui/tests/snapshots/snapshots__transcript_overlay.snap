@@ -13,11 +13,12 @@ expression: screen(&term)
 
 
 ❯ fix the flaky test
+
 ❯ add a parser
 I'll look at the test file.
-❯ fix the flaky test
+
 ❯ add a parser
 I'll look at the test file.
-3 lines · type to filter · ↑↓/pgdn · tab expand tools · esc
-❯
- workspace  /repo                        test-model · $0.000
+4 lines · type to filter · ↑↓/pgdn · tab expand tools · esc
+❯ ask anything  ·  ↑ panel  ·  ? keys
+ workspace  /repo                       test-model · $0.0000

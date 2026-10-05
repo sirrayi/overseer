@@ -12,6 +12,7 @@ expression: screen(&term)
 
 
 
-⠙ working  0s  0 tok  (esc to interrupt)
+  queued[0] also rename the helper
+⠹ working  0s  0 tok  (esc to interrupt)
 ❯
- workspace  /repo                        test-model · $0.000
+ workspace  /repo                       test-model · $0.0000

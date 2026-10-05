@@ -16,8 +16,8 @@
 //! `prompt_frag` is delivered as a harness-authored `Nudge` at mode
 //! switch, not spliced into the static prompt: the frozen ORDER segments
 //! stay byte-stable, and a logged Nudge replays identically on resume.
-//! `// DEFERRED(owner): user-defined modes (roo's `.roomodes` file) —
-//! built-ins only; the loader would be a sibling of `recipe::load`.`
+
+// DEFERRED(owner): user-defined modes (roo's `.roomodes` file) — built-ins only; needs a mode-file loader — gate: a config surface for modes.
 
 use crate::provider::ToolSpec;
 

@@ -393,15 +393,7 @@ pub fn load(path: &Path) -> Result<DaemonConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "overseer-gateway-config-{tag}-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create tmpdir");
-        dir
-    }
+    use crate::test_util::tmpdir;
 
     fn assert_defaults(cfg: &DaemonConfig) {
         assert_eq!(cfg.tick_ms, 500);

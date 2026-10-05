@@ -115,7 +115,7 @@ fn repomap_5k_files_bounded() {
     let map = repomap::render_map(&dir);
     let map_ms = t.elapsed().as_millis();
     let t = Instant::now();
-    let hit = repomap::lookup(&dir, "alpha");
+    let hit = repomap::lookup(&idx, &dir, "alpha");
     let lookup_ms = t.elapsed().as_millis();
     eprintln!(
         "repomap: {} syms, build {build_ms}ms, map {map_ms}ms ({}B), lookup {lookup_ms}ms",
@@ -767,6 +767,7 @@ fn gemini_1k_messages_full_path() {
         thinking_budget: None,
         effort: Some(Effort::High),
         cache_breakpoints: false,
+        cache_key: None,
     };
     let t = Instant::now();
     let resp = g.complete(&req).unwrap();

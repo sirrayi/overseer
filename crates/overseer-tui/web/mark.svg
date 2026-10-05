@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Mark B "Bowtie", bold cut (b-bold) — the ONE geometry source for
+       web use. A mark swap is a one-file change: replace this file.
+       Geometry verbatim from /tmp/overseer-brand/marks.svg#b-bold. -->
+  <g fill="currentColor">
+    <path d="M6 21Q6 18.5 8.3 19.4L29 27V37L8.3 44.6Q6 45.5 6 43Z"/>
+    <path d="M58 21Q58 18.5 55.7 19.4L35 27V37L55.7 44.6Q58 45.5 58 43Z"/>
+    <rect x="28" y="21" width="8" height="22" rx="2.5"/>
+  </g>
+</svg>

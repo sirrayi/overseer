@@ -1,20 +1,27 @@
-//! computer tool (P7-3) — tiered computer-use dispatch.
+//! computer tool (P7-3, S5) — computer-use dispatch.
 //!
-//! Capability tiers, best first: a **structured API** (app/browser
-//! automation endpoint) is cheaper and more deterministic than an
-//! **accessibility** lookup by element name/role, which beats a blind
-//! **pixel** act at screen coordinates. `choose()` walks that order and
-//! takes the first tier the operator has configured. A structured request
-//! never silently degrades into a pixel act — if the tier that can express
-//! it is unconfigured the call fails honestly.
+//! Backend order (D1): a **cua-driver** binary — `OVERSEER_COMPUTER_DRIVER`
+//! or `cua-driver` on PATH — serves every action over its `mcp` stdio
+//! server (see `cua.rs` for transport and response shapes). When no driver
+//! is configured the legacy helper tiers run the subset they can express:
+//! a **structured API** (app/browser automation endpoint) is cheaper and
+//! more deterministic than an **accessibility** lookup by element
+//! name/role, which beats a blind **pixel** act at screen coordinates.
+//! `choose()` walks that order and takes the first tier the operator has
+//! configured. A structured request never silently degrades into a pixel
+//! act — if the tier that can express it is unconfigured the call fails
+//! honestly. Either way the advertised spec is identical: the model never
+//! knows which backend serves it.
 //!
-//! The engine links no OS framework: every backend is an opt-in helper
-//! process named by an environment variable (the platform bindings live
-//! there, not here). A missing backend is an `unconfigured` error naming
-//! the variable to set — never a fake success, never a quiet downgrade.
+//! The engine links no OS framework: every backend is an opt-in process
+//! named by an environment variable or found on PATH (the platform
+//! bindings live there, not here). A missing backend is an `unconfigured`
+//! error naming the variable to set — never a fake success, never a quiet
+//! downgrade.
 //!
-//! | tier        | variable                       |
+//! | backend     | variable                       |
 //! |-------------|--------------------------------|
+//! | cua-driver  | `OVERSEER_COMPUTER_DRIVER`     |
 //! | structured  | `OVERSEER_COMPUTER_STRUCTURED` |
 //! | a11y        | `OVERSEER_COMPUTER_A11Y`       |
 //! | pixel       | `OVERSEER_COMPUTER_PIXEL`      |
@@ -36,6 +43,9 @@
 //! residual — mitigated by egress-deny, the no-creds invariant, and
 //! takeover suppression. OCR scanning is explicitly deferred, not silent.
 
+mod cua;
+mod shape;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -50,26 +60,33 @@ use super::{schema, ToolCtx, ToolOutput};
 pub const ENV_STRUCTURED: &str = "OVERSEER_COMPUTER_STRUCTURED";
 pub const ENV_A11Y: &str = "OVERSEER_COMPUTER_A11Y";
 pub const ENV_PIXEL: &str = "OVERSEER_COMPUTER_PIXEL";
+/// The cua-driver binary (a path) — when configured it serves every action
+/// and the helper tiers below are not consulted (D1).
+pub const ENV_DRIVER: &str = "OVERSEER_COMPUTER_DRIVER";
 
 /// Cap on `batch` members: a batch is one step, and a step is budgeted.
 const MAX_BATCH: usize = 32;
 
-/// Every action the tool accepts. `batch` wraps the rest.
+/// Every action the tool accepts (S5 vocabulary). `batch` wraps the rest.
 const ACTIONS: &[&str] = &[
-    "screenshot",
+    "apps",
+    "windows",
+    "launch",
     "observe",
+    "screenshot",
+    "zoom",
     "click",
-    "move",
-    "scroll",
-    "drag",
-    "hover",
-    "focus",
     "type",
     "key",
-    "paste",
-    "submit",
-    "send",
-    "invoke",
+    "set",
+    "scroll",
+    "drag",
+    "menu",
+    "verify",
+    "browser",
+    "browser_click",
+    "browser_type",
+    "navigate",
 ];
 
 /// Last observation's frame + digest, inside the session dir. Acts scale
@@ -118,18 +135,37 @@ impl Tier {
 }
 
 /// Configured backends. All `None` is the shipped default: computer use is
-/// opt-in per tier, so a stock install cannot drive the user's screen.
+/// opt-in per backend, so a stock install cannot drive the user's screen.
 #[derive(Debug, Clone, Default)]
 pub struct Backends {
+    /// cua-driver binary — `OVERSEER_COMPUTER_DRIVER` or `cua-driver` on
+    /// PATH. When set it serves EVERY action (D1); the helper tiers below
+    /// only run while no driver exists.
+    pub driver: Option<PathBuf>,
+    // DEFERRED(owner): remove the helper-binary protocol once cua-driver is
+    // the only backend in use
     pub structured: Option<PathBuf>,
     pub a11y: Option<PathBuf>,
     pub pixel: Option<PathBuf>,
 }
 
+/// An env-var driver path must be absolute: a relative one resolves
+/// against the agent's cwd, where a workspace file could pose as the
+/// driver and get spawned unsandboxed (F1). The surviving path is
+/// canonicalized so `..`/symlinks collapse to the real file.
+fn driver_env_path(raw: Option<String>) -> Option<PathBuf> {
+    let p = PathBuf::from(raw?.trim());
+    if !p.is_absolute() || !p.is_file() {
+        return None;
+    }
+    p.canonicalize().ok()
+}
+
 impl Backends {
     /// Read the operator's backend config. A variable pointing at a
     /// non-existent helper counts as unset — a stale env var must not look
-    /// like a working backend.
+    /// like a working backend. The driver probe is a PATH stat, never a
+    /// spawn (D1).
     pub fn detect() -> Self {
         let helper = |var: &str| {
             std::env::var(var)
@@ -138,10 +174,17 @@ impl Backends {
                 .filter(|p| p.is_file())
         };
         Backends {
+            driver: driver_env_path(std::env::var(ENV_DRIVER).ok())
+                .or_else(|| super::struct_search::find_on_path(&["cua-driver"])),
             structured: helper(ENV_STRUCTURED),
             a11y: helper(ENV_A11Y),
             pixel: helper(ENV_PIXEL),
         }
+    }
+
+    /// Whether anything can serve the tool — a driver, or any helper tier.
+    pub fn any_configured(&self) -> bool {
+        self.driver.is_some() || Tier::ORDER.iter().any(|t| self.configured(*t))
     }
 
     /// The helper for `tier`, or `None` while the tier is unconfigured.
@@ -348,6 +391,26 @@ fn write_owner_only(path: &std::path::Path, content: &str) -> std::io::Result<()
     }
 }
 
+/// Parent-env keys a helper inherits: the bash allowlist's basics plus the
+/// three tier variables (a helper may chain to a sibling tier).
+fn helper_env_allowed(k: &str) -> bool {
+    matches!(
+        k,
+        "PATH"
+            | "HOME"
+            | "USER"
+            | "SHELL"
+            | "TERM"
+            | "LANG"
+            | "LC_ALL"
+            | "TMPDIR"
+            | ENV_STRUCTURED
+            | ENV_A11Y
+            | ENV_PIXEL
+            | "CI"
+    ) || k.starts_with("LC_")
+}
+
 /// One JSON request in, one JSON response out.
 fn call_helper(helper: &Path, request: &Value) -> Result<Value, String> {
     use std::io::Write;
@@ -355,33 +418,25 @@ fn call_helper(helper: &Path, request: &Value) -> Result<Value, String> {
     // F1 (extreme): no-creds invariant — helpers inherit the allowlisted
     // env only (mirrors bash.rs). The full process env carries brokered
     // secrets and webhook tokens; ComputerConfig::env_allowed was dead code.
-    let mut child = Command::new(helper)
-        .env_clear()
-        .envs(std::env::vars().filter(|(k, _)| {
-            matches!(
-                k.as_str(),
-                "PATH"
-                    | "HOME"
-                    | "USER"
-                    | "SHELL"
-                    | "TERM"
-                    | "LANG"
-                    | "LC_ALL"
-                    | "TMPDIR"
-                    | "OVERSEER_COMPUTER_PIXEL"
-                    | "OVERSEER_COMPUTER_A11Y"
-                    | "OVERSEER_COMPUTER_API"
-                    | "CI"
-            ) || k.starts_with("LC_")
-        }))
+    let mut cmd = Command::new(helper);
+    cmd.env_clear()
+        .envs(super::filter_env(std::env::vars_os(), helper_env_allowed))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = super::spawn_retrying_busy(&mut cmd)
         .map_err(|e| format!("computer: cannot start backend {}: {e}", helper.display()))?;
     match child.stdin.take() {
         Some(mut stdin) => {
-            if let Err(e) = stdin.write_all(request.to_string().as_bytes()) {
+            // A helper that exits without reading its request closes the
+            // pipe; its exit status is the real answer, so EPIPE is not.
+            if let Err(e) = stdin
+                .write_all(request.to_string().as_bytes())
+                .or_else(|e| match e.kind() {
+                    std::io::ErrorKind::BrokenPipe => Ok(()),
+                    _ => Err(e),
+                })
+            {
                 return Err(format!(
                     "computer: cannot write to backend {}: {e}",
                     helper.display()
@@ -443,7 +498,7 @@ fn run_capture(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Valu
         .as_ref()
         .map(|c| c.computer.clone())
         .unwrap_or_default();
-    let suppressed = crate::computer_obs::is_suppressed(&cfg, cred, &action);
+    let suppressed = crate::computer_obs::is_suppressed(&cfg, cred);
     let tier = choose(Need::default(), backends)?;
     let helper = backends
         .helper(tier)
@@ -527,8 +582,9 @@ fn run_capture(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Valu
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
-    let seq = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
-    let file = dir.join(format!("capture-{seq}.json"));
+    // UUID-v7 names are unique and time-ordered; a count of the dir would
+    // reuse a live index after any deletion.
+    let file = dir.join(format!("capture-{}.json", uuid::Uuid::now_v7()));
     let capture = json!({
         "media_type": media_type,
         "data_b64": data,
@@ -553,13 +609,33 @@ fn run_capture(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Valu
         "sent_h": sent_h,
         "pre": pre,
         "post": sha,
-        "note": "send coordinates in the sent frame (sent_w x sent_h); they are scaled to native pixels",
+        "note": "send coordinates in the sent frame (sent_w x sent_h); they are scaled to native pixels (image not persisted across resume)",
     }))
 }
 
-/// One act — click/move/scroll/type/… — through the best configured tier.
+// DEFERRED(owner): remove the helper-binary protocol once cua-driver is
+// the only backend in use
+/// One act — click/scroll/type/… — through the best configured tier. This
+/// is the legacy path; under a cua-driver backend `cua::run` serves every
+/// action instead.
 fn run_act(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Value, String> {
     let action = action_of(input);
+    // Element targeting is driver vocabulary — the helper protocol has no
+    // element handles.
+    if input.get("element").is_some() {
+        return Err(format!(
+            "computer: '{action}' element targeting needs the cua-driver backend — pass x/y, \
+             or set OVERSEER_COMPUTER_DRIVER"
+        ));
+    }
+    // The helper protocol's scroll is vertical only (dy).
+    if action == "scroll" && input.get("dy").is_none() {
+        return Err(
+            "computer: horizontal scroll (dx) needs the cua-driver backend — set \
+             OVERSEER_COMPUTER_DRIVER"
+                .into(),
+        );
+    }
     let need = need_of(input);
     let tier = choose(need, backends)?;
     let helper = backends
@@ -581,8 +657,23 @@ fn run_act(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Value, S
             .map(|c| c.computer.watch_mode)
             .unwrap_or(false),
     });
-    for key in ["api", "name", "role", "text", "dy"] {
+    // 'key' takes `keys` in the S5 vocabulary; the helper protocol's key
+    // act reads `text`.
+    if action == "key" {
+        copy_str(input, &mut req, "keys");
+        if let Some(keys) = input.get("keys").and_then(Value::as_str) {
+            req["text"] = json!(keys);
+        }
+    }
+    // Named targeting is helper vocabulary: api/name/role ride along
+    // verbatim so the structured/a11y tiers can resolve the act (F4).
+    for key in ["text", "button", "api", "name", "role"] {
         copy_str(input, &mut req, key);
+    }
+    for key in ["dy", "dx", "to_x", "to_y", "count"] {
+        if let Some(v) = input.get(key) {
+            req[key] = v.clone();
+        }
     }
     let mut scaled = Value::Null;
     if let (Some(x), Some(y)) = (
@@ -624,8 +715,9 @@ fn run_act(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Value, S
 }
 
 /// Run each member in order; the batch is only as strong as its weakest
-/// member's tier, which is what the result reports.
-fn run_batch(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Value, String> {
+/// member's tier, which is what the result reports. Under a driver the
+/// member envelopes already say `"tier":"cua"`.
+fn run_batch(input: &Value, ctx: &ToolCtx, st: &mut ComputerState) -> Result<Value, String> {
     let Some(actions) = input.get("actions").and_then(Value::as_array) else {
         return Err("computer: 'batch' needs an 'actions' array of actions".into());
     };
@@ -648,8 +740,15 @@ fn run_batch(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Value,
                 "computer: actions[{i}] is a nested batch — not allowed"
             ));
         }
+        // A capture's pixels can't ride a batch result envelope.
+        if matches!(action.as_str(), "screenshot" | "zoom") {
+            return Err(format!(
+                "computer: actions[{i}] is a capture — captures can't be batched — call \
+                 screenshot on its own"
+            ));
+        }
         validate(a).map_err(|e| format!("computer: actions[{i}] — {e}"))?;
-        let out = run_single(a, ctx, backends)
+        let out = run_single(a, ctx, st)
             .map_err(|e| format!("computer: batch failed at actions[{i}] ({action}) — {e}"))?;
         if let Some(t) = out
             .get("tier")
@@ -663,11 +762,16 @@ fn run_batch(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Value,
         results.push(out);
     }
     let post = read_obs(ctx).and_then(|o| o.sha256);
+    let tier = if st.backends.driver.is_some() {
+        "cua"
+    } else {
+        weakest.as_str()
+    };
     Ok(json!({
         "ok": true,
         "computer": "batch",
         "count": results.len(),
-        "tier": weakest.as_str(),
+        "tier": tier,
         "pre": pre,
         "post": post,
         "results": results,
@@ -678,24 +782,47 @@ fn tier_from_str(s: &str) -> Option<Tier> {
     Tier::ORDER.into_iter().find(|t| t.as_str() == s)
 }
 
-fn run_single(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Value, String> {
+fn run_single(input: &Value, ctx: &ToolCtx, st: &mut ComputerState) -> Result<Value, String> {
+    if st.backends.driver.is_some() {
+        return cua::run(input, ctx, st);
+    }
+    legacy_single(input, ctx, &st.backends)
+}
+
+// DEFERRED(owner): remove the helper-binary protocol once cua-driver is
+// the only backend in use
+/// The helper-binary path — the fallback when no cua-driver is configured
+/// (D1). It serves the subset of the S5 vocabulary it can express and
+/// rejects driver-only actions with a pointer at the fix.
+fn legacy_single(input: &Value, ctx: &ToolCtx, backends: &Backends) -> Result<Value, String> {
     let action = action_of(input);
     match action.as_str() {
-        "screenshot" | "observe" => run_capture(input, ctx, backends),
-        _ => run_act(input, ctx, backends),
+        "screenshot" => run_capture(input, ctx, backends),
+        "click" | "type" | "key" | "scroll" | "drag" => run_act(input, ctx, backends),
+        "observe" => Err(
+            "computer: 'observe' needs the cua-driver backend (the helper protocol cannot list \
+             elements) — use 'screenshot', or set OVERSEER_COMPUTER_DRIVER"
+                .into(),
+        ),
+        other => Err(format!(
+            "computer: '{other}' needs the cua-driver backend — install cua-driver or set \
+             OVERSEER_COMPUTER_DRIVER (the helper protocol cannot serve it)"
+        )),
     }
 }
 
 /// Validate one action request (used for top-level calls and for every
-/// batch member). Returns the normalized action name.
+/// batch member). Checks are backend-agnostic — backend-specific params
+/// (pid, window_id, element…) are enforced at dispatch, so the legacy
+/// helpers keep serving the actions they can express. Returns the
+/// normalized action name.
 fn validate(input: &Value) -> Result<String, String> {
     let action = action_of(input);
     if action.is_empty() {
-        return Err(
-            "missing 'action' — expected one of screenshot, observe, click, move, scroll, \
-             type, key, paste, submit, send, invoke, batch"
-                .into(),
-        );
+        return Err(format!(
+            "missing 'action' — expected one of {}, batch",
+            ACTIONS.join(", ")
+        ));
     }
     if action != "batch" && !ACTIONS.contains(&action.as_str()) {
         return Err(format!(
@@ -703,28 +830,77 @@ fn validate(input: &Value) -> Result<String, String> {
             ACTIONS.join(", ")
         ));
     }
+    let pair = |a: &str, b: &str| input.get(a).is_some() && input.get(b).is_some();
     match action.as_str() {
-        "type" | "paste" | "key" if !has_text(input, "text") => {
-            return Err(format!("'{action}' needs 'text'"));
+        "launch" if !has_text(input, "app") => {
+            return Err("'launch' needs 'app' (an application name)".into());
         }
-        "click" | "move"
-            if input.get("x").is_none()
-                && input.get("y").is_none()
-                && !has_text(input, "name")
-                && !has_text(input, "role") =>
+        // pid/window_id are driver params — the legacy helpers work without
+        // them, so they are enforced in cua.rs, not here.
+        "zoom" if !(pair("x1", "y1") && pair("x2", "y2")) => {
+            return Err("'zoom' needs the region 'x1','y1','x2','y2'".into());
+        }
+        // api/name/role are helper-vocabulary targeting — under a driver
+        // cua::click refuses them with a pointer at element/x,y (F4).
+        "click"
+            if input.get("element").is_none()
+                && !pair("x", "y")
+                && input.get("api").is_none()
+                && input.get("name").is_none()
+                && input.get("role").is_none() =>
         {
-            return Err(format!(
-                "'{action}' needs 'x'/'y' coordinates or an element 'name'/'role'"
-            ));
+            return Err(
+                "'click' needs an 'element' index, 'x'/'y' coordinates, or a name/role".into(),
+            );
         }
-        "scroll" if input.get("dy").is_none() => {
-            return Err("'scroll' needs 'dy'".into());
+        "type" if !has_text(input, "text") => {
+            return Err("'type' needs 'text'".into());
+        }
+        "key" if !has_text(input, "keys") => {
+            return Err("'key' needs 'keys' (\"cmd+s\" or \"return\")".into());
+        }
+        "set" if input.get("element").is_none() || input.get("value").is_none() => {
+            return Err("'set' needs 'element' and 'value'".into());
+        }
+        "scroll" if input.get("dx").is_none() && input.get("dy").is_none() => {
+            return Err("'scroll' needs 'dx' or 'dy' (the scroll direction)".into());
+        }
+        "drag" if !(pair("x", "y") && pair("to_x", "to_y")) => {
+            return Err("'drag' needs 'x','y' and 'to_x','to_y'".into());
+        }
+        "menu"
+            if input
+                .get("path")
+                .and_then(Value::as_array)
+                .is_none_or(|p| p.is_empty()) =>
+        {
+            return Err("'menu' needs 'path' — an array of menu item names".into());
+        }
+        "verify" if input.get("expect").is_none() => {
+            return Err("'verify' needs 'expect' (a predicate object or list)".into());
+        }
+        "browser" if !pair("pid", "window_id") && !has_text(input, "tab") => {
+            return Err(
+                "'browser' needs 'pid'+'window_id' (to bind) or 'tab' (to snapshot)".into(),
+            );
+        }
+        "browser_click" | "browser_type" | "navigate" if !has_text(input, "tab") => {
+            return Err(format!("'{action}' needs 'tab' (a bound browser tab)"));
+        }
+        "browser_click" if input.get("ref").is_none() && !pair("x", "y") => {
+            return Err("'browser_click' needs a 'ref' or 'x'/'y'".into());
+        }
+        "browser_type" if !has_text(input, "text") => {
+            return Err("'browser_type' needs 'text'".into());
+        }
+        "navigate" if !has_text(input, "url") => {
+            return Err("'navigate' needs 'url'".into());
         }
         _ => {}
     }
     // F3: coordinate type check — presence is not enough. A string/bool/null
-    // x/y/dy would otherwise scale to Null and dispatch a coordinate-less act.
-    for key in ["x", "y", "dy"] {
+    // coordinate would otherwise scale to Null and dispatch a broken act.
+    for key in ["x", "y", "dx", "dy", "to_x", "to_y", "x1", "y1", "x2", "y2"] {
         if let Some(v) = input.get(key) {
             let ok = v.as_f64().is_some_and(|f| f.is_finite());
             if !ok {
@@ -737,20 +913,54 @@ fn validate(input: &Value) -> Result<String, String> {
     Ok(action)
 }
 
-/// Backend-injecting entry (tests, future config plumbing). `Err` is the
-/// honest error string the model sees.
-pub fn run_with(input: &Value, ctx: &mut ToolCtx, backends: &Backends) -> Result<Value, String> {
-    let action = validate(input).map_err(|e| format!("computer: {e}"))?;
-    if action == "batch" {
-        return run_batch(input, ctx, backends);
-    }
-    run_single(input, ctx, backends)
+/// Computer-tool state held by the registry: the backends detected once at
+/// registry build (D1) and, once spawned, the live cua-driver client (D2).
+pub struct ComputerState {
+    pub backends: Backends,
+    pub(crate) driver: Option<cua::Live>,
 }
 
-/// Tool entry: detect the operator's backends, then dispatch.
-pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
-    let backends = Backends::detect();
-    match run_with(input, ctx, &backends) {
+impl ComputerState {
+    /// Probe the operator's backends (env vars + PATH stat, no spawns).
+    pub fn detect() -> Self {
+        ComputerState {
+            backends: Backends::detect(),
+            driver: None,
+        }
+    }
+
+    /// Fixed-environment constructor for tests and future config plumbing.
+    pub fn new(backends: Backends) -> Self {
+        ComputerState {
+            backends,
+            driver: None,
+        }
+    }
+}
+
+impl Drop for ComputerState {
+    /// `end_session` on registry drop is best-effort (D2): the client's own
+    /// Drop kills the child either way.
+    fn drop(&mut self) {
+        if let Some(mut live) = self.driver.take() {
+            live.end_session();
+        }
+    }
+}
+
+/// Backend-injecting entry (tests, future config plumbing). `Err` is the
+/// honest error string the model sees.
+pub fn run_with(input: &Value, ctx: &mut ToolCtx, st: &mut ComputerState) -> Result<Value, String> {
+    let action = validate(input).map_err(|e| format!("computer: {e}"))?;
+    if action == "batch" {
+        return run_batch(input, ctx, st);
+    }
+    run_single(input, ctx, st)
+}
+
+/// Tool entry: dispatch through the registry's computer state.
+pub fn run(input: &Value, ctx: &mut ToolCtx, st: &mut ComputerState) -> ToolOutput {
+    match run_with(input, ctx, st) {
         Ok(v) => ToolOutput::ok(v.to_string()),
         Err(e) => ToolOutput::err(e),
     }
@@ -787,33 +997,68 @@ pub fn audit_event(tool_result_text: &str) -> Option<crate::event::EventKind> {
     })
 }
 
+/// The image block a `computer` capture carries (S5): the envelope's
+/// `image_file` is read back into a `Block::Image` the agent appends after
+/// the tool result — pixels ride the message, never the event log. All
+/// provider adapters already serialize `Block::Image`.
+pub fn image_block(tool_result_text: &str) -> Option<crate::ir::Block> {
+    let v: Value = serde_json::from_str(tool_result_text.trim()).ok()?;
+    let file = v.get("image_file").and_then(Value::as_str)?;
+    let cap: Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+    Some(crate::ir::Block::Image {
+        media_type: cap.get("media_type")?.as_str()?.to_string(),
+        data_b64: cap.get("data_b64")?.as_str()?.to_string(),
+        px_w: cap.get("px_w")?.as_u64()? as u32,
+        px_h: cap.get("px_h")?.as_u64()? as u32,
+        sent_w: cap.get("sent_w")?.as_u64()? as u32,
+        sent_h: cap.get("sent_h")?.as_u64()? as u32,
+    })
+}
+
+/// The advertised spec is the same with or without a backend (D1 — spec
+/// byte-stability is Invariant 2's): one description line per action
+/// family, no duplicated enum prose.
 pub fn spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
         name: "computer".into(),
         description: concat!(
-            "Drive the user's screen in tiers: a structured API call (`api`), then an element ",
-            "lookup by `name`/`role`, then a pixel act at `x`/`y`. `screenshot`/`observe` capture ",
-            "the screen and return the sent and native frame sizes; give coordinates in the sent ",
-            "frame — they are scaled to native pixels for you. A suppressed capture (credential ",
-            "field, watch mode) returns metadata only. `batch` runs up to 32 actions in order. ",
-            "Backends are opt-in: an unconfigured tier errors instead of guessing."
+            "Drive the user's screen: 'apps'/'windows' find targets; 'observe' lists elements ",
+            "(index as 'element'); 'screenshot'/'zoom' image it; 'click'/'type'/'key'/'set'/'scroll'",
+            "/'drag'/'menu'/'launch' act; 'verify' checks predicates; 'browser*'/'navigate' drive ",
+            "Chrome/Edge tabs via 'tab'/'ref'; 'batch' runs ≤32 actions. x/y are pixels of the ",
+            "image you saw (crop space after 'zoom'); nothing is screenshotted implicitly."
         )
         .into(),
         input_schema: schema(
             json!({
                 "action": {
                     "type": "string",
-                    "description": "screenshot | observe | click | move | scroll | drag | type | key | paste | submit | send | invoke | batch"
+                    "description": "apps | windows | launch | observe | screenshot | zoom | click | type | key | set | scroll | drag | menu | verify | browser | browser_click | browser_type | navigate | batch"
                 },
-                "api": {"type": "string", "description": "Structured-API handle to invoke (structured tier)"},
-                "name": {"type": "string", "description": "Element name to resolve (a11y tier)"},
-                "role": {"type": "string", "description": "Element role to resolve (a11y tier)"},
-                "x": {"type": "number", "description": "X in the frame you were sent"},
-                "y": {"type": "number", "description": "Y in the frame you were sent"},
-                "dy": {"type": "integer", "description": "Scroll delta (positive = down)"},
-                "text": {"type": "string", "description": "Text to type, or key name"},
-                "cred_field": {"type": "boolean", "description": "Target is a credential field (suppresses capture; escalates to identity)"},
-                "actions": {"type": "array", "items": {"type": "object"}, "description": "batch: actions to run in order"},
+                "pid": {"type": "integer", "description": "target app"},
+                "window_id": {"type": "integer", "description": "target window"},
+                "app": {"type": "string", "description": "name to launch"},
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "description": "observe cap (150)"},
+                "max": {"type": "integer"},
+                "element": {"type": "integer", "description": "index from observe"},
+                "x": {"type": "number"}, "y": {"type": "number"},
+                "to_x": {"type": "number"}, "to_y": {"type": "number"},
+                "dx": {"type": "number"}, "dy": {"type": "number"},
+                "x1": {"type": "number"}, "y1": {"type": "number"},
+                "x2": {"type": "number"}, "y2": {"type": "number"},
+                "button": {"type": "string", "description": "left|right"},
+                "count": {"type": "integer", "description": "1|2"},
+                "text": {"type": "string"},
+                "keys": {"type": "string", "description": "\"cmd+s\"|\"return\""},
+                "value": {},
+                "path": {"type": "array", "items": {"type": "string"}},
+                "expect": {},
+                "tab": {"type": "string", "description": "bound browser tab"},
+                "ref": {"type": "string", "description": "browser element ref"},
+                "url": {"type": "string"},
+                "cred_field": {"type": "boolean", "description": "target is a credential field"},
+                "actions": {"type": "array", "items": {"type": "object"}},
             }),
             &["action"],
         ),
@@ -849,6 +1094,44 @@ mod tests {
         }
     }
 
+    /// A registry-free state pinned at these (legacy) backends — driver
+    /// never detected in tests.
+    fn st(b: &Backends) -> ComputerState {
+        ComputerState::new(b.clone())
+    }
+
+    #[test]
+    fn driver_env_path_requires_an_absolute_path() {
+        // F1: a relative env path resolves against the agent's cwd — a
+        // workspace `./cua-driver` would be spawned unsandboxed.
+        let dir = tmpdir("driverenv");
+        std::fs::write(dir.join("cua-driver"), "#!/bin/sh\n").unwrap();
+        // Canonicalize the expectation: driver_env_path canonicalizes
+        // (no `..`/symlinks), and on macOS the temp dir is /var →
+        // /private/var.
+        let real = dir.join("cua-driver").canonicalize().unwrap();
+        let rel = std::path::Path::new(&real)
+            .strip_prefix(std::env::current_dir().unwrap())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| PathBuf::from("./cua-driver"));
+        assert_eq!(
+            driver_env_path(Some(rel.display().to_string())),
+            None,
+            "relative path must be refused"
+        );
+        assert_eq!(driver_env_path(Some("./cua-driver".into())), None);
+        assert_eq!(driver_env_path(Some("cua-driver".into())), None);
+        assert_eq!(driver_env_path(None), None);
+        // Absolute paths survive — canonicalized (no `..`).
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let dotted = format!("{}/sub/../cua-driver", dir.display());
+        assert_eq!(driver_env_path(Some(dotted)), Some(real.clone()));
+        assert_eq!(
+            driver_env_path(Some(format!("  {}  ", real.display()))),
+            Some(real)
+        );
+    }
+
     /// Write an executable helper script and return its path. The helper
     /// protocol is the real contract — the script is the backend.
     fn helper(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
@@ -869,16 +1152,19 @@ mod tests {
     #[test]
     fn tier_order_prefers_structured_then_a11y_then_pixel() {
         let all = Backends {
+            driver: None,
             structured: Some(PathBuf::from("/bin/true")),
             a11y: Some(PathBuf::from("/bin/true")),
             pixel: Some(PathBuf::from("/bin/true")),
         };
         let pixel_only = Backends {
+            driver: None,
             structured: None,
             a11y: None,
             pixel: all.pixel.clone(),
         };
         let a11y_and_pixel = Backends {
+            driver: None,
             structured: None,
             ..all.clone()
         };
@@ -938,6 +1224,7 @@ mod tests {
     /// Backends with everything but the pixel tier configured.
     fn no_pixel() -> Backends {
         Backends {
+            driver: None,
             structured: Some(PathBuf::from("/bin/true")),
             a11y: Some(PathBuf::from("/bin/true")),
             pixel: None,
@@ -973,22 +1260,26 @@ mod tests {
         let err = run_with(
             &json!({"action": "click", "x": 1.0, "y": 2.0}),
             &mut c,
-            &none,
+            &mut st(&none),
         )
         .unwrap_err();
         assert!(err.contains("unconfigured"), "got: {err}");
         assert!(err.contains(ENV_PIXEL), "names the pixel backend: {err}");
-        let err = run_with(&json!({"action": "screenshot"}), &mut c, &none).unwrap_err();
+        let err = run_with(&json!({"action": "screenshot"}), &mut c, &mut st(&none)).unwrap_err();
         assert!(err.contains(ENV_PIXEL), "got: {err}");
-        // Through the registry: the tool is advertised and dispatched, and
-        // an unconfigured backend is an honest error, not a fake success.
+        // Through the registry: with no helper the tool is not advertised,
+        // and a call is an honest error naming how to configure it.
         assert!(super::super::TOOL_NAMES.contains(&"computer"));
-        let mut reg = super::super::ToolRegistry::core(crate::perm::Policy::allow_all());
+        let mut reg = super::super::ToolRegistry::core_with(
+            crate::perm::Policy::allow_all(),
+            super::super::Optional::default(),
+        );
+        assert!(!reg.specs.iter().any(|s| s.name == "computer"));
         let out = reg.call("computer", &json!({"action": "screenshot"}), &mut c);
         assert!(out.is_error);
-        assert!(out.text.contains("unconfigured"), "got: {}", out.text);
+        assert!(out.text.contains(ENV_PIXEL), "got: {}", out.text);
         // Unknown actions are refused with the action list.
-        let bad = run_with(&json!({"action": "frobnicate"}), &mut c, &none).unwrap_err();
+        let bad = run_with(&json!({"action": "frobnicate"}), &mut c, &mut st(&none)).unwrap_err();
         assert!(bad.contains("unknown action"), "got: {bad}");
     }
 
@@ -1007,6 +1298,7 @@ mod tests {
             ),
         );
         let backends = Backends {
+            driver: None,
             structured: None,
             a11y: None,
             pixel: Some(pixel),
@@ -1019,7 +1311,7 @@ mod tests {
                 {"action": "scroll", "dy": -3},
             ]}),
             &mut c,
-            &backends,
+            &mut st(&backends),
         )
         .unwrap();
         assert_eq!(out["computer"], "batch");
@@ -1041,17 +1333,59 @@ mod tests {
         let err = run_with(
             &json!({"action": "batch", "actions": [{"action": "click", "x": 1.0, "y": 1.0}, {"action": "nope"}]}),
             &mut c,
-            &backends,
+            &mut st(&backends),
         )
         .unwrap_err();
         assert!(err.contains("actions[1]"), "got: {err}");
+        // Captures can't be batched — their pixels would be dropped.
+        let err = run_with(
+            &json!({"action": "batch", "actions": [{"action": "screenshot"}]}),
+            &mut c,
+            &mut st(&backends),
+        )
+        .unwrap_err();
+        assert!(err.contains("captures can't be batched"), "got: {err}");
         // Empty / oversized batches are refused before any backend runs.
         let empty = run_with(
             &json!({"action": "batch", "actions": []}),
             &mut c,
-            &backends,
+            &mut st(&backends),
         );
         assert!(empty.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn named_act_forwards_api_name_and_role_to_the_helper() {
+        // F4: api/name/role are helper vocabulary — they ride the request
+        // verbatim so a11y/structured tiers can resolve named acts.
+        let dir = tmpdir("named");
+        let log = dir.join("req.log");
+        let a11y = helper(
+            &dir,
+            "a11y.sh",
+            &format!(
+                "cat >> {log}\nprintf '%s' '{{\"ok\":true,\"detail\":\"done\"}}'",
+                log = log.display()
+            ),
+        );
+        let backends = Backends {
+            driver: None,
+            structured: None,
+            a11y: Some(a11y),
+            pixel: None,
+        };
+        let mut c = ctx(&dir);
+        run_with(
+            &json!({"action": "click", "api": "App.press", "name": "OK", "role": "button"}),
+            &mut c,
+            &mut st(&backends),
+        )
+        .unwrap();
+        let req: Value =
+            serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
+        assert_eq!(req["api"], "App.press");
+        assert_eq!(req["name"], "OK");
+        assert_eq!(req["role"], "button");
     }
 
     #[test]
@@ -1063,12 +1397,13 @@ mod tests {
             r#"{"ok":true,"media_type":"image/png","data_b64":"aGVsbG8=","px_w":2560,"px_h":1600,"sent_w":1280,"sent_h":800}"#,
         );
         let backends = Backends {
+            driver: None,
             structured: None,
             a11y: None,
             pixel: Some(pixel),
         };
         let mut c = ctx(&dir);
-        let out = run_with(&json!({"action": "screenshot"}), &mut c, &backends).unwrap();
+        let out = run_with(&json!({"action": "screenshot"}), &mut c, &mut st(&backends)).unwrap();
         assert_eq!(out["tier"], "pixel");
         assert_eq!(out["px_w"], 2560);
         assert_eq!(out["sent_w"], 1280);
@@ -1108,6 +1443,7 @@ mod tests {
             r#"{"ok":true,"px_w":2560,"px_h":1600,"sent_w":1280,"sent_h":800}"#,
         );
         let backends = Backends {
+            driver: None,
             structured: None,
             a11y: None,
             pixel: Some(pixel),
@@ -1117,7 +1453,7 @@ mod tests {
         let out = run_with(
             &json!({"action": "screenshot", "cred_field": true}),
             &mut c,
-            &backends,
+            &mut st(&backends),
         )
         .unwrap();
         assert_eq!(out["suppressed"], true);
@@ -1134,12 +1470,14 @@ mod tests {
         // Non-zero exit.
         let failing = helper(&dir, "fail.sh", "echo 'no display' >&2\nexit 3");
         let backends = Backends {
+            driver: None,
             structured: None,
             a11y: None,
             pixel: Some(failing),
         };
         let mut c = ctx(&dir);
-        let err = run_with(&json!({"action": "screenshot"}), &mut c, &backends).unwrap_err();
+        let err =
+            run_with(&json!({"action": "screenshot"}), &mut c, &mut st(&backends)).unwrap_err();
         assert!(err.contains("exited with"), "got: {err}");
         assert!(err.contains("no display"), "stderr tail: {err}");
         // ok:false.
@@ -1149,11 +1487,13 @@ mod tests {
             r#"{"ok":false,"error":"permission denied"}"#,
         );
         let backends = Backends {
+            driver: None,
             structured: None,
             a11y: None,
             pixel: Some(refusing),
         };
-        let err = run_with(&json!({"action": "screenshot"}), &mut c, &backends).unwrap_err();
+        let err =
+            run_with(&json!({"action": "screenshot"}), &mut c, &mut st(&backends)).unwrap_err();
         assert!(err.contains("permission denied"), "got: {err}");
     }
 
@@ -1170,6 +1510,7 @@ mod tests {
             ),
         );
         let backends = Backends {
+            driver: None,
             structured: None,
             a11y: None,
             pixel: Some(pixel.clone()),
@@ -1190,7 +1531,7 @@ mod tests {
         let out = run_with(
             &json!({"action": "click", "x": 640.0, "y": 400.0}),
             &mut c,
-            &backends,
+            &mut st(&backends),
         )
         .unwrap();
         assert_eq!(out["native"], json!({"x": 1280, "y": 800}));
@@ -1248,10 +1589,81 @@ mod tests {
         let err = run_with(
             &serde_json::json!({"action": "click", "x": "abc", "y": "def"}),
             &mut ctx,
-            &backends,
+            &mut st(&backends),
         )
         .expect_err("string coords must refuse");
         assert!(err.contains("finite number"), "got: {err}");
+    }
+
+    #[test]
+    fn helper_env_forwards_every_tier_variable_and_nothing_undefined() {
+        for k in [ENV_STRUCTURED, ENV_A11Y, ENV_PIXEL, "PATH", "LC_CTYPE"] {
+            assert!(helper_env_allowed(k), "{k} must reach the helper");
+        }
+        for k in [
+            "OVERSEER_COMPUTER_API",
+            "FOO_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(!helper_env_allowed(k), "{k} must not reach the helper");
+        }
+    }
+
+    #[test]
+    fn a_deleted_capture_never_lets_the_next_one_overwrite_a_survivor() {
+        let dir = tmpdir("capture-seq");
+        let pixel = fixed(
+            &dir,
+            "pixel.sh",
+            r#"{"ok":true,"media_type":"image/png","data_b64":"aGVsbG8=","px_w":2,"px_h":2,"sent_w":2,"sent_h":2}"#,
+        );
+        let backends = Backends {
+            driver: None,
+            structured: None,
+            a11y: None,
+            pixel: Some(pixel),
+        };
+        let mut c = ctx(&dir);
+        let shot = |c: &mut ToolCtx| {
+            run_with(&json!({"action": "screenshot"}), c, &mut st(&backends)).unwrap()["image_file"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let first = shot(&mut c);
+        let second = shot(&mut c);
+        std::fs::remove_file(&first).unwrap();
+        std::fs::write(&second, "survivor").unwrap();
+        let third = shot(&mut c);
+        assert_ne!(third, second, "a new capture reused a live file name");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "survivor");
+    }
+
+    /// Child-process probe with a non-UTF-8 env value (see bash's twin).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_env_value_does_not_kill_the_helper_call() {
+        use std::os::unix::ffi::OsStringExt;
+        const MARK: &str = "LC_OVERSEER_T12_PROBE";
+        if std::env::var_os(MARK).is_some() {
+            let dir = tmpdir("nonutf8");
+            let h = fixed(&dir, "h.sh", r#"{"ok":true}"#);
+            let out = call_helper(&h, &json!({"probe": 1})).unwrap();
+            assert_eq!(out["ok"], true);
+            return;
+        }
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::computer::tests::a_non_utf8_env_value_does_not_kill_the_helper_call",
+                "--test-threads=1",
+            ])
+            .env(MARK, std::ffi::OsString::from_vec(vec![b'f', 0xff]))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
     }
 
     #[test]

@@ -120,6 +120,7 @@ fn transcript_flushes_to_scrollback_and_live_region_stays() {
         stop_reason: "end_turn".into(),
         steps: 1,
         total_cost_usd: 0.001,
+        cache: Default::default(),
     })))
     .unwrap();
     app.step(&mut term, &caps).unwrap();
@@ -296,6 +297,30 @@ fn session_picker_filters_and_switches() {
 }
 
 #[test]
+fn session_picker_marks_skipped_corrupt_sessions() {
+    let (mut app, _e, _w, mut term, caps, root) = session_harness();
+    // A sibling session with a corrupt mid-file line — skipped with a
+    // warning; the picker shows one faint footer line (S1 review).
+    let bad = mk_session(&root, "bad1", "/repo", "gone");
+    let path = bad.join("events.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.insert(1, "{\"id\":77,\"garbage");
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    app.submit_text("/sessions");
+    app.step(&mut term, &caps).unwrap();
+    let picker = screen(&term)
+        .replace("0s ·", "[ago] ·")
+        .replace("1s ·", "[ago] ·");
+    assert!(
+        picker.contains("1 session(s) skipped — unreadable log"),
+        "skipped footer:\n{picker}"
+    );
+    insta::assert_snapshot!("session_picker_skipped", picker);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn session_switch_reseeds_transcript() {
     let (mut app, etx, _w, mut term, caps, root) = session_harness();
     etx.send(EngineMsg::SessionSwitched {
@@ -324,17 +349,17 @@ fn slash_commands_guarded_during_run() {
 #[test]
 fn rewind_picker_lists_checkpoints() {
     let (mut app, _e, wrx, mut term, caps, root) = session_harness();
-    // A checkpoint on e2 (the user input in s1's log); the tracked file
-    // lives inside the temp root so the restore is self-contained.
+    // A checkpoint on e2 (the user input in s1's log). The manifest
+    // path must resolve under the session's recorded cwd (/repo) —
+    // S1/C7 refuses out-of-workspace paths before touching the fs. The
+    // copy target can't exist outside a real workspace, so the fixture
+    // restores 0 files but the picker + SwitchSession flow is intact.
     let cp = root.join("s1/checkpoints/e2/files");
     std::fs::create_dir_all(&cp).unwrap();
     std::fs::write(cp.join("f0"), "snapshot").unwrap();
     std::fs::write(
         root.join("s1/checkpoints/e2/manifest.jsonl"),
-        format!(
-            "{{\"path\":\"{}\",\"stored\":\"f0\",\"existed\":true}}\n",
-            root.join("x.txt").display()
-        ),
+        "{\"path\":\"/repo/x.txt\",\"stored\":\"f0\",\"existed\":true}\n",
     )
     .unwrap();
     app.submit_text("/rewind");
@@ -501,23 +526,32 @@ fn tree_overlay_shows_fork_hierarchy() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Fuzzy `/` menu: "tr" is a subsequence of tree/transcript — both
-/// listed even though neither starts with it.
+/// Fuzzy matching still drives Tab completion — the visible menu
+/// strip was removed in the UI pass. `/t` is a subsequence of
+/// tree/transcript → Tab lands on the common `/tr`; `/tre` then
+/// completes to `/tree`.
 #[test]
-fn slash_menu_matches_fuzzy() {
+fn slash_tab_completes_fuzzy() {
     let (mut app, _etx, _wrx, mut term, caps) = harness();
-    for c in "/tr".chars() {
+    for c in "/t".chars() {
         app.key(crossterm::event::KeyEvent::from(
             crossterm::event::KeyCode::Char(c),
         ));
     }
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Tab,
+    ));
+    for c in "e".chars() {
+        app.key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char(c),
+        ));
+    }
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Tab,
+    ));
     app.step(&mut term, &caps).unwrap();
     let s = screen(&term);
-    assert!(s.contains("tree"), "fuzzy /tr should list /tree:\n{s}");
-    assert!(
-        s.contains("transcript"),
-        "fuzzy /tr should list /transcript:\n{s}"
-    );
+    assert!(s.contains("/tree"), "fuzzy Tab should complete /tree:\n{s}");
 }
 
 /// Transcript overlay: Tab expands completed tool blocks (their
@@ -649,7 +683,10 @@ fn at_mention_completes_paths() {
         root.join("session"),
     );
     let _ = etx;
-    let mut backend = TestBackend::new(60, 20);
+    // Wide enough that the status line never truncates the cwd — at 60
+    // cols a long TMPDIR prefix is cut BEFORE `norm` can replace it,
+    // making the snapshot depend on the host's temp-dir length.
+    let mut backend = TestBackend::new(140, 20);
     backend.set_cursor_position((0, 10)).unwrap();
     let mut term = Terminal::with_options(
         backend,
@@ -660,8 +697,10 @@ fn at_mention_completes_paths() {
     .unwrap();
     let caps = Caps::default();
 
-    // The status line truncates the workspace cwd — normalize the
-    // temp-dir prefix and the pid-bearing dirname separately.
+    // Normalize the temp-dir prefix and the pid-bearing dirname; the
+    // status line's pad before the right block is computed from the RAW
+    // cwd length, so also collapse that gap — otherwise TMPDIR length
+    // shifts the layout and the snapshot is host-dependent.
     let tmp = std::env::temp_dir()
         .display()
         .to_string()
@@ -669,7 +708,18 @@ fn at_mention_completes_paths() {
         .to_string();
     let dirname = root.file_name().unwrap().to_str().unwrap().to_string();
     let norm = move |t: &Terminal<TestBackend>| {
-        screen(t).replace(&tmp, "[tmp]").replace(&dirname, "[root]")
+        screen(t)
+            .replace(&tmp, "[tmp]")
+            .replace(&dirname, "[root]")
+            .lines()
+            .map(|l| match (l.find("[tmp]/[root]"), l.find("test-model")) {
+                (Some(i), Some(j)) if i < j => {
+                    format!("{} {}", &l[..i + "[tmp]/[root]".len()], &l[j..])
+                }
+                _ => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     for c in "@mai".chars() {
@@ -686,4 +736,326 @@ fn at_mention_completes_paths() {
     app.step(&mut term, &caps).unwrap();
     insta::assert_snapshot!("at_completed", norm(&term));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── full-window surface: transcript + 2-row prompt + 1-row footer ──
+
+fn full_harness() -> (
+    App,
+    mpsc::Sender<EngineMsg>,
+    mpsc::Receiver<WorkerCmd>,
+    Terminal<TestBackend>,
+    Caps,
+) {
+    let (etx, erx) = mpsc::channel();
+    let (wtx, wrx) = mpsc::channel();
+    let mut app = App::new(
+        erx,
+        wtx,
+        Preset::WorkspaceWrite,
+        "/repo".into(),
+        "test-model".into(),
+        PathBuf::from("/tmp/session"),
+    );
+    app.mode = overseer_tui::app::UiMode::Full;
+    let term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    (app, etx, wrx, term, Caps::default())
+}
+
+#[test]
+fn full_layout_transcript_prompt_footer() {
+    let (mut app, etx, _w, mut term, caps) = full_harness();
+    etx.send(EngineMsg::Event(ev(EventKind::UserInput {
+        text: "fix the flaky test".into(),
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(model_response("Looking at the test now.")))
+        .unwrap();
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    insta::assert_snapshot!("full_layout", s);
+    // The last row is the footer; the prompt's ❯ sits in the 2-row
+    // window directly above it.
+    let rows: Vec<&str> = s.trim_end_matches('\n').split('\n').collect();
+    // Chromeless footer: the empty footer row is trimmed from the
+    // dump entirely — the prompt's ❯ is the last visible row.
+    let last = rows.last().unwrap();
+    assert!(last.contains('❯'), "last row is the prompt: {last}");
+}
+
+#[test]
+fn full_transcript_pages_up_with_footer_marker() {
+    let (mut app, etx, _w, mut term, caps) = full_harness();
+    // Overflow the transcript region (17 rows) so paging is real.
+    for i in 0..8 {
+        etx.send(EngineMsg::Event(ev(EventKind::UserInput {
+            text: format!("prompt {i}"),
+        })))
+        .unwrap();
+        etx.send(EngineMsg::Event(model_response(&format!(
+            "answer {i} line a\nanswer {i} line b\nanswer {i} line c"
+        ))))
+        .unwrap();
+    }
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("answer 7"), "tail follows by default:\n{s}");
+
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::PageUp,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    insta::assert_snapshot!("full_paged", s);
+    // The `↑N` marker lives on the footer row — the composer
+    // placeholder's `↑` mustn't count.
+    let footer =
+        |t: &Terminal<TestBackend>| screen(t).split('\n').nth(19).unwrap_or("").to_string();
+    assert!(footer(&term).contains('↑'), "footer scroll marker:\n{s}");
+    assert!(
+        !s.contains("answer 7"),
+        "paged view should hide the tail:\n{s}"
+    );
+
+    // Submitting snaps back to the tail.
+    app.submit_text("next task");
+    app.step(&mut term, &caps).unwrap();
+    assert!(!footer(&term).contains('↑'), "submit resets scroll");
+}
+
+#[test]
+fn full_dialog_pins_over_transcript() {
+    let (mut app, etx, _w, mut term, caps) = full_harness();
+    // Scroll up, then open a permission dialog — it pins at the bottom.
+    for i in 0..8 {
+        etx.send(EngineMsg::Event(ev(EventKind::UserInput {
+            text: format!("p{i}"),
+        })))
+        .unwrap();
+        etx.send(EngineMsg::Event(model_response(&format!(
+            "r{i}a\nr{i}b\nr{i}c"
+        ))))
+        .unwrap();
+    }
+    app.step(&mut term, &caps).unwrap();
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::PageUp,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    assert!(screen(&term).contains('↑'), "scrolled");
+
+    let (rtx, _rrx) = mpsc::channel();
+    etx.send(EngineMsg::Ask(
+        AskRequest {
+            tool: "bash".into(),
+            input: serde_json::json!({"command": "rm -rf /tmp/x"}),
+            reason: "destructive".into(),
+        },
+        rtx,
+    ))
+    .unwrap();
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("permission"), "dialog visible:\n{s}");
+    assert!(s.contains("rm -rf /tmp/x"), "typed preview:\n{s}");
+    // The `↑N` marker lives on the footer row — the composer
+    // placeholder's `↑` mustn't count.
+    let footer = s.split('\n').nth(19).unwrap_or("");
+    assert!(!footer.contains('↑'), "dialog force-follows the tail:\n{s}");
+}
+
+#[test]
+fn full_panel_band_sits_below_prompt() {
+    let (mut app, _etx, _w, mut term, caps) = full_harness();
+    // ↑ on an empty composer opens the control panel.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Up,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    insta::assert_snapshot!("full_panel_band", s);
+    // 3-row band sits below the prompt: strip lands two rows under ❯.
+    let rows: Vec<&str> = s.trim_end_matches('\n').split('\n').collect();
+    let prow = rows.iter().position(|r| r.contains('❯')).unwrap();
+    assert!(
+        rows[prow + 2].contains("dashboard"),
+        "strip two rows below prompt: {:?}",
+        rows[prow + 2]
+    );
+    assert!(s.contains("/repo"), "dashboard rows visible");
+}
+
+#[test]
+fn full_panel_click_switches_tabs() {
+    let (mut app, _etx, _w, mut term, caps) = full_harness();
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::F(1),
+    ));
+    app.step(&mut term, &caps).unwrap();
+    assert!(screen(&term).contains("session"), "dashboard open");
+
+    // Strip row = band top: on a 20-row grid the cap gives 15 rows
+    // (min(17, 20-5)) → strip at row 4. " keys " is the fourth tab —
+    // x 30..36 after " dashboard " + " agents " + " settings ".
+    app.on_ct_event(crossterm::event::Event::Mouse(
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 32,
+            row: 4,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        },
+    ));
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    // §4 keys tab is the grouped list — the "edit" group proves it
+    // (the band truncates before the "modes" group at 20 rows).
+    assert!(s.contains("ctrl+w"), "keys tab after click:\n{s}");
+
+    // Esc closes; the band gives the rows back to the transcript.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Esc,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    assert!(!screen(&term).contains("dashboard"), "panel closed");
+}
+
+#[test]
+fn panel_open_composer_still_types() {
+    let (mut app, _etx, _w, mut term, caps) = full_harness();
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::F(1),
+    ));
+    // The panel is passive chrome — plain keys land in the composer.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Char('h'),
+    ));
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Char('i'),
+    ));
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("❯ hi"), "typed through the panel:\n{s}");
+    // Backspace edits; arrows only leave the composer once it's empty.
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Backspace,
+    ));
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Left,
+    ));
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Right,
+    ));
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("❯ h"), "backspace lands:\n{s}");
+    assert!(
+        s.contains("dashboard"),
+        "arrows with text stay in the composer, panel stays:\n{s}"
+    );
+}
+
+// ── L2 graphite redesign ───────────────────────────────────────────
+
+/// §5 empty state + §3 placeholder: a fresh session centres the mark
+/// over the wordmark and hints at the composer.
+#[test]
+fn full_empty_state_and_placeholder() {
+    let (mut app, _e, _w, mut term, caps) = full_harness();
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains('⋈'), "mark glyph centred:\n{s}");
+    assert!(s.contains("overseer"), "wordmark:\n{s}");
+    assert!(s.contains("ask anything"), "composer placeholder:\n{s}");
+    insta::assert_snapshot!("empty_state", s);
+}
+
+/// §2 tool-line indent + glyphs: `●` ok/err, spinner frame running;
+/// the end-of-run summary is right-aligned.
+#[test]
+fn full_tool_glyphs_and_run_summary() {
+    let (mut app, etx, _w, mut term, caps) = full_harness();
+    app.submit_text("run the checks");
+    let _ = _w.try_recv(); // drain the Submit
+    etx.send(EngineMsg::Event(ev(EventKind::UserInput {
+        text: "run the checks".into(),
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolCallStart {
+        call_id: "c1".into(),
+        name: "bash".into(),
+        input: serde_json::json!({"command": "cargo test"}),
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolResult {
+        call_id: "c1".into(),
+        name: "bash".into(),
+        content: "ok".into(),
+        is_error: false,
+        raw_bytes: 2,
+        spilled_to: None,
+        denied: false,
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolCallStart {
+        call_id: "c2".into(),
+        name: "read".into(),
+        input: serde_json::json!({"path": "src/app.rs"}),
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolResult {
+        call_id: "c2".into(),
+        name: "read".into(),
+        content: "permission denied".into(),
+        is_error: true,
+        raw_bytes: 17,
+        spilled_to: None,
+        denied: false,
+    })))
+    .unwrap();
+    etx.send(EngineMsg::Event(ev(EventKind::ToolCallStart {
+        call_id: "c3".into(),
+        name: "grep".into(),
+        input: serde_json::json!({"pattern": "todo", "path": "src"}),
+    })))
+    .unwrap();
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("● bash"), "ok glyph:\n{s}");
+    assert!(s.contains("● read"), "err glyph:\n{s}");
+    insta::assert_snapshot!("tool_lines", s);
+
+    etx.send(EngineMsg::Event(ev(EventKind::RunEnd {
+        stop_reason: "end_turn".into(),
+        steps: 2,
+        total_cost_usd: 0.042,
+        cache: overseer_core::ledger::CacheStats {
+            fresh_input: 41200,
+            cache_read: 30400,
+            cache_write: 1200,
+            output: 800,
+        },
+    })))
+    .unwrap();
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("2 steps"), "run summary:\n{s}");
+    insta::assert_snapshot!("run_summary", s);
+}
+
+/// §4 keys tab: grouped two-column key list.
+#[test]
+fn full_panel_keys_tab() {
+    let (mut app, _e, _w, mut term, caps) = full_harness();
+    app.key(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Up,
+    ));
+    for _ in 0..3 {
+        app.key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Right,
+        ));
+    }
+    app.step(&mut term, &caps).unwrap();
+    let s = screen(&term);
+    assert!(s.contains("ctrl+w"), "grouped keys:\n{s}");
+    insta::assert_snapshot!("panel_keys", s);
 }

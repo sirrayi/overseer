@@ -74,6 +74,12 @@ pub enum EventKind {
         stop_reason: String,
         steps: u32,
         total_cost_usd: f64,
+        /// Cache tokens billed inside this run only (end-of-run
+        /// `Agent::cache_stats()` minus the run-start snapshot) — the
+        /// session ledger keeps the cumulative totals. Absent on
+        /// pre-extension logs, hence `default`.
+        #[serde(default)]
+        cache: crate::ledger::CacheStats,
     },
     /// A background subagent finished (P3.4 fire-and-notify): its bounded
     /// digest is injected as a user message at the next step boundary;
@@ -194,12 +200,15 @@ pub struct Event {
     pub kind: EventKind,
 }
 
-/// Tamper-evident chain hash for one event (FNV-1a, 64-bit).
+/// Structural chain hash for one event (FNV-1a, 64-bit, not
+/// cryptographic).
 ///
 /// Feeds `id` (LE bytes), `parent_id` (`u64::MAX` for `None` — distinct
-/// from any real id), the serde `type` tag of `kind` (stable across
-/// payload edits — payload bytes are NOT hashed), and `prev` (0 for the
-/// chain head). Deterministic, std-only, no new deps.
+/// from any real id), the serde `type` tag of `kind`, and `prev` (0 for the
+/// chain head). It detects structural tampering (reordered, inserted,
+/// dropped or re-typed events, broken parent links); it does NOT detect a
+/// payload edit — payload bytes are not hashed. Deterministic, std-only.
+// DEFERRED(owner): payload hashing — needs a versioned hash format so existing logs still verify.
 pub fn event_hash(id: u64, parent_id: Option<u64>, type_str: &str, prev: u64) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -289,6 +298,7 @@ pub fn verify_chain(events: &[Event]) -> bool {
 /// - Usage fresh/cache/output/reasoning → `gen_ai.usage.*`
 /// - latency_ms → `gen_ai.latency_ms`, cost_usd → `gen_ai.cost_usd`
 /// - ToolCallStart/ToolResult → span `gen_ai.span.kind="tool"`
+#[cfg(test)]
 pub fn otel_spans(events: &[Event]) -> Vec<serde_json::Value> {
     let trace_id = events
         .iter()
@@ -453,20 +463,33 @@ impl EventLog {
         self.file.sync_data()
     }
 
-    /// Replay the whole log.
+    /// Replay the whole log. Strict: only the final non-empty line may be
+    /// unparseable (a torn tail from a crash mid-write — durable-tail
+    /// semantics mean everything before the last fsync is valid). A corrupt
+    /// line anywhere else is `InvalidData` naming its 1-based line number,
+    /// never a silent truncation of the events after it.
     pub fn replay(path: impl AsRef<Path>) -> std::io::Result<Vec<Event>> {
+        let path = path.as_ref();
         let f = File::open(path)?;
-        let mut out = Vec::new();
-        for line in BufReader::new(f).lines() {
+        let mut lines = Vec::new();
+        for (i, line) in BufReader::new(f).lines().enumerate() {
             let line = line?;
-            if line.trim().is_empty() {
-                continue;
+            if !line.trim().is_empty() {
+                lines.push((i + 1, line));
             }
-            match serde_json::from_str::<Event>(&line) {
+        }
+        let last = lines.len().saturating_sub(1);
+        let mut out = Vec::with_capacity(lines.len());
+        for (k, (lineno, line)) in lines.iter().enumerate() {
+            match serde_json::from_str::<Event>(line) {
                 Ok(ev) => out.push(ev),
-                // Tolerate a torn final line (crash mid-write): durable-tail
-                // semantics mean everything before the last fsync is valid.
-                Err(_) => break,
+                Err(_) if k == last => break,
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{}: corrupt event at line {lineno}: {e}", path.display()),
+                    ));
+                }
             }
         }
         Ok(out)
@@ -607,6 +630,50 @@ pub fn clear_stale_tool_results(messages: &mut [crate::ir::Message], keep: usize
     stale
 }
 
+/// Placeholder that replaces an elided image block. Fixed text so the
+/// transform is idempotent.
+pub const ELIDED_IMAGE: &str = "[screenshot elided — take a new one if needed]";
+
+/// F5: keep at most the `keep` most recent `Image` blocks in the model
+/// view; older ones become [`ELIDED_IMAGE`] text. Every image in the
+/// view is a computer capture (the only producer is
+/// `tools::computer::image_block`), and each still rides its own
+/// tool-result's envelope text — tool_use/tool_result pairing is
+/// untouched.
+///
+/// Same view-transform contract as [`clear_stale_tool_results`]: events
+/// are never mutated, so a resumed session's rebuilt view behaves
+/// identically (images never rehydrate — only their envelopes do, which
+/// the `(image not persisted across resume)` note in the envelope
+/// already says).
+pub fn cap_image_blocks(messages: &mut [crate::ir::Message], keep: usize) -> usize {
+    let total = messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter(|b| matches!(b, crate::ir::Block::Image { .. }))
+        .count();
+    let stale = total.saturating_sub(keep);
+    if stale == 0 {
+        return 0;
+    }
+    let mut seen = 0usize;
+    for m in messages.iter_mut() {
+        for b in m.content.iter_mut() {
+            if seen < stale {
+                if let crate::ir::Block::Image { .. } = b {
+                    *b = crate::ir::Block::Text {
+                        text: ELIDED_IMAGE.to_string(),
+                    };
+                    seen += 1;
+                }
+            } else {
+                return stale;
+            }
+        }
+    }
+    stale
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +683,66 @@ mod tests {
         let d = std::env::temp_dir().join(format!("overseer-test-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn img() -> crate::ir::Block {
+        crate::ir::Block::Image {
+            media_type: "image/png".into(),
+            data_b64: "aGVsbG8=".into(),
+            px_w: 2560,
+            px_h: 1600,
+            sent_w: 1280,
+            sent_h: 800,
+        }
+    }
+
+    #[test]
+    fn cap_image_blocks_keeps_the_last_two_and_preserves_pairing() {
+        // Five captures across five tool-result messages (as the agent
+        // loop pushes them: ToolResult then sibling Image).
+        let mut messages: Vec<crate::ir::Message> = (0..5)
+            .map(|i| {
+                crate::ir::Message::tool_results(vec![
+                    crate::ir::Block::ToolResult {
+                        tool_use_id: format!("toolu_{i}"),
+                        content: format!("envelope-{i}"),
+                        is_error: false,
+                    },
+                    img(),
+                ])
+            })
+            .collect();
+        assert_eq!(cap_image_blocks(&mut messages, 2), 3);
+        // Only the last two image blocks remain; older ones are the
+        // fixed placeholder text — and every ToolResult survived.
+        let mut images = 0;
+        let mut tool_results = 0;
+        let mut elided = 0;
+        for (i, m) in messages.iter().enumerate() {
+            for b in &m.content {
+                match b {
+                    crate::ir::Block::Image { .. } => {
+                        images += 1;
+                        assert!(i >= 3, "image {i} should have been elided");
+                    }
+                    crate::ir::Block::ToolResult { tool_use_id, .. } => {
+                        tool_results += 1;
+                        assert_eq!(tool_use_id, &format!("toolu_{i}"), "pairing intact");
+                    }
+                    crate::ir::Block::Text { text } => {
+                        assert_eq!(text, ELIDED_IMAGE);
+                        elided += 1;
+                    }
+                    _ => panic!("unexpected block"),
+                }
+            }
+        }
+        assert_eq!((images, tool_results, elided), (2, 5, 3));
+        // Idempotent — a second pass is a byte-identical no-op.
+        assert_eq!(cap_image_blocks(&mut messages, 2), 0);
+        // Under the cap, nothing changes.
+        let mut few = vec![crate::ir::Message::tool_results(vec![img()])];
+        assert_eq!(cap_image_blocks(&mut few, 2), 0);
     }
 
     #[test]
@@ -1019,5 +1146,67 @@ mod tests {
         }
         // Audit-only: none rehydrate into model messages.
         assert!(rehydrate_messages(&events).is_empty());
+    }
+
+    /// C6: a corrupt NON-final line is an error naming its 1-based line
+    /// number — not a silent truncation of everything after it.
+    #[test]
+    fn corrupt_middle_line_errors_with_line_number() {
+        let dir = tmpdir();
+        let path = dir.join("events.jsonl");
+        {
+            let mut log = EventLog::create(&path).unwrap();
+            log.append(EventKind::UserInput { text: "ok".into() })
+                .unwrap();
+            log.flush().unwrap();
+        }
+        let good = std::fs::read_to_string(&path).unwrap();
+        let good = good.trim_end();
+        std::fs::write(&path, format!("{good}\n{{garbage\n\n{good}\n")).unwrap();
+        let err = EventLog::replay(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("line 2"), "{err}");
+    }
+
+    /// C6: a torn tail followed only by blank lines is still the tail.
+    #[test]
+    fn torn_tail_before_trailing_blank_lines_is_tolerated() {
+        let dir = tmpdir();
+        let path = dir.join("events.jsonl");
+        {
+            let mut log = EventLog::create(&path).unwrap();
+            log.append(EventKind::UserInput { text: "a".into() })
+                .unwrap();
+            log.append(EventKind::UserInput { text: "b".into() })
+                .unwrap();
+            log.flush().unwrap();
+        }
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"{\"id\":3,\"partial\n\n  \n").unwrap();
+        drop(f);
+        let events = EventLog::replay(&path).unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    /// K6 guard: a pre-extension `run_end` line (no cache fields) must keep
+    /// replaying once RunEnd grows `#[serde(default)]` fields.
+    #[test]
+    fn old_shape_run_end_replays() {
+        let old = r#"{"type":"run_end","stop_reason":"end_turn","steps":3,"total_cost_usd":0.0}"#;
+        let kind: EventKind = serde_json::from_str(old).unwrap();
+        assert!(matches!(kind, EventKind::RunEnd { steps: 3, .. }));
+        let dir = tmpdir();
+        let path = dir.join("events.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                old.replacen('{', r#"{"id":1,"parent_id":null,"ts_ms":0,"#, 1)
+            ),
+        )
+        .unwrap();
+        let events = EventLog::replay(&path).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].kind, EventKind::RunEnd { steps: 3, .. }));
     }
 }

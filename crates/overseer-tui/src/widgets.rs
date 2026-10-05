@@ -7,7 +7,7 @@ use overseer_core::perm::{AskRequest, Preset};
 
 use crate::theme;
 
-const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(crate) const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// One-row working indicator: spinner + phase + elapsed + token count +
 /// an *accurate* interrupt hint — it's only drawn while the engine is
@@ -202,16 +202,24 @@ impl Dialog {
     }
 }
 
-/// Bottom status line: mode badge + cwd + model + session cost.
-pub fn status_line(preset: Preset, cwd: &str, model: &str, cost: f64, width: u16) -> Line<'static> {
-    let (label, badge) = match preset {
+/// Mode badge chip for footers: (label, style).
+pub fn preset_badge(preset: Preset) -> (&'static str, ratatui::style::Style) {
+    match preset {
         Preset::WorkspaceWrite => (" workspace ", theme::badge()),
         Preset::ReadOnly => (" read-only ", theme::badge_ro()),
         Preset::Plan => (" plan ", theme::badge_plan()),
-    };
+    }
+}
+
+/// Bottom status line: mode badge + cwd + model + session cost.
+pub fn status_line(preset: Preset, cwd: &str, model: &str, cost: f64, width: u16) -> Line<'static> {
+    let (label, badge) = preset_badge(preset);
     let right = format!("{model} · ${:.4}", cost);
     let left_w = 10 + cwd.len();
-    let pad = (width as usize).saturating_sub(left_w + right.len()).max(1);
+    // 1-col right inset — flush-to-edge grazes the window border.
+    let pad = (width as usize)
+        .saturating_sub(left_w + right.len() + 1)
+        .max(1);
     Line::from(vec![
         Span::styled(label, badge),
         Span::styled(format!(" {cwd}"), theme::status()),
@@ -228,7 +236,7 @@ pub fn help_panel() -> Vec<Line<'static>> {
         "shift+tab    cycle mode (workspace → read-only → plan)",
         "ctrl+t       toggle plan    ctrl+x  cancel queued msg",
         "ctrl+s       stash draft    ctrl+_  undo    ctrl+w  del word",
-        "up/down      history        ctrl+c  clear   ctrl+d  quit",
+        "up/down      history (empty: panel)   ctrl+c/d clear/quit",
         "ctrl+p       sessions       ctrl+o  search  ctrl+y  copy reply",
         "alt+e / /edit               draft in $EDITOR",
         "tab          complete /cmd or @path    !cmd   run shell locally",

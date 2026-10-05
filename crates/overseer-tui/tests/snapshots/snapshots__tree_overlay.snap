@@ -16,5 +16,5 @@ expression: norm
 › s1 · [ago] · fix the flaky test · (current)
     ↳ s3 · [ago] · fix the flaky test
 ↑↓ · enter switch · esc
-❯
- workspace  /repo                        test-model · $0.000
+❯ ask anything  ·  ↑ panel  ·  ? keys
+ workspace  /repo                       test-model · $0.0000

@@ -12,12 +12,18 @@ pub mod gemini;
 pub mod local;
 pub mod openai;
 pub mod responses;
-pub mod router;
 
-/// Native-compaction seam, defined in [`crate::compact`]: adapters opt in
-/// via `NativeCompaction`; routing gates on `provider_compact_capability`.
-/// Re-export only — no existing item touched.
-pub use crate::compact::{provider_compact_capability, NativeCompaction};
+/// Coerce a wire tool-call input into a JSON object. A non-object value
+/// (string/array/number from the wire) is preserved under `_unparsed`, so
+/// adapters can attach linkage fields without `IndexMut` panicking and the
+/// tool sees a schema error instead of silently losing the call.
+pub(crate) fn object_input(v: Value) -> Value {
+    if v.is_object() {
+        v
+    } else {
+        serde_json::json!({ "_unparsed": v })
+    }
+}
 
 /// Cross-provider effort ladder (P3.2). Each adapter maps the enum onto
 /// its native knob — Anthropic `thinking.budget_tokens`, OpenAI
@@ -106,6 +112,10 @@ pub struct Request<'a> {
     pub effort: Option<Effort>,
     /// Attach provider cache breakpoints to the prefix tail.
     pub cache_breakpoints: bool,
+    /// Stable per-session prompt-cache routing key. OpenAI-family adapters
+    /// send it as `prompt_cache_key` where the model profile accepts it;
+    /// the other adapters ignore it.
+    pub cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,16 +155,131 @@ pub struct Response {
 }
 
 /// Failure classes per the Ch.7 §6 matrix — never collapse these into "error".
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ProviderError {
-    #[error("rate limited ({status}); retry after {retry_after_ms}ms")]
     RateLimit { status: u16, retry_after_ms: u64 },
-    #[error("HTTP {status}: {body}")]
     Http { status: u16, body: String },
-    #[error("transport: {0}")]
     Transport(String),
-    #[error("malformed response: {0}")]
     Malformed(String),
+}
+
+impl std::error::Error for ProviderError {}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimit {
+                status,
+                retry_after_ms,
+            } => write!(f, "rate limited ({status}); retry after {retry_after_ms}ms"),
+            Self::Http { status, body } => write!(f, "{}", http_plain(*status, body)),
+            Self::Transport(m) => write!(f, "transport: {m}"),
+            Self::Malformed(m) => write!(f, "malformed response: {m}"),
+        }
+    }
+}
+
+/// The HTTP agent every adapter shares: non-2xx statuses come back as
+/// values (mapped by [`send_json`]), with a 600s global timeout.
+pub(crate) fn http_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(600)))
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+/// `POST url` with bearer auth and a JSON content type, then the adapter's
+/// extra headers (OpenAI Chat Completions and Responses).
+pub(crate) fn bearer_post(
+    agent: &ureq::Agent,
+    url: &str,
+    api_key: &str,
+    extra_headers: &[(String, String)],
+) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+    let mut call = agent
+        .post(url)
+        .header("authorization", &format!("Bearer {api_key}"))
+        .header("content-type", "application/json");
+    for (name, value) in extra_headers {
+        call = call.header(name, value);
+    }
+    call
+}
+
+/// Statuses that mean "back off and retry" (529 is Anthropic's overload).
+pub(crate) const RATE_LIMITED: &[u16] = &[429, 529, 503];
+
+/// Send `body` and map the reply: a `rate_limited` status becomes
+/// `RateLimit` (the `retry-after` seconds, default 5), any other non-2xx
+/// becomes `Http` (rendered by `http_plain`), and a 2xx body is parsed as
+/// JSON. Returns `(json, latency_ms)`, latency measured from `started`.
+pub(crate) fn send_json(
+    call: ureq::RequestBuilder<ureq::typestate::WithBody>,
+    body: &Value,
+    started: std::time::Instant,
+    rate_limited: &[u16],
+) -> Result<(Value, u64), ProviderError> {
+    let mut resp = call
+        .send_json(body)
+        .map_err(|e| ProviderError::Transport(e.to_string()))?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    let status = resp.status().as_u16();
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+    if rate_limited.contains(&status) {
+        let retry_after_ms = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5)
+            * 1000;
+        return Err(ProviderError::RateLimit {
+            status,
+            retry_after_ms,
+        });
+    }
+    if !(200..300).contains(&status) {
+        return Err(ProviderError::Http { status, body: text });
+    }
+    let parsed =
+        serde_json::from_str(&text).map_err(|e| ProviderError::Malformed(e.to_string()))?;
+    Ok((parsed, latency_ms))
+}
+
+/// Render an HTTP failure as one plain-English line: a status gloss
+/// plus the provider's own `error.message` when the body is the usual
+/// `{"error":{…}}` envelope (Anthropic, OpenAI, and Gemini all use it);
+/// non-JSON bodies fall back to a trimmed raw excerpt.
+fn http_plain(status: u16, body: &str) -> String {
+    let gloss = match status {
+        400 => "the request was rejected",
+        401 | 403 => "authentication failed — check the API key",
+        404 => "model or endpoint not found",
+        408 | 504 => "the request timed out",
+        429 => "rate limited",
+        500..=599 => "the provider had a server error",
+        _ => "the request failed",
+    };
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v["error"]["message"]
+                .as_str()
+                .or_else(|| v["message"].as_str())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| body.trim().chars().take(160).collect());
+    if detail.is_empty() {
+        format!("{gloss} (HTTP {status})")
+    } else {
+        format!("{gloss} (HTTP {status}): {detail}")
+    }
 }
 
 /// Providers must be safe to share with a worker thread: frontends (TUI)

@@ -16,6 +16,6 @@ expression: screen(&term)
 I'll look at the test file first.
 
   ls tests/
-◌ bash cargo test flaky
-❯
- workspace  /repo                        test-model · $0.000
+  ⠙ bash  cargo test flaky
+❯ ask anything  ·  ↑ panel  ·  ? keys
+ workspace  /repo                       test-model · $0.0000

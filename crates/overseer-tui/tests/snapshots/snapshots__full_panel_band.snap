@@ -1,0 +1,17 @@
+---
+source: crates/overseer-tui/tests/snapshots.rs
+expression: s
+---
+
+
+❯ ask anything  ·  ↑ panel  ·  ? keys
+
+ dashboard  agents  settings  keys          ↑/↓ · ←/→ · esc
+  session     session
+  cwd         /repo
+  model       test-model
+  mode        workspace
+  state       idle
+  tokens      0
+  cost        $0.0000
+  cache       —

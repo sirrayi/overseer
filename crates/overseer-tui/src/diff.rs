@@ -1,8 +1,8 @@
 //! Line-based unified diff for `/diff` (P2.9). View-only — the diff is
 //! computed from checkpoint snapshots vs the working tree, never stored.
 //!
-//! `hunks` returns structured hunks (the per-hunk accept/reject surface
-//! and the +/− counts); `unified` renders them to display lines.
+//! `hunks` returns structured hunks — the per-hunk accept/reject
+//! surface, the +/− counts, and the display lines all ride on `lines`.
 
 /// One contiguous change region, with its surrounding context for
 /// display and the index ranges needed to revert just this hunk.
@@ -97,15 +97,6 @@ pub fn hunks(old: &str, new: &str, ctx: usize) -> Vec<Hunk> {
         .collect()
 }
 
-/// Unified-diff body lines across all hunks. Empty vec = identical.
-/// Kept for callers that only need display text.
-pub fn unified(old: &str, new: &str, ctx: usize) -> Vec<String> {
-    hunks(old, new, ctx)
-        .into_iter()
-        .flat_map(|h| h.lines)
-        .collect()
-}
-
 /// Reject selected hunks: rebuild `current` with each rejected hunk's
 /// NEW range replaced by its OLD lines. Applies bottom-up so earlier
 /// `new_start` indices stay valid.
@@ -167,16 +158,25 @@ fn lcs_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_rejects, hunks, unified};
+    use super::{apply_rejects, hunks};
+
+    /// Unified-diff body lines across all hunks — what the deleted
+    /// `unified` helper used to render.
+    fn lines(old: &str, new: &str, ctx: usize) -> Vec<String> {
+        hunks(old, new, ctx)
+            .into_iter()
+            .flat_map(|h| h.lines)
+            .collect()
+    }
 
     #[test]
     fn identical_is_empty() {
-        assert!(unified("a\nb\n", "a\nb\n", 3).is_empty());
+        assert!(lines("a\nb\n", "a\nb\n", 3).is_empty());
     }
 
     #[test]
     fn change_marks_minus_plus() {
-        let d = unified("a\nb\nc\n", "a\nx\nc\n", 1);
+        let d = lines("a\nb\nc\n", "a\nx\nc\n", 1);
         assert_eq!(d[0], "@@ hunk @@");
         assert!(d.iter().any(|l| l == "-b"));
         assert!(d.iter().any(|l| l == "+x"));
@@ -185,14 +185,14 @@ mod tests {
 
     #[test]
     fn new_file_is_all_plus() {
-        let d = unified("", "l1\nl2\n", 3);
+        let d = lines("", "l1\nl2\n", 3);
         assert!(d.iter().all(|l| l.starts_with('+') || l.starts_with('@')));
         assert_eq!(d.len(), 3); // marker + 2 lines
     }
 
     #[test]
     fn deleted_file_is_all_minus() {
-        let d = unified("l1\nl2\n", "", 3);
+        let d = lines("l1\nl2\n", "", 3);
         assert!(d.iter().any(|l| l == "-l1") && d.iter().any(|l| l == "-l2"));
     }
 

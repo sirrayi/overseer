@@ -447,7 +447,7 @@ impl Composer {
                 match e {
                     Elem::Text(g) => {
                         col_px += UnicodeWidthStr::width(g.as_str());
-                        spans.push(Span::raw(g.clone()));
+                        spans.push(Span::styled(g.clone(), theme::prompt()));
                     }
                     Elem::Chip(id) => {
                         let label = format!("[Pasted #{id}]");
@@ -471,9 +471,12 @@ impl Composer {
             for (j, wl) in wrapped.into_iter().enumerate() {
                 if !cursor_set {
                     if let Some(px) = cursor_px {
-                        let lo = j * w;
-                        let hi = lo + w + 2;
-                        if px <= hi {
+                        // Rows wrap at w+2 columns, so row j owns the
+                        // half-open px range [j*(w+2), (j+1)*(w+2)) —
+                        // a cursor exactly on the boundary belongs to
+                        // the next row's first column, not this tail.
+                        let lo = j * (w + 2);
+                        if px >= lo && px < lo + w + 2 {
                             cx = px.saturating_sub(lo) as u16;
                             cy = out.len() as u16;
                             cursor_set = true;
@@ -484,8 +487,11 @@ impl Composer {
             }
         }
         if !cursor_set {
+            // px past every row: the buffer ends exactly on a wrap
+            // boundary — the terminal defers the wrap, so park the
+            // cursor at the last row's tail instead of a phantom row.
             cy = out.len().saturating_sub(1) as u16;
-            cx = 2;
+            cx = out.last().map(|l| l.width()).unwrap_or(0) as u16;
         }
         (out, (cx, cy))
     }
@@ -565,6 +571,35 @@ mod tests {
         assert!(c.is_empty());
         c.stash();
         assert_eq!(c.text(), "work in progress");
+    }
+
+    #[test]
+    fn cursor_tracks_wrap_boundaries() {
+        // Width 10 → wrap every 10 cols ("❯ " prefix eats the first 2).
+        let mut c = Composer::new();
+        c.insert_str(&"a".repeat(25));
+        // px 27 → third wrapped row, column 7 (was row-math-off-by-w).
+        let (_l, (cx, cy)) = c.render(10);
+        assert_eq!((cx, cy), (7, 2));
+
+        // Cursor mid-buffer at a wrap boundary belongs to the NEXT
+        // row's first column, not the previous row's tail.
+        let mut c = Composer::new();
+        c.insert_str(&"a".repeat(20));
+        for _ in 0..12 {
+            c.left();
+        }
+        // px 10 = start of visual row 1.
+        let (_l, (cx, cy)) = c.render(10);
+        assert_eq!((cx, cy), (0, 1));
+
+        // Buffer ending exactly on a boundary: deferred wrap keeps the
+        // cursor at the last row's tail — never a phantom row.
+        let mut c = Composer::new();
+        c.insert_str(&"a".repeat(8));
+        let (lines, (cx, cy)) = c.render(10);
+        assert_eq!(lines.len(), 1);
+        assert_eq!((cx, cy), (10, 0));
     }
 
     #[test]

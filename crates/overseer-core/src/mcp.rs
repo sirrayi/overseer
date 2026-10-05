@@ -44,11 +44,11 @@
 //! HTTP/SSE and streamable-HTTP transports plus every auth flow, server-
 //! initiated messages (logging notifications, `sampling`/`roots`/
 //! `elicitation` requests), which desynchronize the one-line-per-call reader
-//! and need a demultiplexing reader task, the server registry/supervisor, and
-//! wiring a discovered tool into the engine's registry
-//! (`tools::ToolRegistry` owns that state and needs an ops surface plus a
-//! supervised server lifetime) — this batch lands the client, the framing,
-//! the tool-spec translation and the name-collision guard.`
+//! and need a demultiplexing reader task, and a server supervisor beyond
+//! lazy spawn + drop-on-failure (health probes, restart policy, per-server
+//! resource limits) — this batch lands the client, the framing, the
+//! tool-spec translation, the name-collision guard and the `mcp` resident
+//! tool (`tools::mcp_tool`) that drives the servers through the engine.`
 //!
 //! DONE, not deferred: per-call timeouts and the hung-server watchdog.
 //! [`CALL_TIMEOUT`] bounds every [`StdioClient::call`];
@@ -56,9 +56,10 @@
 //! answer inside its timeout is killed, so a hung server cannot block
 //! forever.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -88,6 +89,7 @@ pub const CODE_INVALID_REQUEST: i64 = -32600;
 /// before it kills it. Fixed rather than configurable: shutdown is a
 /// transport teardown, not a call — per-call liveness lives in
 /// [`CALL_TIMEOUT`] and [`StdioClient::call_with_timeout`].
+#[cfg(test)]
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(2_000);
 
 /// How long [`StdioClient::call`] waits for one response line before it kills
@@ -97,7 +99,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(2_000);
 /// bound uses [`StdioClient::call_with_timeout`] directly.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Poll interval for the shutdown grace window.
+/// Poll interval for the shutdown and reap grace windows.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 
 /// Longest wire excerpt an error message may embed, in chars (never bytes —
@@ -429,7 +431,11 @@ pub fn namespaced(server: &str, tool: &str) -> String {
 
 /// Map every character outside `[A-Za-z0-9_]` to `_`, char by char, and
 /// collapse a blank result to `_`.
-fn sanitized(part: &str) -> String {
+///
+/// Public because it is the inverse direction a caller needs: given a full
+/// [`namespaced`] name, the server segment is the sanitized server id, and
+/// `tools::mcp_tool` matches that segment back to a configured server.
+pub fn sanitized(part: &str) -> String {
     let mut out: String = part
         .chars()
         .map(|c| {
@@ -469,13 +475,6 @@ pub fn collides_with_resident(server: &str, tool: &str) -> bool {
             || resident.eq_ignore_ascii_case(&bare)
     })
 }
-
-/// Inline budget for assembled MCP tool specs (Invariant 4: tool results
-/// are budgeted — ~30K chars inline, then spill to file). A caller that
-/// lays discovered specs into the model view ranks them with
-/// `search_tools` and trims their descriptions with `trim_description`
-/// so the assembled block stays inside this budget.
-pub const MCP_BUDGET: usize = 30_000;
 
 /// Rank `specs` against `query`, best first, deterministically.
 ///
@@ -546,15 +545,46 @@ pub fn trim_description(desc: &str, cap: usize) -> String {
     out
 }
 
+/// Cap on the shared stderr tail (bytes, kept tail-end so the freshest
+/// diagnostics survive).
+const STDERR_TAIL_CAP: usize = 2 * 1024;
+
+/// Pump a child's stderr until EOF, keeping only the newest
+/// [`STDERR_TAIL_CAP`] bytes of UTF-8-lossy text in the shared buffer.
+/// Runs for the child's whole life on its own thread — the pipe can
+/// never fill, so a logging-heavy server cannot deadlock the client.
+fn drain_stderr(mut pipe: impl Read, tail: Arc<Mutex<String>>) {
+    let mut buf = [0u8; 1024];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let chunk = String::from_utf8_lossy(&buf[..n]);
+                let Ok(mut t) = tail.lock() else { return };
+                t.push_str(&chunk);
+                if t.len() > STDERR_TAIL_CAP {
+                    let mut start = t.len() - STDERR_TAIL_CAP;
+                    while !t.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    t.drain(..start);
+                }
+            }
+        }
+    }
+}
+
 /// A live MCP server process speaking newline-delimited JSON-RPC on stdio.
 ///
 /// Invariants: stdout is read one line per request and every response's `id`
 /// must match the request just written ([`decode_response`]) — a stale or
 /// interleaved line is an error, never accepted as this call's answer; ids
 /// start at 1 and are never reused, even when a write fails, so a late reply
-/// to a failed call can never be mistaken for a fresh one; `stderr` is
-/// `Stdio::null()`, so a chatty server cannot fill a pipe buffer and deadlock
-/// the client while we wait on stdout; a child that exits (or closes stdout)
+/// to a failed call can never be mistaken for a fresh one; `stderr` is drained by a
+/// daemon thread into a bounded (≤2 KiB) tail, so a chatty server cannot fill
+/// a pipe buffer and deadlock the client while we wait on stdout — and a
+/// crash still leaves a diagnostic crumb ([`StdioClient::stderr_tail`]); a
+/// child that exits (or closes stdout)
 /// is reported as an error naming the server and the method — a hang is never
 /// papered over as an empty success; a server that never answers is killed
 /// after [`CALL_TIMEOUT`] (see [`StdioClient::call_with_timeout`]).
@@ -565,8 +595,9 @@ pub fn trim_description(desc: &str, cap: usize) -> String {
 /// arriving between the request and the answer would desynchronize it, which
 /// is why those are deferred (module header).
 pub struct StdioClient {
-    child: Child,
-    /// `None` once [`shutdown`](Self::shutdown) has closed it; any later call
+    /// `None` once a timed-out child was handed to a background reaper.
+    child: Option<Child>,
+    /// `None` once shutdown (or a timeout kill) has closed it; any later call
     /// then fails naming that state instead of writing to a dead pipe.
     stdin: Option<ChildStdin>,
     /// `None` while a reader thread owns the pipe mid-call, and `None`
@@ -575,19 +606,64 @@ pub struct StdioClient {
     stdout: Option<BufReader<ChildStdout>>,
     next_id: u64,
     server: String,
+    /// The ≤2 KiB most recent stderr bytes — kept by the drainer thread so
+    /// spawn/init/transport failures can name what the server said.
+    stderr_tail: Arc<Mutex<String>>,
 }
 
 impl StdioClient {
     /// Spawn an MCP server program and wire its stdio: our writes go to its
-    /// stdin, its stdout is read line by line, its stderr is discarded.
+    /// stdin, its stdout is read line by line, its stderr is drained into a
+    /// bounded tail ([`StdioClient::stderr_tail`]).
     ///
     /// `server` is the short id this server is registered under (used in
     /// errors and by [`namespaced`]); the program and its arguments are the
     /// operator's, taken verbatim — the client ships no server and never
     /// guesses one. Both names must be non-blank; a spawn failure names the
     /// server, the program and the OS error, so a missing binary is one line
-    /// to diagnose.
+    /// to diagnose. This form **inherits the parent environment**, so it is
+    /// test-only: production spawns through
+    /// [`spawn_with_env`](Self::spawn_with_env), the allowlisted path.
+    #[cfg(test)]
     pub fn spawn(server: &str, program: &str, args: &[String]) -> Result<Self, String> {
+        Self::spawn_inner(server, program, args, None)
+    }
+
+    /// Spawn an MCP server program (non-blank `server` id and `program`,
+    /// verbatim operator args) with an explicit child environment instead of
+    /// the inherited one: the child gets a **cleared** environment holding
+    /// only `PATH` and `HOME` (taken from the parent when they are set) plus
+    /// the `env` pairs the operator declared in the server's config.
+    ///
+    /// This is the engine's default spawn path, and the allowlist is the
+    /// point: a third-party MCP server is untrusted code, so it must not
+    /// inherit whatever the operator's shell happens to export — provider
+    /// API keys (`ANTHROPIC_API_KEY`), broker secrets, CI tokens. A secret a
+    /// server genuinely needs is declared in its config and pulled from the
+    /// parent env there (`${VAR}` expansion in `mcp_config`), which makes the
+    /// grant visible in the file instead of implicit. `PATH`/`HOME` ride
+    /// along because a server that cannot find its own interpreter, or a
+    /// home for its cache, is not a hardened server — just a broken one.
+    /// Declared pairs win over the inherited two.
+    pub fn spawn_with_env(
+        server: &str,
+        program: &str,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> Result<Self, String> {
+        Self::spawn_inner(server, program, args, Some(env))
+    }
+
+    /// Shared spawn: `env: None` inherits the parent environment (the
+    /// test-only `spawn`), `env: Some` is
+    /// the cleared-environment path described on
+    /// [`spawn_with_env`](Self::spawn_with_env).
+    fn spawn_inner(
+        server: &str,
+        program: &str,
+        args: &[String],
+        env: Option<&[(String, String)]>,
+    ) -> Result<Self, String> {
         if server.trim().is_empty() {
             return Err(format!(
                 "an MCP server id must be a non-blank name (it namespaces the server's tools), got {server:?}"
@@ -598,11 +674,24 @@ impl StdioClient {
                 "mcp server `{server}`: the program to spawn must be a non-blank path, got {program:?}"
             ));
         }
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(pairs) = env {
+            command.env_clear();
+            for key in ["PATH", "HOME"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            for (key, value) in pairs {
+                command.env(key, value);
+            }
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| format!("mcp server `{server}`: could not spawn `{program}`: {e}"))?;
         let stdin = child.stdin.take().ok_or_else(|| {
@@ -611,13 +700,34 @@ impl StdioClient {
         let stdout = child.stdout.take().ok_or_else(|| {
             format!("mcp server `{server}`: `{program}` did not give us a stdout pipe")
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            format!("mcp server `{server}`: `{program}` did not give us a stderr pipe")
+        })?;
+        // The drainer owns the pipe for the child's whole life and keeps
+        // only the newest ≤2 KiB — the tail, not the stream, is bounded.
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        std::thread::spawn({
+            let tail = Arc::clone(&stderr_tail);
+            move || drain_stderr(stderr, tail)
+        });
         Ok(Self {
-            child,
+            child: Some(child),
             stdin: Some(stdin),
             stdout: Some(BufReader::new(stdout)),
             next_id: 1,
             server: server.to_string(),
+            stderr_tail,
         })
+    }
+
+    /// The last ≤2 KiB the server wrote to stderr — empty when it stayed
+    /// quiet. Diagnostics only (appended to spawn/init errors); never
+    /// parsed for protocol state.
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|t| t.clone())
+            .unwrap_or_default()
     }
 
     /// Send one request and return the **decoded response envelope** (which
@@ -631,7 +741,8 @@ impl StdioClient {
     ///
     /// A well-formed *error* response is returned as `Ok`: at this layer it is
     /// a protocol answer, and the wrappers ([`initialize`](Self::initialize),
-    /// [`list_tools`](Self::list_tools), [`call_tool`](Self::call_tool)) turn
+    /// [`list_tools`](Self::list_tools),
+    /// [`call_tool_with_timeout`](Self::call_tool_with_timeout)) turn
     /// it into an `Err` with the server's own code and message.
     ///
     /// Bounded by [`CALL_TIMEOUT`]: this delegates to
@@ -684,13 +795,13 @@ impl StdioClient {
         let (reader, read, buf) = match rx.recv_timeout(timeout) {
             Ok(out) => out,
             Err(_) => {
-                // Hung server: kill and reap it so it cannot wedge a later
-                // call, then close stdin so the next call fails naming the
-                // shutdown state. `stdout` stays `None`: the stranded reader
-                // thread still owns it and exits once the kill closes the
-                // pipe.
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                // Hung server: kill it and reap it within REAP_GRACE (a child
+                // stuck past SIGKILL is handed to a background reaper rather
+                // than blocking this call), then close stdin so the next
+                // call fails naming the shutdown state. `stdout` stays
+                // `None`: the stranded reader thread still owns it and exits
+                // once the kill closes the pipe.
+                self.child = self.child.take().and_then(kill_and_reap);
                 self.stdin.take();
                 return Err(format!(
                     "mcp server `{}`: call timeout — no response to `{method}` (id {id}) within {} ms; the hung server was killed, restart the server",
@@ -778,8 +889,33 @@ impl StdioClient {
     /// it into an `Err` here would erase MCP's own distinction between "the
     /// call did not happen" and "the call happened and the tool said no".
     /// Only a JSON-RPC `error` (no result at all) becomes an `Err`.
+    #[cfg(test)]
     pub fn call_tool(&mut self, tool: &str, args: Value) -> Result<Value, String> {
-        let msg = self.call("tools/call", json!({ "name": tool, "arguments": args }))?;
+        self.call_tool_with_timeout(tool, args, CALL_TIMEOUT)
+    }
+
+    /// `tools/call` with an explicit bound (the test-only `call_tool` uses
+    /// [`CALL_TIMEOUT`]): identical
+    /// request envelope and identical result mapping, but the response must
+    /// arrive within `timeout` (see
+    /// [`call_with_timeout`](Self::call_with_timeout), which enforces it —
+    /// a server with no answer is killed, and the next call fails naming
+    /// that shutdown state).
+    ///
+    /// The registry's `mcp` tool carries the bound so a test can drive the
+    /// timeout path quickly instead of waiting out the fixed
+    /// [`CALL_TIMEOUT`]; the shipped default is that same constant.
+    pub fn call_tool_with_timeout(
+        &mut self,
+        tool: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let msg = self.call_with_timeout(
+            "tools/call",
+            json!({ "name": tool, "arguments": args }),
+            timeout,
+        )?;
         let result =
             result_of(&msg).map_err(|e| self.rpc_error(&format!("tools/call of `{tool}`"), e))?;
         Ok(result.clone())
@@ -798,6 +934,7 @@ impl StdioClient {
     ///
     /// Calling it twice is a caller bug and says so rather than pretending a
     /// second shutdown happened.
+    #[cfg(test)]
     pub fn shutdown(&mut self) -> Result<(), String> {
         if self.stdin.take().is_none() {
             return Err(format!(
@@ -807,7 +944,10 @@ impl StdioClient {
         }
         let deadline = Instant::now() + SHUTDOWN_GRACE;
         loop {
-            match self.child.try_wait() {
+            let Some(child) = self.child.as_mut() else {
+                return Ok(());
+            };
+            match child.try_wait() {
                 Ok(Some(_status)) => return Ok(()),
                 Ok(None) => {}
                 Err(e) => {
@@ -818,8 +958,7 @@ impl StdioClient {
                 }
             }
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                self.child = self.child.take().and_then(kill_and_reap);
                 return Err(format!(
                     "mcp server `{}`: still running {} ms after stdin closed and had to be killed",
                     self.server,
@@ -831,6 +970,7 @@ impl StdioClient {
     }
 
     /// The server id this client was spawned under.
+    #[cfg(test)]
     pub fn server(&self) -> &str {
         &self.server
     }
@@ -870,7 +1010,7 @@ impl std::fmt::Debug for StdioClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StdioClient")
             .field("server", &self.server)
-            .field("pid", &self.child.id())
+            .field("pid", &self.child.as_ref().map(Child::id))
             .field("next_id", &self.next_id)
             .field("stdin_open", &self.stdin.is_some())
             .finish()
@@ -881,10 +1021,40 @@ impl Drop for StdioClient {
     /// Dropping the client kills and reaps the child: a server we spawned
     /// must not outlive the client that speaks its protocol, and nothing else
     /// in this module can be relied on to have run. On an already-reaped
-    /// child both calls fail harmlessly and are ignored.
+    /// child the kill fails harmlessly and is ignored.
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = self.child.take() {
+            kill_and_reap(child);
+        }
+    }
+}
+
+/// Bound on reaping a killed server before the reap moves off-thread.
+const REAP_GRACE: Duration = Duration::from_millis(2_000);
+
+/// SIGKILL `child`, then [`reap_or_detach`] it within [`REAP_GRACE`].
+fn kill_and_reap(mut child: Child) -> Option<Child> {
+    let _ = child.kill();
+    reap_or_detach(child, REAP_GRACE)
+}
+
+/// Poll `try_wait` for up to `grace`. An exited child comes back (reaped);
+/// one still alive — e.g. stuck in uninterruptible sleep past SIGKILL — is
+/// moved to a background thread that blocks on `wait`, so no caller ever
+/// does, and `None` is returned.
+fn reap_or_detach(mut child: Child, grace: Duration) -> Option<Child> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return Some(child),
+            Ok(None) if Instant::now() >= deadline => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return None;
+            }
+            Ok(None) => std::thread::sleep(SHUTDOWN_POLL),
+        }
     }
 }
 
@@ -1342,8 +1512,9 @@ exit 0"#;
         assert!(err.contains("restart the server"), "{err}");
         // The id is burned: the next call would carry id 2.
         assert_eq!(client.next_id, 2);
-        // The child is dead and reaped: the kill already waited on it.
-        assert!(client.child.try_wait().unwrap().is_some());
+        // The child is dead and reaped within the bounded grace.
+        let child = client.child.as_mut().expect("reaped, not detached");
+        assert!(child.try_wait().unwrap().is_some());
         // The session is dead: the next call fails naming the shutdown state
         // instead of writing to a dead pipe ...
         let err = client.call("tools/list", json!({})).unwrap_err();
@@ -1353,8 +1524,29 @@ exit 0"#;
     }
 
     #[test]
+    fn a_child_that_will_not_die_is_detached_within_the_grace_not_waited_on() {
+        // Stand-in for a child stuck past SIGKILL (uninterruptible sleep,
+        // which a unit test cannot produce): an unkilled sleeper. The
+        // bounded reap must give up at the grace and hand the child off.
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 5"])
+            .spawn()
+            .unwrap();
+        let t = Instant::now();
+        let reaped = reap_or_detach(child, Duration::from_millis(100));
+        assert!(reaped.is_none(), "a live child cannot be reaped");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+
+        let mut done = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let _ = done.wait();
+        assert!(reap_or_detach(done, Duration::from_millis(100)).is_some());
+    }
+
+    #[test]
     fn search_tools_ranks_exact_above_substring_above_overlap() {
-        assert_eq!(MCP_BUDGET, 30_000);
         let specs = vec![
             ToolSpec {
                 name: "read_file".into(),

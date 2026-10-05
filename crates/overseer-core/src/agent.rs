@@ -15,9 +15,10 @@ use crate::provider::{Provider, Request, StopReason};
 use crate::stuck::StuckDetector;
 use crate::tools::{ToolCtx, ToolRegistry};
 
-// Static system prompt — assembled per turn by `prompt::assemble` as an
-// ordered section pipeline with an explicit STATIC/DYNAMIC boundary
-// (Invariant 2: nothing volatile lives above it).
+// Static system prompt — assembled ONCE per Agent (start/resume, and on a
+// model switch) by `prompt::assemble` as an ordered section pipeline with an
+// explicit STATIC/DYNAMIC boundary (Invariant 2: nothing volatile lives
+// above it). Every request of the Agent reuses the exact bytes.
 
 /// P7-4: the marker an untrusted-originated spawn exports
 /// (`channel:<channel>:<sender>`). Absent/empty = a locally-originated run.
@@ -135,6 +136,13 @@ pub struct AgentConfig {
     /// never end up executing unsandboxed just because `runsc` was missing.
     /// Parsed/validated with `crate::backends::SandboxRuntime::parse`.
     pub sandbox_runtime: Option<String>,
+    /// R7 MCP servers this session may drive (`~/.overseer/mcp.json`). Empty
+    /// (the default) means no MCP at all: the registry gets no `mcp` spec and
+    /// the prompt gets no MCP segment, so the session is byte-identical to
+    /// the pre-MCP engine. The registry installs one op tool (see
+    /// `ToolRegistry::with_mcp`) and the discovered tool definitions never
+    /// reach the advertised spec array.
+    pub mcp_servers: Vec<crate::mcp_config::McpServer>,
 }
 
 /// P7-1 computer-use containment flags. All default off except
@@ -223,6 +231,8 @@ impl Default for AgentConfig {
             persona_dir: None,
             // P8-C: unset = the platform default sandbox, exactly as before.
             sandbox_runtime: None,
+            // R7: no MCP unless the CLI's config loader found servers.
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -305,6 +315,24 @@ pub struct Agent {
     /// Frontend steering handle (P2.4): interrupt + queued input, checked
     /// at safe boundaries only. Default = headless, never fires.
     control: Control,
+    /// The frozen static system prefix (invariant 2). Mid-session edits to
+    /// memory INDEX/CORE, skills or persona reach the model through its
+    /// tools, not by rewriting these bytes (which would bust the cache).
+    system: Vec<crate::provider::SystemSegment>,
+    /// Provider prompt-cache routing key: the session id, stable across
+    /// resumes of the same session.
+    cache_key: Option<String>,
+    /// CacheStats snapshot at the current run's start — RunEnd reports
+    /// the delta so a run summary shows ITS hit rate, not the session's.
+    run_cache_start: crate::ledger::CacheStats,
+}
+
+/// A stop gate's verdict: let the stop through, block it (a nudge was
+/// injected; loop again), or end the run.
+enum Gate {
+    Pass,
+    Blocked,
+    Stop(RunOutcome),
 }
 
 impl Agent {
@@ -353,6 +381,9 @@ impl Agent {
             verify_blocks: 0,
             checkpoint: None,
             control: Control::default(),
+            system: Vec::new(),
+            cache_key: Some(session_id.clone()),
+            run_cache_start: crate::ledger::CacheStats::default(),
         };
         if let Some(dir) = agent.config.memory_dir.clone() {
             crate::memory::ensure(&dir)?;
@@ -362,6 +393,7 @@ impl Agent {
         if let Some(dir) = agent.config.persona_dir.clone() {
             crate::onboard::ensure_persona_dir(&dir)?;
         }
+        agent.system = crate::prompt::assemble(&agent.config);
         let cwd = agent.config.cwd.display().to_string();
         agent.log.append(EventKind::SessionStart {
             session_id: session_id.clone(),
@@ -415,9 +447,34 @@ impl Agent {
     ) -> std::io::Result<Self> {
         let events = EventLog::replay(session_dir.join("events.jsonl"))?;
         let messages = rehydrate_messages(&events);
+        // Background tasks already noticed before the resume must not be
+        // re-injected (their SubagentDone rehydrated above).
+        let bg_noticed = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::SubagentDone { task_id, .. } => Some(task_id.clone()),
+                _ => None,
+            })
+            .collect();
+        // The LAST SessionStart is this session's own id — a fork's log
+        // begins with the parent's SessionStart, so first-match would
+        // hand the resumed fork its parent's prompt-cache key.
+        let cache_key = events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                EventKind::SessionStart { session_id, .. } => Some(session_id.clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                session_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            });
         let log = EventLog::open(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::open(session_dir.join("ledger.jsonl"))?;
         let tools = Self::registry(&config);
+        let system = crate::prompt::assemble(&config);
         // Seed the spill counter past existing files so resume can't
         // overwrite earlier spilled output.
         let spill_seq = std::fs::read_dir(session_dir.join("tool-outputs"))
@@ -435,13 +492,16 @@ impl Agent {
             stuck_nudged: false,
             empty_responses: 0,
             effort_boost: 0,
-            bg_noticed: std::collections::HashSet::new(),
+            bg_noticed,
             pending_compact: false,
             ctx_wall_stop: false,
             spill_seq,
             verify_blocks: 0,
             checkpoint: None,
             control: Control::default(),
+            system,
+            cache_key,
+            run_cache_start: crate::ledger::CacheStats::default(),
         })
     }
 
@@ -477,7 +537,9 @@ impl Agent {
     /// audit event carries the from/to ids plus the new model's list
     /// prices (`profile::lookup`), so a session's cost steps are
     /// attributable without re-deriving them from the table later.
-    /// Switching to the current model is a no-op (no event).
+    /// Switching to the current model is a no-op (no event). The static
+    /// system prefix re-assembles: the edit-format contract is per model,
+    /// and a new model has no cache to keep warm.
     pub fn set_model(
         &mut self,
         model: &str,
@@ -488,6 +550,7 @@ impl Agent {
         }
         let p = profile::lookup(model);
         let from = std::mem::replace(&mut self.config.model, model.to_string());
+        self.system = crate::prompt::assemble(&self.config);
         self.emit(
             EventKind::ModelSwitch {
                 from,
@@ -522,6 +585,11 @@ impl Agent {
     /// The active session mode (None = default posture).
     pub fn mode(&self) -> Option<&'static crate::modes::Mode> {
         self.tools.mode
+    }
+
+    /// Session token totals by cache class (see [`crate::ledger::CacheStats`]).
+    pub fn cache_stats(&self) -> crate::ledger::CacheStats {
+        self.ledger.cache_stats()
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -564,6 +632,8 @@ impl Agent {
     ) -> std::io::Result<RunOutcome> {
         self.messages.push(Message::user_text(input));
         self.emit(EventKind::UserInput { text: input.into() }, on_event)?;
+        // Per-run cache baseline — RunEnd emits the delta against this.
+        self.run_cache_start = self.ledger.cache_stats();
 
         // P1.9 checkpointing: open a fresh checkpoint per user prompt,
         // named by the input's event id — that id is also the conversation
@@ -592,163 +662,15 @@ impl Agent {
         let mut steps = 0u32;
 
         loop {
-            // Steering boundary (P2.4): interrupt ends the run; queued
-            // user input lands here as ordinary user messages — after the
-            // previous batch's tool_results, so provider pairing holds.
-            if self.control.interrupted() {
-                self.end_run("interrupted", steps, on_event)?;
-                return Ok(RunOutcome::Interrupted {
-                    steps,
-                    cost_usd: self.ledger.total_cost_usd,
-                });
-            }
-            for text in self.control.take_steer() {
-                self.messages.push(Message::user_text(text.clone()));
-                self.emit(EventKind::UserInput { text }, on_event)?;
-            }
-            self.drain_bg_notices(on_event)?;
-
-            if steps >= self.config.max_steps {
-                let out = RunOutcome::StepBudgetExceeded {
-                    steps,
-                    cost_usd: self.ledger.total_cost_usd,
-                };
-                self.end_run("max_steps", steps, on_event)?;
+            if let Some(out) = self.loop_boundary(steps, on_event)? {
                 return Ok(out);
             }
-            if self.ledger.total_cost_usd >= self.config.max_cost_usd {
-                let out = RunOutcome::CostBudgetExceeded {
-                    steps,
-                    cost_usd: self.ledger.total_cost_usd,
-                };
-                self.end_run("max_cost", steps, on_event)?;
-                return Ok(out);
-            }
-
-            // Compaction boundary: the loop only ever compacts here — after a
-            // complete tool-result batch (or a nudge), never mid-batch, so
-            // the Anthropic pairing rule survives the cut.
-            if self.pending_compact {
-                self.pending_compact = false;
-                let shrunk = self.compact(on_event)?;
-                if !shrunk && self.ctx_wall_stop {
-                    // Provider already refuses this context and there's
-                    // nothing left to drop — end cleanly, don't spin.
-                    self.end_run("context_window", steps, on_event)?;
-                    return Ok(RunOutcome::Completed {
-                        steps,
-                        cost_usd: self.ledger.total_cost_usd,
-                    });
-                }
-            }
-
-            // P1.2: clear stale tool results in the view (events untouched).
-            // In-place on the view — idempotent, so resume and live runs
-            // render identically.
-            if self.config.keep_tool_results > 0 {
-                crate::event::clear_stale_tool_results(
-                    &mut self.messages,
-                    self.config.keep_tool_results,
-                );
-            }
-
-            // System segments assemble per turn via the section pipeline:
-            // the static sections are byte-stable; the memory index sits in
-            // the last static slot so an edit only invalidates cache from
-            // that segment onward — tools+prompt stay warm.
-            let system = crate::prompt::assemble(&self.config);
-
-            let req = Request {
-                model: &self.config.model,
-                system: &system,
-                tools: &self.tools.specs,
-                messages: &self.messages,
-                max_tokens: self.config.max_output_tokens,
-                thinking_budget: self.config.thinking_budget,
-                effort: Some(self.effort_now()),
-                cache_breakpoints: true,
-            };
-
-            // B1-2 (Instructor retry): on a Malformed response only, re-issue
-            // the same request once per provider call (flag scoped to this
-            // invocation, reset before every call — multi-Malformed sequences
-            // retry each call once, never loop). The retry is a normal step:
-            // it increments `steps` and records ledger usage on success.
-            // Malformed responses are prompt-adjacent, so the retry request
-            // stays in the dynamic segment — the static prefix is untouched.
-            // Re-read the profile every iteration: `set_model` can switch
-            // the model mid-session (P8-B), which changes both the cost
-            // math and the compaction trigger.
-            let profile = profile::lookup(&self.config.model);
-            let mut malformed_retried = false;
-            let resp = loop {
-                match self.provider.complete(&req) {
-                    Ok(r) => break r,
-                    Err(crate::provider::ProviderError::Malformed(_msg)) if !malformed_retried => {
-                        malformed_retried = true;
-                        continue;
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        self.emit(
-                            EventKind::Error {
-                                message: msg.clone(),
-                            },
-                            on_event,
-                        )?;
-                        self.end_run("provider_error", steps, on_event)?;
-                        return Ok(RunOutcome::Provider(msg));
-                    }
-                }
+            let resp = match self.request_with_retry(steps, on_event)? {
+                Ok(r) => r,
+                Err(out) => return Ok(out),
             };
             steps += 1;
-
-            let cost = profile.cost_usd(&resp.usage);
-            self.ledger.record(UsageRecord::from_usage(
-                &self.config.model,
-                &resp.usage,
-                resp.request_bytes,
-                resp.latency_ms,
-                count_tool_calls(&resp.blocks) as u32,
-                cost,
-            ))?;
-
-            // Effective-window budget (playbook Ch.3 §9.2): trigger on the
-            // *measured* prompt size from the last call, not an estimate.
-            // A provider context-window stop also forces compaction.
-            self.ctx_wall_stop = resp.stop_reason == StopReason::ContextWindowExceeded;
-            if self.config.auto_compact {
-                let frac = self.config.compact_at.unwrap_or(profile.compact_at);
-                let budget = frac as f64 * f64::from(profile.context_in);
-                // B1-9a: estimator pre-trigger — when measured usage is not
-                // yet over budget but the token estimate is, compact early
-                // rather than risk a context-wall stop mid-turn.
-                let est_tokens = crate::tokens::count_tokens(
-                    &prompt_text_for_estimate(&self.messages),
-                    &self.config.model,
-                ) as f64;
-                if self.ctx_wall_stop
-                    || resp.usage.total_input() as f64 > budget
-                    || est_tokens > budget
-                {
-                    self.pending_compact = true;
-                }
-            }
-
-            self.messages.push(Message {
-                role: crate::ir::Role::Assistant,
-                content: resp.blocks.clone(),
-            });
-            self.emit(
-                EventKind::ModelResponse {
-                    blocks: resp.blocks,
-                    usage: resp.usage,
-                    stop_reason: resp.stop_reason.as_str().to_string(),
-                    latency_ms: resp.latency_ms,
-                    cost_usd: cost,
-                },
-                on_event,
-            )?;
+            let stop_reason = self.record_response(resp, on_event)?;
 
             // Zero-tool-call turn = done (handles end_turn, empty content,
             // pause_turn, refusal — the canonical silent-END failure class).
@@ -767,245 +689,502 @@ impl Agent {
             // "thought" but produced nothing. Nudge and continue; three
             // consecutive empties terminate the run.
             if calls.is_empty() {
-                let has_text = self
-                    .messages
-                    .last()
-                    .map(|m| {
-                        m.content
-                            .iter()
-                            .any(|b| matches!(b, Block::Text { text } if !text.trim().is_empty()))
-                    })
-                    .unwrap_or(false);
-                if !has_text {
-                    self.empty_responses += 1;
-                    if self.empty_responses >= 3 {
-                        self.end_run("empty_response", steps, on_event)?;
-                        return Ok(RunOutcome::EmptyResponse {
-                            steps,
-                            cost_usd: self.ledger.total_cost_usd,
-                        });
-                    }
-                    let text = "[overseer] Your previous turn produced no visible \
-                                output and no tool calls. Continue working — act, \
-                                or explain what is blocking you."
-                        .to_string();
-                    self.messages.push(Message::user_text(text.clone()));
-                    self.emit(EventKind::Nudge { text }, on_event)?;
-                    continue;
+                match self.on_final_response(&stop_reason, steps, on_event)? {
+                    Some(out) => return Ok(out),
+                    None => continue,
                 }
-                self.empty_responses = 0;
-                // A context-window stop isn't a finish — the model was cut
-                // off mid-generation. Compact and let it continue (the loop
-                // exits via ctx_wall_stop if nothing can be dropped).
-                if resp.stop_reason == StopReason::ContextWindowExceeded {
-                    self.pending_compact = true;
-                    continue;
-                }
-                // P1.10 verification gate: the model wants to stop — run the
-                // definition-of-done check first. A failure blocks the stop;
-                // the failing output goes back into context as a nudge.
-                if let Some(cmd) = self.config.verify_cmd.clone() {
-                    if let Err(tail) = run_verify(&cmd, &self.config.cwd) {
-                        self.verify_blocks += 1;
-                        if self.verify_blocks >= self.config.verify_block_cap {
-                            self.end_run("verify_failed", steps, on_event)?;
-                            return Ok(RunOutcome::VerifyFailed {
-                                steps,
-                                cost_usd: self.ledger.total_cost_usd,
-                            });
-                        }
-                        let text = format!(
-                            "[overseer] Verification failed — `{cmd}` did not pass \
-                             (block {}/{}). Output:\n{tail}\nFix the failures, \
-                             then finish.",
-                            self.verify_blocks, self.config.verify_block_cap
-                        );
-                        self.messages.push(Message::user_text(text.clone()));
-                        self.emit(EventKind::Nudge { text }, on_event)?;
-                        // B1-7: post-episode verbal-RL hook — a bounded
-                        // aux-tier critique of this failed attempt, tagged
-                        // so the keep-last-1 eviction never touches
-                        // verify-tail/empty/stuck Nudges. small_model None
-                        // → skip (zero spend change by default).
-                        self.reflect(&tail, on_event)?;
-                        continue;
-                    }
-                }
-                // Stop hook (ECC `stop` event): a data rule may veto the
-                // stop itself on the final text. Blocks share the verify
-                // budget — one cap covers every stop-blocker — and hooks
-                // fail open at the cap (guardrail, not the gate): the
-                // stop is then allowed through.
-                if let Some(reason) =
-                    crate::hooks::maybe_block_stop(&self.tools.hooks, &last_text(&self.messages))
-                {
-                    self.verify_blocks += 1;
-                    if self.verify_blocks < self.config.verify_block_cap {
-                        let text = format!(
-                            "[overseer] Stop blocked by hooks rule — {reason} \
-                             (block {}/{}). Address it, then finish.",
-                            self.verify_blocks, self.config.verify_block_cap
-                        );
-                        self.messages.push(Message::user_text(text.clone()));
-                        self.emit(EventKind::Nudge { text }, on_event)?;
-                        continue;
-                    }
-                }
-                self.end_run(resp.stop_reason.as_str(), steps, on_event)?;
-                return Ok(RunOutcome::Completed {
-                    steps,
-                    cost_usd: self.ledger.total_cost_usd,
-                });
             }
             self.empty_responses = 0;
 
             // Stuck check on the response itself (context-window errors);
             // any trip is handled AFTER the tool batch so every tool_use
             // still gets its tool_result (Anthropic's pairing rule).
-            let mut stuck_hit = self
+            let stuck_hit = self
                 .stuck
-                .observe_response(true, resp.stop_reason == StopReason::ContextWindowExceeded);
-
-            // Execute tool calls; results merge into one user message.
-            // The checkpoint is taken out of self for the batch so ctx can
-            // borrow it while emit() still has &mut self.
-            let mut checkpoint = self.checkpoint.take();
-            let mut ctx = ToolCtx {
-                cwd: self.config.cwd.clone(),
-                session_dir: self.session_dir.clone(),
-                spill_seq: self.spill_seq,
-                provider: Some(self.provider.clone()),
-                agent_config: Some(self.config.clone()),
-                subagent_seq: 0,
-                checkpoint: checkpoint.as_mut(),
-                sandbox: self.config.sandbox_bash,
-                broker: Some(self.config.broker.clone()),
-            };
-            let mut results = Vec::new();
-            for (idx, (call_id, name, input)) in calls.iter().enumerate() {
-                // Tool-launch boundary (P2.4): an interrupt or a queued
-                // steer skips every remaining call with a synthetic
-                // result — every tool_use still gets its tool_result, so
-                // the provider pairing rule survives the truncation.
-                // The loop-top check then ends the run or injects input.
-                if self.control.interrupted() || self.control.steer_pending() {
-                    let skipped = if self.control.interrupted() {
-                        "[skipped: interrupted by user]"
-                    } else {
-                        "[skipped: new user input arrived]"
-                    };
-                    for (call_id, name, _) in &calls[idx..] {
-                        self.emit(
-                            EventKind::ToolCallStart {
-                                call_id: call_id.clone(),
-                                name: name.clone(),
-                                input: serde_json::Value::Null,
-                            },
-                            on_event,
-                        )?;
-                        self.emit(
-                            EventKind::ToolResult {
-                                call_id: call_id.clone(),
-                                name: name.clone(),
-                                content: skipped.to_string(),
-                                is_error: true,
-                                raw_bytes: skipped.len() as u64,
-                                spilled_to: None,
-                                denied: false,
-                            },
-                            on_event,
-                        )?;
-                        results.push(Block::ToolResult {
-                            tool_use_id: call_id.clone(),
-                            content: crate::tools::provenance_wrap(name, skipped),
-                            is_error: true,
-                        });
-                    }
-                    break;
-                }
-
-                self.emit(
-                    EventKind::ToolCallStart {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    },
-                    on_event,
-                )?;
-
-                let out = self.tools.call(name, input, &mut ctx);
-                // P7-3: computer-use acts are auditable — the tool's
-                // envelope carries the serving tier and the pre/post
-                // observation digests (audit-only; never rehydrated).
-                // Only this tool's results are parsed (a bash echo of a
-                // similar object must not forge an audit record), and
-                // error/unconfigured results skip.
-                if name == "computer" {
-                    if let Some(kind) = crate::tools::computer::audit_event(&out.text) {
-                        self.emit(kind, on_event)?;
-                    }
-                }
-                self.emit(
-                    EventKind::ToolResult {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        content: out.text.clone(),
-                        is_error: out.is_error,
-                        raw_bytes: out.raw_bytes,
-                        spilled_to: out.spilled_to.clone(),
-                        denied: out.denied,
-                    },
-                    on_event,
-                )?;
-
-                if stuck_hit.is_none() {
-                    stuck_hit = self
-                        .stuck
-                        .observe_step(name, input, out.is_error, &out.text);
-                }
-
-                results.push(Block::ToolResult {
-                    tool_use_id: call_id.clone(),
-                    content: crate::tools::provenance_wrap(name, &out.text),
-                    is_error: out.is_error,
-                });
-
-                // Rule-of-Two latch flips are auditable events (P3.10).
-                let notices: Vec<String> = std::mem::take(&mut self.tools.taint_notices);
-                for notice in notices {
-                    self.emit(EventKind::Tainted { detail: notice }, on_event)?;
-                }
-            }
-            self.messages.push(Message::tool_results(results));
-            // Carry the session-monotonic spill counter forward; hand the
-            // checkpoint back for the next iteration.
-            self.spill_seq = ctx.spill_seq;
-            self.checkpoint = checkpoint;
-
+                .observe_response(true, stop_reason == StopReason::ContextWindowExceeded);
+            let stuck_hit = self.dispatch_tools(&calls, stuck_hit, on_event)?;
             if let Some(pattern) = stuck_hit {
                 if let Some(outcome) = self.on_stuck(pattern, steps, on_event)? {
                     return Ok(outcome);
                 }
             }
+            self.end_turn(steps, on_event)?;
+        }
+    }
 
-            self.emit(EventKind::TurnEnd { step: steps }, on_event)?;
-            // P8-B: one turn elapsed — the clock a TTL'd session grant
-            // (`AllowEntry::expires_turn`) reads. Bumped at the same
-            // durable boundary as the log flush.
-            self.tools.policy.tick_turn();
-            self.log.flush()?;
-            // Git-version memory at the durable-tail point (playbook: free
-            // history/diff/rollback). Engine-made commit, best-effort.
-            // P6-2 audit: a dirty worktree at the boundary emits a
-            // log-only MemoryUpdated event (never injected into context).
-            if let Some(dir) = &self.config.memory_dir.clone() {
-                crate::memory::commit(dir, &format!("turn {steps}"));
-                let files = crate::memory::dirty_files(dir);
-                if !files.is_empty() {
-                    self.emit(EventKind::MemoryUpdated { files }, on_event)?;
-                }
+    /// Loop-top boundary: steering (interrupt, queued input), background
+    /// notices, the step and cost budgets, the compaction point and stale
+    /// tool-result clearing. `Some` ends the run.
+    fn loop_boundary(
+        &mut self,
+        steps: u32,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<Option<RunOutcome>> {
+        // Steering boundary (P2.4): interrupt ends the run; queued
+        // user input lands here as ordinary user messages — after the
+        // previous batch's tool_results, so provider pairing holds.
+        if self.control.interrupted() {
+            self.end_run("interrupted", steps, on_event)?;
+            return Ok(Some(RunOutcome::Interrupted {
+                steps,
+                cost_usd: self.ledger.total_cost_usd,
+            }));
+        }
+        for text in self.control.take_steer() {
+            self.messages.push(Message::user_text(text.clone()));
+            self.emit(EventKind::UserInput { text }, on_event)?;
+        }
+        self.drain_bg_notices(on_event)?;
+
+        if steps >= self.config.max_steps {
+            let out = RunOutcome::StepBudgetExceeded {
+                steps,
+                cost_usd: self.ledger.total_cost_usd,
+            };
+            self.end_run("max_steps", steps, on_event)?;
+            return Ok(Some(out));
+        }
+        if self.ledger.total_cost_usd >= self.config.max_cost_usd {
+            let out = RunOutcome::CostBudgetExceeded {
+                steps,
+                cost_usd: self.ledger.total_cost_usd,
+            };
+            self.end_run("max_cost", steps, on_event)?;
+            return Ok(Some(out));
+        }
+
+        // Compaction boundary: the loop only ever compacts here — after a
+        // complete tool-result batch (or a nudge), never mid-batch, so
+        // the Anthropic pairing rule survives the cut.
+        if self.pending_compact {
+            self.pending_compact = false;
+            let shrunk = self.compact(on_event)?;
+            if !shrunk && self.ctx_wall_stop {
+                // Provider already refuses this context and there's
+                // nothing left to drop — end cleanly, don't spin.
+                self.end_run("context_window", steps, on_event)?;
+                return Ok(Some(RunOutcome::Completed {
+                    steps,
+                    cost_usd: self.ledger.total_cost_usd,
+                }));
             }
         }
+
+        // P1.2: clear stale tool results in the view (events untouched).
+        // In-place on the view — idempotent, so resume and live runs
+        // render identically.
+        if self.config.keep_tool_results > 0 {
+            crate::event::clear_stale_tool_results(
+                &mut self.messages,
+                self.config.keep_tool_results,
+            );
+        }
+        // F5: keep only the last two computer images in the view —
+        // each capture's envelope text stays on its ToolResult, so
+        // eliding pixels never breaks tool pairing. Same view-only,
+        // idempotent contract as the clearing above.
+        crate::event::cap_image_blocks(&mut self.messages, 2);
+        Ok(None)
+    }
+
+    /// Build the request and send it, re-issuing once on a Malformed
+    /// response. A provider error is logged and ends the run (`Err`).
+    fn request_with_retry(
+        &mut self,
+        steps: u32,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<Result<crate::provider::Response, RunOutcome>> {
+        // The frozen static prefix (assembled at start/resume): every
+        // request of this Agent sends identical system bytes.
+        let req = Request {
+            model: &self.config.model,
+            system: &self.system,
+            tools: &self.tools.specs,
+            messages: &self.messages,
+            max_tokens: self.config.max_output_tokens,
+            thinking_budget: self.config.thinking_budget,
+            effort: Some(self.effort_now()),
+            cache_breakpoints: true,
+            cache_key: self.cache_key.clone(),
+        };
+
+        // B1-2 (Instructor retry): on a Malformed response only, re-issue
+        // the same request once per provider call (flag scoped to this
+        // invocation, reset before every call — multi-Malformed sequences
+        // retry each call once, never loop). The retry is a normal step:
+        // it increments `steps` and records ledger usage on success.
+        // Malformed responses are prompt-adjacent, so the retry request
+        // stays in the dynamic segment — the static prefix is untouched.
+        let mut malformed_retried = false;
+        let resp = loop {
+            match self.provider.complete(&req) {
+                Ok(r) => break r,
+                Err(crate::provider::ProviderError::Malformed(_msg)) if !malformed_retried => {
+                    malformed_retried = true;
+                    continue;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.emit(
+                        EventKind::Error {
+                            message: msg.clone(),
+                        },
+                        on_event,
+                    )?;
+                    self.end_run("provider_error", steps, on_event)?;
+                    return Ok(Err(RunOutcome::Provider(msg)));
+                }
+            }
+        };
+        Ok(Ok(resp))
+    }
+
+    /// Ledger usage, the compaction triggers, then the assistant message
+    /// and its ModelResponse event. Returns the raw stop reason.
+    fn record_response(
+        &mut self,
+        resp: crate::provider::Response,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<StopReason> {
+        // Re-read the profile every iteration: `set_model` can switch
+        // the model mid-session (P8-B), which changes both the cost
+        // math and the compaction trigger.
+        let profile = profile::lookup(&self.config.model);
+        let cost = profile.cost_usd(&resp.usage);
+        self.ledger.record(UsageRecord::from_usage(
+            &self.config.model,
+            &resp.usage,
+            resp.request_bytes,
+            resp.latency_ms,
+            count_tool_calls(&resp.blocks) as u32,
+            cost,
+        ))?;
+
+        // Effective-window budget (playbook Ch.3 §9.2): trigger on the
+        // *measured* prompt size from the last call, not an estimate.
+        // A provider context-window stop also forces compaction.
+        self.ctx_wall_stop = resp.stop_reason == StopReason::ContextWindowExceeded;
+        if self.config.auto_compact {
+            let frac = self.config.compact_at.unwrap_or(profile.compact_at);
+            let budget = frac as f64 * f64::from(profile.context_in);
+            // B1-9a: estimator pre-trigger — when measured usage is not
+            // yet over budget but the token estimate is, compact early
+            // rather than risk a context-wall stop mid-turn.
+            let est_tokens = crate::tokens::count_tokens(
+                &prompt_text_for_estimate(&self.messages),
+                &self.config.model,
+            ) as f64;
+            if self.ctx_wall_stop || resp.usage.total_input() as f64 > budget || est_tokens > budget
+            {
+                self.pending_compact = true;
+            }
+        }
+
+        self.messages.push(Message {
+            role: crate::ir::Role::Assistant,
+            content: resp.blocks.clone(),
+        });
+        self.emit(
+            EventKind::ModelResponse {
+                blocks: resp.blocks,
+                usage: resp.usage,
+                stop_reason: resp.stop_reason.as_str().to_string(),
+                latency_ms: resp.latency_ms,
+                cost_usd: cost,
+            },
+            on_event,
+        )?;
+        Ok(resp.stop_reason)
+    }
+
+    /// A response with no tool calls: the silent-END guard, the
+    /// context-window continue, then the stop gates (verify command, stop
+    /// hook). `None` loops again; `Some` ends the run.
+    fn on_final_response(
+        &mut self,
+        stop_reason: &StopReason,
+        steps: u32,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<Option<RunOutcome>> {
+        let has_text = self
+            .messages
+            .last()
+            .map(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, Block::Text { text } if !text.trim().is_empty()))
+            })
+            .unwrap_or(false);
+        if !has_text {
+            self.empty_responses += 1;
+            if self.empty_responses >= 3 {
+                self.end_run("empty_response", steps, on_event)?;
+                return Ok(Some(RunOutcome::EmptyResponse {
+                    steps,
+                    cost_usd: self.ledger.total_cost_usd,
+                }));
+            }
+            let text = "[overseer] Your previous turn produced no visible \
+                        output and no tool calls. Continue working — act, \
+                        or explain what is blocking you."
+                .to_string();
+            self.messages.push(Message::user_text(text.clone()));
+            self.emit(EventKind::Nudge { text }, on_event)?;
+            return Ok(None);
+        }
+        self.empty_responses = 0;
+        // A context-window stop isn't a finish — the model was cut
+        // off mid-generation. Compact and let it continue (the loop
+        // exits via ctx_wall_stop if nothing can be dropped).
+        if *stop_reason == StopReason::ContextWindowExceeded {
+            self.pending_compact = true;
+            return Ok(None);
+        }
+        match self.verify_gate(steps, on_event)? {
+            Gate::Pass => {}
+            Gate::Blocked => return Ok(None),
+            Gate::Stop(out) => return Ok(Some(out)),
+        }
+        // Stop hook (ECC `stop` event): a data rule may veto the
+        // stop itself on the final text. Blocks share the verify
+        // budget — one cap covers every stop-blocker — and hooks
+        // fail open at the cap (guardrail, not the gate): the
+        // stop is then allowed through.
+        if let Some(reason) =
+            crate::hooks::maybe_block_stop(&self.tools.hooks, &last_text(&self.messages))
+        {
+            self.verify_blocks += 1;
+            if self.verify_blocks < self.config.verify_block_cap {
+                let text = format!(
+                    "[overseer] Stop blocked by hooks rule — {reason} \
+                     (block {}/{}). Address it, then finish.",
+                    self.verify_blocks, self.config.verify_block_cap
+                );
+                self.messages.push(Message::user_text(text.clone()));
+                self.emit(EventKind::Nudge { text }, on_event)?;
+                return Ok(None);
+            }
+        }
+        self.end_run(stop_reason.as_str(), steps, on_event)?;
+        Ok(Some(RunOutcome::Completed {
+            steps,
+            cost_usd: self.ledger.total_cost_usd,
+        }))
+    }
+
+    /// P1.10 verification gate: run the definition-of-done command before
+    /// the model may stop. A failure blocks the stop (nudge + reflection);
+    /// at the block cap the run ends.
+    fn verify_gate(
+        &mut self,
+        steps: u32,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<Gate> {
+        // P1.10 verification gate: the model wants to stop — run the
+        // definition-of-done check first. A failure blocks the stop;
+        // the failing output goes back into context as a nudge.
+        if let Some(cmd) = self.config.verify_cmd.clone() {
+            // I4: verify runs through the bash sandbox wrapper with the
+            // bash child-env allowlist — no provider/broker/checkpoint.
+            let ctx = ToolCtx {
+                cwd: self.config.cwd.clone(),
+                session_dir: self.session_dir.clone(),
+                spill_seq: 0,
+                provider: None,
+                agent_config: Some(self.config.clone()),
+                subagent_seq: 0,
+                checkpoint: None,
+                sandbox: self.config.sandbox_bash,
+                broker: None,
+            };
+            if let Err(tail) = run_verify(&cmd, &ctx) {
+                self.verify_blocks += 1;
+                if self.verify_blocks >= self.config.verify_block_cap {
+                    self.end_run("verify_failed", steps, on_event)?;
+                    return Ok(Gate::Stop(RunOutcome::VerifyFailed {
+                        steps,
+                        cost_usd: self.ledger.total_cost_usd,
+                    }));
+                }
+                let text = format!(
+                    "[overseer] Verification failed — `{cmd}` did not pass \
+                     (block {}/{}). Output:\n{tail}\nFix the failures, \
+                     then finish.",
+                    self.verify_blocks, self.config.verify_block_cap
+                );
+                self.messages.push(Message::user_text(text.clone()));
+                self.emit(EventKind::Nudge { text }, on_event)?;
+                // B1-7: post-episode verbal-RL hook — a bounded
+                // aux-tier critique of this failed attempt, tagged
+                // so the keep-last-1 eviction never touches
+                // verify-tail/empty/stuck Nudges. small_model None
+                // → skip (zero spend change by default).
+                self.reflect(&tail, on_event)?;
+                return Ok(Gate::Blocked);
+            }
+        }
+        Ok(Gate::Pass)
+    }
+
+    /// Execute one tool batch; every tool_use gets a tool_result (synthetic
+    /// when an interrupt or queued input skips the rest). Returns the first
+    /// stuck pattern seen, if any.
+    fn dispatch_tools(
+        &mut self,
+        calls: &[(String, String, serde_json::Value)],
+        mut stuck_hit: Option<crate::stuck::StuckPattern>,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<Option<crate::stuck::StuckPattern>> {
+        // Execute tool calls; results merge into one user message.
+        // The checkpoint is taken out of self for the batch so ctx can
+        // borrow it while emit() still has &mut self.
+        let mut checkpoint = self.checkpoint.take();
+        let mut ctx = ToolCtx {
+            cwd: self.config.cwd.clone(),
+            session_dir: self.session_dir.clone(),
+            spill_seq: self.spill_seq,
+            provider: Some(self.provider.clone()),
+            agent_config: Some(self.config.clone()),
+            subagent_seq: 0,
+            checkpoint: checkpoint.as_mut(),
+            sandbox: self.config.sandbox_bash,
+            broker: Some(self.config.broker.clone()),
+        };
+        let mut results = Vec::new();
+        for (idx, (call_id, name, input)) in calls.iter().enumerate() {
+            // Tool-launch boundary (P2.4): an interrupt or a queued
+            // steer skips every remaining call with a synthetic
+            // result — every tool_use still gets its tool_result, so
+            // the provider pairing rule survives the truncation.
+            // The loop-top check then ends the run or injects input.
+            if self.control.interrupted() || self.control.steer_pending() {
+                let skipped = if self.control.interrupted() {
+                    "[skipped: interrupted by user]"
+                } else {
+                    "[skipped: new user input arrived]"
+                };
+                for (call_id, name, _) in &calls[idx..] {
+                    self.emit(
+                        EventKind::ToolCallStart {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            input: serde_json::Value::Null,
+                        },
+                        on_event,
+                    )?;
+                    self.emit(
+                        EventKind::ToolResult {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            content: skipped.to_string(),
+                            is_error: true,
+                            raw_bytes: skipped.len() as u64,
+                            spilled_to: None,
+                            denied: false,
+                        },
+                        on_event,
+                    )?;
+                    results.push(Block::ToolResult {
+                        tool_use_id: call_id.clone(),
+                        content: crate::tools::provenance_wrap(name, skipped),
+                        is_error: true,
+                    });
+                }
+                break;
+            }
+
+            self.emit(
+                EventKind::ToolCallStart {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                },
+                on_event,
+            )?;
+
+            let out = self.tools.call(name, input, &mut ctx);
+            // P7-3: computer-use acts are auditable — the tool's
+            // envelope carries the serving tier and the pre/post
+            // observation digests (audit-only; never rehydrated).
+            // Only this tool's results are parsed (a bash echo of a
+            // similar object must not forge an audit record), and
+            // error/unconfigured results skip.
+            if name == "computer" {
+                if let Some(kind) = crate::tools::computer::audit_event(&out.text) {
+                    self.emit(kind, on_event)?;
+                }
+            }
+            self.emit(
+                EventKind::ToolResult {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    content: out.text.clone(),
+                    is_error: out.is_error,
+                    raw_bytes: out.raw_bytes,
+                    spilled_to: out.spilled_to.clone(),
+                    denied: out.denied,
+                },
+                on_event,
+            )?;
+
+            if stuck_hit.is_none() {
+                stuck_hit = self
+                    .stuck
+                    .observe_step(name, input, out.is_error, &out.text);
+            }
+
+            results.push(Block::ToolResult {
+                tool_use_id: call_id.clone(),
+                content: crate::tools::provenance_wrap(name, &out.text),
+                is_error: out.is_error,
+            });
+
+            // S5/D4: computer captures ride the conversation as a
+            // sibling user-level image block — pixels never inline
+            // into the tool-result text (budget) or events.jsonl.
+            if name == "computer" {
+                if let Some(img) = crate::tools::computer::image_block(&out.text) {
+                    results.push(img);
+                }
+            }
+
+            // Rule-of-Two latch flips are auditable events (P3.10).
+            let notices: Vec<String> = std::mem::take(&mut self.tools.taint_notices);
+            for notice in notices {
+                self.emit(EventKind::Tainted { detail: notice }, on_event)?;
+            }
+        }
+        self.messages.push(Message::tool_results(results));
+        // Carry the session-monotonic spill counter forward; hand the
+        // checkpoint back for the next iteration.
+        self.spill_seq = ctx.spill_seq;
+        self.checkpoint = checkpoint;
+        Ok(stuck_hit)
+    }
+
+    /// Turn-end bookkeeping at the durable boundary: TurnEnd, the grant
+    /// clock, the log flush, then the memory commit.
+    fn end_turn(&mut self, steps: u32, on_event: &mut dyn FnMut(&Event)) -> std::io::Result<()> {
+        self.emit(EventKind::TurnEnd { step: steps }, on_event)?;
+        // P8-B: one turn elapsed — the clock a TTL'd session grant
+        // (`AllowEntry::expires_turn`) reads. Bumped at the same
+        // durable boundary as the log flush.
+        self.tools.policy.tick_turn();
+        self.log.flush()?;
+        // Git-version memory at the durable-tail point (playbook: free
+        // history/diff/rollback). Engine-made commit, best-effort.
+        // P6-2 audit: a dirty worktree at the boundary emits a
+        // log-only MemoryUpdated event (never injected into context).
+        // The dirty set is captured BEFORE the commit — afterwards the
+        // worktree is clean by construction.
+        if let Some(dir) = &self.config.memory_dir.clone() {
+            let files = crate::memory::dirty_files(dir);
+            crate::memory::commit(dir, &format!("turn {steps}"));
+            if !files.is_empty() {
+                self.emit(EventKind::MemoryUpdated { files }, on_event)?;
+            }
+        }
+        Ok(())
     }
 
     /// Effective effort for the next request: configured level plus one
@@ -1064,6 +1243,7 @@ impl Agent {
             thinking_budget: None,
             effort: Some(crate::provider::Effort::Min),
             cache_breakpoints: false,
+            cache_key: None,
         };
         let critique = match self.provider.complete(&req) {
             Ok(r) => {
@@ -1138,6 +1318,7 @@ impl Agent {
                 thinking_budget: None,
                 effort: Some(crate::provider::Effort::Min),
                 cache_breakpoints: false,
+                cache_key: None,
             };
             // Small tier first; empty text or a provider error escalates.
             if let Ok(r) = self.provider.complete(&req) {
@@ -1163,6 +1344,7 @@ impl Agent {
             thinking_budget: None,
             effort: Some(crate::provider::Effort::Min),
             cache_breakpoints: false,
+            cache_key: None,
         };
         let r = self.provider.complete(&req)?;
         Ok(r.blocks
@@ -1279,15 +1461,25 @@ impl Agent {
 
     /// Registry for the configured preset — plan mode removes mutating
     /// tools from the spec list entirely (capability removal, P1.4).
+    /// R7: the configured MCP servers join the **core** registry only. Plan
+    /// mode is a read-only posture with its own spec set, and the subagent
+    /// registries are quarantined by design — neither gets the `mcp` op tool,
+    /// so neither can spawn a third-party program.
     fn registry(config: &AgentConfig) -> ToolRegistry {
         let policy = Self::policy(config);
-        let mut reg = if !config.full_access && config.policy_preset == crate::perm::Preset::Plan {
+        let plan_mode = !config.full_access && config.policy_preset == crate::perm::Preset::Plan;
+        let mut reg = if plan_mode {
             ToolRegistry::plan_mode(policy)
         } else {
             ToolRegistry::core(policy)
         };
         if !config.disabled_tools.is_empty() {
             reg.disable(&config.disabled_tools);
+        }
+        if !plan_mode {
+            // `--no-tools mcp` survives this: `with_mcp` rebuilds the
+            // advertised list from the resident set minus the disabled set.
+            reg = reg.with_mcp(config.mcp_servers.clone());
         }
         reg
     }
@@ -1335,6 +1527,10 @@ impl Agent {
                 stop_reason: stop.into(),
                 steps,
                 total_cost_usd: self.ledger.total_cost_usd,
+                cache: self
+                    .ledger
+                    .cache_stats()
+                    .saturating_delta(&self.run_cache_start),
             },
             on_event,
         )?;
@@ -1351,7 +1547,10 @@ fn prompt_text_for_estimate(messages: &[Message]) -> String {
             match b {
                 Block::Text { text } => out.push_str(text),
                 Block::ToolResult { content, .. } => out.push_str(content),
-                Block::ToolCall { name, .. } => out.push_str(name),
+                Block::ToolCall { name, input, .. } => {
+                    out.push_str(name);
+                    out.push_str(&input.to_string());
+                }
                 // Screenshots are pixels, not tokens of text — the estimate
                 // counts nothing for them (image cost lands in P7-2 usage).
                 Block::Image { .. } => {}
@@ -1369,12 +1568,6 @@ fn count_tool_calls(blocks: &[Block]) -> usize {
         .count()
 }
 
-/// P1.10 verification gate runner: execute the definition-of-done command
-/// in the session cwd via `sh -c`. Output goes to a temp file (not a pipe)
-/// so a verbose suite can't deadlock on a full buffer; a 120s watchdog
-/// kills runaway checks. `Ok(())` = exit 0; `Err(tail)` = nonzero exit,
-/// spawn failure, or timeout — the tail keeps the last ~6K chars of output
-/// so the failure stays reviewable when injected back into context.
 /// Text of the last assistant message — what a stop hook observes as the
 /// session's "final result" (the `tool` side of the rule never matches a
 /// real dispatch, so payload = the text the model ended on).
@@ -1394,8 +1587,21 @@ fn last_text(messages: &[Message]) -> String {
         .unwrap_or_default()
 }
 
-fn run_verify(cmd: &str, cwd: &std::path::Path) -> Result<(), String> {
+/// P1.10 verification gate runner: execute the definition-of-done command
+/// in the session cwd via `sh -c`. Output goes to a temp file (not a pipe)
+/// so a verbose suite can't deadlock on a full buffer; a 120s watchdog
+/// kills runaway checks. `Ok(())` = exit 0; `Err(tail)` = nonzero exit,
+/// spawn failure, or timeout — the tail keeps the last ~6K chars of output
+/// so the failure stays reviewable when injected back into context.
+// I4: `verify_cmd` goes through the same sandbox bash uses (pinned
+// --runtime when set, else the platform default — an unavailable pinned
+// backend fails closed, never a silent downgrade) and inherits only
+// bash's child-env allowlist, so parent secrets can't reach repo checks.
+fn run_verify(cmd: &str, ctx: &crate::tools::ToolCtx) -> Result<(), String> {
     use std::process::{Command, Stdio};
+
+    let argv = vec!["sh".to_string(), "-c".to_string(), cmd.to_string()];
+    let inv = crate::tools::bash::sandboxed(&argv, ctx)?;
 
     let log_path =
         std::env::temp_dir().join(format!("overseer-verify-{}.log", uuid::Uuid::now_v7()));
@@ -1404,10 +1610,11 @@ fn run_verify(cmd: &str, cwd: &std::path::Path) -> Result<(), String> {
     let err_file = file
         .try_clone()
         .map_err(|e| format!("cannot clone verify log handle: {e}"))?;
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(cwd)
+    let mut child = Command::new(&inv.program)
+        .args(&inv.args)
+        .current_dir(&ctx.cwd)
+        .env_clear()
+        .envs(crate::tools::bash::child_env())
         .stdin(Stdio::null())
         .stdout(file)
         .stderr(err_file)
@@ -1482,6 +1689,7 @@ mod tests {
         responses: Mutex<VecDeque<Response>>,
         seen_systems: Mutex<Vec<Vec<String>>>,
         seen_models: Mutex<Vec<String>>,
+        seen_cache_keys: Mutex<Vec<Option<String>>>,
         /// Models that always error — drives the aux-call escalation path.
         fail_models: Vec<String>,
         /// Fail the next N calls with Malformed, then serve responses.
@@ -1495,6 +1703,7 @@ mod tests {
                 responses: Mutex::new(VecDeque::from(responses)),
                 seen_systems: Mutex::new(Vec::new()),
                 seen_models: Mutex::new(Vec::new()),
+                seen_cache_keys: Mutex::new(Vec::new()),
                 fail_models: Vec::new(),
                 malformed_first: Mutex::new(0),
             }
@@ -1520,6 +1729,10 @@ mod tests {
                 .unwrap()
                 .push(req.system.iter().map(|s| s.text.clone()).collect());
             self.seen_models.lock().unwrap().push(req.model.to_string());
+            self.seen_cache_keys
+                .lock()
+                .unwrap()
+                .push(req.cache_key.clone());
             if self.fail_models.iter().any(|m| m == req.model) {
                 return Err(ProviderError::Transport("mock fail".into()));
             }
@@ -1704,7 +1917,8 @@ mod tests {
         // The audit event never rehydrates into the model's context.
         let view = rehydrate_messages(&events);
         assert!(
-            view.iter().all(|m| !m.text().contains("deepseek-v4.1-flash")),
+            view.iter()
+                .all(|m| !m.text().contains("deepseek-v4.1-flash")),
             "a model switch is provenance, not conversation"
         );
     }
@@ -1813,7 +2027,7 @@ mod tests {
 
     /// With memory enabled, the provider sees a second system segment
     /// carrying INDEX.md — appended *after* the static prompt (end of the
-    /// static region), updated across turns, and git-versioned.
+    /// static region), frozen for the Agent's life, and git-versioned.
     #[test]
     fn memory_index_reaches_provider() {
         let dir = tmpdir();
@@ -2336,6 +2550,32 @@ mod tests {
         }
     }
 
+    /// I4: verify_cmd runs under the bash sandbox wrapper with bash's
+    /// child-env allowlist — a secret-looking parent var is invisible to
+    /// the check, and pass/fail semantics are unchanged.
+    #[test]
+    fn verify_cmd_sandboxed_env_strips_parent_secrets() {
+        let dir = tmpdir();
+        let ctx = ToolCtx {
+            cwd: dir.clone(),
+            session_dir: dir,
+            spill_seq: 0,
+            provider: None,
+            agent_config: Some(AgentConfig::default()),
+            subagent_seq: 0,
+            checkpoint: None,
+            sandbox: false,
+            broker: None,
+        };
+        std::env::set_var("FOO_API_KEY", "sk-parent-secret");
+        let r = run_verify("test -z \"$FOO_API_KEY\"", &ctx);
+        std::env::remove_var("FOO_API_KEY");
+        assert!(r.is_ok(), "FOO_API_KEY leaked into verify child: {r:?}");
+        assert!(run_verify("true", &ctx).is_ok(), "pass behaves as before");
+        let e = run_verify("false", &ctx).unwrap_err();
+        assert!(e.contains("exit"), "fail behaves as before: {e}");
+    }
+
     /// P2.4 interrupt: Esc lands at a tool-launch boundary. The call
     /// already launched completes; every remaining call gets a synthetic
     /// result so tool_use/tool_result pairing survives the truncation.
@@ -2813,19 +3053,11 @@ mod tests {
         // the obs carries metadata only, never pixel bytes.
         let cfg = AgentConfig::default();
         assert!(cfg.computer.takeover_pause, "fail-closed default");
-        assert!(crate::computer_obs::is_suppressed(
-            &cfg.computer,
-            true,
-            "capture"
-        ));
-        assert!(!crate::computer_obs::is_suppressed(
-            &cfg.computer,
-            false,
-            "capture"
-        ));
+        assert!(crate::computer_obs::is_suppressed(&cfg.computer, true));
+        assert!(!crate::computer_obs::is_suppressed(&cfg.computer, false));
         let mut watch = cfg.computer.clone();
         watch.watch_mode = true;
-        assert!(crate::computer_obs::is_suppressed(&watch, false, "capture"));
+        assert!(crate::computer_obs::is_suppressed(&watch, false));
         let obs = crate::computer_obs::metadata_obs(2560, 1600, 1280, 800, "cred-field focus");
         assert!(
             !obs.contains("aGVsbG8"),
@@ -2952,5 +3184,180 @@ mod tests {
             ),
             crate::perm::Verdict::Ask { .. }
         ));
+    }
+
+    /// C1: a resumed session must not re-notice background tasks whose
+    /// SubagentDone is already in the replayed log.
+    #[test]
+    fn resume_does_not_renotice_finished_bg_tasks() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        {
+            let provider = Arc::new(Mock::new(vec![tool_turn(1), done()]));
+            let mut agent = Agent::start(provider, cfg.clone(), dir.clone(), "s".into()).unwrap();
+            let bg = dir.join("subagents/bg-1");
+            std::fs::create_dir_all(&bg).unwrap();
+            std::fs::write(bg.join("done.txt"), "bg-1 digest").unwrap();
+            let mut sink = |_: &Event| {};
+            agent.run_turn("go", &mut sink).unwrap();
+        }
+        let provider = Arc::new(Mock::new(vec![tool_turn(2), done()]));
+        let mut agent = Agent::resume(provider, cfg, dir.clone()).unwrap();
+        let mut events = Vec::new();
+        let mut sink = |e: &Event| events.push(e.kind.clone());
+        agent.run_turn("again", &mut sink).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|k| matches!(k, EventKind::SubagentDone { .. })),
+            "resume re-emitted a SubagentDone: {events:?}"
+        );
+        let copies = agent
+            .messages()
+            .iter()
+            .filter(|m| m.text().contains("bg-1 digest"))
+            .count();
+        assert_eq!(copies, 1, "the notice appears exactly once in the view");
+    }
+
+    /// S1-review: a fork's log opens with the parent's SessionStart —
+    /// resume must take the LAST one or the fork borrows the parent's
+    /// prompt-cache key.
+    #[test]
+    fn resume_keys_prompt_cache_on_last_session_start() {
+        let parent = tmpdir();
+        let cfg = AgentConfig {
+            cwd: parent.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        {
+            let p = Arc::new(Mock::new(vec![done()]));
+            let mut a = Agent::start(p, cfg.clone(), parent.clone(), "parent-id".into()).unwrap();
+            let mut sink = |_: &Event| {};
+            a.run_turn("go", &mut sink).unwrap();
+        }
+        let fork_dir = tmpdir();
+        crate::session::fork(&parent, None, &fork_dir).unwrap();
+        let a = Agent::resume(Arc::new(Mock::new(vec![])), cfg, fork_dir.clone()).unwrap();
+        let want = fork_dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            a.cache_key.as_deref(),
+            Some(want.as_str()),
+            "resumed fork must not reuse the parent's cache key"
+        );
+    }
+
+    /// C2: a dirty memory dir at the turn boundary emits MemoryUpdated
+    /// naming the dirty files (captured BEFORE the commit cleans them).
+    #[test]
+    fn dirty_memory_emits_memory_updated() {
+        let dir = tmpdir();
+        let memdir = dir.join("memory");
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            memory_dir: Some(memdir.clone()),
+            ..AgentConfig::default()
+        };
+        let provider = Arc::new(Mock::new(vec![tool_turn(1), done()]));
+        let mut agent = Agent::start(provider, cfg, dir.join("s"), "s".into()).unwrap();
+        crate::memory::commit(&memdir, "seed");
+        std::fs::write(memdir.join("episodic").join("note.md"), "hi\n").unwrap();
+        let mut events = Vec::new();
+        let mut sink = |e: &Event| events.push(e.kind.clone());
+        agent.run_turn("go", &mut sink).unwrap();
+        assert!(
+            events.iter().any(|k| matches!(
+                k,
+                EventKind::MemoryUpdated { files } if files.iter().any(|f| f.contains("note.md"))
+            )),
+            "no MemoryUpdated for the dirty file: {events:?}"
+        );
+    }
+
+    /// C8: the token estimate counts tool-call inputs — a 100 KB `write`
+    /// body is not "5 chars".
+    #[test]
+    fn estimate_counts_tool_call_input() {
+        let body = "x".repeat(100_000);
+        let msgs = vec![Message {
+            role: crate::ir::Role::Assistant,
+            content: vec![Block::ToolCall {
+                id: "c1".into(),
+                name: "write".into(),
+                input: serde_json::json!({"path": "a.txt", "content": body}),
+            }],
+        }];
+        let text = prompt_text_for_estimate(&msgs);
+        assert!(text.len() >= 100_000, "estimate saw {} chars", text.len());
+    }
+
+    /// K5 (invariant 2): the static system prefix is frozen per Agent — an
+    /// INDEX.md edit between steps leaves the next request's system bytes
+    /// identical (the model reads fresh memory through its tools).
+    #[test]
+    fn system_prefix_frozen_across_memory_edits() {
+        let dir = tmpdir();
+        let memdir = dir.join("memory");
+        std::fs::create_dir_all(&memdir).unwrap();
+        std::fs::write(memdir.join("INDEX.md"), "facts.md — v1\n").unwrap();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            memory_dir: Some(memdir.clone()),
+            ..AgentConfig::default()
+        };
+        let provider = Arc::new(Mock::new(vec![done()]));
+        let mut agent = Agent::start(provider.clone(), cfg, dir.join("s"), "s".into()).unwrap();
+        let mut sink = |_: &Event| {};
+        agent.run_turn("one", &mut sink).unwrap();
+        std::fs::write(memdir.join("INDEX.md"), "facts.md — v2 EDITED\n").unwrap();
+        agent.run_turn("two", &mut sink).unwrap();
+        let seen = provider.seen_systems.lock().unwrap();
+        assert!(seen.len() >= 2);
+        assert_eq!(
+            seen[0],
+            seen[seen.len() - 1],
+            "system bytes moved mid-session"
+        );
+        assert!(seen[0].iter().any(|s| s.contains("v1")));
+    }
+
+    /// K4: every main-loop request carries the session id as its
+    /// prompt-cache key, and a resume keeps the same key.
+    #[test]
+    fn cache_key_is_session_id_across_resume() {
+        let dir = tmpdir();
+        let cfg = AgentConfig {
+            cwd: dir.clone(),
+            full_access: true,
+            ..AgentConfig::default()
+        };
+        let provider = Arc::new(Mock::new(vec![done()]));
+        let sdir = dir.join("s");
+        let mut sink = |_: &Event| {};
+        {
+            let mut agent = Agent::start(
+                provider.clone(),
+                cfg.clone(),
+                sdir.clone(),
+                "sess-42".into(),
+            )
+            .unwrap();
+            agent.run_turn("one", &mut sink).unwrap();
+        }
+        let mut agent = Agent::resume(provider.clone(), cfg, sdir).unwrap();
+        agent.run_turn("two", &mut sink).unwrap();
+        let keys = provider.seen_cache_keys.lock().unwrap();
+        assert!(keys.len() >= 2);
+        assert!(
+            keys.iter().all(|k| k.as_deref() == Some("sess-42")),
+            "{keys:?}"
+        );
     }
 }
