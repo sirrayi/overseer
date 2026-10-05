@@ -116,13 +116,38 @@ fn scan_root(root: &Path, source: &'static str) -> Vec<SkillMeta> {
     out
 }
 
-/// All skills under the standard roots (workspace first).
-pub fn scan(cwd: &Path) -> Vec<SkillMeta> {
-    let mut out = scan_root(&cwd.join(".overseer/skills"), "workspace");
+/// The standard skill roots, workspace first — the one definition both
+/// [`scan`] and [`present`] read.
+fn roots(cwd: &Path) -> [(PathBuf, &'static str); 2] {
     let home = std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/"));
-    out.extend(scan_root(&home.join(".overseer/skills"), "user"));
+    [
+        (cwd.join(".overseer/skills"), "workspace"),
+        (home.join(".overseer/skills"), "user"),
+    ]
+}
+
+/// Whether any `*/SKILL.md` exists under the standard roots — directory
+/// listing and `is_file` checks only, no reads. The registry advertises
+/// the `skill` tool, and [`index_segment`] renders the prompt index, on
+/// exactly this answer, so the two can never disagree.
+pub fn present(cwd: &Path) -> bool {
+    roots(cwd).iter().any(|(root, _)| {
+        std::fs::read_dir(root).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().join("SKILL.md").is_file())
+        })
+    })
+}
+
+/// All skills under the standard roots (workspace first).
+pub fn scan(cwd: &Path) -> Vec<SkillMeta> {
+    let mut out = Vec::new();
+    for (root, source) in roots(cwd) {
+        out.extend(scan_root(&root, source));
+    }
     // Workspace wins on name collisions (first hit rule).
     let mut seen = std::collections::HashSet::new();
     out.retain(|s| seen.insert(s.name.clone()));
@@ -133,10 +158,10 @@ pub fn scan(cwd: &Path) -> Vec<SkillMeta> {
 /// region after the memory index — skill installs are rare, so a change
 /// here only invalidates cache from this segment onward.
 pub fn index_segment(cwd: &Path) -> Option<String> {
-    let skills = scan(cwd);
-    if skills.is_empty() {
+    if !present(cwd) {
         return None;
     }
+    let skills = scan(cwd);
     let mut lines = String::from(
         "## Skills\nLoad a skill's full instructions with the `skill` tool when \
          its description matches the task. One line per skill:\n",
@@ -268,6 +293,24 @@ mod tests {
         assert!(seg.contains("fat — heavy skill"));
         assert!(seg.len() < 1_000, "body must not be resident");
         assert!(index_segment(&tmpdir()).is_none(), "empty → no segment");
+    }
+
+    #[test]
+    fn present_is_existence_only_and_gates_the_index() {
+        let dir = tmpdir();
+        assert!(!present(&dir));
+        // A skill dir without SKILL.md is not a skill.
+        std::fs::create_dir_all(dir.join(".overseer/skills/empty")).unwrap();
+        assert!(!present(&dir));
+        assert!(index_segment(&dir).is_none());
+        mk_skill(
+            &dir.join(".overseer/skills"),
+            "one",
+            "name: one\ndescription: d\n",
+            "b",
+        );
+        assert!(present(&dir));
+        assert!(index_segment(&dir).is_some(), "same answer as the registry");
     }
 
     #[test]

@@ -300,7 +300,19 @@ pub fn tool_summary(name: &str, input: &serde_json::Value) -> String {
                 .map(|a| a.len())
                 .unwrap_or(0)
         ),
-        "task" => s("prompt").to_string(),
+        "task" => {
+            use overseer_core::tools::task::TaskMode;
+            let mode = input
+                .get("mode")
+                .and_then(|m| m.as_str())
+                .and_then(TaskMode::parse)
+                .unwrap_or(TaskMode::Read);
+            let tier = input
+                .get("tier")
+                .and_then(|t| t.as_str())
+                .unwrap_or(mode.default_tier().as_str());
+            format!("{} · {tier}: {}", mode.as_str(), s("prompt"))
+        }
         _ => serde_json::to_string(input).unwrap_or_default(),
     }
 }
@@ -389,17 +401,21 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
             call_id,
             name,
             input,
-        } => Feed::NewCells(vec![Cell::Tool {
-            id: call_id.clone(),
-            name: name.clone(),
-            summary: tool_summary(name, input),
-            status: ToolStatus::Running,
-            output: None,
-            link: input
-                .get("path")
-                .and_then(|v| v.as_str())
-                .map(std::path::PathBuf::from),
-        }]),
+        } => {
+            // `tools op=call` shows the tool it ran, not the dispatcher.
+            let (name, input) = overseer_core::tools::effective_call(name, input);
+            Feed::NewCells(vec![Cell::Tool {
+                id: call_id.clone(),
+                name: name.to_string(),
+                summary: tool_summary(name, input),
+                status: ToolStatus::Running,
+                output: None,
+                link: input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(std::path::PathBuf::from),
+            }])
+        }
         EventKind::ToolResult {
             call_id,
             name,
@@ -435,12 +451,35 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
             text: format!("  ⟲ {text}"),
             link: None,
         }]),
-        EventKind::SubagentDone { task_id: id, trace } => Feed::NewCells(vec![Cell::Meta {
-            style: theme::meta(),
-            // The trace dir goes into the OSC 8 link, not the text.
-            text: format!("  ↳ subagent {id} finished · trace"),
-            link: Some(std::path::PathBuf::from(trace)),
+        EventKind::MemoryNotice { kind, notes, text } => Feed::NewCells(vec![Cell::Meta {
+            style: theme::faint(),
+            text: crate::notice::memory_line(kind, notes, text),
+            link: None,
         }]),
+        EventKind::SubagentDone {
+            task_id: id,
+            trace,
+            cost_usd,
+            tier,
+            model,
+            verdict,
+            ..
+        } => {
+            let mut text = format!("  ↳ subagent {id} finished");
+            if !model.is_empty() {
+                text.push_str(&format!(" · {tier} ({model}) · ${cost_usd:.4}"));
+            }
+            if let Some(v) = verdict {
+                text.push_str(&format!(" · verdict {v}"));
+            }
+            // The trace dir goes into the OSC 8 link, not the text.
+            text.push_str(" · trace");
+            Feed::NewCells(vec![Cell::Meta {
+                style: theme::meta(),
+                text,
+                link: Some(std::path::PathBuf::from(trace)),
+            }])
+        }
         EventKind::Tainted { detail } => Feed::NewCells(vec![Cell::Meta {
             style: theme::warn(),
             text: format!("  ! {detail} — side effects now ask first"),
@@ -448,6 +487,9 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
         }]),
         // P7-3 audit-only computer-use record — no transcript cell.
         EventKind::ComputerAct { .. } => Feed::Ignore,
+        // Audit-only `run_code` sub-call record — the run_code cell and its
+        // result already show what the script did.
+        EventKind::ScriptCall { .. } => Feed::Ignore,
         EventKind::StuckDetected { pattern } => Feed::NewCells(vec![Cell::Meta {
             style: theme::warn(),
             text: format!("  ! stuck: {pattern}"),
@@ -480,9 +522,16 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
             stop_reason,
             steps,
             total_cost_usd,
+            subagent_cost_usd,
             cache,
         } => Feed::NewCells(vec![Cell::End {
-            text: run_summary(*steps, run_elapsed, *total_cost_usd, cache),
+            text: run_summary(
+                *steps,
+                run_elapsed,
+                *total_cost_usd,
+                *subagent_cost_usd,
+                cache,
+            ),
             warn: abnormal_stop(stop_reason),
         }]),
         EventKind::TurnEnd { .. } => Feed::Ignore,
@@ -495,6 +544,7 @@ fn run_summary(
     steps: u32,
     elapsed: Option<std::time::Duration>,
     cost: f64,
+    subagents: f64,
     cache: &overseer_core::ledger::CacheStats,
 ) -> String {
     let mut s = format!("{steps} step{}", if steps == 1 { "" } else { "s" });
@@ -512,6 +562,9 @@ fn run_summary(
     }
     if cost >= 0.0005 {
         s.push_str(&format!(" · ${cost:.3}"));
+        if subagents >= 0.0005 {
+            s.push_str(&format!(" (subagents ${subagents:.3})"));
+        }
     }
     if cache.input_total() > 0 {
         s.push_str(&format!(" · {:.0}% cached", cache.hit_rate() * 100.0));
@@ -613,7 +666,7 @@ mod tests {
         use overseer_core::ledger::CacheStats;
         let zero = CacheStats::default();
         assert_eq!(
-            run_summary(2, None, 0.042, &zero),
+            run_summary(2, None, 0.042, 0.0, &zero),
             "2 steps · $0.042",
             "old-shape RunEnd (empty cache) keeps the L2 text"
         );
@@ -624,7 +677,7 @@ mod tests {
             output: 800,
         };
         assert_eq!(
-            run_summary(2, None, 0.042, &c),
+            run_summary(2, None, 0.042, 0.0, &c),
             "2 steps · $0.042 · 42% cached"
         );
         // Input billed but zero reads still shows — 0% is honest.
@@ -634,7 +687,7 @@ mod tests {
             cache_write: 0,
             output: 5,
         };
-        assert!(run_summary(1, None, 0.0, &c).ends_with("· 0% cached"));
+        assert!(run_summary(1, None, 0.0, 0.0, &c).ends_with("· 0% cached"));
     }
 
     #[test]
@@ -647,6 +700,38 @@ mod tests {
         assert_eq!(truncate("hi", 5), "hi");
         // A full-width tail gives up a column for the marker.
         assert_eq!(truncate("あいう", 4), "あ…");
+    }
+
+    #[test]
+    fn a_tools_call_cell_shows_the_inner_tool() {
+        let ev = overseer_core::event::Event {
+            id: 1,
+            parent_id: None,
+            ts_ms: 0,
+            prev_hash: 0,
+            hash: 0,
+            kind: EventKind::ToolCallStart {
+                call_id: "c1".into(),
+                name: "tools".into(),
+                input: serde_json::json!({"op": "call", "name": "repo_map", "args": {"path": "src"}}),
+            },
+        };
+        match feed(&ev, None) {
+            Feed::NewCells(c) => match &c[0] {
+                Cell::Tool {
+                    name,
+                    summary,
+                    link,
+                    ..
+                } => {
+                    assert_eq!(name, "repo_map");
+                    assert_eq!(summary, r#"{"path":"src"}"#);
+                    assert_eq!(link.as_deref(), Some(std::path::Path::new("src")));
+                }
+                _ => panic!(),
+            },
+            _ => panic!(),
+        }
     }
 
     #[test]

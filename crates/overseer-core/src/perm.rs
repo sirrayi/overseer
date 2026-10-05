@@ -171,11 +171,13 @@ const READ_TOOLS: &[&str] = &[
 /// tool results/inputs; when both are set, side-effecting calls (the
 /// exfil channel, (c)) are forced through human confirmation — headless
 /// fails closed.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct Taint {
     /// Untrusted content entered the context: subagent digests, skill
     /// bodies, or tool output containing injection markers.
     pub untrusted: bool,
+    /// What flipped `untrusted` (a tool name or spawn origin).
+    pub untrusted_via: Option<String>,
     /// Sensitive data was touched: reads/commands on secret paths
     /// (.env, keys, creds dirs) or private-key material in output.
     pub sensitive: bool,
@@ -598,6 +600,9 @@ pub struct Policy {
     /// lane → Ask). This is a declaration in a file, not a discovery about
     /// the server.
     pub mcp_read_servers: Vec<String>,
+    /// Memory v2: `memory` remember/forget are denied (every subagent —
+    /// its stores are throwaway filtered copies). Search/get stay allowed.
+    pub memory_readonly: bool,
 }
 
 impl Policy {
@@ -619,6 +624,7 @@ impl Policy {
             persona_dir: None,
             persona_approved: false,
             mcp_read_servers: Vec::new(),
+            memory_readonly: false,
         }
     }
 
@@ -639,6 +645,7 @@ impl Policy {
             persona_dir: None,
             persona_approved: false,
             mcp_read_servers: Vec::new(),
+            memory_readonly: false,
         }
     }
 
@@ -660,6 +667,7 @@ impl Policy {
             persona_dir: None,
             persona_approved: false,
             mcp_read_servers: Vec::new(),
+            memory_readonly: false,
         }
     }
 
@@ -771,6 +779,7 @@ impl Policy {
                 || INJECTION_MARKERS.iter().any(|m| lower.contains(m)))
         {
             t.untrusted = true;
+            t.untrusted_via = Some(tool.to_string());
             notices.push(format!("untrusted content entered context (via {tool})"));
         }
         if !t.sensitive
@@ -848,6 +857,16 @@ impl Policy {
             .unwrap_or(false)
     }
 
+    /// The untrusted latch alone — memory v2 quarantines `remember` on it.
+    pub fn taint_untrusted(&self) -> bool {
+        self.taint.lock().map(|t| t.untrusted).unwrap_or(false)
+    }
+
+    /// What armed the untrusted latch, if it is armed.
+    pub fn untrusted_via(&self) -> Option<String> {
+        self.taint.lock().ok().and_then(|t| t.untrusted_via.clone())
+    }
+
     /// P7-4 messaging env-arm: pre-arm the untrusted latch at session start
     /// for untrusted-originated spawns. Returns a notice when the latch
     /// newly flips (the engine emits it as an auditable event).
@@ -857,6 +876,7 @@ impl Policy {
             return None;
         }
         t.untrusted = true;
+        t.untrusted_via = Some(origin.to_string());
         Some(format!("untrusted origin armed at start (via {origin})"))
     }
 
@@ -920,6 +940,13 @@ impl Policy {
         if let Some(v) = self.draft_deny(tool, input) {
             return v;
         }
+        // `tools` and `run_code` are pure dispatchers: they run nothing
+        // themselves and re-enter `ToolRegistry::call` under the inner
+        // name, where the real gating happens — so ReadOnly/Plan still
+        // deny a mutating inner call. Deliberately not in READ_TOOLS.
+        if tool == "tools" || tool == "run_code" {
+            return Verdict::Allow;
+        }
         // Read-only tools are allowed under every preset — `task` is safe
         // at the gate (its own read-only registry + step ceiling enforce
         // inside the tool); `plan` writes only to the engine session dir.
@@ -940,6 +967,21 @@ impl Policy {
             }
             if op.eq_ignore_ascii_case("call") && self.mcp_call_read_trusted(input) {
                 return Verdict::Allow;
+            }
+        }
+        // Memory v2: search/get are reads under every preset; remember and
+        // forget are writes — denied outright for subagents, otherwise the
+        // preset path below (ReadOnly/Plan deny; WorkspaceWrite ends at the
+        // `"memory"` arm of `check_workspace`).
+        if tool == "memory" {
+            let op = input.get("op").and_then(Value::as_str).unwrap_or("");
+            if op == "search" || op == "get" {
+                return Verdict::Allow;
+            }
+            if self.memory_readonly {
+                return Verdict::Deny {
+                    reason: crate::tools::memory_tool::SUBAGENT_DENY.into(),
+                };
             }
         }
         match self.preset {
@@ -1157,6 +1199,41 @@ impl Policy {
             // `computer` — keeps an autonomy that earned silence from
             // falling into the unknown-tool deny below.
             "mcp" => Verdict::Allow,
+            // Memory v2 remember/forget: the layer bar is keyed by the
+            // input's `layer` (forget: the target name's layer), combined
+            // with the lane default exactly like the file-write arm below.
+            // Untrusted content never Asks for `remember` — the tool
+            // quarantines it — but a `forget` has no quarantine, so the
+            // Rule-of-Two latch Asks for it (headless ⇒ Deny).
+            "memory" => {
+                let need = crate::memory::layer_bar_for_input(input);
+                let lane_default = match class {
+                    Irreversibility::InternalWrite => Autonomy::ActSilently,
+                    _ => Autonomy::default(),
+                };
+                let level = self
+                    .autonomy
+                    .get(Self::domain(class))
+                    .copied()
+                    .unwrap_or(lane_default);
+                let forget = input.get("op").and_then(Value::as_str) == Some("forget");
+                match need.min(level) {
+                    Autonomy::Observe => Verdict::Deny {
+                        reason: format!("memory: layer needs approval (class {class:?})"),
+                    },
+                    Autonomy::Suggest | Autonomy::ActWithApproval => Verdict::Ask {
+                        reason: format!("memory: layer needs approval (class {class:?})"),
+                    },
+                    _ if forget && self.taint_untrusted() => Verdict::Ask {
+                        reason: format!(
+                            "memory forget: untrusted content in context (via {}) — \
+                             expiring a note needs approval",
+                            self.untrusted_via().unwrap_or_else(|| "context".into())
+                        ),
+                    },
+                    Autonomy::ActAndReport | Autonomy::ActSilently => Verdict::Allow,
+                }
+            }
             // Side-effecting file tools: containment already enforced by
             // hard_deny above (deny wins). Remaining: memory LAYER bar
             // (F5) → Rule-of-Two taint Ask, else Allow.
@@ -2721,5 +2798,101 @@ mod tests {
         ] {
             assert_eq!(class(cmd), Irreversibility::InternalWrite, "{cmd:?}");
         }
+    }
+
+    /// Memory v2 gate: search/get are reads under every preset; remember
+    /// and forget follow the input layer's write bar (forget: the target
+    /// id's layer) combined with the lane default; subagents never write.
+    #[test]
+    fn memory_gate_reads_allow_writes_follow_layer_bars() {
+        let deny = |p: &Policy, i: serde_json::Value| matches!(p.gate("memory", &i), Gate::Deny(_));
+        let mut p = pol();
+        assert!(!deny(&p, json!({"op": "search", "query": "x"})));
+        assert!(!deny(&p, json!({"op": "get", "name": "x"})));
+        assert!(!deny(
+            &p,
+            json!({"op": "remember", "layer": "semantic", "text": "x"})
+        ));
+        assert!(!deny(
+            &p,
+            json!({"op": "remember", "layer": "prospective", "text": "x"})
+        ));
+        // profile needs approval: headless Ask ⇒ Deny (fail-closed).
+        assert!(matches!(
+            p.check(
+                "memory",
+                &json!({"op": "remember", "layer": "profile", "text": "x"})
+            ),
+            Verdict::Ask { .. }
+        ));
+        assert!(deny(
+            &p,
+            json!({"op": "remember", "layer": "profile", "text": "x"})
+        ));
+        assert!(deny(
+            &p,
+            json!({"op": "forget", "name": "user:profile/me.md", "text": "r"})
+        ));
+        assert!(!deny(
+            &p,
+            json!({"op": "forget", "name": "project:semantic/x.md", "text": "r"})
+        ));
+        // An unqualified forget target has no layer to read: fail closed.
+        assert!(deny(&p, json!({"op": "forget", "name": "x", "text": "r"})));
+        // The gate reads the layer from the tool's qualified form only.
+        assert!(!deny(
+            &p,
+            json!({"op": "forget", "name": "semantic/x.md", "text": "r"})
+        ));
+        for bad in [
+            "semantic/x",
+            "bogus:semantic/x.md",
+            "semantic/a/x.md",
+            "x.md",
+            "user:x.md",
+        ] {
+            assert!(
+                deny(&p, json!({"op": "forget", "name": bad, "text": "r"})),
+                "{bad}"
+            );
+        }
+        assert!(deny(
+            &p,
+            json!({"op": "forget", "name": "profile/me.md", "text": "r"})
+        ));
+        p.memory_readonly = true;
+        assert!(!deny(&p, json!({"op": "search", "query": "x"})));
+        assert_eq!(
+            p.gate(
+                "memory",
+                &json!({"op": "remember", "layer": "semantic", "text": "x"})
+            ),
+            Gate::Deny(crate::tools::memory_tool::SUBAGENT_DENY.into())
+        );
+        let ro = Policy::preset(Preset::ReadOnly, PathBuf::from("/tmp/ws"));
+        assert!(!deny(&ro, json!({"op": "get", "name": "x"})));
+        assert!(deny(
+            &ro,
+            json!({"op": "remember", "layer": "semantic", "text": "x"})
+        ));
+    }
+
+    /// Rule-of-Two on `forget`: with untrusted content in context an
+    /// expiry needs a human (headless ⇒ Deny); `remember` stays Allow
+    /// because the tool itself quarantines it.
+    #[test]
+    fn tainted_forget_asks_and_headless_denies() {
+        let p = pol();
+        let forget = json!({"op": "forget", "name": "project:semantic/x.md", "text": "r"});
+        let remember = json!({"op": "remember", "layer": "semantic", "text": "x"});
+        assert_eq!(p.check("memory", &forget), Verdict::Allow);
+        assert!(p.arm_untrusted("web_fetch").is_some());
+        assert!(matches!(p.check("memory", &forget), Verdict::Ask { .. }));
+        assert!(matches!(p.gate("memory", &forget), Gate::Deny(_)));
+        assert_eq!(p.check("memory", &remember), Verdict::Allow);
+        assert!(matches!(
+            p.check("memory", &json!({"op": "search", "query": "x"})),
+            Verdict::Allow
+        ));
     }
 }

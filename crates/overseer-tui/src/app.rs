@@ -144,16 +144,16 @@ pub enum Overlay {
 /// One `task`-tool spawn seen in the event stream — drives the panel's
 /// agents tab. Foreground spawns close on their `ToolResult`;
 /// background ones only acknowledge the spawn there and close on the
-/// later `SubagentDone` (matched via the `bg-N` dir in the ack text).
+/// later `SubagentDone` (matched via the task id in the ack's footer).
 struct AgentEnt {
     /// `ToolCallStart.call_id` — links the spawn to its result.
     call_id: String,
     /// `background: true` in the call input.
     bg: bool,
-    /// `bg-N` parsed from the spawn ack's trace path — the id
+    /// `task-N` parsed from the spawn ack's footer — the id
     /// `SubagentDone` reports under.
     bg_id: Option<String>,
-    /// "read" | "write"
+    /// "read" | "write" | "verify" | "consult"
     mode: &'static str,
     /// "running" | "done" | "failed"
     state: &'static str,
@@ -500,10 +500,11 @@ impl App {
                     call_id: call_id.clone(),
                     bg: input.get("background").and_then(b).unwrap_or(false),
                     bg_id: None,
-                    mode: match input.get("mode").and_then(v) {
-                        Some("write") => "write",
-                        _ => "read",
-                    },
+                    mode: input
+                        .get("mode")
+                        .and_then(v)
+                        .and_then(overseer_core::tools::task::TaskMode::parse)
+                        .map_or("read", |m| m.as_str()),
                     state: "running",
                     prompt: input
                         .get("prompt")
@@ -531,8 +532,8 @@ impl App {
                     if *is_error {
                         a.state = "failed";
                     } else if a.bg {
-                        // The ack isn't the finish — record the dir
-                        // name so `SubagentDone` can close the row.
+                        // The ack isn't the finish — record the task
+                        // id so `SubagentDone` can close the row.
                         a.bg_id = bg_id_of(content);
                     } else {
                         a.state = "done";
@@ -580,11 +581,18 @@ impl App {
                     _ => false,
                 }) {
                     if let Cell::Tool {
+                        name,
+                        summary,
                         status: s,
                         output: o,
                         ..
                     } = &mut self.live[pos]
                     {
+                        if name == "task" {
+                            if let Some(l) = task_label(summary, output.as_deref()) {
+                                *summary = l;
+                            }
+                        }
                         *s = status;
                         *o = output;
                     }
@@ -598,12 +606,19 @@ impl App {
                     for c in self.pending.iter_mut().chain(self.history.iter_mut()).rev() {
                         if let Cell::Tool {
                             id,
+                            name,
+                            summary,
                             status: s,
                             output: o,
                             ..
                         } = c
                         {
                             if *id == call_id {
+                                if name == "task" {
+                                    if let Some(l) = task_label(summary, output.as_deref()) {
+                                        *summary = l;
+                                    }
+                                }
                                 *s = status;
                                 *o = output;
                                 // `tbuf` may already hold a stale
@@ -911,15 +926,18 @@ fn display_path(cwd: &str, path: &std::path::Path) -> String {
     }
 }
 
-/// `bg-N` out of a background spawn ack — the trace dir is the id
-/// `SubagentDone` reports under ("…subagents/bg-3)").
+/// `task-N` out of a background spawn ack's footer — the id
+/// `SubagentDone` reports under.
 fn bg_id_of(content: &str) -> Option<String> {
-    let i = content.rfind("/bg-")? + 1;
-    let id: String = content[i..]
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .collect();
-    (!id.is_empty()).then_some(id)
+    overseer_core::tools::task::Footer::parse(content).map(|f| f.id)
+}
+
+/// A finished task cell's label: the footer's mode/tier/model/cost/verdict
+/// in place of the spawn-time `mode · tier`, prompt kept.
+fn task_label(summary: &str, output: Option<&str>) -> Option<String> {
+    let f = overseer_core::tools::task::Footer::parse(output?)?;
+    let prompt = summary.split_once(": ").map_or("", |(_, p)| p);
+    Some(format!("{}: {prompt}", f.label()))
 }
 
 #[cfg(test)]
@@ -1092,6 +1110,7 @@ mod tests {
             stop_reason: "end_turn".into(),
             steps: 1,
             total_cost_usd: 0.01,
+            subagent_cost_usd: 0.0,
             cache: CacheStats {
                 fresh_input: 100,
                 cache_read: read,
@@ -1112,6 +1131,7 @@ mod tests {
             stop_reason: "end_turn".into(),
             steps: 1,
             total_cost_usd: 0.0,
+            subagent_cost_usd: 0.0,
             cache: Default::default(),
         }));
         assert_eq!(app2.cache.input_total(), 0);

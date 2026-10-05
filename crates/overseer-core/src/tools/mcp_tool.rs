@@ -11,7 +11,8 @@
 //!
 //! - `{op:"search", query}` — find tools; `query` absent/empty lists every
 //!   discovered tool name with a one-line description (capped). Ranked
-//!   search is `mcp::search_tools` (exact name > substring > token overlap).
+//!   search is `mcp::search_tools` (exact name > prefix > substring > token
+//!   overlap).
 //! - `{op:"call", tool, args}` — run one by its full `mcp__<server>__<tool>`
 //!   name. `args` is validated against that tool's own `inputSchema` with the
 //!   registry's `check_args`, so a typo is refused before the server sees it.
@@ -48,7 +49,7 @@ const TOP_K: usize = 5;
 /// Char cap on a description in the output (the full description can be
 /// arbitrarily long; the model asks the server for nothing more by reading a
 /// truncated line).
-const DESC_CAP: usize = 200;
+pub(crate) const DESC_CAP: usize = 200;
 /// Tool names named in an unknown-tool error.
 const UNKNOWN_TOOL_CAP: usize = 20;
 
@@ -169,6 +170,23 @@ impl McpState {
         if self.servers.is_empty() {
             return ToolOutput::ok("mcp: no MCP servers configured.".to_string());
         }
+        let notes = self.discover();
+        let query = query.unwrap_or("").trim();
+        let mut out = if query.is_empty() {
+            self.list_all()
+        } else {
+            self.search_ranked(query)
+        };
+        for note in notes {
+            out.push('\n');
+            out.push_str(&note);
+        }
+        ToolOutput::ok(out)
+    }
+
+    /// Start every configured server that isn't live yet. Returns one note
+    /// per spawn failure or shadowed-name skip, for the search output.
+    pub(crate) fn discover(&mut self) -> Vec<String> {
         let mut notes: Vec<String> = Vec::new();
         let servers = self.servers.clone();
         for server in &servers {
@@ -190,17 +208,30 @@ impl McpState {
                 Err(e) => notes.push(format!("! {e}")),
             }
         }
-        let query = query.unwrap_or("").trim();
-        let mut out = if query.is_empty() {
-            self.list_all()
-        } else {
-            self.search_ranked(query)
-        };
-        for note in notes {
-            out.push('\n');
-            out.push_str(&note);
-        }
-        ToolOutput::ok(out)
+        notes
+    }
+
+    /// Every discovered (callable) tool spec, in configured-server order.
+    pub(crate) fn discovered(&self) -> Vec<ToolSpec> {
+        self.servers
+            .iter()
+            .filter_map(|server| self.live.get(&server.name))
+            .flat_map(|live| live.tools.iter())
+            .map(|tool| tool.spec.clone())
+            .collect()
+    }
+
+    /// The discovered input schema of a full `mcp__<server>__<tool>` name,
+    /// starting its server if needed. `None` when no such tool exists.
+    pub(crate) fn schema_of(&mut self, full: &str) -> Option<Value> {
+        let server = self.server_for(full)?;
+        self.ensure_live(&server).ok()?;
+        self.live
+            .get(&server)?
+            .tools
+            .iter()
+            .find(|t| t.spec.name == full)
+            .map(|t| t.spec.input_schema.clone())
     }
 
     /// Empty query: every discovered (callable) tool, name + one-line
@@ -503,7 +534,7 @@ mod tests {
             spill_seq: 0,
             provider: None,
             agent_config: None,
-            subagent_seq: 0,
+            subagents: Default::default(),
             checkpoint: None,
             sandbox: false,
             broker: None,
@@ -544,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn the_only_spec_added_is_mcp_and_it_is_cache_stable_across_ops() {
+    fn mcp_is_deferred_and_the_advertised_array_is_cache_stable_across_ops() {
         let dir = tmpdir();
         let server = stub(
             "stub",
@@ -560,9 +591,25 @@ mod tests {
         .with_mcp(vec![server]);
         let mut c = ctx(&dir);
 
-        // Exactly one spec was added, with the fixed envelope schema.
-        assert_eq!(reg.specs.len(), crate::tools::TOOL_NAMES.len());
-        let mcp_spec = reg.specs.iter().find(|s| s.name == "mcp").unwrap();
+        // The internal `mcp` op spec is resident but never advertised; the
+        // only advertised change is `tools` naming MCP servers.
+        let plain = ToolRegistry::core_with(
+            crate::perm::Policy::allow_all(),
+            crate::tools::Optional::ALL,
+        );
+        assert_eq!(reg.specs.len(), plain.specs.len());
+        assert!(!reg.specs.iter().any(|s| s.name == "mcp"));
+        let tools_desc = |r: &ToolRegistry| {
+            r.specs
+                .iter()
+                .find(|s| s.name == "tools")
+                .unwrap()
+                .description
+                .clone()
+        };
+        assert!(tools_desc(&reg).contains("MCP servers"));
+        assert!(!tools_desc(&plain).contains("MCP"));
+        let mcp_spec = reg.base_specs.iter().find(|s| s.name == "mcp").unwrap();
         assert_eq!(
             mcp_spec.input_schema.get("additionalProperties"),
             Some(&Value::Bool(false))
@@ -599,7 +646,103 @@ mod tests {
 
         // ... and the advertised array never moved: the whole point.
         assert_eq!(before, specs_json(&reg.specs));
-        assert_eq!(reg.specs.len(), crate::tools::TOOL_NAMES.len());
+        let via_tools = reg.call("tools", &json!({"op": "search", "query": "echo"}), &mut c);
+        assert!(via_tools.text.contains("mcp__stub__echo"));
+        assert_eq!(before, specs_json(&reg.specs));
+    }
+
+    #[test]
+    fn mcp_tools_are_found_and_called_through_tools_and_latch_untrusted() {
+        let dir = tmpdir();
+        let server = stub(
+            "stub",
+            &scripted(
+                r#"[{"name":"echo","description":"Echo text back. Second sentence.","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}}]"#,
+                r#"{"content":[{"type":"text","text":"hello from echo"}]}"#,
+            ),
+        );
+        let mut reg = ToolRegistry::core_with(
+            crate::perm::Policy::allow_all(),
+            crate::tools::Optional::ALL,
+        )
+        .with_mcp(vec![server]);
+        let mut c = ctx(&dir);
+        let found = reg.call("tools", &json!({"op": "search", "query": "echo"}), &mut c);
+        assert!(!found.is_error, "{}", found.text);
+        let hit: Value = serde_json::from_str(found.text.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(hit["name"], "mcp__stub__echo");
+        assert_eq!(hit["input_schema"]["required"], json!(["text"]));
+        assert!(
+            reg.taint_notices.iter().any(|n| n.contains("via mcp")),
+            "server-authored descriptions latch untrusted: {:?}",
+            reg.taint_notices
+        );
+        let no_args = reg.call(
+            "tools",
+            &json!({"op": "call", "name": "mcp__stub__echo"}),
+            &mut c,
+        );
+        assert!(
+            no_args.is_error && no_args.text.contains("\"required\""),
+            "{}",
+            no_args.text
+        );
+        let called = reg.call(
+            "tools",
+            &json!({"op": "call", "name": "mcp__stub__echo", "args": {"text": "hi"}}),
+            &mut c,
+        );
+        assert!(!called.is_error, "{}", called.text);
+        assert_eq!(called.text, "hello from echo");
+    }
+
+    #[test]
+    fn a_resumed_session_replaying_old_mcp_calls_still_dispatches() {
+        // Pre-`tools` sessions called the resident `mcp` op tool by name;
+        // it is no longer advertised but the internal dispatch arm stays.
+        let dir = tmpdir();
+        let server = stub(
+            "stub",
+            &scripted(
+                r#"[{"name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]"#,
+                r#"{"content":[{"type":"text","text":"hello from echo"}]}"#,
+            ),
+        );
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all()).with_mcp(vec![server]);
+        assert!(!reg.specs.iter().any(|s| s.name == "mcp"));
+        let mut c = ctx(&dir);
+        let old = reg.call(
+            "mcp",
+            &json!({"op": "call", "tool": "mcp__stub__echo", "args": {"text": "hi"}}),
+            &mut c,
+        );
+        assert!(!old.is_error, "{}", old.text);
+        assert_eq!(old.text, "hello from echo");
+    }
+
+    #[test]
+    fn no_tools_mcp_hides_and_refuses_mcp_through_tools() {
+        let dir = tmpdir();
+        let server = stub("stub", "exit 1");
+        let mut reg = ToolRegistry::core(crate::perm::Policy::allow_all()).with_mcp(vec![server]);
+        reg.disable(&["mcp".to_string()]);
+        let tools = reg.specs.iter().find(|s| s.name == "tools").unwrap();
+        assert!(!tools.description.contains("MCP"), "{}", tools.description);
+        let mut c = ctx(&dir);
+        let search = reg.call("tools", &json!({"op": "search", "query": "stub"}), &mut c);
+        assert!(!search.text.contains("mcp__"), "{}", search.text);
+        assert!(reg.taint_notices.is_empty(), "no server was spawned");
+        for input in [
+            json!({"op": "call", "name": "mcp__stub__echo", "args": {}}),
+            json!({"op": "call", "name": "mcp__stub__echo"}),
+        ] {
+            let out = reg.call("tools", &input, &mut c);
+            assert!(
+                out.is_error && out.text.contains("disabled"),
+                "{}",
+                out.text
+            );
+        }
     }
 
     #[test]

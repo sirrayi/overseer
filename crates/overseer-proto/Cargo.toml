@@ -6,6 +6,12 @@ license.workspace = true
 description = "Overseer wire protocol: typed session events and commands (JSON-RPC/NDJSON)"
 
 [dependencies]
-overseer-core = { path = "../overseer-core", version = "0.1.0" }
+overseer-core = { path = "../overseer-core", version = "0.1.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# `overseer-core`'s only default feature is `code-mode`; it is re-exposed
+# here so `--no-default-features` really drops `run_code`.
+[features]
+default = ["code-mode"]
+code-mode = ["overseer-core/code-mode"]

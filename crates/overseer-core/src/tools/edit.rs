@@ -12,8 +12,8 @@ pub fn spec() -> crate::provider::ToolSpec {
         description: concat!(
             "Replace an exact string in a file (verbatim, including indentation; ",
             "unique unless replace_all), or apply `patch`, a unified diff for ",
-            "this file alone. The file must have been read or written earlier ",
-            "this session. On failure, re-read the lines and retry with more context."
+            "this file alone. Read or write the file first this session. ",
+            "On failure, re-read the lines and retry with more context."
         )
         .into(),
         input_schema: schema(
@@ -21,7 +21,7 @@ pub fn spec() -> crate::provider::ToolSpec {
                 "path": {"type": "string", "description": "File to edit."},
                 "old_string": {"type": "string", "description": "Exact text to replace. Omit with `patch`."},
                 "new_string": {"type": "string", "description": "Replacement text. Omit with `patch`."},
-                "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)."},
+                "replace_all": {"type": "boolean", "description": "Every occurrence (default false)."},
                 "patch": {"type": "string", "description": "`@@ -a,b +c,d @@` hunks with context, '-' and '+' lines."}
             }),
             // Only `path` is structurally required: the edit *variant*
@@ -803,7 +803,7 @@ mod tests {
             spill_seq: 0,
             provider: None,
             agent_config: None,
-            subagent_seq: 0,
+            subagents: Default::default(),
             checkpoint: None,
             sandbox: false,
             broker: None,
@@ -997,7 +997,7 @@ mod tests {
             spill_seq: 0,
             provider: None,
             agent_config: None,
-            subagent_seq: 0,
+            subagents: Default::default(),
             checkpoint: None,
             sandbox: false,
             broker: None,
@@ -1046,7 +1046,7 @@ mod tests {
             spill_seq: 0,
             provider: None,
             agent_config: None,
-            subagent_seq: 0,
+            subagents: Default::default(),
             checkpoint: None,
             sandbox: false,
             broker: None,

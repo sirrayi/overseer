@@ -120,6 +120,7 @@ fn transcript_flushes_to_scrollback_and_live_region_stays() {
         stop_reason: "end_turn".into(),
         steps: 1,
         total_cost_usd: 0.001,
+        subagent_cost_usd: 0.0,
         cache: Default::default(),
     })))
     .unwrap();
@@ -1028,6 +1029,7 @@ fn full_tool_glyphs_and_run_summary() {
         stop_reason: "end_turn".into(),
         steps: 2,
         total_cost_usd: 0.042,
+        subagent_cost_usd: 0.0,
         cache: overseer_core::ledger::CacheStats {
             fresh_input: 41200,
             cache_read: 30400,

@@ -24,6 +24,7 @@ pub(crate) struct ExecFlags {
     pub(crate) thinking: Option<u32>,
     pub(crate) effort: Option<overseer_core::provider::Effort>,
     pub(crate) small_model: Option<String>,
+    pub(crate) heavy_model: Option<String>,
     pub(crate) full_access: bool,
     pub(crate) policy: overseer_core::perm::Preset,
     pub(crate) auto_compact: bool,
@@ -41,6 +42,8 @@ pub(crate) struct ExecFlags {
     /// fails the bash call instead of silently running unsandboxed.
     pub(crate) runtime: Option<String>,
     pub(crate) memory: bool,
+    /// `--no-memory`: no user or project store (`--bare` implies it).
+    pub(crate) no_memory: bool,
     /// `--no-tools a,b,c` — P4.3 ablation: named tools are removed from the
     /// spec list and refused at dispatch.
     pub(crate) no_tools: Vec<String>,
@@ -73,6 +76,7 @@ pub(crate) const EXEC_FLAGS: &[Flag] = &[
     Flag::value(&["--thinking"]),
     Flag::value(&["--effort"]),
     Flag::value(&["--small-model"]),
+    Flag::value(&["--heavy-model"]),
     Flag::switch(&["--full-access"]),
     Flag::value(&["--policy"]),
     Flag::value(&["--compact-at"]),
@@ -85,6 +89,7 @@ pub(crate) const EXEC_FLAGS: &[Flag] = &[
     Flag::switch(&["--no-sandbox"]),
     Flag::value(&["--runtime"]),
     Flag::switch(&["--memory"]),
+    Flag::switch(&["--no-memory"]),
     Flag::value(&["--autonomy"]),
     Flag::value(&["--credential-store"]),
     Flag::value(&["--no-tools"]),
@@ -114,6 +119,7 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
         thinking: None,
         effort: None,
         small_model: None,
+        heavy_model: None,
         full_access: false,
         policy: overseer_core::perm::Preset::WorkspaceWrite,
         auto_compact: true,
@@ -126,6 +132,7 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
         sandbox: true,
         runtime: None,
         memory: false,
+        no_memory: false,
         no_tools: Vec::new(),
         autonomy: Vec::new(),
         credential_store: overseer_core::cred::CredentialStore::Auto,
@@ -174,6 +181,7 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
                 )
             }
             "--small-model" => f.small_model = Some(v.clone()),
+            "--heavy-model" => f.heavy_model = Some(v.clone()),
             "--full-access" => f.full_access = true,
             "--policy" => {
                 f.policy = match v.as_str() {
@@ -207,6 +215,7 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
                 f.runtime = Some(rt.as_str().to_string());
             }
             "--memory" => f.memory = true,
+            "--no-memory" => f.no_memory = true,
             "--autonomy" => {
                 let (domain, level) = v
                     .split_once('=')
@@ -264,6 +273,17 @@ mod tests {
             dir.starts_with(std::env::temp_dir()),
             "bare session must live in temp: {}",
             dir.display()
+        );
+    }
+
+    #[test]
+    fn heavy_model_flag_reaches_agent_config() {
+        let f =
+            parse_exec(&["--heavy-model".into(), "claude-opus-4-8".into(), "x".into()]).unwrap();
+        assert_eq!(f.heavy_model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(
+            agent_config(&f).heavy_model.as_deref(),
+            Some("claude-opus-4-8")
         );
     }
 
@@ -462,6 +482,33 @@ mod autonomy_flag_tests {
         assert_eq!(
             cfg.autonomy.get("external"),
             Some(&overseer_core::perm::Autonomy::Suggest)
+        );
+    }
+
+    #[test]
+    fn memory_flags_resolve_the_stores() {
+        use crate::session::memory_stores;
+        let cwd = std::path::Path::new("/w");
+        for off in [&["--bare", "x"][..], &["--no-memory", "x"]] {
+            let args: Vec<String> = off.iter().map(|s| s.to_string()).collect();
+            let f = parse_exec(&args).unwrap();
+            assert_eq!(memory_stores(&f, cwd), (None, None), "{off:?}");
+            let cfg = agent_config(&f);
+            assert!(
+                cfg.memory_dir.is_none() && cfg.user_memory_dir.is_none(),
+                "{off:?}"
+            );
+        }
+        let home = overseer_core::memory::overseer_home();
+        let (user, project) = memory_stores(&parse_exec(&["x".into()]).unwrap(), cwd);
+        assert_eq!(user.is_some(), home.is_some(), "on by default");
+        assert_eq!(project.is_some(), home.is_some());
+        let (_, legacy) =
+            memory_stores(&parse_exec(&["--memory".into(), "x".into()]).unwrap(), cwd);
+        assert_eq!(
+            legacy,
+            Some(cwd.join("memory")),
+            "--memory keeps v1's in-workspace store"
         );
     }
 }

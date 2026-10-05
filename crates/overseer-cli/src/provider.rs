@@ -102,18 +102,24 @@ pub(crate) fn build_provider(
             // muse-spark-* is Responses-API-only on Go (chat/completions
             // 500s upstream) — those models take the responses adapter.
             // The adapter choice follows --model; aux calls (consolidate,
-            // reflect) reuse this provider with --small-model as the
-            // request model. Warn when they disagree in transport family:
-            // e.g. --model deepseek --small-model muse-* would send muse
-            // to chat/completions and 500 every time.
-            if let Some(sm) = &flags.small_model {
-                if sm.starts_with("muse-") != flags.model.starts_with("muse-") {
-                    eprintln!(
-                        "overseer: warning — --small-model '{sm}' and --model '{}' \
-                         use different opencode transports (Responses vs chat); \
-                         aux calls may fail upstream",
-                        flags.model
-                    );
+            // reflect) and subagent tiers reuse this provider with
+            // --small-model / --heavy-model as the request model. Warn when
+            // they disagree in transport family: e.g. --model deepseek
+            // --small-model muse-* would send muse to chat/completions and
+            // 500 every time.
+            for (flag, alt) in [
+                ("--small-model", &flags.small_model),
+                ("--heavy-model", &flags.heavy_model),
+            ] {
+                if let Some(alt) = alt {
+                    if alt.starts_with("muse-") != flags.model.starts_with("muse-") {
+                        eprintln!(
+                            "overseer: warning — {flag} '{alt}' and --model '{}' \
+                             use different opencode transports (Responses vs chat); \
+                             calls on it may fail upstream",
+                            flags.model
+                        );
+                    }
                 }
             }
             if flags.model.starts_with("muse-") {

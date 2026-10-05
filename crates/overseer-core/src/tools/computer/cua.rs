@@ -855,8 +855,9 @@ fn capture_envelope(
         "window_h": window_h,
         "pre": pre,
         "post": sha,
-        "note": "send x/y in sent_w x sent_h pixels — the driver takes the same space \
-         (image not persisted across resume)",
+        "note": "give x/y in the frame you were shown (sent_w x sent_h); they are mapped into \
+         the driver's pixel space — after 'zoom', they are crop pixels the driver maps back \
+         (from_zoom) (image not persisted across resume)",
     }))
 }
 
@@ -1166,7 +1167,7 @@ mod tests {
             spill_seq: 0,
             provider: None,
             agent_config: None,
-            subagent_seq: 0,
+            subagents: Default::default(),
             checkpoint: None,
             sandbox: false,
             broker: None,
@@ -1961,7 +1962,11 @@ done
         );
         without.computer = super::super::ComputerState::new(super::super::Backends::default());
         let spec_of = |reg: &super::super::super::ToolRegistry| {
-            let spec = reg.specs.iter().find(|s| s.name == "computer").unwrap();
+            let spec = reg
+                .base_specs
+                .iter()
+                .find(|s| s.name == "computer")
+                .unwrap();
             format!(
                 "{}{}",
                 spec.description,

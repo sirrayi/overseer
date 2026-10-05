@@ -27,6 +27,11 @@ pub struct UsageRecord {
     pub cost_usd: f64,
     /// cache_read / total_input — the SEV-metric KPI (target ≥0.90 in-session).
     pub cache_hit_rate: f64,
+    /// Set on a subagent settlement row: the task id whose own ledger
+    /// total this row brings into the parent's. Zero tokens — the parent's
+    /// token stats count only its own calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
 }
 
 impl UsageRecord {
@@ -56,6 +61,15 @@ impl UsageRecord {
             } else {
                 0.0
             },
+            subagent: None,
+        }
+    }
+
+    /// A settlement row: `cost_usd` of subagent `task_id`'s spend, no tokens.
+    pub fn settlement(task_id: &str, model: &str, cost_usd: f64) -> Self {
+        UsageRecord {
+            subagent: Some(task_id.to_string()),
+            ..Self::from_usage(model, &Usage::default(), 0, 0, 0, cost_usd)
         }
     }
 }
@@ -118,9 +132,16 @@ impl CacheStats {
 pub struct Ledger {
     file: File,
     path: PathBuf,
+    /// Own calls plus settled subagent spend.
     pub total_cost_usd: f64,
+    /// The settled-subagent share of `total_cost_usd`.
+    pub subagent_cost_usd: f64,
+    /// Own provider calls (settlement rows excluded).
     pub calls: u64,
     cache: CacheStats,
+    /// Per task id: spend settled so far (replayed on open, so resumes
+    /// settle only the delta).
+    settled: std::collections::HashMap<String, f64>,
 }
 
 impl Ledger {
@@ -134,33 +155,47 @@ impl Ledger {
             file,
             path,
             total_cost_usd: 0.0,
+            subagent_cost_usd: 0.0,
             calls: 0,
             cache: CacheStats::default(),
+            settled: Default::default(),
         })
     }
 
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().append(true).open(&path)?;
-        // Tally existing rows so a resumed session keeps a running total.
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut total = 0.0;
-        let mut calls = 0u64;
-        let mut cache = CacheStats::default();
-        for line in existing.lines() {
-            if let Ok(r) = serde_json::from_str::<UsageRecord>(line) {
-                total += r.cost_usd;
-                calls += 1;
-                cache.add(&r);
-            }
-        }
-        Ok(Ledger {
+        let mut ledger = Ledger {
             file,
             path,
-            total_cost_usd: total,
-            calls,
-            cache,
-        })
+            total_cost_usd: 0.0,
+            subagent_cost_usd: 0.0,
+            calls: 0,
+            cache: CacheStats::default(),
+            settled: Default::default(),
+        };
+        // Tally existing rows so a resumed session keeps a running total.
+        let existing = std::fs::read_to_string(&ledger.path).unwrap_or_default();
+        for line in existing.lines() {
+            if let Ok(r) = serde_json::from_str::<UsageRecord>(line) {
+                ledger.tally(&r);
+            }
+        }
+        Ok(ledger)
+    }
+
+    fn tally(&mut self, r: &UsageRecord) {
+        self.total_cost_usd += r.cost_usd;
+        match &r.subagent {
+            Some(id) => {
+                self.subagent_cost_usd += r.cost_usd;
+                *self.settled.entry(id.clone()).or_default() += r.cost_usd;
+            }
+            None => {
+                self.calls += 1;
+                self.cache.add(r);
+            }
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -172,10 +207,21 @@ impl Ledger {
         line.push('\n');
         self.file.write_all(line.as_bytes())?;
         self.file.flush()?;
-        self.total_cost_usd += rec.cost_usd;
-        self.calls += 1;
-        self.cache.add(&rec);
+        self.tally(&rec);
         Ok(())
+    }
+
+    /// Bring subagent `task_id`'s spend to `total_usd` (its own ledger
+    /// total): appends one settlement row for the unsettled delta, none
+    /// when already settled — idempotent across drains and resumes.
+    /// Returns the delta recorded.
+    pub fn settle(&mut self, task_id: &str, model: &str, total_usd: f64) -> std::io::Result<f64> {
+        let delta = total_usd - self.settled.get(task_id).copied().unwrap_or(0.0);
+        if delta <= 1e-12 {
+            return Ok(0.0);
+        }
+        self.record(UsageRecord::settlement(task_id, model, delta))?;
+        Ok(delta)
     }
 
     /// Running cache-class token totals for this session (resumed sessions
@@ -198,6 +244,11 @@ impl Ledger {
     pub fn summarize(records: &[UsageRecord]) -> Summary {
         let mut s = Summary::default();
         for r in records {
+            if r.subagent.is_some() {
+                s.total_cost_usd += r.cost_usd;
+                s.subagent_cost_usd += r.cost_usd;
+                continue;
+            }
             // FAIL-3: saturating accumulation — a corrupt/hand-edited ledger
             // row (u64::MAX fields) must not panic the dashboard.
             s.calls += 1;
@@ -228,7 +279,10 @@ pub struct Summary {
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
     pub output_tokens: u64,
+    /// Own calls plus settled subagent spend.
     pub total_cost_usd: f64,
+    /// The settled-subagent share of `total_cost_usd`.
+    pub subagent_cost_usd: f64,
     /// Σcache_read / Σtotal_input — the SEV metric (target ≥0.90).
     pub cache_hit_rate: f64,
     /// B1-10: true when `cache_hit_rate < 0.90` — the prefix-discipline
@@ -240,6 +294,38 @@ pub struct Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settlement rows move cost, never tokens, and re-settling the same
+    /// total (a second drain, a resume) records nothing.
+    #[test]
+    fn settlement_is_idempotent_and_token_free() {
+        let dir = std::env::temp_dir().join(format!("overseer-settle-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.jsonl");
+        let mut l = Ledger::create(&path).unwrap();
+        l.record(rec(100, 0, 0, 10)).unwrap();
+        let own = l.total_cost_usd;
+        assert_eq!(l.settle("task-1", "claude-haiku-4-5", 0.20).unwrap(), 0.20);
+        assert_eq!(l.settle("task-1", "claude-haiku-4-5", 0.20).unwrap(), 0.0);
+        // A resumed subagent's ledger grew to 0.30: only the delta lands.
+        assert!((l.settle("task-1", "claude-haiku-4-5", 0.30).unwrap() - 0.10).abs() < 1e-9);
+        assert_eq!(l.calls, 1, "settlements are not calls");
+        assert_eq!(l.cache_stats().fresh_input, 100);
+        let reopened = Ledger::open(&path).unwrap();
+        assert!((reopened.total_cost_usd - (own + 0.30)).abs() < 1e-9);
+        assert!((reopened.subagent_cost_usd - 0.30).abs() < 1e-9);
+        assert_eq!(reopened.calls, 1);
+        let mut reopened = reopened;
+        assert_eq!(
+            reopened.settle("task-1", "m", 0.30).unwrap(),
+            0.0,
+            "replayed settle"
+        );
+        let s = Ledger::summarize(&Ledger::read_all(&path));
+        assert_eq!(s.calls, 1);
+        assert!((s.subagent_cost_usd - 0.30).abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn rec(fresh: u64, read: u64, write: u64, output: u64) -> UsageRecord {
         UsageRecord::from_usage(
@@ -344,6 +430,7 @@ mod tests {
             tool_calls: 0,
             cost_usd: 0.0,
             cache_hit_rate: 0.0,
+            subagent: None,
         };
         let s = Ledger::summarize(&[rec]);
         assert_eq!(s.input_tokens, u64::MAX);
@@ -366,6 +453,7 @@ mod tests {
             tool_calls: 0,
             cost_usd: 0.0,
             cache_hit_rate: 0.0,
+            subagent: None,
         }];
         let s = Ledger::summarize(&low);
         assert!(s.cache_alert, "0.167 hit rate must alert");
@@ -382,6 +470,7 @@ mod tests {
             tool_calls: 0,
             cost_usd: 0.0,
             cache_hit_rate: 0.0,
+            subagent: None,
         }];
         let s2 = Ledger::summarize(&high);
         assert!(!s2.cache_alert, "0.95 hit rate must not alert");
