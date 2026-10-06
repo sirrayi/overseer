@@ -78,7 +78,16 @@ pub fn restore(session_dir: &Path, boundary: Option<u64>, mode: Mode) -> std::io
     }
 
     if !matches!(mode, Mode::Code) {
+        let events_path = session_dir.join("events.jsonl");
+        let cursor = crate::event::EventLog::replay(&events_path)
+            .map(|e| crate::memory::learn::cursor_of(&e))
+            .unwrap_or(0);
         report.truncated = truncate_log(session_dir, boundary)?;
+        // The truncate drops the review that covered events up to the
+        // boundary; re-pin the cursor so they are never reviewed twice.
+        if cursor > boundary {
+            append_rewind_cursor(&events_path, boundary)?;
+        }
     }
 
     // Summarize = truncate + compaction marker (no file restore —
@@ -268,6 +277,24 @@ fn truncate_log(session_dir: &Path, boundary: u64) -> std::io::Result<u32> {
     std::fs::write(&tmp, kept.join("\n") + "\n")?;
     std::fs::rename(&tmp, &events_path)?;
     Ok(dropped as u32)
+}
+
+fn append_rewind_cursor(events_path: &Path, boundary: u64) -> std::io::Result<()> {
+    use crate::event::{EventKind, EventLog};
+    let mut log = EventLog::open(events_path)?;
+    log.append(EventKind::MemoryReview {
+        trigger: String::new(),
+        through: boundary,
+        applied: vec![],
+        staged: vec![],
+        quarantined: vec![],
+        rejected: 0,
+        skipped: Some("rewind".into()),
+        model: String::new(),
+        cost_usd: 0.0,
+        taint: None,
+    })?;
+    log.flush()
 }
 
 /// `--mode summarize`: after truncation, append a Compaction marker so the
