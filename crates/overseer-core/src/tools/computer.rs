@@ -68,6 +68,21 @@ pub const ENV_DRIVER: &str = "OVERSEER_COMPUTER_DRIVER";
 const MAX_BATCH: usize = 32;
 
 /// Every action the tool accepts (S5 vocabulary). `batch` wraps the rest.
+/// Read-only actions: no input reaches the screen. Allowed after the kill
+/// switch fired (P5); `wait_for` (P4) is one of them.
+// perm.rs classifies computer actions from its own hard-coded read list, not
+// this table — routing it here needs a perm.rs change (outside this slice).
+pub const OBSERVE_ACTIONS: &[&str] = &[
+    "apps",
+    "windows",
+    "observe",
+    "screenshot",
+    "zoom",
+    "verify",
+    "wait_for",
+    "browser",
+];
+
 pub(crate) const ACTIONS: &[&str] = &[
     "apps",
     "windows",
@@ -83,6 +98,7 @@ pub(crate) const ACTIONS: &[&str] = &[
     "drag",
     "menu",
     "verify",
+    "wait_for",
     "browser",
     "browser_click",
     "browser_type",
@@ -735,12 +751,64 @@ fn run_batch(input: &Value, ctx: &ToolCtx, st: &mut ComputerState) -> Result<Val
         ));
     }
     let pre = read_obs(ctx).and_then(|o| o.sha256);
+    st.batching = st.backends.driver.is_some();
+    let ran = batch_members(actions, input, ctx, st);
+    st.batching = false;
+    let (results, weakest, halt, last) = ran?;
+    let post = read_obs(ctx).and_then(|o| o.sha256);
+    let tier = if st.backends.driver.is_some() {
+        "cua"
+    } else {
+        weakest.as_str()
+    };
+    let mut out = json!({
+        "ok": true,
+        "computer": "batch",
+        "count": results.len(),
+        "tier": tier,
+        "pre": pre,
+        "post": post,
+        "results": results,
+    });
+    if let Some((key, note)) = halt {
+        out[key] = json!(note);
+    }
+    if let (Some(i), true) = (last, st.backends.driver.is_some()) {
+        cua::batch_post(&actions[i], st, &mut out);
+    }
+    Ok(out)
+}
+
+type Members = (
+    Vec<Value>,
+    Tier,
+    Option<(&'static str, String)>,
+    Option<usize>,
+);
+
+/// The batch loop: stops between members on interrupt, on an unmet
+/// `wait_for`, and — with `stop_if_changed` (P10) — when a member's window
+/// AX sha moved after it ran.
+fn batch_members(
+    actions: &[Value],
+    input: &Value,
+    ctx: &ToolCtx,
+    st: &mut ComputerState,
+) -> Result<Members, String> {
+    let n = actions.len();
+    let watch = st.backends.driver.is_some()
+        && input
+            .get("stop_if_changed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let mut seen: Option<((u64, u64), String)> = None;
     let mut results = Vec::new();
     let mut weakest = Tier::ORDER[0];
-    let mut interrupted = None;
+    let mut halt = None;
+    let mut last = None;
     for (i, a) in actions.iter().enumerate() {
         if st.control.interrupted() {
-            interrupted = Some(format!("interrupted after {i} of {}", actions.len()));
+            halt = Some(("interrupted", format!("interrupted after {i} of {n}")));
             break;
         }
         let action = action_of(a);
@@ -757,6 +825,9 @@ fn run_batch(input: &Value, ctx: &ToolCtx, st: &mut ComputerState) -> Result<Val
             ));
         }
         validate(a).map_err(|e| format!("computer: actions[{i}] — {e}"))?;
+        if watch && seen.is_none() {
+            seen = cua::ax_sha(a, st);
+        }
         let out = run_single(a, ctx, st)
             .map_err(|e| format!("computer: batch failed at actions[{i}] ({action}) — {e}"))?;
         if let Some(t) = out
@@ -768,27 +839,41 @@ fn run_batch(input: &Value, ctx: &ToolCtx, st: &mut ComputerState) -> Result<Val
                 weakest = t;
             }
         }
+        let unmet = out.get("met") == Some(&Value::Bool(false));
         results.push(out);
+        last = Some(i);
+        if unmet {
+            halt = Some((
+                "stopped",
+                format!(
+                    "actions[{i}] (wait_for) was not met — stopped; {} of {n} ran",
+                    i + 1
+                ),
+            ));
+            break;
+        }
+        if watch && i + 1 < n {
+            let now = cua::ax_sha(a, st);
+            if let (Some((k0, before)), Some((k1, after))) = (&seen, &now) {
+                if k0 == k1 && before != after {
+                    halt = Some((
+                        "stopped",
+                        format!(
+                            "the window changed after actions[{i}] — stopped at actions[{}]; \
+                             {} of {n} ran",
+                            i + 1,
+                            i + 1
+                        ),
+                    ));
+                    break;
+                }
+            }
+            if now.is_some() {
+                seen = now;
+            }
+        }
     }
-    let post = read_obs(ctx).and_then(|o| o.sha256);
-    let tier = if st.backends.driver.is_some() {
-        "cua"
-    } else {
-        weakest.as_str()
-    };
-    let mut out = json!({
-        "ok": true,
-        "computer": "batch",
-        "count": results.len(),
-        "tier": tier,
-        "pre": pre,
-        "post": post,
-        "results": results,
-    });
-    if let Some(note) = interrupted {
-        out["interrupted"] = json!(note);
-    }
-    Ok(out)
+    Ok((results, weakest, halt, last))
 }
 
 fn tier_from_str(s: &str) -> Option<Tier> {
@@ -866,14 +951,17 @@ fn validate(input: &Value) -> Result<String, String> {
                 "'click' needs an 'element' index, 'x'/'y' coordinates, or a name/role".into(),
             );
         }
-        "type" if !has_text(input, "text") => {
-            return Err("'type' needs 'text'".into());
+        "type" if !has_text(input, "text") && !has_text(input, "secret") => {
+            return Err("'type' needs 'text' (or 'secret': a credential name)".into());
         }
         "key" if !has_text(input, "keys") => {
             return Err("'key' needs 'keys' (\"cmd+s\" or \"return\")".into());
         }
-        "set" if input.get("element").is_none() || input.get("value").is_none() => {
-            return Err("'set' needs 'element' and 'value'".into());
+        "set"
+            if input.get("element").is_none()
+                || (input.get("value").is_none() && !has_text(input, "secret")) =>
+        {
+            return Err("'set' needs 'element' and 'value' (or 'secret')".into());
         }
         "scroll" if input.get("dx").is_none() && input.get("dy").is_none() => {
             return Err("'scroll' needs 'dx' or 'dy' (the scroll direction)".into());
@@ -891,6 +979,9 @@ fn validate(input: &Value) -> Result<String, String> {
         }
         "verify" if input.get("expect").is_none() => {
             return Err("'verify' needs 'expect' (a predicate object or list)".into());
+        }
+        "wait_for" if input.get("expect").is_none() => {
+            return Err("'wait_for' needs 'expect' (a predicate object or list)".into());
         }
         "browser" if !pair("pid", "window_id") && !has_text(input, "tab") => {
             return Err(
@@ -936,6 +1027,19 @@ pub struct ComputerState {
     pub(crate) driver: Option<cua::Live>,
     /// The run's steering handle: `batch` stops between members on interrupt.
     control: crate::control::Control,
+    /// Per-turn state, reset when a new `Control` (a new user turn) arrives.
+    pub(crate) turn: Turn,
+    /// Inside a driver batch: members skip the post-act read (P3).
+    pub(crate) batching: bool,
+}
+
+/// Per-turn computer state: image bytes delivered and the last image's sha
+/// (P7), and the kill-switch latch (P5).
+#[derive(Default)]
+pub(crate) struct Turn {
+    pub(crate) image_bytes: usize,
+    pub(crate) last_image: Option<(String, Option<(u64, u64)>)>,
+    pub(crate) killed: bool,
 }
 
 impl ComputerState {
@@ -945,6 +1049,8 @@ impl ComputerState {
             backends: Backends::detect(),
             driver: None,
             control: Default::default(),
+            turn: Turn::default(),
+            batching: false,
         }
     }
 
@@ -954,12 +1060,44 @@ impl ComputerState {
             backends,
             driver: None,
             control: Default::default(),
+            turn: Turn::default(),
+            batching: false,
         }
     }
 
     /// Attach the run's steering handle (checked between batch members).
+    /// A different handle is a new user turn: the image budget, the
+    /// unchanged-image sha and the kill latch reset.
     pub fn set_control(&mut self, control: crate::control::Control) {
+        if !std::sync::Arc::ptr_eq(&self.control.interrupt_flag(), &control.interrupt_flag()) {
+            self.turn = Turn::default();
+        }
         self.control = control;
+    }
+
+    /// P5: a server-initiated driver message. `kill_switch` (the physical
+    /// Escape) raises the run's interrupt and refuses acts until the next
+    /// user turn. Returns whether the message was the kill switch.
+    // DEFERRED(computer): driver kill-switch capability — gate: live macOS
+    // (cua-driver 0.26.1 advertises no such notification and mcp.rs reads one
+    // line per request, so nothing calls this outside tests yet.)
+    pub fn driver_notification(&mut self, msg: &Value) -> bool {
+        let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        let kill = matches!(method, "notifications/kill_switch" | "kill_switch");
+        if kill {
+            self.kill();
+        }
+        kill
+    }
+
+    pub(crate) fn kill(&mut self) {
+        self.control.interrupt();
+        self.turn.killed = true;
+    }
+
+    /// Acts are refused until the next user turn (P5).
+    pub fn kill_latched(&self) -> bool {
+        self.turn.killed
     }
 }
 
@@ -1049,9 +1187,13 @@ pub fn spec() -> crate::provider::ToolSpec {
         description: concat!(
             "Drive the user's screen and Chrome/Edge tabs. Tiered: the structured API first, then ",
             "element lookups by name/role, then pixel acts. 'apps'/'windows' find targets; ",
-            "'observe' lists elements (index as 'element'); 'screenshot'/'zoom' image it; ",
-            "'click'/'type'/'key'/'set'/'scroll'/'drag'/'menu'/'launch' act; 'verify' checks ",
-            "predicates; 'browser*'/'navigate' drive tabs via 'tab'/'ref'; 'batch' runs ≤32 actions. ",
+            "'observe' lists elements with marks (pass \"e7\" as 'element'; only the latest observe's ",
+            "marks work) and an open sheet/dialog as 'modal' (dismiss it first); 'screenshot'/'zoom' ",
+            "image it ('unchanged' if identical; 8 MiB per turn, then observe); ",
+            "'click'/'type'/'key'/'set'/'scroll'/'drag'/'menu'/'launch' act, then re-read the window: ",
+            "'changed' + capped 'diff'; 'verify' checks predicates, 'wait_for' polls them ≤10 s; ",
+            "'browser*'/'navigate' drive tabs via 'tab'/'ref'; 'batch' runs ≤32 actions ",
+            "('stop_if_changed' halts on a window change). 'secret' types a credential by name. ",
             "give x/y in the frame you were shown; they are mapped into the driver's pixel space. ",
             "After 'zoom', x/y are crop pixels the driver maps back (from_zoom). Nothing is screenshotted ",
             "implicitly; a suppressed capture returns metadata only; credential fields are never ",
@@ -1062,7 +1204,7 @@ pub fn spec() -> crate::provider::ToolSpec {
             json!({
                 "action": {
                     "type": "string",
-                    "description": "apps | windows | launch | observe | screenshot | zoom | click | type | key | set | scroll | drag | menu | verify | browser | browser_click | browser_type | navigate | batch"
+                    "description": "apps | windows | launch | observe | screenshot | zoom | click | type | key | set | scroll | drag | menu | verify | wait_for | browser | browser_click | browser_type | navigate | batch"
                 },
                 "pid": {"type": "integer", "description": "target app"},
                 "window_id": {"type": "integer", "description": "target window"},
@@ -1070,7 +1212,8 @@ pub fn spec() -> crate::provider::ToolSpec {
                 "query": {"type": "string"},
                 "limit": {"type": "integer", "description": "observe cap (150)"},
                 "max": {"type": "integer"},
-                "element": {"type": "integer", "description": "index from observe"},
+                "depth": {"type": "integer", "description": "observe depth cap"},
+                "element": {"description": "mark from observe (\"e7\")"},
                 "x": {"type": "number"}, "y": {"type": "number"},
                 "to_x": {"type": "number"}, "to_y": {"type": "number"},
                 "dx": {"type": "number"}, "dy": {"type": "number"},
@@ -1083,6 +1226,9 @@ pub fn spec() -> crate::provider::ToolSpec {
                 "value": {},
                 "path": {"type": "array", "items": {"type": "string"}},
                 "expect": {},
+                "timeout_ms": {"type": "integer", "description": "wait_for cap (≤10000)"},
+                "secret": {"type": "string", "description": "credential name for type/set"},
+                "stop_if_changed": {"type": "boolean"},
                 "tab": {"type": "string", "description": "bound browser tab"},
                 "ref": {"type": "string", "description": "browser element ref"},
                 "url": {"type": "string"},
