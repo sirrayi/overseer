@@ -557,6 +557,10 @@ impl Agent {
             });
         let log = EventLog::open(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::open(session_dir.join("ledger.jsonl"))?;
+        // The learned review headroom survives resume through the ledger:
+        // every past `memory_review` row that billed reasoning marks its
+        // model, so this process's first review opens at 5,200.
+        let review_reasoners = ledger.review_reasoners.clone();
         let tools = Self::registry(&config);
         let system = crate::prompt::assemble(&config);
         // Seed the spill counter past existing files so resume can't
@@ -598,7 +602,7 @@ impl Agent {
             // so a covered window is never reviewed twice.
             review_cursor: crate::memory::learn::cursor_of(&events),
             learn_floor: crate::memory::learn::remember_floor(&events),
-            review_reasoners: std::collections::HashSet::new(),
+            review_reasoners,
             _live: live,
         };
         // C1b + perm-latch-resume: both Rule-of-Two latches are
@@ -2808,6 +2812,79 @@ mod tests {
             .filter(|r| r.purpose.as_deref() == Some("memory_review"))
             .count();
         assert_eq!(review_rows, calls.len());
+    }
+
+    /// `review_reasoners` is session state, but `exec --resume` is a new
+    /// process every turn: the set is rebuilt from the replayed ledger —
+    /// a `memory_review` row that billed reasoning marks its model, so
+    /// the first post-resume review opens at the headroom limit.
+    #[test]
+    fn resume_seeds_review_reasoners_from_the_ledger() {
+        struct Rec {
+            reviews: Mutex<Vec<(String, u32)>>,
+        }
+        impl Provider for Rec {
+            fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
+                if !req.tools.is_empty() {
+                    return Ok(done());
+                }
+                self.reviews
+                    .lock()
+                    .unwrap()
+                    .push((req.model.to_string(), req.max_tokens));
+                let mut r = done();
+                r.usage.reasoning = 2_000;
+                Ok(r)
+            }
+            fn name(&self) -> &'static str {
+                "rec"
+            }
+        }
+        assert!(!profile::lookup("deepseek-v4.1-flash").reasons());
+        let dir = tmpdir();
+        let (user, project, ws) = (
+            dir.join("user-mem"),
+            dir.join("project-mem"),
+            dir.join("ws"),
+        );
+        crate::memory::ensure(&user).unwrap();
+        crate::memory::ensure(&project).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let cfg = || AgentConfig {
+            cwd: ws.clone(),
+            full_access: true,
+            model: "deepseek-v4.1-flash".into(),
+            small_model: None,
+            memory_dir: Some(project.clone()),
+            user_memory_dir: Some(user.clone()),
+            reflect: ReflectMode::Off,
+            max_cost_usd: 5.0,
+            ..AgentConfig::default()
+        };
+        let p = Arc::new(Rec {
+            reviews: Mutex::new(Vec::new()),
+        });
+        let sdir = dir.join("s");
+        {
+            let mut agent = Agent::start(p.clone(), cfg(), sdir.clone(), "s".into()).unwrap();
+            agent
+                .run_turn("remember that tea beats coffee", &mut |_: &Event| {})
+                .unwrap();
+        }
+        let mut agent = Agent::resume(p.clone(), cfg(), sdir).unwrap();
+        agent
+            .run_turn("remember that coffee beats tea", &mut |_: &Event| {})
+            .unwrap();
+        let calls = p.reviews.lock().unwrap().clone();
+        assert_eq!(
+            calls.as_slice(),
+            [
+                ("deepseek-v4.1-flash".to_string(), 1_200),
+                ("deepseek-v4.1-flash".to_string(), 5_200),
+            ],
+            "the fresh agent's review runs at 1,200; the resumed agent's \
+             opens at 5,200, seeded from the ledger"
+        );
     }
 
     fn tmpdir() -> PathBuf {

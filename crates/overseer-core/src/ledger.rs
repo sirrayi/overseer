@@ -150,6 +150,10 @@ pub struct Ledger {
     /// Per task id: spend settled so far (replayed on open, so resumes
     /// settle only the delta).
     settled: std::collections::HashMap<String, f64>,
+    /// Models observed billing reasoning on a `memory_review` row —
+    /// replayed on open so a resumed agent's first review opens at the
+    /// headroom limit (they reasoned once; they will reason again).
+    pub review_reasoners: std::collections::HashSet<String>,
 }
 
 impl Ledger {
@@ -168,6 +172,7 @@ impl Ledger {
             calls: 0,
             cache: CacheStats::default(),
             settled: Default::default(),
+            review_reasoners: Default::default(),
         })
     }
 
@@ -184,6 +189,7 @@ impl Ledger {
             calls: 0,
             cache: CacheStats::default(),
             settled: Default::default(),
+            review_reasoners: Default::default(),
         };
         // Tally existing rows so a resumed session keeps a running total.
         let existing = std::fs::read_to_string(&ledger.path).unwrap_or_default();
@@ -207,6 +213,9 @@ impl Ledger {
                 self.cache.add(r);
                 if r.purpose.as_deref() == Some(REVIEW_PURPOSE) {
                     self.review_cost_usd += r.cost_usd;
+                    if r.reasoning > 0 {
+                        self.review_reasoners.insert(r.model.clone());
+                    }
                 }
             }
         }
