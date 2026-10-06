@@ -5,6 +5,7 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -15,6 +16,10 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 /// Logs get middle-truncated within the inline cap (errors cluster at tail).
 const LOG_TRUNC: usize = 20_000;
+/// How long the reader joins wait for EOF once the group is dead.
+const JOIN_GRACE: Duration = Duration::from_millis(500);
+const BG_NOTE: &str =
+    "(a background process is still running; its output after this point is not captured)";
 
 pub fn spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
@@ -68,8 +73,8 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         Err(e) => return ToolOutput::err(e),
     };
 
-    let mut child = match Command::new(&prog)
-        .args(&args)
+    let mut cmd = Command::new(&prog);
+    cmd.args(&args)
         .current_dir(&ctx.cwd)
         .env_clear()
         .envs(child_env())
@@ -79,44 +84,76 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
         .envs(broker_env(ctx))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // Own process group (the wrapper's, under bwrap/seatbelt): dash keeps
+    // `cmd &` jobs and subshells as separate processes in it, so killing
+    // only the direct child would orphan grandchildren that hold the pipes.
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return ToolOutput::err(format!("Failed to spawn shell: {e}")),
     };
+    let pgid = child.id();
 
-    // Read pipes on threads to avoid pipe-buffer deadlock.
-    let mut out_pipe = child.stdout.take().unwrap();
-    let mut err_pipe = child.stderr.take().unwrap();
-    let out_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = out_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let err_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = err_pipe.read_to_end(&mut buf);
-        buf
-    });
+    // Reader threads drain the pipes so a chatty child never blocks on a
+    // full buffer; they report EOF on a channel so the join below can give
+    // up on a pipe a process outside the group keeps open.
+    let out_buf = Arc::new(Mutex::new(Some(Vec::new())));
+    let err_buf = Arc::new(Mutex::new(Some(Vec::new())));
+    let (done_tx, done_rx) = mpsc::channel();
+    drain(child.stdout.take(), out_buf.clone(), done_tx.clone());
+    drain(child.stderr.take(), err_buf.clone(), done_tx);
 
     let deadline = Instant::now() + Duration::from_millis(timeout);
     let status = loop {
         match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
+            Ok(Some(s)) => {
+                // `sh` is done; whatever it left in the group goes with it.
+                kill_group(pgid);
+                break Some(s);
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    // Kill the group before reaping (an unreaped pid can't
+                    // be reused); the direct kill is the fallback.
+                    kill_group(pgid);
                     let _ = child.kill();
+                    let _ = child.wait();
                     break None;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(e) => return ToolOutput::err(format!("Failed waiting on command: {e}")),
+            Err(e) => {
+                kill_group(pgid);
+                let _ = child.kill();
+                let _ = child.wait();
+                return ToolOutput::err(format!("Failed waiting on command: {e}"));
+            }
         }
     };
 
-    let stdout = String::from_utf8_lossy(&out_thread.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&err_thread.join().unwrap_or_default()).into_owned();
+    let join_by = Instant::now() + JOIN_GRACE;
+    let mut open = 2;
+    while open > 0 {
+        match done_rx.recv_timeout(join_by.saturating_duration_since(Instant::now())) {
+            Ok(()) => open -= 1,
+            Err(_) => break,
+        }
+    }
+    let background = open > 0;
+    let take = |b: &Arc<Mutex<Option<Vec<u8>>>>| {
+        let bytes = b
+            .lock()
+            .map(|mut g| g.take().unwrap_or_default())
+            .unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let stdout = take(&out_buf);
+    let stderr = take(&err_buf);
 
     let (status_text, is_error) = match status {
         Some(s) if s.success() => (format!("exit {}", s.code().unwrap_or(0)), false),
@@ -137,6 +174,10 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     if body.is_empty() {
         body.push_str("(no output)");
     }
+    if background {
+        body.push('\n');
+        body.push_str(BG_NOTE);
+    }
 
     let text = match note {
         Some(n) => format!("{status_text}\n[{n}]\n{body}"),
@@ -146,6 +187,54 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     o.is_error = is_error;
     o
 }
+
+/// Drain one pipe into `buf`, signalling `done` at EOF. Once the caller
+/// has taken the buffer (`None`), later bytes are read and discarded so a
+/// detached writer neither blocks nor grows memory.
+fn drain(
+    pipe: Option<impl Read + Send + 'static>,
+    buf: Arc<Mutex<Option<Vec<u8>>>>,
+    done: mpsc::Sender<()>,
+) {
+    std::thread::spawn(move || {
+        if let Some(mut p) = pipe {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match p.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut g) = buf.lock() {
+                            if let Some(v) = g.as_mut() {
+                                v.extend_from_slice(&chunk[..n]);
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        let _ = done.send(());
+    });
+}
+
+/// SIGKILL the process group `pgid` (spawned with `process_group(0)`).
+#[cfg(unix)]
+fn kill_group(pgid: u32) {
+    extern "C" {
+        fn killpg(pgrp: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    if let Ok(pgid) = i32::try_from(pgid) {
+        // SAFETY: plain syscall wrapper; a stale or empty group is ESRCH.
+        unsafe {
+            killpg(pgid, SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pgid: u32) {}
 
 /// Declared broker secrets as (selector, real) env pairs for the child.
 /// Empty without a broker — the allowlisted env above is untouched.
@@ -587,6 +676,60 @@ mod tests {
             sandbox,
             broker: None,
         }
+    }
+
+    /// T1 under the platform sandbox wrapper: the group is the wrapper's,
+    /// so a detached grandchild can't hold the call open.
+    #[cfg(unix)]
+    #[test]
+    fn sandboxed_bash_returns_despite_a_detached_grandchild() {
+        let dir = std::env::temp_dir().join(format!("overseer-bash-pg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = ctx(&dir, true);
+        let start = Instant::now();
+        let out = run(&json!({ "command": "(sleep 20 &); echo ok" }), &mut c);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        if !out.is_error {
+            assert!(out.text.contains("ok"), "{}", out.text);
+        }
+        let start = Instant::now();
+        let _ = run(
+            &json!({ "command": "sleep 15 & wait", "timeout_ms": 1000 }),
+            &mut c,
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A process that leaves the group (`setsid`) and keeps the pipes is
+    /// reported, not waited for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_setsid_escapee_holding_the_pipes_gets_the_background_note() {
+        let dir = std::env::temp_dir().join(format!("overseer-bash-bg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = ctx(&dir, false);
+        let start = Instant::now();
+        let out = run(
+            &json!({ "command": "echo first; setsid sleep 5 &" }),
+            &mut c,
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(out.text.contains("first"), "{}", out.text);
+        assert!(out.text.contains(BG_NOTE), "{}", out.text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Re-runs this test in a child test process whose env carries a
