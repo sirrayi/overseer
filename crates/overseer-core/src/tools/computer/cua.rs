@@ -108,23 +108,26 @@ impl CoordFrame {
         }
     }
 
-    /// `origin + v × driver/sent`, clamped into the driver frame; a
-    /// zero-sided frame passes the value through rounded.
-    fn map(&self, x: f64, y: f64) -> (i64, i64) {
-        let conv = |v: f64, sent: u32, drv: u32, o: f64| -> i64 {
+    /// `origin + v × driver/sent`; a point outside the driver frame is
+    /// refused, never clamped onto the edge. A zero-sided frame passes the
+    /// value through rounded.
+    fn map(&self, x: f64, y: f64) -> Result<(i64, i64), CallErr> {
+        let conv = |v: f64, sent: u32, drv: u32, o: f64| -> Option<i64> {
             if sent == 0 || drv == 0 {
-                return v.round() as i64;
+                return Some(v.round() as i64);
             }
-            let out = o + v * f64::from(drv) / f64::from(sent);
-            if !out.is_finite() {
-                return 0;
-            }
-            (out.round() as i64).clamp(0, i64::from(drv) - 1)
+            let out = (o + v * f64::from(drv) / f64::from(sent)).round();
+            (out.is_finite() && out >= 0.0 && out < f64::from(drv)).then_some(out as i64)
         };
-        (
+        match (
             conv(x, self.sent.0, self.driver.0, self.origin.0),
             conv(y, self.sent.1, self.driver.1, self.origin.1),
-        )
+        ) {
+            (Some(nx), Some(ny)) => Ok((nx, ny)),
+            _ => Err(CallErr::Refused(
+                "computer: point is outside the last screenshot — take a fresh screenshot".into(),
+            )),
+        }
     }
 }
 
@@ -133,13 +136,13 @@ impl CoordFrame {
 /// `from_zoom:true` and the driver translates them back to full-window
 /// space — the only correct mapping, since the crop carries the
 /// driver's own 20% padding we cannot reproduce locally (F3).
-const FROM_ZOOM_TOOLS: &[&str] = &["click", "right_click", "double_click", "drag"];
+const FROM_ZOOM_TOOLS: &[&str] = &["click", "drag"];
 
 /// Live driver session: the stdio client plus the per-window snapshot and
 /// browser-tab bookkeeping later calls need.
 pub struct Live {
     client: StdioClient,
-    /// `ovs-<8 chars of the overseer session id>` (D2).
+    /// `ovs-<8 hex of sha256(session path)>` (D2).
     session: String,
     /// One `check_permissions` probe per client lifetime (D6).
     perm_checked: bool,
@@ -149,15 +152,15 @@ pub struct Live {
     /// `from_zoom:true` until the next `screenshot` or `observe` (F3).
     zoomed: bool,
     /// (pid, window_id) → the last observation's snapshot handle and
-    /// element-index → element_token map. A bare element_index is refused
-    /// by the driver, so the token (preferred) or the snapshot id rides
-    /// along on every element-targeted call.
+    /// element-index → element_token map. The token rides along on every
+    /// element-targeted call; an index without one is refused locally.
     snaps: HashMap<(u64, u64), Snap>,
     /// Browser `tab_id` → `target_id` minted by the bind call.
     tabs: HashMap<String, String>,
 }
 
 struct Snap {
+    #[cfg(test)]
     id: Option<String>,
     tokens: HashMap<i64, String>,
     /// element_index → {x,y,w,h} bounds — only the live coordinate test
@@ -211,16 +214,18 @@ pub fn spawn(path: &Path, ctx: &ToolCtx) -> Result<Live, String> {
     })
 }
 
-/// `ovs-<8 chars of the overseer session id>` — the label the driver uses
-/// to scope snapshots, browser targets and refs (D2).
+/// `ovs-<first 8 hex of sha256(canonical session path)>` — the label the
+/// driver uses to scope snapshots, browser targets and refs (D2). The full
+/// path, not the dir name: session names share timestamp prefixes and
+/// every subagent dir is `task-<n>`.
 fn session_label(ctx: &ToolCtx) -> String {
-    let id = ctx
+    use sha2::{Digest, Sha256};
+    let path = ctx
         .session_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    let short: String = id.chars().take(8).collect();
-    format!("ovs-{short}")
+        .canonicalize()
+        .unwrap_or_else(|_| ctx.session_dir.clone());
+    let hex = format!("{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes()));
+    format!("ovs-{}", &hex[..8])
 }
 
 impl Live {
@@ -459,9 +464,9 @@ fn u64_of(input: &Value, key: &str) -> Option<u64> {
     })
 }
 
-/// Element addressing (D3): the driver refuses a bare `element_index`, so
-/// the last observation's `element_token` (preferred) or `snapshot_id` +
-/// `element_index` rides along. Coordinates map through the recorded
+/// Element addressing (D3): the last observation's `element_token` rides
+/// along; an index with no remembered token is refused locally (the 0.34
+/// schemas take no `element_index`). Coordinates map through the recorded
 /// [`CoordFrame`] — and after a `zoom`, pointer acts carry `from_zoom`
 /// verbatim so the driver translates the crop space itself (F2/F3).
 fn target(
@@ -478,20 +483,16 @@ fn target(
         };
         let pid = u64_of(input, "pid").unwrap_or(0);
         let wid = u64_of(input, "window_id").unwrap_or(0);
-        match d.snaps.get(&(pid, wid)) {
-            Some(s) if s.tokens.contains_key(&(el as i64)) => {
-                args.insert("element_token".into(), json!(s.tokens[&(el as i64)]));
-            }
-            Some(s) => {
-                args.insert("element_index".into(), json!(el));
-                if let Some(id) = &s.id {
-                    args.insert("snapshot_id".into(), json!(id));
-                }
-            }
-            None => {
-                args.insert("element_index".into(), json!(el));
-            }
-        }
+        let Some(token) = d
+            .snaps
+            .get(&(pid, wid))
+            .and_then(|s| s.tokens.get(&(el as i64)))
+        else {
+            return Err(CallErr::Refused(format!(
+                "computer: element {el} is unknown — observe again"
+            )));
+        };
+        args.insert("element_token".into(), json!(token));
         return Ok(());
     }
     if let (Some(x), Some(y)) = (
@@ -499,6 +500,11 @@ fn target(
         input.get("y").and_then(Value::as_f64),
     ) {
         if d.zoomed {
+            if matches!(tool, "right_click" | "double_click") {
+                return Err(CallErr::Refused(
+                    "computer: re-take a full screenshot before right/double click".into(),
+                ));
+            }
             if !FROM_ZOOM_TOOLS.contains(&tool) {
                 return Err(CallErr::Refused(format!(
                     "computer: x/y in a zoom crop can't be translated for '{tool}' — take a fresh \
@@ -512,11 +518,10 @@ fn target(
             args.insert("from_zoom".into(), json!(true));
             return Ok(());
         }
-        let (nx, ny) = d
-            .frame
-            .as_ref()
-            .map(|f| f.map(x, y))
-            .unwrap_or_else(|| (x.round() as i64, y.round() as i64));
+        let (nx, ny) = match d.frame.as_ref() {
+            Some(f) => f.map(x, y)?,
+            None => (x.round() as i64, y.round() as i64),
+        };
         args.insert("x".into(), json!(nx));
         args.insert("y".into(), json!(ny));
     }
@@ -605,8 +610,8 @@ fn observe(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
     let r = call(d, "get_window_state", a, input)?;
     // A fresh full observation ends the zoom frame (F3).
     d.zoomed = false;
-    // Remember the snapshot: `element` acts address through element_token
-    // (preferred) or snapshot_id — a bare index is refused by the driver.
+    // Remember the snapshot: `element` acts address through element_token —
+    // an index with no remembered token is refused locally.
     let els = shape::parse_elements(&r);
     let key = (
         u64_of(input, "pid").unwrap_or(0),
@@ -615,6 +620,7 @@ fn observe(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
     d.snaps.insert(
         key,
         Snap {
+            #[cfg(test)]
             id: r
                 .pointer("/structuredContent/snapshot_id")
                 .and_then(Value::as_str)
@@ -694,7 +700,7 @@ fn screenshot(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallE
         .get("max")
         .and_then(Value::as_u64)
         .unwrap_or(1280)
-        .clamp(1, 8192);
+        .clamp(1, 8000);
     a.insert("max_dimension".into(), json!(max));
     let r = call(d, "get_window_state", a, input)?;
     capture_envelope(d, ctx, "screenshot", &r)
@@ -913,18 +919,25 @@ fn key(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
     let mut a = Map::new();
     put(&mut a, "pid", input)?;
     put(&mut a, "window_id", input)?;
-    let (tool, a) = if keys.contains('+') {
-        a.insert(
-            "keys".into(),
-            json!(keys
-                .split('+')
-                .map(|k| k.trim())
-                .filter(|k| !k.is_empty())
-                .collect::<Vec<_>>()),
-        );
+    // A trailing `+` after a separator (`cmd++`), or a bare `+`, is the
+    // plus key itself.
+    let (body, plus) = match keys.strip_suffix('+') {
+        Some(rest) if rest.is_empty() || rest.ends_with('+') => (rest, true),
+        _ => (keys, false),
+    };
+    let mut parts: Vec<&str> = body
+        .split('+')
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .collect();
+    if plus {
+        parts.push("+");
+    }
+    let (tool, a) = if parts.len() >= 2 {
+        a.insert("keys".into(), json!(parts));
         ("hotkey", a)
     } else {
-        a.insert("key".into(), json!(keys));
+        a.insert("key".into(), json!(parts.first().copied().unwrap_or(keys)));
         ("press_key", a)
     };
     act(d, tool, a, input, ctx)
@@ -971,16 +984,14 @@ fn drag(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
         a.insert("to_y".into(), json!(num("to_y")));
         a.insert("from_zoom".into(), json!(true));
     } else {
-        let (fx, fy) = d
-            .frame
-            .as_ref()
-            .map(|f| f.map(num("x"), num("y")))
-            .unwrap_or_else(|| (num("x").round() as i64, num("y").round() as i64));
-        let (tx, ty) = d
-            .frame
-            .as_ref()
-            .map(|f| f.map(num("to_x"), num("to_y")))
-            .unwrap_or_else(|| (num("to_x").round() as i64, num("to_y").round() as i64));
+        let (fx, fy) = match d.frame.as_ref() {
+            Some(f) => f.map(num("x"), num("y"))?,
+            None => (num("x").round() as i64, num("y").round() as i64),
+        };
+        let (tx, ty) = match d.frame.as_ref() {
+            Some(f) => f.map(num("to_x"), num("to_y"))?,
+            None => (num("to_x").round() as i64, num("to_y").round() as i64),
+        };
         a.insert("from_x".into(), json!(fx));
         a.insert("from_y".into(), json!(fy));
         a.insert("to_x".into(), json!(tx));
@@ -1397,7 +1408,15 @@ done
         assert!(text.contains("12  kworker"), "{text}");
         assert!(!text.contains("NotRunning"), "{text}");
         // Every request (initialize excluded) carries the session label.
-        let label = format!("ovs-{}", "session");
+        let hex = {
+            use sha2::{Digest, Sha256};
+            let path = c
+                .session_dir
+                .canonicalize()
+                .unwrap_or_else(|_| c.session_dir.clone());
+            format!("{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes()))
+        };
+        let label = format!("ovs-{}", &hex[..8]);
         for req in req_lines(&log) {
             if req.contains("\"method\":\"tools/call\"") {
                 assert!(
@@ -1850,7 +1869,7 @@ done
     #[test]
     fn stale_element_says_run_observe_again() {
         let dir = tmpdir("stale");
-        let (driver, _log) = fake_driver(&dir, "fake.sh", "");
+        let (driver, log) = fake_driver(&dir, "fake.sh", "");
         let mut st = state(&driver);
         let c = ctx(&dir);
         run_ok(
@@ -1859,15 +1878,21 @@ done
             &mut st,
         )
         .unwrap();
-        // element 99 has no remembered token → element_index+snapshot_id;
-        // the fake refuses it as stale.
+        // element 99 has no remembered token → refused locally, never sent.
         let err = run(
             &json!({"action": "click", "pid": 11, "window_id": 101, "element": 99}),
             &c,
             &mut st,
         )
         .unwrap_err();
-        assert!(err.contains("is stale — run observe again"), "{err}");
+        assert!(
+            err.contains("element 99 is unknown — observe again"),
+            "{err}"
+        );
+        assert!(
+            !req_lines(&log).iter().any(|r| r.contains("element_index")),
+            "unknown index reached the driver"
+        );
     }
 
     #[test]
