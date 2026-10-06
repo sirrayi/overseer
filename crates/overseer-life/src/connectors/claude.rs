@@ -185,6 +185,20 @@ fn push_limit(
     resets: Option<&Value>,
     mins: u32,
 ) {
+    // A negative reading is invalid, not "0 % used": drop it and mark the
+    // snapshot degraded (Malformed) while keeping the windows that parsed.
+    let percent = match percent {
+        Some(p) if p < 0.0 => {
+            if matches!(snap.status, Status::Ok) {
+                snap.status = Status::Error {
+                    kind: ErrorKind::Malformed,
+                    message: format!("{label}: negative utilization dropped"),
+                };
+            }
+            None
+        }
+        p => p,
+    };
     let used_percent = clamp_percent(percent);
     let resets_at_ms = iso_to_ms(resets);
     if used_percent.is_none() && resets_at_ms.is_none() {

@@ -67,11 +67,21 @@ pub enum Trigger {
         allow_senders: Vec<String>,
         limiter: webhook::RateLimiter,
         offset: Option<i64>,
+        /// Durable copy of `offset`, so a restart never re-delivers.
+        state: PathBuf,
     },
 }
 
 impl Trigger {
+    /// Build a trigger whose durable state lives under the default daemon
+    /// dir (`~/.overseer/daemon/channels`).
     pub fn from_spec(spec: &TriggerSpec) -> Self {
+        Self::from_spec_in(spec, &default_state_dir())
+    }
+
+    /// Build a trigger whose durable state (the Telegram offset) lives in
+    /// `state_dir`.
+    pub fn from_spec_in(spec: &TriggerSpec, state_dir: &Path) -> Self {
         let now = now_ms();
         match spec {
             TriggerSpec::Interval {
@@ -138,16 +148,20 @@ impl Trigger {
                 spec: spec.clone(),
                 limiter: webhook::RateLimiter::new(spec.rate_per_min),
             },
-            TriggerSpec::Telegram(spec) => Trigger::Telegram {
-                id: spec.id.clone(),
-                spec: spec.clone(),
-                client: telegram::Telegram::from_env(&spec.token_env)
-                    .ok()
-                    .map(|c| c.with_base(spec.base.clone())),
-                allow_senders: spec.allow_senders.clone(),
-                limiter: webhook::RateLimiter::new(spec.rate_per_min),
-                offset: None,
-            },
+            TriggerSpec::Telegram(spec) => {
+                let state = telegram_state_path(state_dir, spec);
+                Trigger::Telegram {
+                    id: spec.id.clone(),
+                    spec: spec.clone(),
+                    client: telegram::Telegram::from_env(&spec.token_env)
+                        .ok()
+                        .map(|c| c.with_base(spec.base.clone())),
+                    allow_senders: spec.allow_senders.clone(),
+                    limiter: webhook::RateLimiter::new(spec.rate_per_min),
+                    offset: load_offset(&state),
+                    state,
+                }
+            }
         }
     }
 
@@ -340,20 +354,34 @@ impl Trigger {
                 allow_senders,
                 limiter,
                 offset,
+                state,
             } => {
-                let Some(client) = client.as_ref() else {
+                let Some(bot) = client.as_ref() else {
                     return Vec::new();
                 };
-                let polled = match client.poll(*offset) {
+                let polled = match bot.poll(*offset) {
                     Ok(p) => p,
                     Err(e) => return vec![channels::rejection_event("telegram", &e)],
                 };
-                // Advance the offset first: a re-poll must never re-deliver
-                // the same update, even if a message below is refused.
-                if polled.next_offset.is_some() {
-                    *offset = polled.next_offset;
+                if polled.overflowed {
+                    *client = None;
+                    return vec![channels::rejection_event(
+                        "telegram",
+                        "update_id overflows the offset; polling stopped",
+                    )];
                 }
                 let mut events = Vec::new();
+                // Advance the offset first: a re-poll must never re-deliver
+                // the same update, even if a message below is refused.
+                if polled.next_offset.is_some() && polled.next_offset != *offset {
+                    *offset = polled.next_offset;
+                    if let Err(e) = save_offset(state, polled.next_offset) {
+                        events.push(channels::rejection_event(
+                            "telegram",
+                            &format!("offset not persisted: {e}"),
+                        ));
+                    }
+                }
                 for inbound in polled.messages {
                     if !webhook::sender_allowed(allow_senders, &inbound.sender) {
                         events.push(channels::rejection_event(
@@ -397,8 +425,8 @@ fn poll_webhook(
     files.sort();
     let mut events = Vec::new();
     for path in files {
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let outcome = webhook::parse_request(&text)
+        let outcome = read_spool_record(&path)
+            .and_then(|text| webhook::parse_request(&text))
             .and_then(|req| webhook::ingest(spec, secret, &req, limiter, now));
         match outcome {
             Ok(ev) => events.push(ev),
@@ -412,6 +440,60 @@ fn poll_webhook(
         let _ = std::fs::rename(&path, done);
     }
     events
+}
+
+/// Largest spool record read: the body cap plus worst-case JSON escaping
+/// (`\u00XX` is six bytes per byte) and room for the signature.
+const MAX_SPOOL_RECORD: u64 = webhook::MAX_BODY_BYTES as u64 * 6 + 64 * 1024;
+
+fn read_spool_record(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("webhook: spool read: {e}"))?;
+    let mut text = String::new();
+    file.take(MAX_SPOOL_RECORD + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("webhook: spool read: {e}"))?;
+    if text.len() as u64 > MAX_SPOOL_RECORD {
+        return Err("webhook: spool record exceeds the size cap".into());
+    }
+    Ok(text)
+}
+
+/// `$HOME/.overseer/daemon/channels` — the CLI's default daemon root.
+fn default_state_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".overseer/daemon/channels")
+}
+
+/// One offset file per bot identity (id, token variable, API base), so a
+/// different bot never inherits another's offset. Names only — no token.
+fn telegram_state_path(dir: &Path, spec: &TelegramSpec) -> PathBuf {
+    let key = format!("{}\n{}\n{}", spec.id, spec.token_env, spec.base);
+    let digest = webhook::hex(&webhook::sha256(key.as_bytes())[..8]);
+    dir.join(format!("telegram-{digest}.offset"))
+}
+
+fn load_offset(path: &Path) -> Option<i64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Write-to-temp + fsync + rename: a crash leaves the old offset or the
+/// new one, never a torn file.
+fn save_offset(path: &Path, offset: Option<i64>) -> std::io::Result<()> {
+    use std::io::Write;
+    let Some(offset) = offset else {
+        return Ok(());
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("offset.tmp.{}", std::process::id()));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(offset.to_string().as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
 }
 
 fn mtime_ms(path: &Path) -> u64 {
@@ -688,8 +770,8 @@ impl CivilTime {
     /// Resolve an epoch-ms timestamp to local civil time. `None` before
     /// 1970 (nothing schedulable lives there).
     pub fn from_epoch_ms(ms: u64) -> Option<Self> {
-        let offset_min = crate::gate::tz_offset_min();
-        let secs = (ms / 1000) as i64 + offset_min * 60;
+        let offset_s = crate::gate::tz_offset_min().checked_mul(60)?;
+        let secs = i64::try_from(ms / 1000).ok()?.checked_add(offset_s)?;
         if secs < 0 {
             return None;
         }

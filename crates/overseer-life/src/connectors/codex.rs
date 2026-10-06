@@ -24,6 +24,8 @@ const KEYCHAIN_SERVICE: &str = "Codex Auth";
 const LAST_REFRESH_MAX_AGE_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 /// Credits are counted, not dollars; $0.04 each is OpenAI's list price.
 const CREDIT_LIST_PRICE_USD: f64 = 0.04;
+/// Ten years: a longer `reset_after_seconds` is treated as unknown.
+const MAX_RESET_AFTER_S: f64 = 10.0 * 365.0 * 86_400.0;
 
 struct CodexAuth {
     access_token: String,
@@ -156,9 +158,10 @@ fn parse_usage(
         let used_percent =
             clamp_percent(header(hdr)).or_else(|| clamp_percent(as_f64(&window["used_percent"])));
         let resets_at_ms = unix_seconds_to_ms(as_f64(&window["reset_at"])).or_else(|| {
+            // Upstream data: anything past ten years is nonsense, not a reset.
             as_f64(&window["reset_after_seconds"])
-                .filter(|s| *s > 0.0)
-                .map(|s| ctx.now_ms + (s * 1000.0) as i64)
+                .filter(|s| *s > 0.0 && *s <= MAX_RESET_AFTER_S)
+                .and_then(|s| ctx.now_ms.checked_add((s * 1000.0) as i64))
         });
         let minutes = as_f64(&window["limit_window_seconds"])
             .map(|s| (s / 60.0).round() as u32)

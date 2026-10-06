@@ -30,7 +30,8 @@ use crate::connector::{Connector, ConnectorInfo, Ctx, Discovered};
 use crate::creds::{self, base64url_encode};
 use crate::http::{form_encode, is_auth_failure, Body, HttpError, Method, Request};
 use crate::snapshot::{
-    as_f64, as_str, ErrorKind, Metric, Provenance, ProvenanceKind, Snapshot, SourceId, Status,
+    as_f64, as_non_negative, as_str, ErrorKind, Metric, Provenance, ProvenanceKind, Snapshot,
+    SourceId, Status,
 };
 use crate::time::utc_day;
 use sha2::{Digest, Sha256};
@@ -615,7 +616,7 @@ pub fn counts(
         ("tweet_count", "posts"),
         ("listed_count", "listed"),
     ] {
-        if let Some(v) = as_f64(&metrics_v[field]) {
+        if let Some(v) = as_non_negative(&metrics_v[field]) {
             snap.metrics.push(Metric {
                 name: name.into(),
                 value: v,
