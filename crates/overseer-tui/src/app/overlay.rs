@@ -91,6 +91,23 @@ pub(crate) fn transcript_lines(
         .collect()
 }
 
+/// A permission dialog's bash command, one `$ ` row per line.
+pub(crate) fn command_lines(cmd: &str, query: &str, width: u16) -> Vec<Line<'static>> {
+    let q = query.to_lowercase();
+    cmd.lines()
+        .filter(|l| q.is_empty() || l.to_lowercase().contains(&q))
+        .flat_map(|l| {
+            crate::cells::wrap_styled(
+                vec![
+                    Span::styled("$ ", crate::theme::dialog_key()),
+                    Span::styled(l.to_string(), crate::theme::dialog()),
+                ],
+                width.max(8) as usize,
+            )
+        })
+        .collect()
+}
+
 /// Files tracked by checkpoint manifests → `/diff` rows (earliest
 /// snapshot vs current working-tree content).
 pub(crate) fn collect_diff_rows(session_dir: &std::path::Path) -> Vec<DiffRow> {
@@ -374,7 +391,32 @@ impl App {
             query: String::new(),
             scroll: usize::MAX, // clamped to the tail on first render
             expand_tools: false,
+            command: None,
         });
+    }
+
+    /// Tab on a permission dialog: every line of the bash command in
+    /// the transcript pager, from the top. The dialog stays pending.
+    pub(crate) fn open_command_view(&mut self, cmd: String) {
+        self.overlay = Some(Overlay::Transcript {
+            query: String::new(),
+            scroll: 0,
+            expand_tools: false,
+            command: Some(cmd),
+        });
+    }
+
+    /// The overlay owns the live region unless a dialog waits — then
+    /// only the dialog's own command view may cover it.
+    pub(crate) fn overlay_shown(&self) -> bool {
+        self.dialog.is_none()
+            || matches!(
+                self.overlay,
+                Some(Overlay::Transcript {
+                    command: Some(_),
+                    ..
+                })
+            )
     }
 
     /// `/diff`: every path a checkpoint manifest records, earliest
@@ -672,21 +714,30 @@ impl App {
                 query,
                 scroll,
                 expand_tools,
+                command,
             } => {
-                let all = transcript_lines(self, query, width, *expand_tools);
+                let (all, win) = match command {
+                    Some(cmd) => (
+                        command_lines(cmd, query, width),
+                        (self.view_h as usize).saturating_sub(2).max(4),
+                    ),
+                    None => (transcript_lines(self, query, width, *expand_tools), 4),
+                };
                 let n = all.len();
                 let mut out = vec![Line::from(vec![
                     Span::styled("/ ", theme::dialog_key()),
                     Span::styled(format!("{query}▌"), theme::dialog()),
                 ])];
                 // Scroll is a line offset; usize::MAX (fresh open) means tail.
-                let max = n.saturating_sub(4);
+                let max = n.saturating_sub(win);
                 let start = (*scroll).min(max);
-                out.extend(all.into_iter().skip(start).take(4));
-                out.push(Line::from(Span::styled(
-                    format!("{n} lines · type to filter · ↑↓/pgdn · tab expand tools · esc"),
-                    theme::dim(),
-                )));
+                out.extend(all.into_iter().skip(start).take(win));
+                let hint = if command.is_some() {
+                    format!("{n} lines · type to filter · ↑↓/pgdn · esc back to the prompt")
+                } else {
+                    format!("{n} lines · type to filter · ↑↓/pgdn · tab expand tools · esc")
+                };
+                out.push(Line::from(Span::styled(hint, theme::dim())));
                 out
             }
             Overlay::Diff {

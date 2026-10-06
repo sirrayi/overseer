@@ -121,6 +121,9 @@ pub enum Overlay {
         scroll: usize,
         /// `x`-key toggle: render tool output under each tool cell.
         expand_tools: bool,
+        /// Tab from a permission dialog: page this bash command
+        /// instead of the transcript; Esc returns to the dialog.
+        command: Option<String>,
     },
     /// `/diff`: files touched by write/edit since their first checkpoint.
     Diff {
@@ -329,7 +332,7 @@ impl App {
     pub fn transcript_plain(&self) -> String {
         let mut out = String::new();
         for c in &self.history {
-            let p = c.plain();
+            let p = crate::notify::sanitize(&c.plain());
             if !p.is_empty() {
                 out.push_str(&p);
                 out.push('\n');
@@ -958,6 +961,37 @@ mod tests {
             "m".into(),
             PathBuf::from("/tmp/ovw-sess"),
         )
+    }
+
+    #[test]
+    fn dialog_tab_pages_the_full_bash_command() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = test_app("/tmp");
+        let cmd: String = (1..=10).map(|i| format!("echo {i}\n")).collect();
+        let (tx, rx) = mpsc::channel();
+        app.dialog = Some((
+            Dialog {
+                req: overseer_core::perm::AskRequest {
+                    tool: "bash".into(),
+                    input: serde_json::json!({ "command": cmd }),
+                    reason: String::new(),
+                },
+                opened: Instant::now(),
+                selected: 0,
+            },
+            tx,
+        ));
+        assert_eq!(app.dialog.as_ref().unwrap().0.hidden_lines(), 2);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Transcript { command: Some(c), .. }) if *c == cmd
+        ));
+        assert!(app.overlay_shown());
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.overlay.is_none());
+        assert!(app.dialog.is_some(), "Esc in the viewer must not deny");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

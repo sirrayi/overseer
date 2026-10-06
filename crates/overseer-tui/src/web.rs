@@ -72,6 +72,7 @@ const BODY_CAP: usize = 64 * 1024;
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+const CONN_THREAD: &str = "overseer-web-conn";
 
 /// Security headers on the page + assets. `style-src 'self'` works
 /// because `app.js` styles spans via CSSOM (`el.style.*`) — parser-level
@@ -111,13 +112,16 @@ pub fn run_web_with(cfg: TuiConfig, opts: WebOpts) -> std::io::Result<i32> {
         conns: Arc::new(AtomicUsize::new(0)),
     });
 
+    quiet_conn_panics();
     {
         let ctx = ctx.clone();
         std::thread::spawn(move || loop {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let ctx = ctx.clone();
-                    std::thread::spawn(move || handle_conn(stream, ctx));
+                    let _ = std::thread::Builder::new()
+                        .name(CONN_THREAD.into())
+                        .spawn(move || handle_conn(stream, ctx));
                 }
                 Err(_) => return,
             }
@@ -193,6 +197,20 @@ pub fn run_web_with(cfg: TuiConfig, opts: WebOpts) -> std::io::Result<i32> {
     broadcast(&ctx.clients, "data: {\"bye\":true}\n\n");
     let _ = worker.join();
     Ok(0)
+}
+
+/// A panicking connection thread just drops its socket: the default
+/// hook would print over the user's terminal session.
+fn quiet_conn_panics() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().name() != Some(CONN_THREAD) {
+                prev(info);
+            }
+        }));
+    });
 }
 
 fn bind_port(port: Option<u16>) -> std::io::Result<TcpListener> {
@@ -535,11 +553,12 @@ impl Request {
     /// One query value — `?a=x&b=y` order-agnostic.
     fn query(&self, key: &str) -> Option<String> {
         let q = self.path.split_once('?')?.1;
-        q.split('&').find_map(|kv| {
-            kv.split_once('=').and_then(|(k, v)| {
-                (k == key).then(|| String::from_utf8_lossy(&url_decode(v)).into_owned())
-            })
-        })
+        let v = q.split('&').find_map(|kv| {
+            kv.split_once('=')
+                .filter(|(k, _)| *k == key)
+                .map(|(_, v)| v)
+        })?;
+        url_decode(v).map(|b| String::from_utf8_lossy(&b).into_owned())
     }
 
     fn route(&self) -> &str {
@@ -574,9 +593,13 @@ fn read_request_within(
     let mut head = Vec::with_capacity(1024);
     let mut buf = [0u8; 4096];
     let split = loop {
-        if std::time::Instant::now() >= deadline {
+        let Some(rem) = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|d| !d.is_zero())
+        else {
             return Err(HeadErr::Silent);
-        }
+        };
+        let _ = s.set_read_timeout(Some(rem));
         let n = s.read(&mut buf).map_err(|_| HeadErr::Silent)?;
         if n == 0 {
             return Err(HeadErr::Silent);
@@ -616,10 +639,19 @@ fn read_request_within(
     if cls.len() > 1 {
         return Err(HeadErr::Status(400));
     }
-    let body_len = cls
-        .first()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
+    // No chunked support: any Transfer-Encoding (alone or beside a
+    // Content-Length, the CL.TE shape) is refused outright.
+    if headers.iter().any(|(k, _)| k == "transfer-encoding") {
+        return Err(HeadErr::Status(400));
+    }
+    let body_len = match cls.first() {
+        None => 0,
+        Some(v) if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) => {
+            return Err(HeadErr::Status(400));
+        }
+        // All digits but past usize: over the cap either way.
+        Some(v) => v.parse::<usize>().unwrap_or(usize::MAX),
+    };
     if body_len > BODY_CAP {
         return Err(HeadErr::Status(413));
     }
@@ -907,15 +939,17 @@ fn embedded_asset(name: &str) -> &'static [u8] {
 
 /// Minimal percent-decoder for the `?d=`/`?t=` payloads — `%XX` and
 /// `+` are all the page emits via `encodeURIComponent` (which actually
-/// uses `%20`, but `+` is harmless to support).
-fn url_decode(s: &str) -> Vec<u8> {
+/// uses `%20`, but `+` is harmless to support). Works on bytes; a
+/// malformed escape is `None` (the caller answers 400/401).
+fn url_decode(s: &str) -> Option<Vec<u8>> {
+    let hex = |c: Option<&u8>| c.and_then(|&c| (c as char).to_digit(16)).map(|d| d as u8);
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         out.push(match b[i] {
-            b'%' if i + 2 < b.len() => {
-                let hv = u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap_or(0);
+            b'%' => {
+                let hv = (hex(b.get(i + 1))? << 4) | hex(b.get(i + 2))?;
                 i += 3;
                 hv
             }
@@ -929,7 +963,7 @@ fn url_decode(s: &str) -> Vec<u8> {
             }
         });
     }
-    out
+    Some(out)
 }
 
 // ── input mapping ───────────────────────────────────────────────────
@@ -999,9 +1033,11 @@ fn parse_input(body: &[u8]) -> Option<CtEvent> {
             row: 0,
             modifiers: KeyModifiers::empty(),
         })),
+        // Clamped before the cast: 0 panics frame_json's `chunks`, and
+        // a huge grid is an allocation bomb.
         "resize" => Some(CtEvent::Resize(
-            get("cols")?.as_u64()? as u16,
-            get("rows")?.as_u64()? as u16,
+            get("cols")?.as_u64()?.clamp(20, 500) as u16,
+            get("rows")?.as_u64()?.clamp(5, 200) as u16,
         )),
         "focus" => Some(if get("gained").and_then(|b| b.as_bool()).unwrap_or(true) {
             CtEvent::FocusGained

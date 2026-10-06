@@ -106,6 +106,14 @@ impl App {
                     }
                     Some(None)
                 }
+                (KeyCode::Tab, m)
+                    if m.is_empty() && self.dialog.as_ref().unwrap().0.hidden_lines() > 0 =>
+                {
+                    let (dlg, _) = self.dialog.as_ref().unwrap();
+                    let cmd = dlg.bash_command().unwrap_or_default().to_string();
+                    self.open_command_view(cmd);
+                    Some(None)
+                }
                 (KeyCode::Char(c), m) if m.is_empty() && matches!(c, '1' | '2' | '3' | '4') => {
                     let (dlg, _) = self.dialog.as_ref().unwrap();
                     match dlg.resolve(c) {
