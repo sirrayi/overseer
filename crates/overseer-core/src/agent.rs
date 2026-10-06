@@ -513,6 +513,18 @@ impl Agent {
         config: AgentConfig,
         session_dir: PathBuf,
     ) -> std::io::Result<Self> {
+        // Not a session dir (no regular events.jsonl): refuse before the
+        // live lock creates or chmods anything there.
+        let events_path = session_dir.join("events.jsonl");
+        if !events_path
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_file())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{}: not a session (no events.jsonl)", session_dir.display()),
+            ));
+        }
         // F4: fail fast on a live session — replay is read-only, but a
         // resume that can't write must not get this far anyway.
         let live = crate::live::LiveLock::acquire(&session_dir)?;
@@ -1240,6 +1252,7 @@ impl Agent {
                 && !out.is_error
                 && !out.denied
                 && ran_input.get("op").and_then(serde_json::Value::as_str) == Some("remember")
+                && !crate::memory::learn::is_quarantined_remember(&out.text)
             {
                 self.learn_floor = self.log.last().map(|e| e.id).unwrap_or(self.learn_floor);
             }
