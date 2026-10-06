@@ -44,6 +44,18 @@ pub struct InboxItem {
     /// Snooze wake time; also reused as acted/resolved timestamp.
     #[serde(default)]
     pub until_ms: Option<u64>,
+    /// The producing event was untrusted; an approval keeps its floor.
+    #[serde(default)]
+    pub untrusted: bool,
+}
+
+impl InboxItem {
+    /// Whether acting on this item must carry the untrusted floor. Items
+    /// written before `untrusted` existed fall back to their class: every
+    /// `msg.*` / `channel.*` class is untrusted.
+    pub fn is_untrusted(&self) -> bool {
+        self.untrusted || self.class.starts_with("msg.") || self.class.starts_with("channel.")
+    }
 }
 
 pub struct Inbox {
@@ -210,6 +222,7 @@ mod tests {
             act_prompt: None,
             state,
             until_ms,
+            untrusted: false,
         }
     }
 
@@ -405,6 +418,38 @@ mod tests {
             Some("acted")
         );
         assert_no_tmp(&root);
+    }
+
+    #[test]
+    fn untrusted_field_round_trips_and_old_items_fall_back_to_class() {
+        let (_root, inbox, journal) = setup("trust");
+        let mut flagged = mk("t1", 100, ItemState::Open, None);
+        flagged.class = "note.low".into();
+        flagged.untrusted = true;
+        inbox.open(&journal, flagged).unwrap();
+        let back = inbox.get("t1").unwrap();
+        assert!(back.untrusted && back.is_untrusted());
+
+        let old = |class: &str| -> InboxItem {
+            serde_json::from_value(serde_json::json!({
+                "id": "x", "created_ms": 1, "class": class, "source": "s",
+                "title": "t", "body": "b", "state": "open",
+            }))
+            .unwrap()
+        };
+        for class in [
+            "msg.inbound",
+            "msg.inbound.steer",
+            "channel.rejected",
+            "channel.x",
+        ] {
+            let it = old(class);
+            assert!(!it.untrusted);
+            assert!(it.is_untrusted(), "{class} must keep the floor");
+        }
+        for class in ["note.low", "spawn.deferred", "ci.failed", "message"] {
+            assert!(!old(class).is_untrusted(), "{class} is local");
+        }
     }
 
     #[test]

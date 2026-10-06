@@ -346,6 +346,7 @@ impl Daemon {
             act_prompt: triage.act_prompt.clone(),
             state: ItemState::Open,
             until_ms: None,
+            untrusted: matches!(self.origin_for(ev), Origin::Untrusted(_)),
         };
         if let Err(e) = self.inbox.open(&self.journal, item) {
             self.journal
@@ -423,6 +424,7 @@ impl Daemon {
                 act_prompt: Some(prompt),
                 state: ItemState::Open,
                 until_ms: None,
+                untrusted: matches!(origin, Origin::Untrusted(_)),
             };
             let _ = self.inbox.open(&self.journal, item);
             return;
@@ -556,11 +558,10 @@ impl Daemon {
                     // An approval is the human's decision, but an item
                     // that came from a channel keeps its untrusted origin
                     // (and therefore the autonomy floor).
-                    let origin = match item.class.as_str() {
-                        c if c.starts_with("msg.inbound") => {
-                            Origin::Untrusted(format!("channel:approved:{}", item.source))
-                        }
-                        _ => Origin::Local,
+                    let origin = if item.is_untrusted() {
+                        Origin::Untrusted(format!("channel:approved:{}", item.source))
+                    } else {
+                        Origin::Local
                     };
                     self.spawn_for(prompt, Some(item.id.clone()), origin);
                     let _ = self.inbox.mark_acted(&self.journal, &item.id);
@@ -601,6 +602,7 @@ impl Daemon {
                             act_prompt: None,
                             state: ItemState::Open,
                             until_ms: None,
+                            untrusted: false,
                         };
                         if let Err(e) = self.inbox.open(&self.journal, item) {
                             return CtlResponse::err(e.to_string());

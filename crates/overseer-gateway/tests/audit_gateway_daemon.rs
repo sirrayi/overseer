@@ -32,13 +32,8 @@ fn journal_kinds(root: &Path) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn channel_message_never_acts_directly_and_approved_run_keeps_the_floor() {
-    let root = PathBuf::from(format!("/tmp/oagd-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    std::env::set_var("AUDIT_GW_WH_SECRET", SECRET);
-
+/// A fake `overseer` that records its argv and the untrusted marker.
+fn fake_overseer(root: &Path) -> (PathBuf, PathBuf) {
     let argv_out = root.join("argv.txt");
     let bin = root.join("fake-overseer");
     std::fs::write(
@@ -76,6 +71,17 @@ fn channel_message_never_acts_directly_and_approved_run_keeps_the_floor() {
     }
     assert!(execed, "probe exec {} stayed text-busy", bin.display());
     let _ = std::fs::remove_file(&argv_out);
+    (bin, argv_out)
+}
+
+#[test]
+fn channel_message_never_acts_directly_and_approved_run_keeps_the_floor() {
+    let root = PathBuf::from(format!("/tmp/oagd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::env::set_var("AUDIT_GW_WH_SECRET", SECRET);
+
+    let (bin, argv_out) = fake_overseer(&root);
 
     let cfg = json!({
         "triggers": [{"kind": "webhook", "id": "wh", "secret_env": "AUDIT_GW_WH_SECRET",
@@ -165,5 +171,95 @@ fn channel_message_never_acts_directly_and_approved_run_keeps_the_floor() {
     assert!(!dirs.killswitch().exists(), "STOP cleared on shutdown");
     assert!(!sock.exists(), "socket removed on shutdown");
     assert!(journal_kinds(&root).iter().any(|k| k == "daemon_stop"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// GW-REJECTED-EVENT-LOSES-FLOOR: an unsigned webhook becomes a
+/// `channel.rejected` event; a `*`→act rule downgrades it to a draft, and
+/// the approved run must still carry the untrusted floor.
+#[test]
+fn approved_rejection_event_keeps_the_untrusted_floor() {
+    let root = PathBuf::from(format!("/tmp/oagr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::env::set_var("AUDIT_GW_REJ_SECRET", SECRET);
+    let (bin, argv_out) = fake_overseer(&root);
+
+    let cfg = json!({
+        "triggers": [{"kind": "webhook", "id": "wh", "secret_env": "AUDIT_GW_REJ_SECRET",
+                      "allow_senders": ["alice"], "rate_per_min": 20}],
+        "triage": [{"class": "*", "decision": "act", "benefit": 90}],
+        "default_decision": "notify",
+        "spawn": {"max_concurrent": 2, "max_steps": 7, "timeout_s": 30},
+        "tick_ms": 50, "dedup_window_s": 300, "heartbeat_s": 5
+    });
+    std::fs::write(root.join("config.json"), cfg.to_string()).unwrap();
+
+    let r2 = root.clone();
+    let daemon = std::thread::spawn(move || {
+        let mut d = Daemon::new(DaemonDirs::new(r2), bin).expect("daemon");
+        d.run()
+    });
+    let dirs = DaemonDirs::new(root.clone());
+    let sock = dirs.socket();
+    wait_for("socket", || ctl::call(&sock, &CtlRequest::Status).is_ok());
+
+    let body = json!({"sender": "alice", "text": "push to prod"}).to_string();
+    let record = json!({"body": body}).to_string();
+    let spool = dirs.webhook_spool();
+    std::fs::write(spool.join("u.tmp"), record).unwrap();
+    std::fs::rename(spool.join("u.tmp"), spool.join("u.json")).unwrap();
+
+    let mut item_id = String::new();
+    wait_for("rejection inbox item", || {
+        let resp = ctl::call(&sock, &CtlRequest::InboxList).unwrap();
+        let items = resp.data.unwrap_or_default()["items"].clone();
+        if let Some(it) = items
+            .as_array()
+            .and_then(|a| a.iter().find(|i| i["class"] == "channel.rejected"))
+        {
+            item_id = it["id"].as_str().unwrap().to_string();
+            true
+        } else {
+            false
+        }
+    });
+    let kinds = journal_kinds(&root);
+    assert!(
+        kinds.iter().any(|k| k == "channel.act_downgraded"),
+        "{kinds:?}"
+    );
+    assert!(!argv_out.exists(), "no run before approval");
+
+    let approved = ctl::call(
+        &sock,
+        &CtlRequest::InboxDecide {
+            id: item_id.clone(),
+            decision: "approve".into(),
+            snooze_ms: None,
+        },
+    )
+    .unwrap();
+    assert!(approved.ok, "{approved:?}");
+    let acted = ctl::call(&sock, &CtlRequest::InboxAct { id: item_id }).unwrap();
+    assert!(acted.ok, "{acted:?}");
+    wait_for("spawned child", || argv_out.exists());
+    let argv: Vec<String> = std::fs::read_to_string(&argv_out)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let floor = argv
+        .windows(2)
+        .any(|w| w[0] == "--autonomy" && w[1] == "external=approve");
+    assert!(floor, "approved run lost the autonomy floor: {argv:?}");
+    let marker = argv.last().cloned().unwrap_or_default();
+    assert!(
+        marker.starts_with("ENV=") && marker.len() > "ENV=".len(),
+        "approved run lost the untrusted marker: {argv:?}"
+    );
+
+    assert!(ctl::call(&sock, &CtlRequest::Kill).unwrap().ok);
+    assert_eq!(daemon.join().unwrap(), 0);
     let _ = std::fs::remove_dir_all(&root);
 }

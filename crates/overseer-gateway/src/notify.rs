@@ -432,6 +432,7 @@ mod tests {
             act_prompt: None,
             state: ItemState::Open,
             until_ms: None,
+            untrusted: false,
         }
     }
 
