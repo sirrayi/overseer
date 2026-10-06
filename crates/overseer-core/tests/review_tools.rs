@@ -48,7 +48,6 @@ fn ctx(dir: &Path) -> ToolCtx<'static> {
 /// the pipes — the tool call blocks for the grandchild's whole lifetime
 /// and then still reports `exit 0`.
 #[test]
-#[ignore = "review: T1"]
 fn bash_returns_when_sh_exits_with_a_detached_pipe_holding_grandchild() {
     let ws = tmpdir("bash-grandchild");
     let mut c = ctx(&ws);
@@ -57,7 +56,7 @@ fn bash_returns_when_sh_exits_with_a_detached_pipe_holding_grandchild() {
     let out = bash::run(&json!({ "command": "(sleep 20 &)" }), &mut c);
     let elapsed = start.elapsed();
     assert!(
-        elapsed < Duration::from_secs(10),
+        elapsed < Duration::from_secs(3),
         "bash call blocked {elapsed:?} on an orphaned grandchild's pipes \
          (sh exits at once; the sleep holds stdout/stderr open)"
     );
@@ -90,7 +89,6 @@ fn bash_returns_when_sh_exits_with_a_detached_pipe_holding_grandchild() {
 /// identical call asks again. (The TUI still toasts
 /// "rule saved to ~/.overseer/rules" — app/input.rs.)
 #[test]
-#[ignore = "review: T2"]
 fn allow_session_is_recorded_for_non_bash_tools() {
     let root = tmpdir("session-grant");
     let mut p = Policy::preset(Preset::WorkspaceWrite, root.clone());
@@ -134,7 +132,6 @@ fn allow_session_is_recorded_for_non_bash_tools() {
 /// even shadows the Rule-of-Two Ask ("an explicit user grant beats the
 /// latch", perm.rs:1492-1494).
 #[test]
-#[ignore = "review: T3"]
 fn allow_always_does_not_retarget_a_grant_via_the_turns_suffix() {
     let dir = tmpdir("rules-turns");
     let rules = dir.join("rules");
@@ -179,7 +176,6 @@ fn allow_always_does_not_retarget_a_grant_via_the_turns_suffix() {
 /// write through a hard-linked journal file into its outside alias.
 #[cfg(unix)]
 #[test]
-#[ignore = "review: T4"]
 fn memory_journal_append_does_not_write_through_a_hardlink() {
     use overseer_core::memory::activation;
 

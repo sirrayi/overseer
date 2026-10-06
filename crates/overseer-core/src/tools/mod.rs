@@ -1265,8 +1265,9 @@ pub(crate) fn read_no_follow(target: &Path) -> std::io::Result<String> {
     Ok(buf)
 }
 
-/// Open `target` for appending with `O_NOFOLLOW` (same refusal rule as
-/// [`write_no_follow`], no truncate).
+/// Open `target` for appending with `O_NOFOLLOW` (same refusal rules as
+/// [`write_no_follow`]: a symlinked final component fails the open and a
+/// hard-linked target is refused on the open handle; no truncate).
 pub(crate) fn open_append_no_follow(target: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.append(true).create(true);
@@ -1293,7 +1294,22 @@ pub(crate) fn open_append_no_follow(target: &Path) -> std::io::Result<std::fs::F
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "symlink"));
         }
     }
-    opts.open(target)
+    let f = opts.open(target)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if f.metadata()?.nlink() > 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to append to hard-linked {} (it may alias a file outside the \
+                     workspace)",
+                    target.display()
+                ),
+            ));
+        }
+    }
+    Ok(f)
 }
 
 /// Keep the env pairs whose key passes `keep`. Built on `vars_os` so a
