@@ -40,6 +40,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::{middle_truncate, need_str, opt_u64, schema, ToolCtx, ToolOutput};
 use crate::agent::{AgentConfig, RunOutcome};
@@ -211,23 +212,27 @@ pub fn filtered_memory_dir(
     Some(dest.to_path_buf())
 }
 
-/// A writer's scratch branch: `overseer/<session-id first 8>/task-N` —
-/// branches are repo-global, so the session id keeps sessions apart.
-fn writer_branch(session_dir: &Path, seq: u64) -> String {
-    let sid: String = session_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(8)
-        .collect();
-    let sid = if sid.is_empty() {
-        "session".into()
-    } else {
-        sid
-    };
-    format!("overseer/{sid}/task-{seq}")
+/// A writer's scratch branch: `overseer/<8 hex>/task-N` — branches are
+/// repo-global, so the id must keep sessions apart. Session dirs are
+/// named by unix ms, so a name prefix is shared by every session within
+/// a day; the sha256 prefix of the canonical session path is not.
+/// Canonicalize via the parent: the leaf may not exist yet at spawn, and
+/// hashing the raw path would differ once it does (`/var` vs
+/// `/private/var`). The resume path never lands here — it reuses the
+/// branch recorded in the sidecar.
+pub(crate) fn writer_branch(session_dir: &Path, seq: u64) -> String {
+    let canon = session_dir.canonicalize().unwrap_or_else(|_| {
+        session_dir
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .map(|p| match session_dir.file_name() {
+                Some(n) => p.join(n),
+                None => p,
+            })
+            .unwrap_or_else(|| session_dir.to_path_buf())
+    });
+    let hex = format!("{:x}", Sha256::digest(canon.to_string_lossy().as_bytes()));
+    format!("overseer/{}/task-{seq}", &hex[..8])
 }
 
 /// `git worktree add` for a writer subagent on `branch`. Returns the
@@ -1636,21 +1641,46 @@ mod tests {
     fn write_mode_uses_worktree() {
         let dir = repo();
         let mut c = ctx(&dir);
+        let branch = writer_branch(&c.session_dir, 1);
         let out = run(&json!({"prompt": "write stuff", "mode": "write"}), &mut c);
         assert!(!out.is_error, "{}", out.text);
         // A writer that changed nothing leaves no worktree or branch.
         assert!(
-            out.text
-                .contains("branch `overseer/session/task-1` deleted"),
+            out.text.contains(&format!("branch `{branch}` deleted")),
             "{}",
             out.text
         );
         assert!(!dir.join("session/subagents/wt-1/wt").exists());
         let s = sc(&dir, "task-1");
-        assert_eq!(s.branch.as_deref(), Some("overseer/session/task-1"));
+        assert_eq!(s.branch.as_deref(), Some(branch.as_str()));
         assert_eq!(s.worktree, None);
         assert_eq!(s.tier, Tier::Standard);
         assert!(s.base.is_some());
+    }
+
+    /// Session dirs are unix-ms names: two sessions inside the same
+    /// window share their first 8 chars, so a name prefix cannot keep
+    /// their writer branches apart — the path sha can.
+    #[test]
+    fn writer_branch_ids_differ_for_same_window_sessions() {
+        let root = tmpdir();
+        let a = root.join("1790724600269");
+        let b = root.join("1790724600999");
+        let (ba, bb) = (writer_branch(&a, 1), writer_branch(&b, 1));
+        assert_eq!(
+            a.file_name().unwrap().to_string_lossy()[..8],
+            b.file_name().unwrap().to_string_lossy()[..8],
+            "the name prefix really is shared"
+        );
+        assert_ne!(ba, bb);
+        for br in [&ba, &bb] {
+            let (scope, name) = br.rsplit_once('/').unwrap();
+            assert_eq!(name, "task-1");
+            assert!(scope.starts_with("overseer/"), "{br}");
+            let hex = &scope["overseer/".len()..];
+            assert_eq!(hex.len(), 8, "{br}");
+            assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{br}");
+        }
     }
 
     /// A full-access writer's policy root is `/`, but its skills live in
@@ -1722,16 +1752,14 @@ mod tests {
         let marker = dir.join("session/subagents/task-1/done.txt");
         wait_for(&marker);
         let done = std::fs::read_to_string(&marker).expect("done.txt");
+        let branch = writer_branch(&c.session_dir, 1);
         assert!(done.contains("digest body"), "{done}");
         assert!(
-            done.contains("worktree branch `overseer/session/task-1`"),
+            done.contains(&format!("worktree branch `{branch}`")),
             "{done}"
         );
         assert!(done.contains("changes:"), "{done}");
-        assert!(
-            done.contains("`git merge overseer/session/task-1`"),
-            "{done}"
-        );
+        assert!(done.contains(&format!("`git merge {branch}`")), "{done}");
         assert!(done.contains("git worktree remove --force"), "{done}");
     }
 

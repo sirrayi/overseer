@@ -3929,7 +3929,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(sc["branch"], format!("overseer/session/task-{n}"));
+            assert_eq!(sc["branch"], crate::tools::task::writer_branch(&session, n));
             // No-op writers clean up after themselves.
             assert!(!session.join(format!("subagents/wt-{n}/wt")).exists());
         }
