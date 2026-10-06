@@ -216,3 +216,21 @@ Both `MEMORY.md` files:
 - [[semantic/msrv-rust-1-80-no-let-chains]] — Project "scratch" targets Rust 1.80 (MSRV). Do NOT use let-chains (`if let ... &
 - [[episodic/session-2026-10-06-fresh]] — Session 2026-10-06 fresh: add a function mul(a,b) with a test
 ```
+
+## Part 2: red-team suites (release)
+
+Env: `REDTEAM_ITERS=200000`, `REDTEAM_SEED` ∈ {1, 12648430, 20261006}, run one at a time with `timeout --kill-after=10 540 cargo test --release -q -p overseer-core --test <suite> -- --nocapture` (binaries pre-built with `--no-run`, so the times exclude compiling). Also set `REDTEAM_SECS=530`, the suites' own deadline knob (default 600 s, which is past the 9-min cap). With it, a suite that would hit the cap stops itself at 530 s and prints `iters_done`. A suite counts as "capped" when it stopped on that deadline before 200000 iterations. No suite reached the 540 s kill.
+
+| Suite | Seed 1 | Seed 12648430 | Seed 20261006 |
+|---|---|---|---|
+| memory_v3_redteam_parser (5 tests) | pass, 372.6 s, A iters_done=200000 | pass, 369.4 s, A iters_done=200000 | pass, 346.6 s, A iters_done=200000 |
+| memory_v3_redteam_threat (19 tests) | pass, 20.6 s, B iters_done=200000 (transformed-evasions=24834) | pass, 17.5 s, B iters_done=200000 (transformed-evasions=24901) | pass, 17.5 s, B iters_done=200000 (transformed-evasions=24876) |
+| memory_v3_redteam_review (18 tests) | pass, capped at 530.2 s: C4 iters_done=10979 writes=8372 | pass, capped at 530.2 s: C4 iters_done=10888 writes=8496 | pass, capped at 530.2 s: C4 iters_done=10574 writes=8215 |
+| memory_v3_redteam_store (17 tests) | pass, capped at 530.1 s: D iters_done=200000 applied=874; F iters_done=85199 (capped) | pass, capped at 530.1 s: D iters_done=200000 applied=866; F iters_done=86807 (capped) | pass, capped at 530.1 s: D iters_done=200000 applied=931; F iters_done=83793 (capped) |
+| memory_v3_redteam_lock (10 tests) | pass, 10.1 s (no seed/iters knob; 6 worker processes, 0 acquire timeouts each) | pass, 10.1 s (same) | pass, 10.1 s (same) |
+| audit_memory2_notes (16 tests) | pass, 0.1 s (does not read REDTEAM_*) | pass, 0.1 s | pass, 0.2 s |
+
+All 18 suite × seed runs passed: 0 failures, so there is no minimal input to report.
+
+- `transformed-evasions` (threat suite B) is printed for information only. B asserts that every plain payload is caught and that the scan of transformed text never panics; it does not assert that transformed text is caught (memory_v3_redteam_threat.rs, around lines 371–392).
+- `REDTEAM_SLOW=1 cargo test --release -p overseer-core --test memory_v3_redteam_lock e_slow_live_holder_31s_keeps_exclusivity`: pass, 31.1 s (`e_slow_live_holder_31s_keeps_exclusivity ... ok`; its re-exec'd `e_worker ... ok`). Without `REDTEAM_SLOW`, the suite runs this test as a skip (`skipped: set REDTEAM_SLOW=1`).
