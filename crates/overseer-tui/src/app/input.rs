@@ -5,6 +5,7 @@
 use super::overlay::*;
 use super::panel::PANEL_TABS;
 use super::*;
+use overseer_core::perm::Remember;
 
 pub(crate) fn subseq_match(hay: &str, needle: &str) -> bool {
     let mut it = hay.chars().flat_map(char::to_lowercase);
@@ -125,19 +126,26 @@ impl App {
             };
             if let Some(decision) = decide {
                 if let Some(d) = decision {
-                    if d == AskDecision::AllowAlways {
-                        // Mirrors `Policy::persist_rule`: a command with a
-                        // newline/control char is allowed once, never saved
-                        // (the engine's note lands on the tool result).
-                        let (dlg, _) = self.dialog.as_ref().unwrap();
-                        let unsavable = dlg
-                            .bash_command()
-                            .is_some_and(|c| c.chars().any(char::is_control));
-                        self.set_toast(if unsavable {
-                            "approved once — not saved (command has a newline/control char)".into()
-                        } else {
-                            "rule saved to ~/.overseer/rules".into()
-                        });
+                    // `remember` is what the engine will actually record
+                    // (its note lands on the tool result too).
+                    let (dlg, _) = self.dialog.as_ref().unwrap();
+                    let toast = match (d, dlg.req.remember) {
+                        (AskDecision::AllowSession | AskDecision::AllowAlways, Remember::Once) => {
+                            Some(format!(
+                                "approved once — {}'s approvals can't be remembered",
+                                dlg.req.tool
+                            ))
+                        }
+                        (AskDecision::AllowAlways, Remember::SessionOnly(why)) => {
+                            Some(format!("approved once — not saved ({why})"))
+                        }
+                        (AskDecision::AllowAlways, Remember::Saved) => {
+                            Some("rule saved to ~/.overseer/rules".into())
+                        }
+                        _ => None,
+                    };
+                    if let Some(t) = toast {
+                        self.set_toast(t);
                     }
                     let (_, tx) = self.dialog.take().unwrap();
                     let _ = tx.send(d);

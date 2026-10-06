@@ -963,6 +963,69 @@ mod tests {
         )
     }
 
+    /// T2: the toast reports what the engine really records for the
+    /// answer, not a blanket "rule saved".
+    #[test]
+    fn grant_toast_says_what_really_happened() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        use overseer_core::perm::{AskDecision, Remember};
+        let cases = [
+            (
+                "memory",
+                Remember::Once,
+                '3',
+                Some("approved once — memory's approvals can't be remembered"),
+            ),
+            (
+                "mcp",
+                Remember::Once,
+                '2',
+                Some("approved once — mcp's approvals can't be remembered"),
+            ),
+            (
+                "bash",
+                Remember::SessionOnly("why"),
+                '3',
+                Some("approved once — not saved (why)"),
+            ),
+            (
+                "write",
+                Remember::Saved,
+                '3',
+                Some("rule saved to ~/.overseer/rules"),
+            ),
+            ("write", Remember::Saved, '2', None),
+        ];
+        for (tool, remember, key, want) in cases {
+            let mut app = test_app("/tmp");
+            let (tx, rx) = mpsc::channel();
+            app.dialog = Some((
+                Dialog {
+                    req: overseer_core::perm::AskRequest {
+                        remember,
+                        tool: tool.into(),
+                        input: serde_json::json!({}),
+                        reason: String::new(),
+                    },
+                    opened: Instant::now() - Duration::from_secs(5),
+                    selected: 0,
+                },
+                tx,
+            ));
+            app.on_key(KeyEvent::from(KeyCode::Char(key)));
+            let sent = rx.try_recv().unwrap();
+            assert!(matches!(
+                sent,
+                AskDecision::AllowSession | AskDecision::AllowAlways
+            ));
+            assert_eq!(
+                app.toast.as_ref().map(|t| t.0.as_str()),
+                want,
+                "{tool} {key}"
+            );
+        }
+    }
+
     #[test]
     fn dialog_tab_pages_the_full_bash_command() {
         use crossterm::event::{KeyCode, KeyEvent};
@@ -972,6 +1035,7 @@ mod tests {
         app.dialog = Some((
             Dialog {
                 req: overseer_core::perm::AskRequest {
+                    remember: overseer_core::perm::Remember::Saved,
                     tool: "bash".into(),
                     input: serde_json::json!({ "command": cmd }),
                     reason: String::new(),

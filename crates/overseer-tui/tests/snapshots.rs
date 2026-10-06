@@ -134,6 +134,7 @@ fn permission_dialog_renders_and_denies() {
     let (rtx, rrx) = mpsc::channel();
     etx.send(EngineMsg::Ask(
         AskRequest {
+            remember: overseer_core::perm::Remember::Saved,
             tool: "bash".into(),
             input: serde_json::json!({"command": "git push origin main"}),
             reason: "outside allowlist".into(),
@@ -846,6 +847,7 @@ fn full_dialog_pins_over_transcript() {
     let (rtx, _rrx) = mpsc::channel();
     etx.send(EngineMsg::Ask(
         AskRequest {
+            remember: overseer_core::perm::Remember::Saved,
             tool: "bash".into(),
             input: serde_json::json!({"command": "rm -rf /tmp/x"}),
             reason: "destructive".into(),

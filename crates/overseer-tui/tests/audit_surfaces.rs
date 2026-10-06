@@ -166,6 +166,7 @@ fn open_dialog(h: &mut H, command: &str) -> mpsc::Receiver<AskDecision> {
     h.etx
         .send(EngineMsg::Ask(
             AskRequest {
+                remember: overseer_core::perm::Remember::Saved,
                 tool: "bash".into(),
                 input: json!({ "command": command }),
                 reason: "publishes history to a remote".into(),

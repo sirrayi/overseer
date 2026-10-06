@@ -30,15 +30,30 @@ pub struct AskRequest {
     pub tool: String,
     pub input: Value,
     pub reason: String,
+    /// What a "session"/"always" answer can record for this call, so the
+    /// frontend can report what really happened.
+    pub remember: Remember,
 }
 
-/// The human's answer to an `AskRequest`.
+/// What `AllowSession`/`AllowAlways` can record for one ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remember {
+    /// The call has a key: "session" records it, "always" also saves it.
+    Saved,
+    /// The call has a key the rules file can't hold (the reason): "session"
+    /// records it, "always" runs this call once.
+    SessionOnly(&'static str),
+    /// The tool has no key: "session" and "always" run this call once.
+    Once,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AskDecision {
     /// Run this call only.
     AllowOnce,
     /// Run this call and every later call with the same tool+resource
-    /// key (exact bash command string, canonical file path).
+    /// key: `bash:<exact command>`, `write:<canonical path>`,
+    /// `edit:<canonical path>`. Other tools have no key — the call runs
+    /// once and the result carries a note saying so.
     AllowSession,
     /// Like AllowSession, but the key is also appended to the policy's
     /// rules file — the allow survives restarts and other sessions.
@@ -604,19 +619,21 @@ impl AllowEntry {
         if line.is_empty() || line.starts_with('#') {
             return None;
         }
-        match line.split_once("@turns=") {
-            Some((key, n)) => {
+        // Only a trailing ` @turns=<digits>` is a TTL; any other
+        // `@turns=` is part of the key.
+        match line.rsplit_once(" @turns=") {
+            Some((key, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
                 let key = key.trim();
                 if key.is_empty() {
                     return None;
                 }
-                let n: u64 = n.trim().parse().ok()?;
+                let n: u64 = n.parse().ok()?;
                 Some(AllowEntry {
                     key: key.to_string(),
                     expires_turn: Some(base_turn.saturating_add(n)),
                 })
             }
-            None => Some(AllowEntry {
+            _ => Some(AllowEntry {
                 key: line.to_string(),
                 expires_turn: None,
             }),
@@ -766,8 +783,8 @@ impl Policy {
             if let Ok(mut s) = self.session_allow.lock() {
                 for line in text.lines() {
                     // One entry per line: `key` or `key @turns=N`. A line
-                    // whose TTL does not parse is dropped, never loaded as
-                    // a permanent key (a bad TTL must not widen a grant).
+                    // whose TTL overflows is dropped, never loaded as a
+                    // permanent key (a bad TTL must not widen a grant).
                     if let Some(e) = AllowEntry::parse_line(line, base) {
                         s.insert(e);
                     }
@@ -796,11 +813,9 @@ impl Policy {
 
     /// Append a key to the rules file. Best-effort: a write failure
     /// leaves the session-allow in place, it just doesn't persist.
-    /// Returns false (nothing written) for a key with a control character:
-    /// the file is line-oriented, so an embedded newline would plant extra
-    /// rules.
+    /// Returns false (nothing written) for a key `unsavable` refuses.
     fn persist_rule(&self, key: &str) -> bool {
-        if key.chars().any(char::is_control) {
+        if unsavable(key).is_some() {
             return false;
         }
         let Some(path) = &self.rules_path else {
@@ -830,15 +845,30 @@ impl Policy {
     }
 
     /// Session-scoped allow key: what `AllowSession` records and later
-    /// `check`s match. Bash keys on the exact command string; file tools
-    /// key on the canonicalized path.
+    /// `check`s match. Bash keys on the exact command string; `write` and
+    /// `edit` key on the canonicalized path. Every other tool has no key,
+    /// so its approvals can't be remembered.
     fn session_key(&self, tool: &str, input: &Value) -> Option<String> {
         match tool {
             "bash" => input
                 .get("command")
                 .and_then(Value::as_str)
                 .map(|c| format!("bash:{c}")),
+            "write" | "edit" => input.get("path").and_then(Value::as_str).map(|p| {
+                let resolved = if Path::new(p).is_absolute() {
+                    PathBuf::from(p)
+                } else {
+                    self.root.join(p)
+                };
+                format!("{tool}:{}", canon_deep(&resolved).display())
+            }),
             _ => None,
+        }
+    }
+
+    fn note(&self, text: String) {
+        if let Ok(mut n) = self.notes.lock() {
+            n.push(text);
         }
     }
 
@@ -1038,23 +1068,33 @@ impl Policy {
                 let Some(handler) = &self.ask_handler else {
                     return Gate::Deny(reason);
                 };
+                let key = self.session_key(tool, input);
+                let remember = match key.as_deref().map(unsavable) {
+                    None => Remember::Once,
+                    Some(Some(why)) => Remember::SessionOnly(why),
+                    Some(None) => Remember::Saved,
+                };
                 let req = AskRequest {
                     tool: tool.to_string(),
                     input: input.clone(),
                     reason: reason.clone(),
+                    remember,
                 };
                 match handler.ask(&req) {
                     AskDecision::AllowOnce => Gate::Allow,
                     d @ (AskDecision::AllowSession | AskDecision::AllowAlways) => {
-                        if let Some(key) = self.session_key(tool, input) {
+                        let Some(key) = key else {
+                            self.note(format!(
+                                "{tool}: approved once — this tool's approvals can't be remembered"
+                            ));
+                            return Gate::Allow;
+                        };
+                        {
                             if d == AskDecision::AllowAlways && !self.persist_rule(&key) {
-                                if let Ok(mut n) = self.notes.lock() {
-                                    n.push(format!(
-                                        "{tool}: approved once — not saved as an \"always\" \
-                                         rule (the command contains a newline or control \
-                                         character)"
-                                    ));
-                                }
+                                let why = unsavable(&key).unwrap_or("it can't be saved");
+                                self.note(format!(
+                                    "{tool}: approved once — not saved as an \"always\" rule ({why})"
+                                ));
                                 return Gate::Allow;
                             }
                             // P8-B: `AllowSession` grants honor the
@@ -1253,26 +1293,6 @@ impl Policy {
                 // dirs that don't exist yet can't canonicalize, and the
                 // raw TMPDIR path vs the /private symlink would compare
                 // unequal without it.
-                fn canon_deep(p: &Path) -> PathBuf {
-                    let mut missing: Vec<std::ffi::OsString> = Vec::new();
-                    let mut cur = p.to_path_buf();
-                    loop {
-                        if let Ok(c) = cur.canonicalize() {
-                            let mut out = c;
-                            for comp in missing.iter().rev() {
-                                out.push(comp);
-                            }
-                            return out;
-                        }
-                        match cur.file_name() {
-                            Some(name) => {
-                                missing.push(name.to_os_string());
-                                cur.pop();
-                            }
-                            None => return p.to_path_buf(),
-                        }
-                    }
-                }
                 let canon = canon_deep(&resolved);
                 let root = canon_deep(&self.root);
                 if canon.starts_with(&root) {
@@ -1327,7 +1347,7 @@ impl Policy {
         // Explicit user grants beat the ladder (AllowSession/AllowAlways
         // recorded by gate(), or loaded from the rules file). Deny already
         // won above, so honoring an allow here cannot rescue a denied call.
-        // (session_key exists for bash only; other tools skip.)
+        // (session_key covers bash and write/edit; other tools never match.)
         if self.session_allowed(tool, input) {
             return Verdict::Allow;
         }
@@ -1470,7 +1490,7 @@ impl Policy {
                 if self.taint_armed() {
                     return Verdict::Ask {
                         reason: format!(
-                            "{tool}: Rule-of-Two — untrusted content and                                  sensitive data are both in context; this write                                  needs human confirmation"
+                            "{tool}: Rule-of-Two — untrusted content and sensitive data are both in context; this write needs human confirmation"
                         ),
                     };
                 }
@@ -1498,7 +1518,7 @@ impl Policy {
                 // exfil channel while both latches are set.
                 if self.taint_armed() {
                     return Verdict::Ask {
-                        reason: "bash: Rule-of-Two — untrusted content and                                  sensitive data are both in context; this                                  command needs human confirmation"
+                        reason: "bash: Rule-of-Two — untrusted content and sensitive data are both in context; this command needs human confirmation"
                             .into(),
                     };
                 }
@@ -1671,6 +1691,42 @@ impl Policy {
             .unwrap_or(0);
         let n = PROPOSAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(mem.join("proposals").join(format!("{ts}-{n}.md")))
+    }
+}
+
+/// Canonicalize the longest existing ancestor and re-append the
+/// remainder: not-yet-created paths canonicalize too.
+fn canon_deep(p: &Path) -> PathBuf {
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            let mut out = c;
+            for comp in missing.iter().rev() {
+                out.push(comp);
+            }
+            return out;
+        }
+        match cur.file_name() {
+            Some(name) => {
+                missing.push(name.to_os_string());
+                cur.pop();
+            }
+            None => return p.to_path_buf(),
+        }
+    }
+}
+
+/// Why a session key can't go in the line-oriented rules file: a control
+/// character could plant extra lines, and `@turns=` would re-parse as a
+/// TTL onto a different key.
+fn unsavable(key: &str) -> Option<&'static str> {
+    if key.chars().any(char::is_control) {
+        Some("the command contains a newline or control character")
+    } else if key.contains("@turns=") {
+        Some("it contains `@turns=`, which the rules file reads as a TTL")
+    } else {
+        None
     }
 }
 
@@ -2341,6 +2397,117 @@ mod tests {
             Gate::Deny(r) => assert!(r.contains("denied by user")),
             Gate::Allow => panic!("expected deny"),
         }
+    }
+
+    /// T2: `write`/`edit` grants key on the canonical path — a relative and
+    /// an absolute spelling of one file share the grant; `edit` doesn't.
+    #[test]
+    fn write_session_grant_keys_on_the_canonical_path() {
+        let root =
+            std::env::temp_dir().join(format!("overseer-write-key-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let mut p = Policy::preset(Preset::WorkspaceWrite, root.clone());
+        p.ask_handler = Some(AskHandler(Arc::new(move |req: &AskRequest| {
+            seen2.lock().unwrap().push(req.remember);
+            AskDecision::AllowSession
+        })));
+        p.rearm("untrusted", "test");
+        let _ = p.mark_sensitive("test");
+        let rel = json!({"path": "f.txt", "content": "x"});
+        assert_eq!(p.gate("write", &rel), Gate::Allow);
+        assert_eq!(*seen.lock().unwrap(), vec![Remember::Saved]);
+        let abs = json!({"path": root.join("f.txt"), "content": "y"});
+        assert_eq!(p.check("write", &abs), Verdict::Allow);
+        assert!(matches!(
+            p.check("edit", &json!({"path": "f.txt", "old": "x", "new": "y"})),
+            Verdict::Ask { .. }
+        ));
+        assert!(p.take_notes().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T2: a tool with no session key can't remember a grant — "always"
+    /// runs once, says so, and writes no rule.
+    #[test]
+    fn keyless_tool_grant_runs_once_with_a_note() {
+        let dir = std::env::temp_dir().join(format!("overseer-keyless-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rules = dir.join("rules");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let mut p = Policy::preset(Preset::WorkspaceWrite, dir.clone());
+        p.load_rules(rules.clone());
+        p.ask_handler = Some(AskHandler(Arc::new(move |req: &AskRequest| {
+            seen2.lock().unwrap().push(req.remember);
+            AskDecision::AllowAlways
+        })));
+        p.rearm("untrusted", "test");
+        let _ = p.mark_sensitive("test");
+        let input = json!({});
+        assert!(matches!(
+            p.check("diagnostics", &input),
+            Verdict::Ask { .. }
+        ));
+        assert_eq!(p.gate("diagnostics", &input), Gate::Allow);
+        assert_eq!(*seen.lock().unwrap(), vec![Remember::Once]);
+        assert_eq!(
+            p.take_notes(),
+            vec!["diagnostics: approved once — this tool's approvals can't be remembered"]
+        );
+        assert!(matches!(
+            p.check("diagnostics", &input),
+            Verdict::Ask { .. }
+        ));
+        assert!(!rules.exists() || std::fs::read_to_string(&rules).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T3: only a trailing ` @turns=<digits>` is a TTL; "always" refuses a
+    /// key containing `@turns=` (allowed once, with a note).
+    #[test]
+    fn turns_suffix_is_strict_and_unsavable_keys_are_refused() {
+        let e = AllowEntry::parse_line("bash:x @turns=3", 10).unwrap();
+        assert_eq!((e.key.as_str(), e.expires_turn), ("bash:x", Some(13)));
+        for literal in [
+            "bash:run @turns=5 now",
+            "bash:x@turns=3",
+            "bash:x @turns=",
+            "bash:x @turns=-1",
+        ] {
+            let e = AllowEntry::parse_line(literal, 0).unwrap();
+            assert_eq!((e.key.as_str(), e.expires_turn), (literal, None));
+        }
+        assert!(AllowEntry::parse_line("bash:x @turns=99999999999999999999999", 0).is_none());
+
+        let dir = std::env::temp_dir().join(format!("overseer-turns-key-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rules = dir.join("rules");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let mut p = Policy::preset(Preset::WorkspaceWrite, dir.clone());
+        p.load_rules(rules.clone());
+        p.ask_handler = Some(AskHandler(Arc::new(move |req: &AskRequest| {
+            seen2.lock().unwrap().push(req.remember);
+            AskDecision::AllowAlways
+        })));
+        let cmd = json!({"command": "git push @turns=5"});
+        assert_eq!(p.gate("bash", &cmd), Gate::Allow);
+        assert!(matches!(
+            seen.lock().unwrap()[0],
+            Remember::SessionOnly(w) if w.contains("@turns=")
+        ));
+        let notes = p.take_notes();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("not saved as an \"always\" rule"),
+            "{notes:?}"
+        );
+        assert!(!rules.exists() || std::fs::read_to_string(&rules).unwrap().is_empty());
+        assert!(matches!(p.check("bash", &cmd), Verdict::Ask { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

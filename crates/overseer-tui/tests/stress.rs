@@ -110,6 +110,7 @@ fn esc_works_through_queued_and_dialog_states() {
     let (rtx, rrx) = mpsc::channel();
     etx.send(EngineMsg::Ask(
         AskRequest {
+            remember: overseer_core::perm::Remember::Saved,
             tool: "bash".into(),
             input: serde_json::json!({"command": "rm -rf x"}),
             reason: "destructive".into(),
@@ -226,6 +227,7 @@ fn permission_churn_keeps_context() {
         let (rtx, rrx) = mpsc::channel();
         etx.send(EngineMsg::Ask(
             AskRequest {
+                remember: overseer_core::perm::Remember::Saved,
                 tool: format!("tool{i}"),
                 input: serde_json::json!({"n": i}),
                 reason: format!("reason-{i}"),
