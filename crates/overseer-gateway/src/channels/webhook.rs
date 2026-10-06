@@ -16,6 +16,8 @@
 //! gateway's frozen dependency edge for P7 is `ureq` only (R1-F1), so the
 //! MAC is hand-rolled and pinned by RFC 4231 vectors in the tests below.
 
+use std::collections::{HashMap, VecDeque};
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::WebhookSpec;
@@ -40,11 +42,25 @@ pub struct Inbound {
     pub text: String,
 }
 
-/// Rolling-window rate limiter — per sender, one window, no timers.
+/// Largest accepted webhook body; checked before the MAC or parser runs.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// A signed `ts_ms` must lie within this distance of the daemon clock, and
+/// a record first accepted longer ago than this is a replay.
+pub const REPLAY_WINDOW_MS: u64 = 5 * 60_000;
+
+/// Accepted signatures remembered for replay detection (oldest evicted).
+pub const MAX_SEEN: usize = 10_000;
+
+/// Rolling-window rate limiter — per sender, one window, no timers. It
+/// also remembers accepted signatures, so replay refusal shares its
+/// lifetime (and its carry-over on config reload).
 #[derive(Debug)]
 pub struct RateLimiter {
     per_min: u32,
     window: Vec<(String, u64)>,
+    seen: HashMap<String, u64>,
+    seen_order: VecDeque<String>,
 }
 
 impl RateLimiter {
@@ -52,6 +68,8 @@ impl RateLimiter {
         RateLimiter {
             per_min,
             window: Vec::new(),
+            seen: HashMap::new(),
+            seen_order: VecDeque::new(),
         }
     }
 
@@ -59,6 +77,40 @@ impl RateLimiter {
     /// the window; the new `per_min` applies from now on).
     pub fn inherit(&mut self, old: RateLimiter) {
         self.window = old.window;
+        self.seen = old.seen;
+        self.seen_order = old.seen_order;
+    }
+
+    /// Refuse a replay. A record carrying a signed `ts_ms` is accepted
+    /// once; one without is refused once its first acceptance has left the
+    /// window (inside it, repeats are the rate limiter's business — an
+    /// untimestamped relay cannot tell a resend from a replay).
+    fn check_replay(&self, key: &str, ts_ms: Option<u64>, now_ms: u64) -> Result<(), String> {
+        if let Some(ts) = ts_ms {
+            if ts.abs_diff(now_ms) > REPLAY_WINDOW_MS {
+                return Err("webhook: record timestamp is outside the ±5 min window".into());
+            }
+        }
+        match self.seen.get(key) {
+            Some(_) if ts_ms.is_some() => Err("webhook: replayed record refused".into()),
+            Some(first) if now_ms.saturating_sub(*first) > REPLAY_WINDOW_MS => {
+                Err("webhook: replayed record refused".into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn remember(&mut self, key: &str, now_ms: u64) {
+        if self.seen.contains_key(key) {
+            return;
+        }
+        while self.seen_order.len() >= MAX_SEEN {
+            if let Some(old) = self.seen_order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        self.seen.insert(key.to_string(), now_ms);
+        self.seen_order.push_back(key.to_string());
     }
 
     /// Admit (or refuse) an arrival at `now_ms`. `per_min == 0` refuses
@@ -83,8 +135,14 @@ impl RateLimiter {
 /// and `text` are required — an anonymous or empty message is refused
 /// rather than defaulted into something that looks legitimate.
 pub fn parse(body: &str) -> Result<Inbound, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| format!("webhook: body is not JSON: {e}"))?;
+    parse_value(&body_json(body)?)
+}
+
+fn body_json(body: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(body).map_err(|e| format!("webhook: body is not JSON: {e}"))
+}
+
+fn parse_value(v: &serde_json::Value) -> Result<Inbound, String> {
     let sender = v
         .get("sender")
         .and_then(|s| s.as_str())
@@ -154,10 +212,30 @@ pub fn ingest(
             spec.secret_env
         ));
     };
+    if req.body.len() > MAX_BODY_BYTES {
+        return Err(format!(
+            "webhook: body of {} bytes exceeds the 1 MiB cap",
+            req.body.len()
+        ));
+    }
     if !verify(secret, &req.signature, &req.body) {
         return Err("webhook: signature rejected".into());
     }
-    let inbound = parse(&req.body)?;
+    let v = body_json(&req.body)?;
+    let inbound = parse_value(&v)?;
+    let ts_ms = match v.get("ts_ms") {
+        None => None,
+        Some(t) => Some(
+            t.as_u64()
+                .ok_or("webhook: 'ts_ms' must be unix milliseconds")?,
+        ),
+    };
+    let replay_key = req
+        .signature
+        .trim()
+        .trim_start_matches("sha256=")
+        .to_ascii_lowercase();
+    limiter.check_replay(&replay_key, ts_ms, now_ms)?;
     if !sender_allowed(&spec.allow_senders, &inbound.sender) {
         return Err(format!(
             "webhook: sender '{}' is not on the allowlist",
@@ -170,6 +248,7 @@ pub fn ingest(
             inbound.sender
         ));
     }
+    limiter.remember(&replay_key, now_ms);
     // `event_for` (not `from_channel`) so the keyword verbs are classed
     // (`msg.inbound.queue`) and the intent lands in the origin metadata.
     Ok(super::event_for(&inbound))
@@ -499,5 +578,44 @@ mod tests {
         // Zero means closed.
         let mut closed = RateLimiter::new(0);
         assert!(!closed.admit_at("k", 0));
+    }
+
+    #[test]
+    fn signed_timestamp_bounds_the_window_and_is_accepted_once() {
+        let at = |ts: u64| {
+            let body = format!(r#"{{"sender":"u1","text":"hi","ts_ms":{ts}}}"#);
+            WebhookRequest {
+                signature: hex(&hmac_sha256(b"k", body.as_bytes())),
+                body,
+            }
+        };
+        let s = spec("S", &["u1"], 10);
+        let mut limiter = RateLimiter::new(10);
+        let now = 10_000_000;
+        let fresh = at(now - 60_000);
+        assert!(ingest(&s, Some("k"), &fresh, &mut limiter, now).is_ok());
+        let err = ingest(&s, Some("k"), &fresh, &mut limiter, now + 1).unwrap_err();
+        assert!(err.contains("replayed"), "got: {err}");
+        for ts in [now - REPLAY_WINDOW_MS - 1, now + REPLAY_WINDOW_MS + 1] {
+            let err = ingest(&s, Some("k"), &at(ts), &mut limiter, now).unwrap_err();
+            assert!(err.contains("outside"), "got: {err}");
+        }
+        let bad = r#"{"sender":"u1","text":"hi","ts_ms":"soon"}"#;
+        let req = WebhookRequest {
+            signature: hex(&hmac_sha256(b"k", bad.as_bytes())),
+            body: bad.into(),
+        };
+        assert!(ingest(&s, Some("k"), &req, &mut limiter, now).is_err());
+    }
+
+    #[test]
+    fn replay_memory_is_bounded_oldest_first() {
+        let mut limiter = RateLimiter::new(1);
+        for i in 0..=MAX_SEEN {
+            limiter.remember(&format!("sig{i}"), 0);
+        }
+        assert_eq!(limiter.seen.len(), MAX_SEEN);
+        assert!(!limiter.seen.contains_key("sig0"));
+        assert!(limiter.seen.contains_key(&format!("sig{MAX_SEEN}")));
     }
 }

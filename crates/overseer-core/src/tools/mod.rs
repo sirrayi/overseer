@@ -570,8 +570,10 @@ impl ToolRegistry {
     }
 
     /// Attach the run's steering handle: `run_code` aborts on its
-    /// interrupt, between sub-calls and inside the JS interrupt handler.
+    /// interrupt, between sub-calls and inside the JS interrupt handler,
+    /// and a `computer` batch stops between members.
     pub fn set_control(&mut self, control: crate::control::Control) {
+        self.computer.set_control(control.clone());
         self.control = control;
     }
 
@@ -795,6 +797,15 @@ impl ToolRegistry {
             &ctx.cwd,
             crate::memory::now_secs(),
         );
+        let notes = self.policy.take_notes();
+        let out = if notes.is_empty() {
+            out
+        } else {
+            ToolOutput {
+                text: format!("{}\n[overseer] {}", out.text, notes.join("\n[overseer] ")),
+                ..out
+            }
+        };
         // P8-B post_tool_use hooks: annotate (never block) the result so
         // the model sees the flagged property inline. Runs on the RAW text
         // — same ordering rule as the taint latch, which reads below.
@@ -1168,11 +1179,12 @@ pub(crate) fn contained_target(path: &Path, root: &Path) -> Result<PathBuf, Stri
 
 /// Create/truncate `target` and write `content` through a handle opened
 /// with `O_NOFOLLOW`: if the final component is (or became) a symlink,
-/// the open fails instead of writing through it.
+/// the open fails instead of writing through it. A hard-linked target is
+/// refused before truncation (checked on the open handle).
 pub(crate) fn write_no_follow(target: &Path, content: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1188,6 +1200,22 @@ pub(crate) fn write_no_follow(target: &Path, content: &[u8]) -> Result<(), Strin
     }
     let mut f = opts
         .open(target)
+        .map_err(|e| format!("Cannot write {}: {e}", target.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = f
+            .metadata()
+            .map_err(|e| format!("Cannot write {}: {e}", target.display()))?;
+        if meta.nlink() > 1 {
+            return Err(format!(
+                "Cannot write {}: refusing to modify a hard-linked file (it may alias a \
+                 file outside the workspace)",
+                target.display()
+            ));
+        }
+    }
+    f.set_len(0)
         .map_err(|e| format!("Cannot write {}: {e}", target.display()))?;
     f.write_all(content)
         .map_err(|e| format!("Cannot write {}: {e}", target.display()))

@@ -66,6 +66,21 @@ pub struct Dialog {
 impl Dialog {
     pub const GRACE_MS: u128 = 200;
     const N_OPTS: usize = 4;
+    /// bash command lines previewed before the "+N more" marker.
+    pub const CMD_LINES: usize = 8;
+
+    pub fn bash_command(&self) -> Option<&str> {
+        if self.req.tool != "bash" {
+            return None;
+        }
+        self.req.input.get("command").and_then(|v| v.as_str())
+    }
+
+    /// Command lines the preview leaves out (Tab opens all of them).
+    pub fn hidden_lines(&self) -> usize {
+        self.bash_command()
+            .map_or(0, |c| c.lines().count().saturating_sub(Self::CMD_LINES))
+    }
 
     pub fn armed(&self) -> bool {
         self.opened.elapsed().as_millis() >= Self::GRACE_MS
@@ -119,13 +134,23 @@ impl Dialog {
         // wants the target + head of content.
         match self.req.tool.as_str() {
             "bash" => {
-                if let Some(cmd) = self.req.input.get("command").and_then(|v| v.as_str()) {
-                    for l in cmd.lines().take(3) {
+                if let Some(cmd) = self.bash_command() {
+                    for l in cmd.lines().take(Self::CMD_LINES) {
                         out.extend(crate::cells::wrap_styled(
                             vec![
                                 Span::styled("  $ ", theme::dialog_key()),
                                 Span::styled(l.to_string(), theme::dialog()),
                             ],
+                            w,
+                        ));
+                    }
+                    let hidden = self.hidden_lines();
+                    if hidden > 0 {
+                        out.extend(crate::cells::wrap_styled(
+                            vec![Span::styled(
+                                format!("  … +{hidden} more lines (Tab to view all)"),
+                                theme::warn(),
+                            )],
                             w,
                         ));
                     }
@@ -190,7 +215,13 @@ impl Dialog {
                     spans.push(Span::raw("  "));
                 }
             }
-            spans.push(Span::styled("  (←→ ⏎)".to_string(), theme::dim()));
+            // The options row repeats the marker: a clipped live stack
+            // can never leave a truncated command approvable unflagged.
+            let hint = match self.hidden_lines() {
+                0 => "  (←→ ⏎)".to_string(),
+                n => format!("  (←→ ⏎ · +{n} lines: Tab)"),
+            };
+            spans.push(Span::styled(hint, theme::dim()));
             out.push(Line::from(spans));
         } else {
             out.push(Line::from(Span::styled(

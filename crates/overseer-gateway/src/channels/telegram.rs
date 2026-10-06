@@ -21,6 +21,9 @@ use crate::config::TelegramSpec;
 pub struct Polled {
     pub messages: Vec<Inbound>,
     pub next_offset: Option<i64>,
+    /// The batch holds an `update_id` the offset cannot move past
+    /// (`i64::MAX`): the caller must stop polling, not loop on it.
+    pub overflowed: bool,
 }
 
 /// Whole-request bound for every Bot API call: one hung connection must
@@ -120,9 +123,11 @@ impl Telegram {
                     .unwrap_or("no description")
             )));
         }
+        let overflowed = max_update_id(&v).is_some_and(|m| m.checked_add(1).is_none());
         Ok(Polled {
             messages: parse_updates(&v),
             next_offset: next_offset(&v, offset),
+            overflowed,
         })
     }
 
@@ -170,21 +175,27 @@ impl Telegram {
 /// The offset the next `getUpdates` call must carry: highest `update_id`
 /// seen plus one. `None` when the batch is empty or unparsable, so the
 /// caller keeps its current offset (never rewinds to "deliver everything").
+/// An `update_id` of `i64::MAX` cannot be advanced past: the current
+/// offset is kept and [`Polled::overflowed`] tells the caller to stop.
 pub fn next_offset(v: &Value, current: Option<i64>) -> Option<i64> {
-    let max = v
-        .get("result")
+    let Some(next) = max_update_id(v)?.checked_add(1) else {
+        return current;
+    };
+    Some(match current {
+        Some(c) if c > next => c,
+        _ => next,
+    })
+}
+
+fn max_update_id(v: &Value) -> Option<i64> {
+    v.get("result")
         .and_then(Value::as_array)
         .and_then(|updates| {
             updates
                 .iter()
                 .filter_map(|u| u.get("update_id").and_then(Value::as_i64))
                 .max()
-        })?;
-    let next = max + 1;
-    Some(match current {
-        Some(c) if c > next => c,
-        _ => next,
-    })
+        })
 }
 
 /// Extract inbound messages from a `getUpdates` body. Unsupported update

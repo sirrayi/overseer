@@ -196,7 +196,27 @@ const INJECTION_MARKERS: &[&str] = &[
     "your real instructions",
 ];
 
-/// Path fragments that mark a tool call as touching secrets.
+/// Credential stores under `$HOME` — the ONE list behind the bwrap masks,
+/// the seatbelt read-denies (`tools/bash.rs`) and the sensitive latch here.
+pub(crate) const HOME_SECRETS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".config/gh",
+    ".gnupg",
+    ".overseer",
+    ".kube",
+    ".docker",
+    ".config/gcloud",
+    ".azure",
+    ".netrc",
+    ".npmrc",
+    ".pgpass",
+    ".git-credentials",
+    ".config/op",
+];
+
+/// Path fragments that mark a tool call as touching secrets (on top of
+/// [`HOME_SECRETS`]).
 const SENSITIVE_PATHS: &[&str] = &[
     ".env",
     ".envrc",
@@ -205,13 +225,21 @@ const SENSITIVE_PATHS: &[&str] = &[
     "id_dsa",
     ".pem",
     ".key",
-    ".aws/",
-    ".ssh/",
-    ".gnupg/",
-    ".netrc",
     "credentials",
     "secrets/",
 ];
+
+/// Whether lowercased `s` names a [`HOME_SECRETS`] entry as a whole path
+/// segment run (so `.kube` matches `~/.kube/config`, not `.kubernetes`).
+fn mentions_home_secret(s: &str) -> bool {
+    let seg = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    HOME_SECRETS.iter().any(|rel| {
+        s.match_indices(rel).any(|(i, _)| {
+            !s[..i].chars().next_back().is_some_and(seg)
+                && !s[i + rel.len()..].chars().next().is_some_and(seg)
+        })
+    })
+}
 
 /// Content markers that mark a result as carrying secret material.
 /// Lowercase: compared against lowercased text (RT-1: uppercase markers
@@ -345,11 +373,7 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
         };
     }
     if tool == "computer" {
-        let action = input
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_lowercase();
+        let action = crate::tools::computer::normalize_action(input).unwrap_or_default();
         // Credential-field focus is an identity touch regardless of the
         // physical action — keystrokes near secrets outrank the click.
         if input
@@ -377,7 +401,11 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
         if action == "navigate" {
             return Irreversibility::ExternalComms;
         }
-        return Irreversibility::InternalWrite; // side-effect acts + future actions default up
+        // An action dispatch would refuse classifies fail-closed.
+        if action != "batch" && !crate::tools::computer::ACTIONS.contains(&action.as_str()) {
+            return Irreversibility::ExternalComms;
+        }
+        return Irreversibility::InternalWrite;
     }
     match tool {
         t if READ_TOOLS.contains(&t) => Irreversibility::Read,
@@ -603,6 +631,8 @@ pub struct Policy {
     /// Memory v2: `memory` remember/forget are denied (every subagent —
     /// its stores are throwaway filtered copies). Search/get stay allowed.
     pub memory_readonly: bool,
+    /// Notes from `gate` for the caller to surface (`take_notes`).
+    notes: Mutex<Vec<String>>,
 }
 
 impl Policy {
@@ -625,6 +655,7 @@ impl Policy {
             persona_approved: false,
             mcp_read_servers: Vec::new(),
             memory_readonly: false,
+            notes: Mutex::new(Vec::new()),
         }
     }
 
@@ -646,6 +677,7 @@ impl Policy {
             persona_approved: false,
             mcp_read_servers: Vec::new(),
             memory_readonly: false,
+            notes: Mutex::new(Vec::new()),
         }
     }
 
@@ -668,6 +700,7 @@ impl Policy {
             persona_approved: false,
             mcp_read_servers: Vec::new(),
             memory_readonly: false,
+            notes: Mutex::new(Vec::new()),
         }
     }
 
@@ -710,9 +743,15 @@ impl Policy {
 
     /// Append a key to the rules file. Best-effort: a write failure
     /// leaves the session-allow in place, it just doesn't persist.
-    fn persist_rule(&self, key: &str) {
+    /// Returns false (nothing written) for a key with a control character:
+    /// the file is line-oriented, so an embedded newline would plant extra
+    /// rules.
+    fn persist_rule(&self, key: &str) -> bool {
+        if key.chars().any(char::is_control) {
+            return false;
+        }
         let Some(path) = &self.rules_path else {
-            return;
+            return true;
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -725,6 +764,16 @@ impl Policy {
         {
             let _ = writeln!(f, "{key}");
         }
+        true
+    }
+
+    /// Drain the notes `gate` left for the caller to show (a refused
+    /// "always" rule). The registry appends them to the tool result.
+    pub fn take_notes(&self) -> Vec<String> {
+        self.notes
+            .lock()
+            .map(|mut n| std::mem::take(&mut *n))
+            .unwrap_or_default()
     }
 
     /// Session-scoped allow key: what `AllowSession` records and later
@@ -784,6 +833,7 @@ impl Policy {
         }
         if !t.sensitive
             && (SENSITIVE_PATHS.iter().any(|m| input_s.contains(m))
+                || mentions_home_secret(&input_s)
                 || SENSITIVE_CONTENT.iter().all(|m| lower.contains(m)))
         {
             t.sensitive = true;
@@ -821,7 +871,7 @@ impl Policy {
         if tool != "computer" {
             return false;
         }
-        let action = input.get("action").and_then(Value::as_str).unwrap_or("");
+        let action = crate::tools::computer::normalize_action(input).unwrap_or_default();
         if [
             "apps",
             "windows",
@@ -831,12 +881,11 @@ impl Policy {
             "verify",
             "browser",
         ]
-        .iter()
-        .any(|a| action.eq_ignore_ascii_case(a))
+        .contains(&action.as_str())
         {
             return true;
         }
-        if action.eq_ignore_ascii_case("batch") {
+        if action == "batch" {
             return input
                 .get("actions")
                 .and_then(Value::as_array)
@@ -901,8 +950,15 @@ impl Policy {
                     AskDecision::AllowOnce => Gate::Allow,
                     d @ (AskDecision::AllowSession | AskDecision::AllowAlways) => {
                         if let Some(key) = self.session_key(tool, input) {
-                            if d == AskDecision::AllowAlways {
-                                self.persist_rule(&key);
+                            if d == AskDecision::AllowAlways && !self.persist_rule(&key) {
+                                if let Ok(mut n) = self.notes.lock() {
+                                    n.push(format!(
+                                        "{tool}: approved once — not saved as an \"always\" \
+                                         rule (the command contains a newline or control \
+                                         character)"
+                                    ));
+                                }
+                                return Gate::Allow;
                             }
                             // P8-B: `AllowSession` grants honor the
                             // policy's session TTL (None = session-long).
@@ -966,6 +1022,16 @@ impl Policy {
                 return Verdict::Allow;
             }
             if op.eq_ignore_ascii_case("call") && self.mcp_call_read_trusted(input) {
+                // Armed: the call's arguments leave the process, so a
+                // read-trusted server is still an exfil channel.
+                if self.taint_armed() {
+                    return Verdict::Ask {
+                        reason: "mcp: Rule-of-Two — untrusted content and sensitive data are \
+                                 both in context; this call's arguments leave the process \
+                                 and need human confirmation"
+                            .into(),
+                    };
+                }
                 return Verdict::Allow;
             }
         }
@@ -1189,6 +1255,13 @@ impl Policy {
             // Read-class (screenshot/observe) falls through to Allow; ladder
             // Ask/Deny already won for side-effecting actions. Explicit
             // autonomy keeps the default ActWithApproval Ask for acts.
+            // Rule of Two: once the exfil triangle is armed, no screen act
+            // rides a silent lane.
+            "computer" if class != Irreversibility::Read && self.taint_armed() => Verdict::Ask {
+                reason: format!(
+                    "computer: untrusted + sensitive context — needs approval (class {class:?})"
+                ),
+            },
             "computer" => Verdict::Allow,
             // R6 `mcp` arm — reached only after the ladder floor above, and
             // only for a `call`: `search` and read-trust calls returned Allow
@@ -1338,6 +1411,20 @@ impl Policy {
                             reason: format!("bash: '{pattern}' needs confirmation — {why}"),
                         };
                     }
+                }
+                Verdict::Allow
+            }
+
+            // `cargo check` runs `build.rs` and proc-macros: code execution,
+            // gated like a plain shell call.
+            "diagnostics" => {
+                if self.taint_armed() {
+                    return Verdict::Ask {
+                        reason: "diagnostics: Rule-of-Two — untrusted content and sensitive \
+                                 data are both in context; running the checker needs human \
+                                 confirmation"
+                            .into(),
+                    };
                 }
                 Verdict::Allow
             }
@@ -1698,10 +1785,10 @@ mod tests {
             classify("computer", &json!({"action": "type", "cred_field": true})),
             Irreversibility::Identity
         );
-        // Unknown actions default up, never down.
+        // Unknown actions fail closed, never down.
         assert_eq!(
             classify("computer", &json!({"action": "frobnicate"})),
-            Irreversibility::InternalWrite
+            Irreversibility::ExternalComms
         );
     }
 

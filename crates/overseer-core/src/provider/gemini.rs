@@ -165,6 +165,11 @@ impl Gemini {
                 {
                     input["safety_decision"] = sd.clone();
                 }
+                // The signed part rides opaque ahead of its call; the echo
+                // re-attaches its thoughtSignature (invariant 6).
+                if p.get("thoughtSignature").is_some() {
+                    blocks.push(Block::Reasoning { raw: p.clone() });
+                }
                 blocks.push(Block::ToolCall {
                     id: name.clone(), // pairing is by name on Gemini
                     name,
@@ -194,11 +199,9 @@ impl Gemini {
             match cand.get("finishReason").and_then(Value::as_str) {
                 Some("STOP") | Some("STOP_SEQUENCE") => StopReason::EndTurn,
                 Some("MAX_TOKENS") => StopReason::MaxTokens,
-                Some("SAFETY")
-                | Some("PROHIBITED_CONTENT")
-                | Some("RECITATION")
-                | Some("BLOCKLIST")
-                | Some("SPII") => StopReason::Refusal,
+                Some(
+                    s @ ("SAFETY" | "PROHIBITED_CONTENT" | "RECITATION" | "BLOCKLIST" | "SPII"),
+                ) => StopReason::Blocked(s.to_string()),
                 Some(s) => StopReason::Other(s.to_string()),
                 None => StopReason::Other("missing".to_string()),
             }
@@ -306,9 +309,13 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
         Role::Assistant => "model",
     };
     let mut parts: Vec<Value> = Vec::new();
+    let mut fc_signature: Option<Value> = None;
     for b in &m.content {
         match b {
             Block::Text { text } => parts.push(json!({"text": text})),
+            Block::Reasoning { raw } if raw.get("functionCall").is_some() => {
+                fc_signature = raw.get("thoughtSignature").cloned();
+            }
             // Opaque reasoning/thought parts echo back verbatim —
             // thoughtSignature continuity is load-bearing on tool turns.
             Block::Reasoning { raw } => parts.push(raw.clone()),
@@ -320,9 +327,13 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
             } => parts.push(json!({
                 "inline_data": {"mime_type": media_type, "data": data_b64}
             })),
-            Block::ToolCall { name, input, .. } => parts.push(json!({
-                "functionCall": {"name": name, "args": input}
-            })),
+            Block::ToolCall { name, input, .. } => {
+                let mut part = json!({"functionCall": {"name": name, "args": input}});
+                if let Some(sig) = fc_signature.take() {
+                    part["thoughtSignature"] = sig;
+                }
+                parts.push(part);
+            }
             Block::ToolResult {
                 tool_use_id,
                 content,
@@ -634,7 +645,8 @@ mod tests {
                 "finishReason": "SAFETY"}]
         });
         let r = Gemini::parse_response(&body, 0, 0).unwrap();
-        assert_eq!(r.stop_reason, StopReason::Refusal);
+        assert!(r.stop_reason.is_refusal());
+        assert_eq!(r.stop_reason.as_str(), "SAFETY");
     }
 
     #[test]

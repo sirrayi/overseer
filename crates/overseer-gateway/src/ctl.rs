@@ -15,6 +15,9 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -149,12 +152,57 @@ pub fn listen(
     std::thread::Builder::new()
         .name("ctl-listener".into())
         .spawn(move || {
+            let live = Arc::new(AtomicUsize::new(0));
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { continue };
+                let _ = s.set_write_timeout(Some(REQUEST_DEADLINE));
+                if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    write_response(&mut s, &CtlResponse::err("too many control connections"));
+                    continue;
+                }
                 let tx = tx.clone();
-                std::thread::spawn(move || handle_conn(&mut s, tx));
+                let slot = ConnSlot(Arc::clone(&live));
+                std::thread::spawn(move || {
+                    let _slot = slot;
+                    handle_conn(&mut s, tx);
+                });
             }
         })
+}
+
+/// Whole-request budget: a client gets this long to deliver one complete
+/// request line, however slowly it dribbles bytes.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Concurrent connections served at once; extras are refused immediately
+/// so idle clients cannot pin an unbounded number of threads.
+pub const MAX_CONNECTIONS: usize = 16;
+
+/// Releases one connection slot when the handler thread ends.
+struct ConnSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A stream whose every read is bounded by one absolute deadline.
+struct DeadlineReader<'a> {
+    stream: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        (&*self.stream).read(buf)
+    }
 }
 
 /// Longest accepted request line. Every legitimate request is tiny; the
@@ -167,7 +215,12 @@ fn read_request_line(r: impl Read) -> Result<String, String> {
     let mut buf = Vec::new();
     BufReader::new(r.take(MAX_REQUEST_LINE as u64 + 1))
         .read_until(b'\n', &mut buf)
-        .map_err(|e| format!("read: {e}"))?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                format!("no complete request within {}s", REQUEST_DEADLINE.as_secs())
+            }
+            _ => format!("read: {e}"),
+        })?;
     if buf.len() > MAX_REQUEST_LINE {
         return Err("request line exceeds 64 KiB".into());
     }
@@ -178,7 +231,11 @@ fn handle_conn(
     s: &mut UnixStream,
     tx: std::sync::mpsc::Sender<(CtlRequest, std::sync::mpsc::Sender<CtlResponse>)>,
 ) {
-    let resp = match read_request_line(&*s) {
+    let reader = DeadlineReader {
+        stream: s,
+        deadline: Instant::now() + REQUEST_DEADLINE,
+    };
+    let resp = match read_request_line(reader) {
         Err(e) => CtlResponse::err(e),
         Ok(line) => match serde_json::from_str::<CtlRequest>(&line) {
             Ok(req) => {
@@ -192,7 +249,11 @@ fn handle_conn(
             Err(e) => CtlResponse::err(format!("bad request: {e}")),
         },
     };
-    if let Ok(mut out) = serde_json::to_string(&resp) {
+    write_response(s, &resp);
+}
+
+fn write_response(s: &mut UnixStream, resp: &CtlResponse) {
+    if let Ok(mut out) = serde_json::to_string(resp) {
         out.push('\n');
         let _ = s.write_all(out.as_bytes());
     }

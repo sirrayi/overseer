@@ -256,27 +256,30 @@ pub fn run_line(mut cfg: TuiConfig) -> std::io::Result<i32> {
                 EngineMsg::Ask(req, tx) => {
                     println!(
                         "! {} {} — allow? [once/session/always/deny]",
-                        req.tool,
-                        cells::tool_summary(&req.tool, &req.input)
+                        notify::sanitize(&req.tool),
+                        notify::sanitize(&cells::tool_summary(&req.tool, &req.input))
                     );
                     pending_ask = Some(tx);
                 }
                 EngineMsg::RunDone(out) => {
                     control = None;
                     if let overseer_core::agent::RunOutcome::Provider(m) = &out {
-                        println!("provider error: {m}");
+                        println!("provider error: {}", notify::sanitize(m));
                     }
                     print!("> ");
                     let _ = std::io::stdout().flush();
                 }
                 EngineMsg::RunError(e) => {
                     control = None;
-                    println!("engine error: {e}");
+                    println!("engine error: {}", notify::sanitize(&e));
                     print!("> ");
                     let _ = std::io::stdout().flush();
                 }
                 EngineMsg::SessionSwitched { dir } => {
-                    println!("── session {} ──", dir.display());
+                    println!(
+                        "── session {} ──",
+                        notify::sanitize(&dir.display().to_string())
+                    );
                 }
             }
         }
@@ -295,7 +298,7 @@ pub fn run_line(mut cfg: TuiConfig) -> std::io::Result<i32> {
                     break;
                 } else if let Some(cmd) = line.strip_prefix('!') {
                     let (code, out) = app::line_shell(cmd.trim(), &cwd);
-                    println!("{out}(exit {code})");
+                    println!("{}(exit {code})", notify::sanitize(&out));
                 } else if !line.is_empty() {
                     if let Some(c) = &control {
                         c.steer(line); // mid-run → steering
@@ -323,13 +326,13 @@ fn print_cell(c: &cells::Cell) {
     match c {
         cells::Cell::User { .. } => {} // the echoed input line suffices
         cells::Cell::Tool { .. } => {
-            println!("{}", c.plain());
+            println!("{}", notify::sanitize(&c.plain()));
             if let Some(p) = c.link_path() {
                 let url = format!("file://{}", p.display());
                 println!("  ⤷ {}", notify::osc8(&url, &p.display().to_string()));
             }
         }
-        _ => println!("{}", c.plain()),
+        _ => println!("{}", notify::sanitize(&c.plain())),
     }
 }
 
