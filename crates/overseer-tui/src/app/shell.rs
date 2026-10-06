@@ -22,6 +22,10 @@ const JOIN_GRACE: Duration = Duration::from_millis(500);
 
 const BG_NOTE: &str = "(still running in the background)";
 
+/// Bytes kept across stdout+stderr; the rest is drained and discarded.
+const CAPTURE_MAX: usize = 1 << 20;
+const TRUNC_NOTE: &str = "[output truncated at 1 MiB]";
+
 /// The cap is a parameter so tests don't wait 10 s. The child gets its
 /// own process group and the whole group is killed on completion or
 /// timeout; a process that left the group (`setsid`, double fork) and
@@ -50,10 +54,41 @@ pub(crate) struct Captured {
     pub background: bool,
 }
 
-/// Drain one pipe into `buf`, signalling `done` at EOF.
+/// Shared capture budget: bytes still allowed, and whether any were cut.
+struct Budget {
+    left: std::sync::atomic::AtomicUsize,
+    cut: std::sync::atomic::AtomicBool,
+}
+
+impl Budget {
+    fn new(max: usize) -> Self {
+        Budget {
+            left: max.into(),
+            cut: false.into(),
+        }
+    }
+
+    /// Reserve up to `n` bytes; returns how many may be kept.
+    fn take(&self, n: usize) -> usize {
+        use std::sync::atomic::Ordering::SeqCst;
+        let prev = self
+            .left
+            .fetch_update(SeqCst, SeqCst, |l| Some(l.saturating_sub(n)))
+            .unwrap_or(0);
+        let keep = prev.min(n);
+        if keep < n {
+            self.cut.store(true, SeqCst);
+        }
+        keep
+    }
+}
+
+/// Drain one pipe into `buf` (within `budget`) to EOF, signalling `done`.
+/// Bytes over budget are read and discarded so the child never blocks.
 fn drain(
     pipe: Option<impl Read + Send + 'static>,
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    budget: std::sync::Arc<Budget>,
     done: mpsc::Sender<()>,
 ) {
     std::thread::spawn(move || {
@@ -62,7 +97,12 @@ fn drain(
             loop {
                 match p.read(&mut chunk) {
                     Ok(0) => break,
-                    Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                    Ok(n) => {
+                        let keep = budget.take(n);
+                        if keep > 0 {
+                            buf.lock().unwrap().extend_from_slice(&chunk[..keep]);
+                        }
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
                 }
@@ -99,9 +139,20 @@ pub(crate) fn capture(cmd: &str, cwd: &str, cap: Duration) -> std::io::Result<Ca
     // process keeps open.
     let out_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let err_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let budget = std::sync::Arc::new(Budget::new(CAPTURE_MAX));
     let (done_tx, done_rx) = mpsc::channel();
-    drain(child.stdout.take(), out_buf.clone(), done_tx.clone());
-    drain(child.stderr.take(), err_buf.clone(), done_tx);
+    drain(
+        child.stdout.take(),
+        out_buf.clone(),
+        budget.clone(),
+        done_tx.clone(),
+    );
+    drain(
+        child.stderr.take(),
+        err_buf.clone(),
+        budget.clone(),
+        done_tx,
+    );
     let deadline = Instant::now() + cap;
     // None = hit the cap.
     let code = loop {
@@ -150,7 +201,14 @@ pub(crate) fn capture(cmd: &str, cwd: &str, cap: Duration) -> std::io::Result<Ca
                 }
                 text.push_str(&err);
             }
-            text.chars().take(8192).collect()
+            let mut text: String = text.chars().take(8192).collect();
+            if budget.cut.load(std::sync::atomic::Ordering::SeqCst) {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(TRUNC_NOTE);
+            }
+            text
         }
         None => format!("(timed out after {cap:?})"),
     };
@@ -199,5 +257,39 @@ impl App {
                 link: None,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S2: the drain keeps at most the budget and still reads to EOF.
+    #[test]
+    fn drain_caps_at_the_budget_and_reads_to_eof() {
+        let src = std::io::repeat(b'a').take(3 * CAPTURE_MAX as u64);
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let budget = std::sync::Arc::new(Budget::new(CAPTURE_MAX));
+        let (tx, rx) = mpsc::channel();
+        drain(Some(src), buf.clone(), budget.clone(), tx);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("drained to EOF");
+        assert_eq!(buf.lock().unwrap().len(), CAPTURE_MAX);
+        assert!(budget.cut.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn capture_over_one_mib_is_marked_truncated() {
+        let (code, out) =
+            shell_capture_timeout("head -c 3000000 /dev/zero", "/", Duration::from_secs(10))
+                .unwrap();
+        assert_eq!(code, 0, "{out:.80}");
+        assert!(
+            out.ends_with(TRUNC_NOTE),
+            "{:?}",
+            &out[out.len().saturating_sub(60)..]
+        );
+        let (_, small) = shell_capture("echo hi", "/").unwrap();
+        assert!(!small.contains(TRUNC_NOTE));
     }
 }

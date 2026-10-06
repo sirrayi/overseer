@@ -1030,8 +1030,8 @@ fn parse_input(body: &[u8]) -> Option<CtEvent> {
         // regions the terminal's mouse events use.
         "click" => Some(CtEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: get("col")?.as_u64()? as u16,
-            row: get("row")?.as_u64()? as u16,
+            column: u16::try_from(get("col")?.as_u64()?).ok()?,
+            row: u16::try_from(get("row")?.as_u64()?).ok()?,
             modifiers: KeyModifiers::empty(),
         })),
         "paste" => Some(CtEvent::Paste(get("text")?.as_str()?.to_string())),
@@ -1065,6 +1065,21 @@ mod tests {
     use super::*;
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn click_coordinates_over_u16_are_refused_not_wrapped() {
+        let ok = parse_input(br#"{"type":"click","col":65535,"row":3}"#);
+        assert!(matches!(
+            ok,
+            Some(CtEvent::Mouse(MouseEvent {
+                column: 65535,
+                row: 3,
+                ..
+            }))
+        ));
+        assert!(parse_input(br#"{"type":"click","col":65536,"row":3}"#).is_none());
+        assert!(parse_input(br#"{"type":"click","col":1,"row":65537}"#).is_none());
+    }
 
     #[test]
     fn web_surface_resolves_graphite() {
