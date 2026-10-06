@@ -747,7 +747,8 @@ pub(crate) fn dup_norm_body(body: &str) -> String {
     dup_norm(b)
 }
 
-/// `valid_to` expiry: the stored instant is strictly before now. Compared
+/// `valid_to` expiry: the stored instant is at or before now (a note
+/// forgotten this second is gone this second). Compared
 /// as epoch seconds so `Z` and `±HH:MM` stamps order by the instant they
 /// name, not by their spelling. An unparseable stamp reads as not expired
 /// — `parse_meta` already refuses one, so only a directly constructed
@@ -761,7 +762,7 @@ fn meta_expired_at(meta: &EntryMeta, now: u64) -> bool {
     meta.valid_to
         .as_deref()
         .and_then(rfc3339_epoch)
-        .is_some_and(|to| to < now)
+        .is_some_and(|to| to <= now)
 }
 
 /// True when the topic body carries a `superseded_by` trailer pointing at
@@ -2319,12 +2320,8 @@ pub(crate) fn live_pointers(dir: &Path, now: u64) -> Vec<(String, String)> {
 /// The instant a current entry stops being current (earliest of
 /// `valid_to` and the TTL clock), for index invalidation.
 pub(crate) fn expires_at(meta: &EntryMeta, mtime: u64) -> Option<u64> {
-    // `valid_to` is inclusive (expired once strictly past), the TTL is not.
-    let to = meta
-        .valid_to
-        .as_deref()
-        .and_then(rfc3339_epoch)
-        .map(|t| t.saturating_add(1));
+    // Both bounds are exclusive: expired at the instant itself.
+    let to = meta.valid_to.as_deref().and_then(rfc3339_epoch);
     let ttl = meta
         .ttl_days
         .map(|d| mtime.saturating_add(d.saturating_mul(86_400)));
