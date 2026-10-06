@@ -596,18 +596,26 @@ fn memory_md_is_amr_valid_and_imports_foreign_edits() {
         );
     }
     // A foreign edit (another tool touching MEMORY.md) is imported into
-    // semantic/amr-import-<date>.md on the next commit, then regenerated.
+    // the proposal proposals/amr-import-<date>.md on the next commit (never
+    // a live note), then regenerated.
     let mut foreign = text;
     foreign.push_str("- the release train leaves fridays\n");
     std::fs::write(&md, foreign).unwrap();
     memory::commit(&user, "memory: test");
     // The date fragment varies; find the file by prefix.
-    let imports: Vec<_> = std::fs::read_dir(user.join("semantic"))
+    assert!(
+        !std::fs::read_dir(user.join("semantic"))
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("amr-import-")),
+        "no live import note"
+    );
+    let imports: Vec<_> = std::fs::read_dir(user.join("proposals"))
         .unwrap()
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with("amr-import-"))
         .collect();
-    assert_eq!(imports.len(), 1, "one import note");
+    assert_eq!(imports.len(), 1, "one import proposal");
     let import = std::fs::read_to_string(imports[0].path()).unwrap();
     assert!(import.contains("provenance: amr-import"), "{import}");
     assert!(import.contains("release train leaves fridays"), "{import}");

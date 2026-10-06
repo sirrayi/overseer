@@ -385,16 +385,23 @@ fn amr_valid(f: &Fx) {
     }
 }
 
+/// Every imported bullet, live or proposed: imports land in `proposals/`
+/// (S3), and `semantic/` is still read so a live import would show too.
 fn imports(f: &Fx) -> String {
-    std::fs::read_dir(f.store.join("semantic"))
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("amr-import"))
-                .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .concat()
+    ["semantic", "proposals"]
+        .iter()
+        .map(|layer| {
+            std::fs::read_dir(f.store.join(layer))
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("amr-import"))
+                        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .concat()
+                })
+                .unwrap_or_default()
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn seeded(tag: &str) -> Fx {
