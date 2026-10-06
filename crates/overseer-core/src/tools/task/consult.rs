@@ -9,7 +9,7 @@ use super::Attempt;
 use crate::agent::RunOutcome;
 use crate::event::{EventKind, EventLog};
 use crate::ir::{Block, Message};
-use crate::ledger::{Ledger, UsageRecord};
+use crate::ledger::Ledger;
 use crate::provider::{Provider, Request};
 
 const MAX_TOKENS: u32 = 2_000;
@@ -43,28 +43,16 @@ fn run(
             .unwrap_or_default(),
         cwd: cwd.display().to_string(),
         model: route.model.clone(),
-        harness_version: env!("CARGO_PKG_VERSION").to_string(),
+        harness_version: env!("CARGO_PKG_VERSION").into(),
         parent: None,
     })?;
     log.append(EventKind::UserInput {
         text: prompt.to_string(),
     })?;
-    // One call can't be stopped midway: refuse when its worst case
-    // (whole prompt fresh + a full answer) would exceed the cap.
-    let profile = crate::profile::lookup(&route.model);
-    let worst = (crate::tokens::count_tokens(prompt, &route.model) as f64 * profile.price.input
-        + f64::from(MAX_TOKENS) * profile.price.output)
-        / 1_000_000.0;
-    if worst > cap {
-        let message = format!("consult could cost up to ${worst:.4}, above its ${cap:.4} cap");
-        log.append(EventKind::Error {
-            message: message.clone(),
-        })?;
-        log.flush()?;
-        return Ok(Attempt::refused(message));
-    }
+    // One call can't be stopped midway: the spend gate lowers its
+    // `max_tokens` to what the cap affords and refuses below its floor.
     let msgs = [Message::user_text(prompt)];
-    let req = Request {
+    let mut req = Request {
         model: &route.model,
         system: &[],
         tools: &[],
@@ -75,17 +63,25 @@ fn run(
         cache_breakpoints: false,
         cache_key: None,
     };
-    let attempt = match provider.complete(&req) {
-        Ok(r) => {
-            let cost = profile.cost_usd(&r.usage);
-            ledger.record(UsageRecord::from_usage(
-                &route.model,
-                &r.usage,
-                r.request_bytes,
-                r.latency_ms,
-                0,
-                cost,
-            ))?;
+    let gated = crate::ledger::Gate {
+        provider,
+        ledger: &mut ledger,
+        cap_usd: cap,
+        reserved_usd: 0.0,
+    }
+    .call(&mut req, Some("consult"));
+    let attempt = match gated {
+        Err(crate::ledger::GateError::Budget { worst_usd, .. }) => {
+            let message =
+                format!("consult could cost up to ${worst_usd:.4}, above its ${cap:.4} cap");
+            log.append(EventKind::Error {
+                message: message.clone(),
+            })?;
+            log.flush()?;
+            return Ok(Attempt::refused(message));
+        }
+        Err(crate::ledger::GateError::Io(e)) => return Err(e),
+        Ok((r, cost)) => {
             let text: String = r
                 .blocks
                 .iter()
@@ -120,7 +116,7 @@ fn run(
                 notes: Vec::new(),
             }
         }
-        Err(e) => {
+        Err(crate::ledger::GateError::Provider(e)) => {
             log.append(EventKind::Error {
                 message: e.to_string(),
             })?;

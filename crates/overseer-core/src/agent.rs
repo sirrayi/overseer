@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::control::Control;
 use crate::event::{rehydrate_messages, Event, EventKind, EventLog};
 use crate::ir::{Block, Message};
-use crate::ledger::{Ledger, UsageRecord};
+use crate::ledger::Ledger;
 use crate::profile;
 use crate::provider::{Provider, Request, StopReason};
 use crate::stuck::StuckDetector;
@@ -357,6 +357,9 @@ pub struct Agent {
     /// Frontend steering handle (P2.4): interrupt + queued input, checked
     /// at safe boundaries only. Default = headless, never fires.
     control: Control,
+    /// The last review's spend (all its calls): the review-share gate's
+    /// estimate of the next one.
+    last_review_usd: f64,
     /// The frozen static system prefix (invariant 2). Mid-session edits to
     /// memory INDEX/CORE, skills or persona reach the model through its
     /// tools, not by rewriting these bytes (which would bust the cache).
@@ -442,6 +445,7 @@ impl Agent {
             verify_blocks: 0,
             checkpoint: None,
             control: Control::default(),
+            last_review_usd: 0.0,
             system: Vec::new(),
             cache_key: Some(session_id.clone()),
             run_cache_start: crate::ledger::CacheStats::default(),
@@ -467,7 +471,7 @@ impl Agent {
             session_id: session_id.clone(),
             cwd,
             model: agent.config.model.clone(),
-            harness_version: env!("CARGO_PKG_VERSION").to_string(),
+            harness_version: env!("CARGO_PKG_VERSION").into(),
             parent: None,
         })?;
         agent.log.flush()?;
@@ -492,7 +496,10 @@ impl Agent {
         // informational only (never parsed).
         if let Some(src) = untrusted_origin_from(get) {
             if let Some(notice) = agent.tools.policy.arm_untrusted(&src) {
-                agent.log.append(EventKind::Tainted { detail: notice })?;
+                agent.log.append(EventKind::Tainted {
+                    detail: notice,
+                    latch: "untrusted".into(),
+                })?;
             }
         }
         // Run manifest (P4.5): provenance record for the reporting
@@ -577,6 +584,7 @@ impl Agent {
             verify_blocks: 0,
             checkpoint: None,
             control: Control::default(),
+            last_review_usd: 0.0,
             system,
             cache_key,
             run_cache_start: crate::ledger::CacheStats::default(),
@@ -586,18 +594,72 @@ impl Agent {
             learn_floor: crate::memory::learn::remember_floor(&events),
             _live: live,
         };
-        // C1b: the untrusted latch is session-scoped but lives in memory —
-        // re-arm it from the replayed `Tainted` so a resumed session
-        // keeps quarantining its own memory writes (the event itself is
-        // already on the log; only the latch needs restoring).
+        // C1b + perm-latch-resume: both Rule-of-Two latches are
+        // session-scoped but live in memory — re-arm each from the
+        // replayed `Tainted` events, so a resumed session keeps gating
+        // side effects and quarantining its own memory writes (the events
+        // are already on the log; only the latches need restoring).
         for e in &events {
-            if let EventKind::Tainted { detail } = &e.kind {
-                let _ = agent.tools.policy.arm_untrusted(detail);
-                break;
+            if let EventKind::Tainted { detail, latch } = &e.kind {
+                if latch.is_empty() {
+                    for (l, part) in crate::perm::split_notice(detail) {
+                        agent.tools.policy.rearm(&l, crate::perm::via_of(&part));
+                    }
+                } else {
+                    agent.tools.policy.rearm(latch, crate::perm::via_of(detail));
+                }
             }
         }
+        agent.close_dangling_calls(&events)?;
         agent.reconcile_subagents()?;
         Ok(agent)
+    }
+
+    /// The text of a synthetic result for a call a crash left unanswered.
+    pub const INTERRUPTED_CALL: &'static str =
+        "interrupted: the session ended before this call finished; it may or may not have run";
+
+    /// resume-dangling-tool-use: every replayed `tool_use` without a
+    /// matching result gets a synthetic error `ToolResult`, appended to the
+    /// log as a real event before the first new request — so this and
+    /// every later replay rehydrate the same, provider-valid view.
+    fn close_dangling_calls(&mut self, events: &[Event]) -> std::io::Result<()> {
+        let answered: std::collections::HashSet<&str> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut dangling = Vec::new();
+        for e in events {
+            if let EventKind::ModelResponse { blocks, .. } = &e.kind {
+                for b in blocks {
+                    if let Block::ToolCall { id, name, .. } = b {
+                        if !answered.contains(id.as_str()) {
+                            dangling.push((id.clone(), name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        if dangling.is_empty() {
+            return Ok(());
+        }
+        for (call_id, name) in dangling {
+            self.log.append(EventKind::ToolResult {
+                call_id,
+                name,
+                content: Self::INTERRUPTED_CALL.into(),
+                is_error: true,
+                raw_bytes: Self::INTERRUPTED_CALL.len() as u64,
+                spilled_to: None,
+                denied: false,
+            })?;
+        }
+        self.log.flush()?;
+        self.messages = rehydrate_messages(&EventLog::replay(self.log.path())?);
+        Ok(())
     }
 
     /// Swap the tool registry — used to spawn read-only subagents with a
@@ -611,6 +673,7 @@ impl Agent {
     /// `Control` per run so a consumed interrupt can't leak into the next
     /// turn; queued steering survives an interrupt (stop ≠ clear-queue).
     pub fn set_control(&mut self, control: Control) {
+        control.adopt(&self.control);
         self.control = control;
     }
 
@@ -625,7 +688,16 @@ impl Agent {
     /// policy: changing modes is a trust-boundary change.
     pub fn set_preset(&mut self, preset: crate::perm::Preset) {
         self.config.policy_preset = preset;
+        self.rebuild_tools();
+    }
+
+    /// Rebuild the registry from the config, carrying the Rule-of-Two
+    /// latches into the new `Policy` (approvals still reset: they live
+    /// in the fresh policy).
+    fn rebuild_tools(&mut self) {
+        let taint = self.tools.policy.taint_snapshot();
         self.tools = Self::registry(&self.config);
+        self.tools.policy.restore_taint(&taint);
     }
 
     /// P8-B (crush `set_model`): switch the run's model mid-session. The
@@ -725,6 +797,11 @@ impl Agent {
         input: &str,
         on_event: &mut dyn FnMut(&Event),
     ) -> std::io::Result<RunOutcome> {
+        // Stuck state is per user turn: one turn's repetition (and the
+        // nudge/effort boost it earned) never trips the next.
+        self.stuck.reset();
+        self.stuck_nudged = false;
+        self.effort_boost = 0;
         self.messages.push(Message::user_text(input));
         self.emit(EventKind::UserInput { text: input.into() }, on_event)?;
         // Per-run cache baseline — RunEnd emits the delta against this.
@@ -835,22 +912,21 @@ impl Agent {
         self.memory_notices(None, on_event)?;
 
         if steps >= self.config.max_steps {
-            let out = RunOutcome::StepBudgetExceeded {
+            // Built after end_run: the run-end review's spend counts.
+            self.end_run("max_steps", steps, on_event)?;
+            return Ok(Some(RunOutcome::StepBudgetExceeded {
                 steps,
                 cost_usd: self.ledger.total_cost_usd,
-            };
-            self.end_run("max_steps", steps, on_event)?;
-            return Ok(Some(out));
+            }));
         }
         // Own + settled subagent spend (both in the ledger) + caps still
         // reserved for subagents in flight.
         if self.ledger.total_cost_usd + self.spend.reserved_usd() >= self.config.max_cost_usd {
-            let out = RunOutcome::CostBudgetExceeded {
+            self.end_run("max_cost", steps, on_event)?;
+            return Ok(Some(RunOutcome::CostBudgetExceeded {
                 steps,
                 cost_usd: self.ledger.total_cost_usd,
-            };
-            self.end_run("max_cost", steps, on_event)?;
-            return Ok(Some(out));
+            }));
         }
 
         // Compaction boundary: the loop only ever compacts here — after a
@@ -896,7 +972,7 @@ impl Agent {
     ) -> std::io::Result<Result<crate::provider::Response, RunOutcome>> {
         // The frozen static prefix (assembled at start/resume): every
         // request of this Agent sends identical system bytes.
-        let req = Request {
+        let mut req = Request {
             model: &self.config.model,
             system: &self.system,
             tools: &self.tools.specs,
@@ -912,16 +988,36 @@ impl Agent {
         // the same request once per provider call (flag scoped to this
         // invocation, reset before every call — multi-Malformed sequences
         // retry each call once, never loop). The retry is a normal step:
-        // it increments `steps` and records ledger usage on success.
-        // Malformed responses are prompt-adjacent, so the retry request
-        // stays in the dynamic segment — the static prefix is untouched.
+        // it increments `steps`. Malformed responses are prompt-adjacent,
+        // so the retry request stays in the dynamic segment — the static
+        // prefix is untouched. Every attempt passes the spend gate and
+        // leaves one ledger row; a call the budget can't afford ends the
+        // run `max_cost`.
         let mut malformed_retried = false;
         let resp = loop {
-            match self.provider.complete(&req) {
-                Ok(r) => break r,
-                Err(crate::provider::ProviderError::Malformed(_msg)) if !malformed_retried => {
+            let gated = crate::ledger::Gate {
+                provider: self.provider.as_ref(),
+                ledger: &mut self.ledger,
+                cap_usd: self.config.max_cost_usd,
+                reserved_usd: self.spend.reserved_usd(),
+            }
+            .call(&mut req, None);
+            self.spend.sync(self.ledger.total_cost_usd);
+            match gated {
+                Ok((r, _)) => break r,
+                Err(crate::ledger::GateError::Provider(
+                    crate::provider::ProviderError::Malformed(_),
+                )) if !malformed_retried => {
                     malformed_retried = true;
                     continue;
+                }
+                Err(crate::ledger::GateError::Io(e)) => return Err(e),
+                Err(crate::ledger::GateError::Budget { .. }) => {
+                    self.end_run("max_cost", steps, on_event)?;
+                    return Ok(Err(RunOutcome::CostBudgetExceeded {
+                        steps,
+                        cost_usd: self.ledger.total_cost_usd,
+                    }));
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -951,15 +1047,7 @@ impl Agent {
         // math and the compaction trigger.
         let profile = profile::lookup(&self.config.model);
         let cost = profile.cost_usd(&resp.usage);
-        self.ledger.record(UsageRecord::from_usage(
-            &self.config.model,
-            &resp.usage,
-            resp.request_bytes,
-            resp.latency_ms,
-            count_tool_calls(&resp.blocks) as u32,
-            cost,
-        ))?;
-        self.spend.sync(self.ledger.total_cost_usd);
+        // The spend gate already wrote this call's ledger row.
 
         // Effective-window budget (playbook Ch.3 §9.2): trigger on the
         // *measured* prompt size from the last call, not an estimate.
@@ -1149,6 +1237,7 @@ impl Agent {
             subagents: crate::tools::task::SubagentCtx {
                 seq: self.subagent_seq,
                 spend: Some(self.spend.clone()),
+                control: self.control.clone(),
             },
             checkpoint: checkpoint.as_mut(),
             sandbox: self.config.sandbox_bash,
@@ -1282,7 +1371,9 @@ impl Agent {
             // Rule-of-Two latch flips are auditable events (P3.10).
             let notices: Vec<String> = std::mem::take(&mut self.tools.taint_notices);
             for notice in notices {
-                self.emit(EventKind::Tainted { detail: notice }, on_event)?;
+                for (latch, detail) in crate::perm::split_notice(&notice) {
+                    self.emit(EventKind::Tainted { detail, latch }, on_event)?;
+                }
             }
         }
         self.messages.push(Message::tool_results(results));
@@ -1392,6 +1483,25 @@ impl Agent {
     /// older tagged critiques from BOTH (keep last 1). Log bytes are never
     /// rewritten — eviction is view-only (messages drain + rehydrate rule).
     /// small_model None → Ok (skip). Respects `reflect: Off`.
+    /// The spend gate ([`crate::ledger::Gate`]) on this agent's ledger,
+    /// cap and subagent reservations, for a request that borrows nothing
+    /// of `self` (the main call builds its gate inline).
+    fn gated(
+        &mut self,
+        req: &mut Request<'_>,
+        purpose: Option<&str>,
+    ) -> Result<(crate::provider::Response, f64), crate::ledger::GateError> {
+        let out = crate::ledger::Gate {
+            provider: self.provider.as_ref(),
+            ledger: &mut self.ledger,
+            cap_usd: self.config.max_cost_usd,
+            reserved_usd: self.spend.reserved_usd(),
+        }
+        .call(req, purpose);
+        self.spend.sync(self.ledger.total_cost_usd);
+        out
+    }
+
     /// ≤1 aux call per verify block, ≤300-token critique, 1024-token request.
     fn reflect(
         &mut self,
@@ -1415,7 +1525,7 @@ impl Agent {
         // Nudge remains. Zero main-model spend, by construction.
         let small = self.config.small_model.clone().expect("checked above");
         let msgs = [Message::user_text(prompt)];
-        let req = Request {
+        let mut req = Request {
             model: &small,
             system: &[],
             tools: &[],
@@ -1426,8 +1536,8 @@ impl Agent {
             cache_breakpoints: false,
             cache_key: None,
         };
-        let critique = match self.provider.complete(&req) {
-            Ok(r) => {
+        let critique = match self.gated(&mut req, Some("reflect")) {
+            Ok((r, _)) => {
                 let t: String = r
                     .blocks
                     .iter()
@@ -1444,7 +1554,9 @@ impl Agent {
                 }
                 t
             }
-            Err(_) => return Ok(()), // fail-soft: the verify Nudge remains
+            Err(crate::ledger::GateError::Io(e)) => return Err(e),
+            // fail-soft (provider error or budget): the verify Nudge remains
+            Err(_) => return Ok(()),
         };
         let text = format!("{} {critique}", Self::REFLECTION_TAG);
         self.messages.push(Message::user_text(text.clone()));
@@ -1487,11 +1599,14 @@ impl Agent {
     /// for titles/consolidation/guardrails. Escalates to the main model
     /// when the small call fails — the tier contract is "cheap first,
     /// correct always". Min effort; these calls never need reasoning.
-    pub fn aux_call(&self, prompt: &str) -> Result<String, crate::provider::ProviderError> {
+    pub fn aux_call(&mut self, prompt: &str) -> Result<String, crate::provider::ProviderError> {
         let msgs = [Message::user_text(prompt)];
-        if let Some(small) = &self.config.small_model {
-            let req = Request {
-                model: small,
+        let mut models: Vec<String> = self.config.small_model.iter().cloned().collect();
+        models.push(self.config.model.clone());
+        let mut last = None;
+        for (i, model) in models.iter().enumerate() {
+            let mut req = Request {
+                model,
                 system: &[],
                 tools: &[],
                 messages: &msgs,
@@ -1501,40 +1616,29 @@ impl Agent {
                 cache_breakpoints: false,
                 cache_key: None,
             };
-            // Small tier first; empty text or a provider error escalates.
-            if let Ok(r) = self.provider.complete(&req) {
-                let text = r
-                    .blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        Block::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<String>();
-                if !text.trim().is_empty() {
-                    return Ok(text);
+            // Small tier first; empty text or an error escalates. Both
+            // calls are gated and ledgered.
+            match self.gated(&mut req, Some("aux")) {
+                Ok((r, _)) => {
+                    let text: String = r
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            Block::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !text.trim().is_empty() || i + 1 == models.len() {
+                        return Ok(text);
+                    }
                 }
+                Err(crate::ledger::GateError::Provider(e)) => last = Some(e),
+                Err(e) => last = Some(crate::provider::ProviderError::Transport(e.to_string())),
             }
         }
-        let req = Request {
-            model: &self.config.model,
-            system: &[],
-            tools: &[],
-            messages: &msgs,
-            max_tokens: 1_024,
-            thinking_budget: None,
-            effort: Some(crate::provider::Effort::Min),
-            cache_breakpoints: false,
-            cache_key: None,
-        };
-        let r = self.provider.complete(&req)?;
-        Ok(r.blocks
-            .iter()
-            .filter_map(|b| match b {
-                Block::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect())
+        Err(last.unwrap_or_else(|| {
+            crate::provider::ProviderError::Transport("aux call produced no text".into())
+        }))
     }
 
     /// Bring every finished subagent's spend into this ledger — one
@@ -1586,7 +1690,10 @@ impl Agent {
             };
             self.bg_noticed.insert(sc.id.clone(), sc.run);
             let footer = Footer::parse(&digest);
-            let text = format!("[subagent {} finished]\n{digest}", sc.id);
+            // subagent-done-replay-offlog: the event carries the capped
+            // digest and footer; live and replay build the same text.
+            let (body, footer_line) = crate::event::split_digest(&digest);
+            let text = crate::event::subagent_notice(&sc.id, &body, footer_line.as_deref());
             self.messages.push(Message::user_text(text));
             self.emit(
                 EventKind::SubagentDone {
@@ -1600,8 +1707,14 @@ impl Agent {
                     model: footer
                         .as_ref()
                         .map_or(sc.model.clone(), |f| f.model.clone()),
+                    status: footer
+                        .as_ref()
+                        .map(|f| f.status.clone())
+                        .unwrap_or_default(),
                     verdict: footer.and_then(|f| f.verdict),
                     run: sc.run,
+                    digest: Some(body),
+                    footer: footer_line,
                     task_id: sc.id,
                     trace: path.display().to_string(),
                 },
@@ -1665,7 +1778,7 @@ impl Agent {
         // never touches the message view. The `events` replay predates
         // the MemoryReview event by construction; summaries and
         // rehydrate never consume it.
-        self.maybe_review(Some("pre_compaction"), anchor, on_event)?;
+        self.maybe_review(Some("pre_compaction"), anchor, None, on_event)?;
         let summary = crate::compact::summarize(&events, anchor);
         self.emit(
             EventKind::Compaction {
@@ -1750,6 +1863,12 @@ impl Agent {
         on_event: &mut dyn FnMut(&Event),
     ) -> std::io::Result<()> {
         self.reconcile_subagents()?;
+        // §1.2 + review-cost-after-runend: the run-end review runs before
+        // RunEnd (and before the outcome the caller builds), so both
+        // include its spend; it gets the stop reason directly. The
+        // episode note reads RunEnd, so it is written last.
+        self.log.flush()?;
+        self.maybe_review(None, u64::MAX, Some(stop), on_event)?;
         self.emit(
             EventKind::RunEnd {
                 stop_reason: stop.into(),
@@ -1765,12 +1884,6 @@ impl Agent {
         )?;
         self.log.flush()?;
         self.write_episode();
-        // §1.2: the run-end review, after the episode write. The
-        // MemoryReview event lands after RunEnd (audit only); its cost
-        // is already in the ledger, so the RunOutcome the caller builds
-        // includes it.
-        self.maybe_review(None, u64::MAX, on_event)?;
-        self.log.flush()?;
         Ok(())
     }
 
@@ -1788,6 +1901,7 @@ impl Agent {
         &mut self,
         forced: Option<&'static str>,
         upto: u64,
+        stop: Option<&str>,
         on_event: &mut dyn FnMut(&Event),
     ) -> std::io::Result<()> {
         use crate::memory::learn;
@@ -1814,7 +1928,11 @@ impl Agent {
                 } else {
                     stats
                 };
-                if floored.signals > 0 {
+                // An explicit "remember" fires at once; a correction
+                // only when the last review is ≥ 2 user turns back.
+                let correction_due = self.review_cursor == 0 || stats.user_turns >= 2;
+                if floored.remembers > 0 || (floored.signals > floored.remembers && correction_due)
+                {
                     Some("signal")
                 } else if floored.user_turns >= self.config.learn_every.max(1) {
                     Some("turns")
@@ -1840,7 +1958,7 @@ impl Agent {
             );
         }
         let now = crate::memory::now_secs();
-        let digest = learn::digest(&events, self.review_cursor, upto);
+        let digest = learn::digest_with_stop(&events, self.review_cursor, upto, stop);
         if digest.through <= self.review_cursor {
             return self.emit_review(
                 trigger,
@@ -1852,18 +1970,28 @@ impl Agent {
                 on_event,
             );
         }
+        // review-share: session review spend stays within 25% of main
+        // spend + $0.02 — the next review is estimated at the last one's.
+        let review_usd = self.ledger.review_cost_usd;
+        let main_usd = self.ledger.total_cost_usd - review_usd;
+        if review_usd + self.last_review_usd > 0.25 * main_usd + 0.02 {
+            return self.emit_review(
+                trigger,
+                None,
+                Some("review-share".into()),
+                None,
+                0.0,
+                digest.taint_reason.clone(),
+                on_event,
+            );
+        }
         let prompt = self.review_prompt(&digest, &stores, now, None);
-        // §1.7 + F6: skip when the worst-case review cost (chars/4 in +
-        // 1,200 out) exceeds the budget left after own spend and
-        // subagent reservations. Worst case SUMS across the distinct
-        // candidate models — a failed small call escalates to the main
-        // model, so both can be billed.
+        // §1.7 + F6: skip when the worst-case review (chars/4 in + its
+        // max_tokens out) exceeds the budget left after own spend and
+        // reservations. Worst case SUMS across the distinct candidate
+        // models — a failed small call escalates, so both can be billed.
+        // Each call is still gated (one it can't afford returns `budget`).
         let est_tokens = (prompt.len() as f64 / 4.0).ceil() as u64;
-        let u = crate::ir::Usage {
-            fresh_input: est_tokens,
-            output: 1_200,
-            ..Default::default()
-        };
         let mut worst = 0.0f64;
         let mut seen = std::collections::HashSet::new();
         for m in [
@@ -1874,7 +2002,11 @@ impl Agent {
         .flatten()
         {
             if seen.insert(m.clone()) {
-                worst += profile::lookup(&m).cost_usd(&u);
+                worst += profile::lookup(&m).cost_usd(&crate::ir::Usage {
+                    fresh_input: est_tokens,
+                    output: u64::from(review_max_tokens(&m)),
+                    ..Default::default()
+                });
             }
         }
         let remaining =
@@ -1890,7 +2022,10 @@ impl Agent {
                 on_event,
             );
         }
-        match self.review_call(&prompt) {
+        let before = self.ledger.review_cost_usd;
+        let result = self.review_call(&prompt);
+        self.last_review_usd = self.ledger.review_cost_usd - before;
+        match result {
             Ok((reply, model, cost)) => {
                 let parsed = learn::parse(&reply);
                 let ctx = learn::ApplyCtx {
@@ -1964,12 +2099,14 @@ impl Agent {
         crate::memory::learn::prompt(digest, &related, &[], focus, false)
     }
 
-    /// §1.7: the review's one model call. Small tier first (the same
-    /// escalate-on-failure/empty contract `aux_call` has), but unlike
-    /// `aux_call` every attempt is ledgered: a `UsageRecord` tagged
-    /// `purpose: "memory_review"` whose cost lands in the run total.
-    /// `max_tokens` 1,200, effort Min, no reasoning.
+    /// §1.7: the review's model call. Small tier first (the same
+    /// escalate-on-failure/empty contract `aux_call` has); every attempt
+    /// passes the spend gate and is ledgered `purpose: "memory_review"`.
+    /// Effort Min, `max_tokens` 1,200 — plus 4,000 of headroom on a model
+    /// that reasons anyway. A reply with no text that hit its limit
+    /// retries once at double the limit (≤ 12,000).
     fn review_call(&mut self, prompt: &str) -> Result<(String, String, f64), String> {
+        const RETRY_CEILING: u32 = 12_000;
         let msgs = [Message::user_text(prompt.to_string())];
         let mut models: Vec<String> = Vec::with_capacity(2);
         if let Some(s) = &self.config.small_model {
@@ -1981,55 +2118,56 @@ impl Agent {
         let mut last = String::from("review call produced no text");
         for (i, model) in models.iter().enumerate() {
             let last_try = i + 1 == models.len();
-            let req = Request {
-                model,
-                system: &[],
-                tools: &[],
-                messages: &msgs,
-                max_tokens: 1_200,
-                thinking_budget: None,
-                effort: Some(crate::provider::Effort::Min),
-                cache_breakpoints: false,
-                cache_key: None,
-            };
-            match self.provider.complete(&req) {
-                Ok(r) => {
-                    let cost = profile::lookup(model).cost_usd(&r.usage);
-                    self.ledger
-                        .record(crate::ledger::UsageRecord {
-                            purpose: Some("memory_review".into()),
-                            ..crate::ledger::UsageRecord::from_usage(
-                                model,
-                                &r.usage,
-                                r.request_bytes,
-                                r.latency_ms,
-                                0,
-                                cost,
-                            )
-                        })
-                        .map_err(|e| e.to_string())?;
-                    self.spend.sync(self.ledger.total_cost_usd);
-                    let text: String = r
-                        .blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            Block::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    if !text.trim().is_empty() {
-                        return Ok((text, model.clone(), cost));
+            let reasons = profile::lookup(model).reasons();
+            let mut max_tokens = review_max_tokens(model);
+            let mut retried = false;
+            loop {
+                let mut req = Request {
+                    model,
+                    system: &[],
+                    tools: &[],
+                    messages: &msgs,
+                    max_tokens,
+                    thinking_budget: None,
+                    effort: Some(crate::provider::Effort::Min),
+                    cache_breakpoints: false,
+                    cache_key: None,
+                };
+                match self.gated(&mut req, Some(crate::ledger::REVIEW_PURPOSE)) {
+                    Ok((r, cost)) => {
+                        let text: String = r
+                            .blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                Block::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        if !text.trim().is_empty() {
+                            return Ok((text, model.clone(), cost));
+                        }
+                        let used = r.usage.output.saturating_add(r.usage.reasoning);
+                        let hit = r.stop_reason == StopReason::MaxTokens
+                            || used >= u64::from(req.max_tokens);
+                        // Reasoning ate the limit: one retry at double.
+                        let reasoned = reasons || r.usage.reasoning > 0;
+                        if hit && reasoned && !retried && max_tokens < RETRY_CEILING {
+                            retried = true;
+                            max_tokens = max_tokens.saturating_mul(2).min(RETRY_CEILING);
+                            continue;
+                        }
+                        break;
                     }
-                    if last_try {
-                        return Err(last);
-                    }
-                }
-                Err(e) => {
-                    last = e.to_string();
-                    if last_try {
-                        return Err(last);
+                    Err(crate::ledger::GateError::Budget { .. }) => return Err("budget".into()),
+                    Err(crate::ledger::GateError::Io(e)) => return Err(e.to_string()),
+                    Err(crate::ledger::GateError::Provider(e)) => {
+                        last = e.to_string();
+                        break;
                     }
                 }
+            }
+            if last_try {
+                return Err(last);
             }
         }
         Err(last)
@@ -2105,6 +2243,16 @@ impl Agent {
 
 /// Serialize the current message view for the B1-9 token estimate.
 /// Runs once per turn at the budget checkpoint — never in hot loops.
+/// §1.7 review output limit: 1,200, plus 4,000 of headroom on a model
+/// that reasons anyway (its reasoning bills against the same limit).
+fn review_max_tokens(model: &str) -> u32 {
+    if profile::lookup(model).reasons() {
+        1_200 + 4_000
+    } else {
+        1_200
+    }
+}
+
 fn prompt_text_for_estimate(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
@@ -2124,13 +2272,6 @@ fn prompt_text_for_estimate(messages: &[Message]) -> String {
         }
     }
     out
-}
-
-fn count_tool_calls(blocks: &[Block]) -> usize {
-    blocks
-        .iter()
-        .filter(|b| matches!(b, Block::ToolCall { .. }))
-        .count()
 }
 
 /// Text of the last assistant message — what a stop hook observes as the
@@ -2358,6 +2499,172 @@ mod tests {
             request_bytes: 0,
             latency_ms: 0,
         }
+    }
+
+    /// Scripted spender: every call bills a random share (≤ the gated
+    /// request's own worst case) of its counted input and `max_tokens`.
+    struct Spender {
+        calls: Mutex<u64>,
+        rng: Mutex<u64>,
+    }
+
+    fn xorshift(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+
+    impl Provider for Spender {
+        fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
+            let n = {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                *n
+            };
+            let mut x = self.rng.lock().unwrap();
+            let fresh_input = xorshift(&mut x) % (crate::ledger::request_tokens(req) + 1);
+            let output = xorshift(&mut x) % (u64::from(req.max_tokens) + 1);
+            Ok(Response {
+                blocks: vec![Block::ToolCall {
+                    id: format!("c{n}"),
+                    name: "bash".into(),
+                    input: serde_json::json!({"command": format!("echo spend{n}")}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    fresh_input,
+                    output,
+                    ..Usage::default()
+                },
+                request_bytes: 0,
+                latency_ms: 0,
+            })
+        }
+        fn name(&self) -> &'static str {
+            "spender"
+        }
+    }
+
+    /// Spend-gate property: random scripted per-call costs never push
+    /// spend past the cap, and ledger rows always equal provider calls.
+    #[test]
+    fn spend_gate_never_passes_the_cap_and_ledgers_every_call() {
+        let mut budget_stops = 0;
+        for seed in 1..=24u64 {
+            let dir = tmpdir();
+            let cap = 0.02 + seed as f64 * 0.013;
+            let cfg = AgentConfig {
+                cwd: dir.clone(),
+                full_access: true,
+                model: "claude-sonnet-5".into(),
+                max_cost_usd: cap,
+                max_steps: 40,
+                ..AgentConfig::default()
+            };
+            let p = Arc::new(Spender {
+                calls: Mutex::new(0),
+                rng: Mutex::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
+            });
+            let mut agent = Agent::start(p.clone(), cfg, dir.clone(), "s".into()).unwrap();
+            let out = agent.run_turn("spend", &mut |_: &Event| {}).unwrap();
+            let rows = Ledger::read_all(dir.join("ledger.jsonl"));
+            let spent: f64 = rows.iter().map(|r| r.cost_usd).sum();
+            assert!(
+                spent <= cap + 1e-9,
+                "seed {seed}: ${spent} > ${cap} ({out:?})"
+            );
+            assert_eq!(rows.len() as u64, *p.calls.lock().unwrap(), "seed {seed}");
+            budget_stops += usize::from(matches!(out, RunOutcome::CostBudgetExceeded { .. }));
+        }
+        assert!(
+            budget_stops >= 12,
+            "only {budget_stops} runs reached the cap"
+        );
+    }
+
+    /// §1.7: a reasoning-only review reply that hit its limit retries
+    /// once at double the limit — exactly one retry — then escalates.
+    #[test]
+    fn reasoning_only_review_reply_retries_exactly_once() {
+        struct Reasoner {
+            reviews: Mutex<Vec<(String, u32)>>,
+        }
+        impl Provider for Reasoner {
+            fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
+                if !req.tools.is_empty() {
+                    return Ok(done());
+                }
+                self.reviews
+                    .lock()
+                    .unwrap()
+                    .push((req.model.to_string(), req.max_tokens));
+                let blocks = if req.model == "gpt-reasoner-1" {
+                    vec![]
+                } else {
+                    vec![Block::Text {
+                        text: "NOTHING".into(),
+                    }]
+                };
+                Ok(Response {
+                    blocks,
+                    stop_reason: StopReason::MaxTokens,
+                    usage: Usage {
+                        fresh_input: 100,
+                        reasoning: u64::from(req.max_tokens),
+                        ..Usage::default()
+                    },
+                    request_bytes: 0,
+                    latency_ms: 0,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "reasoner"
+            }
+        }
+        let dir = tmpdir();
+        let (user, project, ws) = (
+            dir.join("user-mem"),
+            dir.join("project-mem"),
+            dir.join("ws"),
+        );
+        crate::memory::ensure(&user).unwrap();
+        crate::memory::ensure(&project).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let cfg = AgentConfig {
+            cwd: ws,
+            full_access: true,
+            model: "claude-fable-5".into(),
+            small_model: Some("gpt-reasoner-1".into()),
+            memory_dir: Some(project),
+            user_memory_dir: Some(user),
+            reflect: ReflectMode::Off,
+            max_cost_usd: 5.0,
+            ..AgentConfig::default()
+        };
+        assert!(profile::lookup("gpt-reasoner-1").reasons());
+        let p = Arc::new(Reasoner {
+            reviews: Mutex::new(Vec::new()),
+        });
+        let mut agent = Agent::start(p.clone(), cfg, dir.join("s"), "s".into()).unwrap();
+        agent
+            .run_turn("remember that tea beats coffee", &mut |_: &Event| {})
+            .unwrap();
+        let reviews = p.reviews.lock().unwrap().clone();
+        assert_eq!(
+            reviews,
+            [
+                ("gpt-reasoner-1".to_string(), 5_200),
+                ("gpt-reasoner-1".to_string(), 10_400),
+                ("claude-fable-5".to_string(), 1_200),
+            ]
+        );
+        let rows = Ledger::read_all(dir.join("s/ledger.jsonl"));
+        let review_rows = rows
+            .iter()
+            .filter(|r| r.purpose.as_deref() == Some("memory_review"))
+            .count();
+        assert_eq!(review_rows, 3);
     }
 
     fn tmpdir() -> PathBuf {
@@ -3293,7 +3600,7 @@ mod tests {
             ..AgentConfig::default()
         };
         let provider = Arc::new(Mock::new(vec![done()]));
-        let agent = Agent::start(provider.clone(), cfg, dir, "s".into()).unwrap();
+        let mut agent = Agent::start(provider.clone(), cfg, dir, "s".into()).unwrap();
         let out = agent.aux_call("title this").unwrap();
         assert_eq!(out.trim(), "all done");
         let models = provider.seen_models.lock().unwrap();
@@ -3311,7 +3618,7 @@ mod tests {
             ..AgentConfig::default()
         };
         let provider = Arc::new(Mock::failing_on(&["tiny-1"], vec![done()]));
-        let agent = Agent::start(provider.clone(), cfg, dir, "s".into()).unwrap();
+        let mut agent = Agent::start(provider.clone(), cfg, dir, "s".into()).unwrap();
         let out = agent.aux_call("title this").unwrap();
         assert_eq!(out.trim(), "all done");
         let models = provider.seen_models.lock().unwrap();
@@ -3334,11 +3641,12 @@ mod tests {
         let mut sink = |_: &Event| {};
         let out = agent.run_turn("finish fast", &mut sink).unwrap();
         assert!(matches!(out, RunOutcome::Completed { steps: 1, .. }));
-        // Two provider calls (initial + 1 retry), one recorded ledger call
-        // (ledger records successes; the Malformed attempt never completes).
+        // Two provider calls (initial + 1 retry), two ledger rows: the
+        // spend gate ledgers every call, the Malformed one at $0.
         assert_eq!(provider.seen_models.lock().unwrap().len(), 2);
         let ledger = Ledger::read_all(dir.join("ledger.jsonl"));
-        assert_eq!(ledger.len(), 1, "retry success records exactly 1 call");
+        assert_eq!(ledger.len(), 2, "one row per provider call");
+        assert_eq!(ledger[0].cost_usd, 0.0);
     }
 
     /// P3.10: tool results enter the model view provenance-wrapped, and
@@ -3616,13 +3924,17 @@ mod tests {
         let mut sink = |_: &Event| {};
         agent.run_turn("go", &mut sink).unwrap();
         for n in [1, 2] {
-            assert!(session
-                .join(format!("subagents/task-{n}/task.json"))
-                .exists());
-            assert!(session.join(format!("subagents/wt-{n}/wt")).exists());
+            let sc: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(session.join(format!("subagents/task-{n}/task.json")))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sc["branch"], format!("overseer/session/task-{n}"));
+            // No-op writers clean up after themselves.
+            assert!(!session.join(format!("subagents/wt-{n}/wt")).exists());
         }
-        let branches = git(&repo, &["branch", "--list", "overseer-task-*"]);
-        assert!(branches.contains("overseer-task-1") && branches.contains("overseer-task-2"));
+        let branches = git(&repo, &["branch", "--list", "overseer/*"]);
+        assert!(branches.trim().is_empty(), "{branches}");
         let results: Vec<String> = agent
             .messages()
             .iter()
@@ -3661,39 +3973,31 @@ mod tests {
         let out = agent
             .run_turn("go", &mut |e: &Event| events.push(e.kind.clone()))
             .unwrap();
-        // task-2 was capped at what was left ($0.04) but its one call cost
-        // $0.06: spend is only known after a call, so the parent stops.
+        // After task-1's $0.06 the $0.04 left can't buy the parent's next
+        // call (1,024 fable output tokens alone cost more): the spend gate
+        // stops the run before task-2 is spawned — the cap is never passed.
         let RunOutcome::CostBudgetExceeded { cost_usd, .. } = out else {
             panic!("{out:?}");
         };
-        assert!((cost_usd - 0.12).abs() < 1e-3, "{cost_usd}");
-        let caps: Vec<f64> = [1, 2]
-            .iter()
-            .map(|n| {
-                crate::tools::task::sidecar::Sidecar::load(&dir.join(format!("subagents/task-{n}")))
-                    .unwrap()
-                    .cap_usd
-            })
-            .collect();
-        assert!(
-            (caps[0] - 0.10).abs() < 1e-9 && (caps[1] - 0.04).abs() < 1e-3,
-            "{caps:?}"
-        );
+        assert!((cost_usd - 0.06).abs() < 1e-3, "{cost_usd}");
+        let sc = crate::tools::task::sidecar::Sidecar::load(&dir.join("subagents/task-1")).unwrap();
+        assert!((sc.cap_usd - 0.10).abs() < 1e-9, "{}", sc.cap_usd);
+        assert!(!dir.join("subagents/task-2").exists());
         assert!(events.iter().any(|k| matches!(k,
             EventKind::RunEnd { total_cost_usd, subagent_cost_usd, .. }
-                if (total_cost_usd - 0.12).abs() < 1e-3 && (subagent_cost_usd - 0.12).abs() < 1e-3)));
+                if (total_cost_usd - 0.06).abs() < 1e-3 && (subagent_cost_usd - 0.06).abs() < 1e-3)));
         let settlements = |d: &std::path::Path| {
             Ledger::read_all(d.join("ledger.jsonl"))
                 .iter()
                 .filter(|r| r.subagent.is_some())
                 .count()
         };
-        assert_eq!(settlements(&dir), 2);
+        assert_eq!(settlements(&dir), 1);
         drop(agent);
         let resumed = Agent::resume(provider, cfg, dir.clone()).unwrap();
-        assert!((resumed.ledger.total_cost_usd - 0.12).abs() < 1e-3);
-        assert_eq!(settlements(&dir), 2, "resume must not settle again");
-        assert_eq!(resumed.subagent_seq, 2);
+        assert!((resumed.ledger.total_cost_usd - 0.06).abs() < 1e-3);
+        assert_eq!(settlements(&dir), 1, "resume must not settle again");
+        assert_eq!(resumed.subagent_seq, 1);
     }
 
     /// P3.2: effort bumps one notch per stuck-detector trip.

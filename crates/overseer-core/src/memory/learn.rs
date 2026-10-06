@@ -374,6 +374,12 @@ pub struct Digest {
 
 /// Build the digest over `events` in `(after, upto]`.
 pub fn digest(events: &[Event], after: u64, upto: u64) -> Digest {
+    digest_with_stop(events, after, upto, None)
+}
+
+/// [`digest`] for the run-end review, which runs before its run's
+/// `RunEnd` is logged: `stop` is that run's stop reason.
+pub fn digest_with_stop(events: &[Event], after: u64, upto: u64, stop: Option<&str>) -> Digest {
     let mut d = Digest {
         through: after,
         ..Digest::default()
@@ -408,7 +414,7 @@ pub fn digest(events: &[Event], after: u64, upto: u64) -> Digest {
     // Tainted event reviewed last time must keep tainting later windows
     // of the same session (F1).
     for e in events.iter().filter(|e| e.id <= upto) {
-        if let EventKind::Tainted { detail } = &e.kind {
+        if let EventKind::Tainted { detail, .. } = &e.kind {
             d.tainted = true;
             if d.taint_reason.is_none() {
                 d.taint_reason = Some(detail.clone());
@@ -509,6 +515,9 @@ pub fn digest(events: &[Event], after: u64, upto: u64) -> Digest {
     if !files.is_empty() {
         head.push_str(&format!("files touched: {}\n", files.join(", ")));
     }
+    if let Some(s) = stop {
+        stops.push(s.to_string());
+    }
     if !stops.is_empty() {
         head.push_str(&format!("stop reasons: {}\n", stops.join(", ")));
     }
@@ -542,6 +551,8 @@ pub struct WindowStats {
     pub tool_calls: u32,
     /// LearnSignal events — the signal trigger reads this.
     pub signals: u32,
+    /// The explicit "remember"-kind share of `signals`.
+    pub remembers: u32,
 }
 
 /// One pass over the window for trigger math (the digest stays the
@@ -552,7 +563,12 @@ pub fn window_stats(events: &[Event], after: u64, upto: u64) -> WindowStats {
         match &e.kind {
             EventKind::UserInput { .. } => s.user_turns += 1,
             EventKind::ToolCallStart { .. } => s.tool_calls += 1,
-            EventKind::LearnSignal { .. } => s.signals += 1,
+            EventKind::LearnSignal { kind, .. } => {
+                s.signals += 1;
+                if kind == "remember" {
+                    s.remembers += 1;
+                }
+            }
             _ => {}
         }
     }
@@ -1928,6 +1944,7 @@ mod tests {
                 2,
                 EventKind::Tainted {
                     detail: "untrusted content armed".into(),
+                    latch: String::new(),
                 },
             ),
             mk(

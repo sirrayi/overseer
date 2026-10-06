@@ -142,6 +142,8 @@ pub struct Ledger {
     pub total_cost_usd: f64,
     /// The settled-subagent share of `total_cost_usd`.
     pub subagent_cost_usd: f64,
+    /// The learning-review share (`purpose: memory_review` rows).
+    pub review_cost_usd: f64,
     /// Own provider calls (settlement rows excluded).
     pub calls: u64,
     cache: CacheStats,
@@ -162,6 +164,7 @@ impl Ledger {
             path,
             total_cost_usd: 0.0,
             subagent_cost_usd: 0.0,
+            review_cost_usd: 0.0,
             calls: 0,
             cache: CacheStats::default(),
             settled: Default::default(),
@@ -170,12 +173,14 @@ impl Ledger {
 
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        crate::harden::repair_torn_tail(&path)?;
         let file = OpenOptions::new().append(true).open(&path)?;
         let mut ledger = Ledger {
             file,
             path,
             total_cost_usd: 0.0,
             subagent_cost_usd: 0.0,
+            review_cost_usd: 0.0,
             calls: 0,
             cache: CacheStats::default(),
             settled: Default::default(),
@@ -200,6 +205,9 @@ impl Ledger {
             None => {
                 self.calls += 1;
                 self.cache.add(r);
+                if r.purpose.as_deref() == Some(REVIEW_PURPOSE) {
+                    self.review_cost_usd += r.cost_usd;
+                }
             }
         }
     }
@@ -295,6 +303,168 @@ pub struct Summary {
     /// alert. Computed in `summarize`, read by dashboards/CI.
     pub cache_alert: bool,
     pub latency_ms: u64,
+}
+
+/// `purpose` of the §1.7 learning review's rows.
+pub const REVIEW_PURPOSE: &str = "memory_review";
+/// Below this many affordable output tokens the gate refuses a call.
+pub const MIN_OUTPUT_TOKENS: u32 = 1_024;
+/// Input-estimate stand-in for one image block.
+const IMAGE_TOKENS: u64 = 1_600;
+
+/// Counted input tokens of `req`: system, tool specs and message text,
+/// images at a flat [`IMAGE_TOKENS`].
+pub fn request_tokens(req: &crate::provider::Request<'_>) -> u64 {
+    use crate::ir::Block;
+    let mut text = String::new();
+    let mut images = 0u64;
+    for s in req.system {
+        text.push_str(&s.text);
+    }
+    for t in req.tools {
+        text.push_str(&t.name);
+        text.push_str(&t.description);
+        text.push_str(&t.input_schema.to_string());
+    }
+    for m in req.messages {
+        for b in &m.content {
+            match b {
+                Block::Text { text: t } => text.push_str(t),
+                Block::ToolResult { content, .. } => text.push_str(content),
+                Block::ToolCall { name, input, .. } => {
+                    text.push_str(name);
+                    text.push_str(&input.to_string());
+                }
+                Block::Reasoning { raw } => text.push_str(&raw.to_string()),
+                Block::Image { .. } => images += 1,
+            }
+        }
+    }
+    crate::tokens::count_tokens(&text, req.model)
+        .saturating_add(images.saturating_mul(IMAGE_TOKENS))
+}
+
+/// The one spend gate every provider call goes through (main turn,
+/// reflection, aux, memory review, consult; subagents and escalations
+/// are agents, so theirs too). Before the call: `worst` = the counted
+/// input priced at the dearer of fresh/cache-write plus `max_tokens` of
+/// output; when `spent + reserved + worst` would pass the cap the
+/// request's `max_tokens` drops to what is left, and below
+/// [`MIN_OUTPUT_TOKENS`] the call is refused ([`GateError::Budget`]).
+/// After the call — answered or failed — exactly one ledger row, tagged
+/// with `purpose` (None = an ordinary turn call).
+pub struct Gate<'a> {
+    pub provider: &'a dyn crate::provider::Provider,
+    pub ledger: &'a mut Ledger,
+    pub cap_usd: f64,
+    /// Caps still held for subagents in flight.
+    pub reserved_usd: f64,
+}
+
+#[derive(Debug)]
+pub enum GateError {
+    /// Not even [`MIN_OUTPUT_TOKENS`] fit in what is left.
+    Budget {
+        worst_usd: f64,
+        remaining_usd: f64,
+    },
+    Provider(crate::provider::ProviderError),
+    /// The ledger row could not be written.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for GateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GateError::Budget {
+                worst_usd,
+                remaining_usd,
+            } => write!(
+                f,
+                "budget: the call could cost ${worst_usd:.4}, ${remaining_usd:.4} left"
+            ),
+            GateError::Provider(e) => write!(f, "{e}"),
+            GateError::Io(e) => write!(f, "ledger: {e}"),
+        }
+    }
+}
+
+impl Gate<'_> {
+    /// Gate, send and ledger one call. Returns the response and its cost.
+    pub fn call(
+        self,
+        req: &mut crate::provider::Request<'_>,
+        purpose: Option<&str>,
+    ) -> Result<(crate::provider::Response, f64), GateError> {
+        let profile = crate::profile::lookup(req.model);
+        let n = request_tokens(req);
+        let in_usd = profile
+            .cost_usd(&Usage {
+                fresh_input: n,
+                ..Usage::default()
+            })
+            .max(profile.cost_usd(&Usage {
+                cache_write: n,
+                ..Usage::default()
+            }));
+        let per_out = profile.cost_usd(&Usage {
+            output: 1_000_000,
+            ..Usage::default()
+        }) / 1_000_000.0;
+        let remaining = self.cap_usd - self.ledger.total_cost_usd - self.reserved_usd;
+        let worst = in_usd + f64::from(req.max_tokens) * per_out;
+        if worst > remaining {
+            let afford = if per_out > 0.0 {
+                ((remaining - in_usd) / per_out).floor()
+            } else {
+                -1.0
+            };
+            if afford < f64::from(MIN_OUTPUT_TOKENS) {
+                return Err(GateError::Budget {
+                    worst_usd: worst,
+                    remaining_usd: remaining,
+                });
+            }
+            req.max_tokens = req.max_tokens.min(afford as u32);
+            // A thinking budget must stay under the output limit.
+            if let Some(tb) = req.thinking_budget {
+                if tb >= req.max_tokens {
+                    req.thinking_budget =
+                        Some(req.max_tokens / 2).filter(|b| *b >= MIN_OUTPUT_TOKENS);
+                }
+            }
+        }
+        let (rec, out) = match self.provider.complete(req) {
+            Ok(r) => {
+                let cost = profile.cost_usd(&r.usage);
+                let calls = r
+                    .blocks
+                    .iter()
+                    .filter(|b| matches!(b, crate::ir::Block::ToolCall { .. }))
+                    .count() as u32;
+                let rec = UsageRecord::from_usage(
+                    req.model,
+                    &r.usage,
+                    r.request_bytes,
+                    r.latency_ms,
+                    calls,
+                    cost,
+                );
+                (rec, Ok((r, cost)))
+            }
+            Err(e) => (
+                UsageRecord::from_usage(req.model, &Usage::default(), 0, 0, 0, 0.0),
+                Err(GateError::Provider(e)),
+            ),
+        };
+        self.ledger
+            .record(UsageRecord {
+                purpose: purpose.map(str::to_string),
+                ..rec
+            })
+            .map_err(GateError::Io)?;
+        out
+    }
 }
 
 #[cfg(test)]
