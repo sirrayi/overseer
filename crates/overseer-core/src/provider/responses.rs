@@ -141,16 +141,24 @@ impl ResponsesApi {
     ) -> Result<Response, ProviderError> {
         let mut blocks = Vec::new();
         let mut saw_tool_call = false;
+        let mut saw_refusal = false;
         let response_id = parsed["id"].clone();
         for item in parsed["output"].as_array().cloned().unwrap_or_default() {
             match item["type"].as_str() {
                 Some("reasoning") => blocks.push(Block::Reasoning { raw: item }),
                 Some("message") => {
                     for part in item["content"].as_array().cloned().unwrap_or_default() {
-                        if part["type"].as_str() == Some("output_text") {
-                            blocks.push(Block::Text {
+                        match part["type"].as_str() {
+                            Some("output_text") => blocks.push(Block::Text {
                                 text: part["text"].as_str().unwrap_or("").to_string(),
-                            });
+                            }),
+                            Some("refusal") => {
+                                saw_refusal = true;
+                                blocks.push(Block::Text {
+                                    text: part["refusal"].as_str().unwrap_or("").to_string(),
+                                });
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -225,6 +233,7 @@ impl ResponsesApi {
             StopReason::ToolUse
         } else {
             match parsed["status"].as_str() {
+                Some("completed") if saw_refusal => StopReason::Refusal,
                 Some("completed") => StopReason::EndTurn,
                 Some("incomplete") => match parsed["incomplete_details"]["reason"].as_str() {
                     Some("max_output_tokens") => StopReason::MaxTokens,

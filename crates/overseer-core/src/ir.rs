@@ -117,7 +117,9 @@ pub struct Usage {
 
 impl Usage {
     pub fn total_input(&self) -> u64 {
-        self.fresh_input + self.cache_write + self.cache_read
+        self.fresh_input
+            .saturating_add(self.cache_write)
+            .saturating_add(self.cache_read)
     }
 }
 

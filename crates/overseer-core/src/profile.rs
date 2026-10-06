@@ -152,7 +152,7 @@ impl ModelProfile {
         (u.fresh_input as f64 * self.price.input
             + u.cache_write as f64 * self.price.cache_write
             + u.cache_read as f64 * self.price.cache_read
-            + (u.output + u.reasoning) as f64 * self.price.output)
+            + u.output.saturating_add(u.reasoning) as f64 * self.price.output)
             / per_m
     }
 }

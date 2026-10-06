@@ -125,6 +125,9 @@ pub enum StopReason {
     ToolUse,
     PauseTurn,
     Refusal,
+    /// A refusal whose raw provider reason survives (Gemini SAFETY,
+    /// RECITATION, BLOCKLIST, SPII, PROHIBITED_CONTENT, …).
+    Blocked(String),
     /// Anthropic 4.5+: generation stopped at the window wall.
     ContextWindowExceeded,
     Other(String),
@@ -139,8 +142,12 @@ impl StopReason {
             Self::PauseTurn => "pause_turn",
             Self::Refusal => "refusal",
             Self::ContextWindowExceeded => "model_context_window_exceeded",
-            Self::Other(s) => s.as_str(),
+            Self::Blocked(s) | Self::Other(s) => s.as_str(),
         }
+    }
+
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Self::Refusal | Self::Blocked(_))
     }
 }
 
@@ -168,6 +175,14 @@ impl std::error::Error for ProviderError {}
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::RateLimit {
+                status,
+                retry_after_ms,
+            } if *retry_after_ms > MAX_RETRY_AFTER_MS => write!(
+                f,
+                "rate limited ({status}); provider asked to retry after {}s",
+                retry_after_ms / 1000
+            ),
             Self::RateLimit {
                 status,
                 retry_after_ms,
@@ -207,6 +222,10 @@ pub(crate) fn bearer_post(
     call
 }
 
+/// Longest Retry-After worth waiting out. A `RateLimit` above it is a
+/// failed call ("provider asked to retry after Ns"), not a sleep.
+pub const MAX_RETRY_AFTER_MS: u64 = 60_000;
+
 /// Statuses that mean "back off and retry" (529 is Anthropic's overload).
 pub(crate) const RATE_LIMITED: &[u16] = &[429, 529, 503];
 
@@ -238,7 +257,7 @@ pub(crate) fn send_json(
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(5)
-            * 1000;
+            .saturating_mul(1000);
         return Err(ProviderError::RateLimit {
             status,
             retry_after_ms,
