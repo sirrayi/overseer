@@ -61,6 +61,14 @@ pub(crate) fn cmd_rewind(argv: &[String]) -> i32 {
         return 2;
     };
 
+    // R5: a session live in another overseer process keeps appending to
+    // its log — truncating it here would fork the hash chain. CLI-only
+    // check: the TUI's in-process /rewind already holds the lock itself.
+    if overseer_core::live::held(&dir) {
+        eprintln!("overseer rewind: {}", overseer_core::live::BUSY);
+        return 2;
+    }
+
     let m = Mode::parse(&mode).unwrap_or(Mode::Both);
     match overseer_core::rewind::restore(&dir, want_cp, m) {
         Ok(r) => {

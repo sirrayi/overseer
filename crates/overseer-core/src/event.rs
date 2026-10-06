@@ -269,6 +269,10 @@ pub enum EventKind {
         model: String,
         #[serde(default)]
         cost_usd: f64,
+        /// Why the window was untrusted when it was (F10): a `Tainted`
+        /// latch detail or the first Context-scope pattern id.
+        #[serde(default)]
+        taint: Option<String>,
     },
 }
 

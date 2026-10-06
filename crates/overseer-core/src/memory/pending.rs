@@ -84,12 +84,23 @@ fn scope_char(scope: Scope) -> char {
     }
 }
 
+/// One pending/proposals file's size ceiling: a record or proposal the
+/// engine will read into memory is bounded like every other store read
+/// (D-oversized-payload).
+const PENDING_FILE_MAX: u64 = 64 * 1024;
+
 fn rel_target(dir: &Path, rel: &str) -> PathBuf {
     dir.join(rel)
 }
 
+/// sha256 of a target's bytes — `O_NOFOLLOW`, so a note swapped for a
+/// symlink never pins the outside target's bytes (D-symlink-target).
 fn sha_of(path: &Path) -> Option<String> {
-    std::fs::read(path).ok().map(|b| super::sha_hex(&b, 64))
+    use std::io::Read;
+    let mut f = crate::tools::open_read_no_follow(path).ok()?;
+    let mut b = Vec::new();
+    f.read_to_end(&mut b).ok()?;
+    Some(super::sha_hex(&b, 64))
 }
 
 /// A pending record's target must be a store-relative `layer/name.md`:
@@ -200,9 +211,36 @@ pub fn stage(
     now: u64,
 ) -> Result<String, String> {
     let _lock = StoreLock::acquire(dir).map_err(|e| e.to_string())?;
+    // D-symlink-queue-dir: pending/ must be a real dir — a symlinked one
+    // would write the record outside the store.
+    super::real_dir(dir, DIR)?;
     let pdir = dir.join(DIR);
     crate::harden::ensure_private_dir(&pdir).map_err(|e| e.to_string())?;
     let (tag, target, payload, sha) = encode(dir, &op)?;
+    // C-feedback-pending-spam: an identical op on the same target that
+    // is already queued returns the open record's id instead of
+    // writing a second one.
+    if let Some(target) = &target {
+        if let Ok(rd) = std::fs::read_dir(&pdir) {
+            for e in rd.flatten() {
+                let is_rec = e.file_name().to_string_lossy().ends_with(".json")
+                    && e.metadata()
+                        .map(|m| m.len() <= PENDING_FILE_MAX)
+                        .unwrap_or(false);
+                if !is_rec {
+                    continue;
+                }
+                if let Some(rec) = read_record(&e.path()) {
+                    if rec.op == tag
+                        && rec.target.as_ref() == Some(target)
+                        && rec.payload == payload
+                    {
+                        return Ok(rec.id);
+                    }
+                }
+            }
+        }
+    }
     // create_new on the record file is the id claim; retry on a
     // collision. The id takes the v7 tail — its head is a timestamp,
     // so two stages in the same millisecond would collide on it.
@@ -220,11 +258,15 @@ pub fn stage(
             created: super::rfc3339(now),
         };
         let text = serde_json::to_string_pretty(&rec).map_err(|e| e.to_string())?;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(pdir.join(format!("{id}.json")))
+        let file = pdir.join(format!("{id}.json"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(crate::tools::O_NOFOLLOW);
+        }
+        match opts.open(&file) {
             Ok(mut f) => {
                 use std::io::Write;
                 f.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
@@ -239,67 +281,103 @@ pub fn stage(
 }
 
 fn read_record(path: &Path) -> Option<Record> {
-    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    // O_NOFOLLOW + the file-size ceiling: an oversized or symlinked
+    // record is not something the engine applies (D-oversized-payload,
+    // D-symlink-target).
+    if std::fs::symlink_metadata(path)
+        .map(|m| m.len() > PENDING_FILE_MAX)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    serde_json::from_str(&crate::tools::read_no_follow(path).ok()?).ok()
 }
 
 /// Every staged op across `stores`, then every v2 `proposals/` file
-/// (kind `proposal`, promotable via `approve`).
+/// (kind `proposal`, promotable via `approve`). Symlinked queue dirs
+/// list nothing — the store never follows them (D-symlink-queue-dir).
 pub fn list(stores: &[(Scope, PathBuf)]) -> Vec<PendingItem> {
     let mut out = Vec::new();
     for (scope, dir) in stores {
-        if let Ok(rd) = std::fs::read_dir(dir.join(DIR)) {
-            let mut recs: Vec<Record> = rd
-                .flatten()
-                .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
-                .filter_map(|e| read_record(&e.path()))
-                .collect();
-            recs.sort_by(|a, b| a.id.cmp(&b.id));
-            for r in recs {
-                let summary = r
-                    .payload
-                    .get("text")
-                    .or_else(|| r.payload.get("reason"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| {
-                        s.split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                            .chars()
-                            .take(80)
-                            .collect::<String>()
+        if let Ok(pdir) = super::real_dir(dir, DIR) {
+            if let Ok(rd) = std::fs::read_dir(&pdir) {
+                let mut items: Vec<PendingItem> = rd
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+                    .map(|e| {
+                        let oversized = e
+                            .metadata()
+                            .map(|m| m.len() > PENDING_FILE_MAX)
+                            .unwrap_or(false);
+                        match (oversized, read_record(&e.path())) {
+                            (true, _) | (_, None) => PendingItem {
+                                id: e.file_name().to_string_lossy().into_owned(),
+                                scope: *scope,
+                                kind: "pending".into(),
+                                target: None,
+                                summary: "(oversized, reject it)".into(),
+                                created: String::new(),
+                                proposal: false,
+                            },
+                            (_, Some(r)) => PendingItem {
+                                id: r.id,
+                                scope: *scope,
+                                kind: r.op,
+                                target: r.target,
+                                summary: r
+                                    .payload
+                                    .get("text")
+                                    .or_else(|| r.payload.get("reason"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| {
+                                        s.split_whitespace()
+                                            .collect::<Vec<_>>()
+                                            .join(" ")
+                                            .chars()
+                                            .take(80)
+                                            .collect::<String>()
+                                    })
+                                    .unwrap_or_default(),
+                                created: r.created,
+                                proposal: false,
+                            },
+                        }
                     })
-                    .unwrap_or_default();
-                out.push(PendingItem {
-                    id: r.id,
-                    scope: *scope,
-                    kind: r.op,
-                    target: r.target,
-                    summary,
-                    created: r.created,
-                    proposal: false,
-                });
+                    .collect();
+                items.sort_by(|a, b| a.id.cmp(&b.id));
+                out.extend(items);
             }
         }
-        if let Ok(rd) = std::fs::read_dir(dir.join("proposals")) {
-            let mut names: Vec<String> = rd
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.ends_with(".md"))
-                .collect();
-            names.sort();
-            for name in names {
-                let path = dir.join("proposals").join(&name);
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let title = super::title_of(&text).to_string();
-                out.push(PendingItem {
-                    id: format!("{}:proposals/{name}", scope.name()),
-                    scope: *scope,
-                    kind: "proposal".into(),
-                    target: None,
-                    summary: title,
-                    created: String::new(),
-                    proposal: true,
-                });
+        if let Ok(pdir) = super::real_dir(dir, "proposals") {
+            if let Ok(rd) = std::fs::read_dir(&pdir) {
+                let mut names: Vec<String> = rd
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".md"))
+                    .collect();
+                names.sort();
+                for name in names {
+                    let path = pdir.join(&name);
+                    let oversized = path
+                        .symlink_metadata()
+                        .map(|m| m.len() > PENDING_FILE_MAX)
+                        .unwrap_or(false);
+                    let summary = if oversized {
+                        "(oversized, reject it)".to_string()
+                    } else {
+                        let text = crate::tools::read_no_follow(&path).unwrap_or_default();
+                        super::title_of(&text).to_string()
+                    };
+                    out.push(PendingItem {
+                        id: format!("{}:proposals/{name}", scope.name()),
+                        scope: *scope,
+                        kind: "proposal".into(),
+                        target: None,
+                        summary,
+                        created: String::new(),
+                        proposal: true,
+                    });
+                }
             }
         }
     }
@@ -319,13 +397,16 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// The (store dir, pending record path) holding `id`, if any.
+/// The (store dir, pending record path) holding `id`, if any. A
+/// symlinked `pending/` yields nothing — the record would live outside
+/// the store (D-symlink-queue-dir).
 fn find_pending(stores: &[(Scope, PathBuf)], id: &str) -> Option<(Scope, PathBuf, PathBuf)> {
     if !valid_id(id) {
         return None;
     }
     stores.iter().find_map(|(s, d)| {
-        let p = d.join(DIR).join(format!("{id}.json"));
+        let pdir = super::real_dir(d, DIR).ok()?;
+        let p = pdir.join(format!("{id}.json"));
         p.is_file().then_some((*s, d.clone(), p))
     })
 }
@@ -363,7 +444,8 @@ pub fn approve(stores: &[(Scope, PathBuf)], id: &str, now: u64) -> Result<String
     let Some((_scope, dir, path)) = find_pending(stores, id) else {
         return Err(format!("memory: no pending op `{id}`"));
     };
-    let rec = read_record(&path).ok_or("memory: unreadable pending record")?;
+    let rec =
+        read_record(&path).ok_or("memory: unreadable or oversized pending record — reject it")?;
     let _lock = StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
     let done = apply_record(&dir, &rec, now)?;
     std::fs::remove_file(&path).map_err(|e| e.to_string())?;
@@ -380,6 +462,19 @@ fn apply_record(dir: &Path, rec: &Record, now: u64) -> Result<String, String> {
     if !target_rel.is_empty() && !valid_target(target_rel) {
         return Err(format!(
             "memory: {} has a bad target `{target_rel}`",
+            rec.id
+        ));
+    }
+    // D-unpinned-record: ops that mutate an existing note must pin the
+    // bytes they were staged against — a missing/null sha would apply
+    // to whatever the target has drifted into.
+    if matches!(
+        rec.op.as_str(),
+        "supersede" | "forget" | "merge" | "contradict"
+    ) && rec.target_sha256.is_none()
+    {
+        return Err(format!(
+            "memory: {} is an unpinned record — reject it",
             rec.id
         ));
     }
@@ -403,14 +498,14 @@ fn apply_record(dir: &Path, rec: &Record, now: u64) -> Result<String, String> {
                 .get("text")
                 .and_then(|v| v.as_str())
                 .ok_or("pending supersede: missing payload.text")?;
-            if let Some(msg) = super::threat::strict_refusal(text) {
-                return Err(format!("memory: approve {} — {msg}", rec.id));
-            }
-            std::fs::write(
-                rel_target(dir, target_rel),
-                format!("{}\n", text.trim_end()),
-            )
-            .map_err(|e| e.to_string())?;
+            // D-oversized-payload: the field passes through the same
+            // vetting the parser applied at stage time (cap, controls,
+            // redact, strict scan) — a tampered record can't smuggle in
+            // what the review never vetted.
+            let text =
+                super::learn::vetted(text, PENDING_FILE_MAX as usize, "supersede text", true)
+                    .map_err(|e| format!("memory: approve {} — {e}", rec.id))?;
+            super::store_write(dir, target_rel, format!("{}\n", text.trim_end()).as_bytes())?;
             refresh_pointer_title(dir, target_rel);
             Ok(format!("approved {}: superseded {target_rel}", rec.id))
         }
@@ -420,13 +515,14 @@ fn apply_record(dir: &Path, rec: &Record, now: u64) -> Result<String, String> {
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("staged forget");
-            if let Some(msg) = super::threat::strict_refusal(reason) {
-                return Err(format!("memory: approve {} — {msg}", rec.id));
-            }
-            let path = rel_target(dir, target_rel);
-            let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            std::fs::write(&path, super::expire_note(&text, reason, now))
-                .map_err(|e| e.to_string())?;
+            let reason = super::learn::vetted(reason, 600, "forget reason", false)
+                .map_err(|e| format!("memory: approve {} — {e}", rec.id))?;
+            let text = super::store_read(dir, target_rel)?;
+            super::store_write(
+                dir,
+                target_rel,
+                super::expire_note(&text, &reason, now).as_bytes(),
+            )?;
             Ok(format!("approved {}: forgot {target_rel}", rec.id))
         }
         "add" => {
@@ -446,25 +542,23 @@ fn apply_record(dir: &Path, rec: &Record, now: u64) -> Result<String, String> {
                 .get("text")
                 .and_then(|v| v.as_str())
                 .ok_or("pending add: missing text")?;
-            if let Some(msg) = super::threat::strict_refusal(text) {
-                return Err(format!("memory: approve {} — {msg}", rec.id));
-            }
+            let text = super::learn::vetted(text, 600, "add text", false)
+                .map_err(|e| format!("memory: approve {} — {e}", rec.id))?;
             // The staged slug goes straight into a filename — enforce
             // the same shape the `layer/slug.md` target check does.
             if !valid_target(&format!("{}/{slug}.md", layer.name())) {
                 return Err(format!("memory: {} has a bad slug `{slug}`", rec.id));
             }
-            let cues = rec
-                .payload
-                .get("cues")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
+            let mut cues_v = Vec::new();
+            if let Some(a) = rec.payload.get("cues").and_then(|v| v.as_array()) {
+                for c in a.iter().filter_map(|v| v.as_str()) {
+                    cues_v.push(
+                        super::learn::vetted(c, 60, "add cue", false)
+                            .map_err(|e| format!("memory: approve {} — {e}", rec.id))?,
+                    );
+                }
+            }
+            let cues = cues_v.join(", ");
             let mut meta = format!("provenance: approved:{}\nconfidence: 0.6\n", rec.origin);
             // A review-staged add carries the session/event stamp it was
             // drafted under; a hand-staged record gets today's `added`.
@@ -482,7 +576,7 @@ fn apply_record(dir: &Path, rec: &Record, now: u64) -> Result<String, String> {
                 meta.push_str(&format!("cues: {cues}\n"));
             }
             meta.push_str(&format!("valid_from: {}\n", super::rfc3339(now)));
-            let rel = super::add_note(dir, layer, slug, &meta, text).map_err(|e| e.to_string())?;
+            let rel = super::add_note(dir, layer, slug, &meta, &text).map_err(|e| e.to_string())?;
             Ok(format!("approved {}: added {rel}", rec.id))
         }
         "merge" | "contradict" => Err(format!(
@@ -495,7 +589,7 @@ fn apply_record(dir: &Path, rec: &Record, now: u64) -> Result<String, String> {
 
 /// Keep the INDEX pointer's title in step with a superseded body.
 fn refresh_pointer_title(dir: &Path, rel: &str) {
-    let Ok(text) = std::fs::read_to_string(rel_target(dir, rel)) else {
+    let Ok(text) = super::store_read(dir, rel) else {
         return;
     };
     let title = super::pointer_title(&text);
@@ -507,10 +601,22 @@ fn refresh_pointer_title(dir: &Path, rel: &str) {
 /// approval is the vetting, so the taint marker is rewritten to a
 /// `promoted` provenance note.
 fn approve_proposal(dir: &Path, scope: Scope, name: &str, now: u64) -> Result<String, String> {
+    // D-symlink-queue-dir: proposals/ must be a real dir — a symlinked
+    // one would have approve read and remove files outside the store.
+    super::real_dir(dir, "proposals")?;
     let src = dir.join("proposals").join(name);
     let _lock = StoreLock::acquire(dir).map_err(|e| e.to_string())?;
-    let text =
-        std::fs::read_to_string(&src).map_err(|e| format!("memory: proposal `{name}`: {e}"))?;
+    if src
+        .symlink_metadata()
+        .map(|m| m.len() > PENDING_FILE_MAX)
+        .unwrap_or(true)
+    {
+        return Err(format!(
+            "memory: proposal `{name}` is oversized — reject it"
+        ));
+    }
+    let text = crate::tools::read_no_follow(&src)
+        .map_err(|e| format!("memory: proposal `{name}`: {e}"))?;
     let (meta, body) =
         super::parse_meta(&text).map_err(|e| format!("memory: proposal `{name}`: {e}"))?;
     // A proposal was drafted inside a tainted window — the likeliest
@@ -564,7 +670,10 @@ pub fn reject(stores: &[(Scope, PathBuf)], id: &str) -> Result<String, String> {
         let Some((_, dir)) = stores.iter().find(|(s, _)| *s == scope) else {
             return Err(format!("no {} store", scope.name()));
         };
-        let path = dir.join("proposals").join(name);
+        // D-symlink-queue-dir: refuse before `proposals/` — a symlinked
+        // dir would have reject remove a file outside the store.
+        let pdir = super::real_dir(dir, "proposals")?;
+        let path = pdir.join(name);
         let _lock = StoreLock::acquire(dir).map_err(|e| e.to_string())?;
         std::fs::remove_file(&path).map_err(|e| format!("memory: reject `{id}`: {e}"))?;
         super::commit(dir, &format!("memory: reject {id}"));

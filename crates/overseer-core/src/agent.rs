@@ -375,6 +375,10 @@ pub struct Agent {
     /// the agent saving on its own resets the turn/signal triggers
     /// (never the tools trigger or the review window itself).
     learn_floor: u64,
+    /// F4: `live.lock` on the session dir for this Agent's lifetime —
+    /// one live writer per session, so a second process' `EventLog`
+    /// can't mint the same next ids and fork the hash chain.
+    _live: crate::live::LiveLock,
 }
 
 /// A stop gate's verdict: let the stop through, block it (a nudge was
@@ -409,6 +413,9 @@ impl Agent {
         get: impl Fn(&str) -> Option<String>,
     ) -> std::io::Result<Self> {
         crate::harden::ensure_private_dir(&session_dir)?;
+        // F4: claim the session before the log exists — a concurrent
+        // process must fail here, not mid-way through create.
+        let live = crate::live::LiveLock::acquire(&session_dir)?;
         let log = EventLog::create(session_dir.join("events.jsonl"))?;
         let ledger = Ledger::create(session_dir.join("ledger.jsonl"))?;
         let subagents_dir = session_dir.join("subagents");
@@ -440,6 +447,7 @@ impl Agent {
             run_cache_start: crate::ledger::CacheStats::default(),
             review_cursor: 0,
             learn_floor: 0,
+            _live: live,
         };
         agent.reconcile_subagents()?;
         if let Some(dir) = agent.config.memory_dir.clone() {
@@ -505,6 +513,9 @@ impl Agent {
         config: AgentConfig,
         session_dir: PathBuf,
     ) -> std::io::Result<Self> {
+        // F4: fail fast on a live session — replay is read-only, but a
+        // resume that can't write must not get this far anyway.
+        let live = crate::live::LiveLock::acquire(&session_dir)?;
         let events = EventLog::replay(session_dir.join("events.jsonl"))?;
         let messages = rehydrate_messages(&events);
         // Background tasks already noticed before the resume must not be
@@ -573,7 +584,18 @@ impl Agent {
             // so a covered window is never reviewed twice.
             review_cursor: crate::memory::learn::cursor_of(&events),
             learn_floor: crate::memory::learn::remember_floor(&events),
+            _live: live,
         };
+        // C1b: the untrusted latch is session-scoped but lives in memory —
+        // re-arm it from the replayed `Tainted` so a resumed session
+        // keeps quarantining its own memory writes (the event itself is
+        // already on the log; only the latch needs restoring).
+        for e in &events {
+            if let EventKind::Tainted { detail } = &e.kind {
+                let _ = agent.tools.policy.arm_untrusted(detail);
+                break;
+            }
+        }
         agent.reconcile_subagents()?;
         Ok(agent)
     }
@@ -1813,6 +1835,7 @@ impl Agent {
                 Some("nothing-new".into()),
                 None,
                 0.0,
+                None,
                 on_event,
             );
         }
@@ -1825,15 +1848,24 @@ impl Agent {
                 Some("nothing-new".into()),
                 None,
                 0.0,
+                digest.taint_reason.clone(),
                 on_event,
             );
         }
         let prompt = self.review_prompt(&digest, &stores, now, None);
-        // §1.7: skip when the worst-case review cost (chars/4 in + 1,200
-        // out, priced at the dearer candidate model) exceeds the budget
-        // left after own spend and subagent reservations.
+        // §1.7 + F6: skip when the worst-case review cost (chars/4 in +
+        // 1,200 out) exceeds the budget left after own spend and
+        // subagent reservations. Worst case SUMS across the distinct
+        // candidate models — a failed small call escalates to the main
+        // model, so both can be billed.
         let est_tokens = (prompt.len() as f64 / 4.0).ceil() as u64;
+        let u = crate::ir::Usage {
+            fresh_input: est_tokens,
+            output: 1_200,
+            ..Default::default()
+        };
         let mut worst = 0.0f64;
+        let mut seen = std::collections::HashSet::new();
         for m in [
             self.config.small_model.clone(),
             Some(self.config.model.clone()),
@@ -1841,24 +1873,32 @@ impl Agent {
         .into_iter()
         .flatten()
         {
-            let u = crate::ir::Usage {
-                fresh_input: est_tokens,
-                output: 1_200,
-                ..Default::default()
-            };
-            worst = worst.max(profile::lookup(&m).cost_usd(&u));
+            if seen.insert(m.clone()) {
+                worst += profile::lookup(&m).cost_usd(&u);
+            }
         }
         let remaining =
             self.config.max_cost_usd - self.ledger.total_cost_usd - self.spend.reserved_usd();
         if worst > remaining {
-            return self.emit_review(trigger, None, Some("budget".into()), None, 0.0, on_event);
+            return self.emit_review(
+                trigger,
+                None,
+                Some("budget".into()),
+                None,
+                0.0,
+                digest.taint_reason.clone(),
+                on_event,
+            );
         }
         match self.review_call(&prompt) {
             Ok((reply, model, cost)) => {
                 let parsed = learn::parse(&reply);
                 let ctx = learn::ApplyCtx {
                     stores: &stores,
-                    tainted: digest.tainted,
+                    // digest.tainted covers any Tainted event at or before
+                    // `upto` (F1); the live latch covers one armed by a
+                    // tool result the window boundary didn't catch.
+                    tainted: digest.tainted || self.tools.policy.taint_untrusted(),
                     attended: false,
                     stage_all: self.config.learn_stage,
                     session_id: self.cache_key.as_deref().unwrap_or("unknown"),
@@ -1874,6 +1914,7 @@ impl Agent {
                     None,
                     Some(model),
                     cost,
+                    digest.taint_reason.clone(),
                     on_event,
                 )?;
                 // §1.8: the cursor covers up to the review's through —
@@ -1883,7 +1924,15 @@ impl Agent {
             }
             Err(e) => {
                 let reason = e.chars().take(120).collect::<String>();
-                self.emit_review(trigger, None, Some(reason), None, 0.0, on_event)?;
+                self.emit_review(
+                    trigger,
+                    None,
+                    Some(reason),
+                    None,
+                    0.0,
+                    digest.taint_reason.clone(),
+                    on_event,
+                )?;
             }
         }
         Ok(())
@@ -1911,7 +1960,8 @@ impl Agent {
                 (d.id(), index::snippet(d, &digest.query, 160))
             })
             .collect();
-        crate::memory::learn::prompt(digest, &related, &[], focus)
+        // DEFERRED(owner): learned-skill listing + SKILL grammar — gate: H2
+        crate::memory::learn::prompt(digest, &related, &[], focus, false)
     }
 
     /// §1.7: the review's one model call. Small tier first (the same
@@ -1986,8 +2036,10 @@ impl Agent {
     }
 
     /// Emit one `MemoryReview` audit event. `applied` carries the outcome
-    /// when a review ran; `skipped` carries the reason when it didn't.
+    /// when a review ran; `skipped` carries the reason when it didn't;
+    /// `taint` records why the window was untrusted, when it was.
     /// Never rehydrated into the message view.
+    #[allow(clippy::too_many_arguments)]
     fn emit_review(
         &mut self,
         trigger: &str,
@@ -1995,6 +2047,7 @@ impl Agent {
         skipped: Option<String>,
         model: Option<String>,
         cost_usd: f64,
+        taint: Option<String>,
         on_event: &mut dyn FnMut(&Event),
     ) -> std::io::Result<()> {
         let (through, applied_, staged, quarantined, rejected) = match applied {
@@ -2018,6 +2071,7 @@ impl Agent {
                 skipped,
                 model: model.unwrap_or_default(),
                 cost_usd,
+                taint,
             },
             on_event,
         )
@@ -2032,6 +2086,13 @@ impl Agent {
             .as_deref()
             .filter(|_| !self.config.is_subagent)
         else {
+            return;
+        };
+        // W1: the note write + pointer append + commit are one store
+        // mutation — they ride the store lock like every other write
+        // path. A held lock just skips this turn's episode; the next
+        // run end rewrites it from the same log.
+        let Ok(_lock) = crate::memory::StoreLock::acquire(dir) else {
             return;
         };
         if let Ok(events) = EventLog::replay(self.log.path()) {

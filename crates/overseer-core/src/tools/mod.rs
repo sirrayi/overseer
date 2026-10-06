@@ -1052,7 +1052,7 @@ pub fn resolve(ctx: &ToolCtx, path: &str) -> PathBuf {
     target_os = "netbsd",
     target_os = "dragonfly"
 ))]
-const O_NOFOLLOW: i32 = 0x0100;
+pub(crate) const O_NOFOLLOW: i32 = 0x0100;
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     any(
@@ -1062,7 +1062,7 @@ const O_NOFOLLOW: i32 = 0x0100;
         target_arch = "powerpc64"
     )
 ))]
-const O_NOFOLLOW: i32 = 0o100000;
+pub(crate) const O_NOFOLLOW: i32 = 0o100000;
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     not(any(
@@ -1072,7 +1072,7 @@ const O_NOFOLLOW: i32 = 0o100000;
         target_arch = "powerpc64"
     ))
 ))]
-const O_NOFOLLOW: i32 = 0o400000;
+pub(crate) const O_NOFOLLOW: i32 = 0o400000;
 #[cfg(all(
     unix,
     not(any(
@@ -1086,7 +1086,7 @@ const O_NOFOLLOW: i32 = 0o400000;
         target_os = "dragonfly"
     ))
 ))]
-const O_NOFOLLOW: i32 = 0;
+pub(crate) const O_NOFOLLOW: i32 = 0;
 
 /// Canonicalize the longest existing ancestor of `p` and re-append the
 /// missing remainder (the same shape as the permission gate's check).
@@ -1191,6 +1191,78 @@ pub(crate) fn write_no_follow(target: &Path, content: &[u8]) -> Result<(), Strin
         .map_err(|e| format!("Cannot write {}: {e}", target.display()))?;
     f.write_all(content)
         .map_err(|e| format!("Cannot write {}: {e}", target.display()))
+}
+
+/// Open `target` for reading with `O_NOFOLLOW`: if the final component
+/// is (or became) a symlink, the open fails instead of reading through
+/// it (memory-store note IO, D-symlink-*).
+pub(crate) fn open_read_no_follow(target: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NOFOLLOW);
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))
+    ))]
+    {
+        // No O_NOFOLLOW on this unix: fall back to a metadata check.
+        if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "symlink"));
+        }
+    }
+    opts.open(target)
+}
+
+/// `read_to_string` through [`open_read_no_follow`].
+pub(crate) fn read_no_follow(target: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    open_read_no_follow(target)?.read_to_string(&mut buf)?;
+    Ok(buf)
+}
+
+/// Open `target` for appending with `O_NOFOLLOW` (same refusal rule as
+/// [`write_no_follow`], no truncate).
+pub(crate) fn open_append_no_follow(target: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NOFOLLOW);
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))
+    ))]
+    {
+        if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "symlink"));
+        }
+    }
+    opts.open(target)
 }
 
 /// Keep the env pairs whose key passes `keep`. Built on `vars_os` so a

@@ -276,7 +276,7 @@ impl MemoryState {
             ));
         };
         let d = &idx.docs[i];
-        let Ok(text) = std::fs::read_to_string(&d.path) else {
+        let Ok(text) = crate::tools::read_no_follow(&d.path) else {
             return ToolOutput::err(format!("memory: cannot read {}", d.id()));
         };
         let mut body: String = text.chars().take(GET_CAP).collect();
@@ -374,8 +374,10 @@ impl MemoryState {
 
         if quarantine.is_some() {
             let _lock = crate::memory::StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
-            let pdir = dir.join("proposals");
-            crate::harden::ensure_private_dir(&pdir).map_err(|e| e.to_string())?;
+            crate::harden::ensure_private_dir(&dir.join("proposals")).map_err(|e| e.to_string())?;
+            // D-symlink-queue-dir: proposals/ must be a real dir — a
+            // symlinked one would land the quarantined note outside.
+            let pdir = crate::memory::real_dir(&dir, "proposals").map_err(|e| e.to_string())?;
             let name =
                 crate::memory::create_unique(&pdir, &base, &format!("---\n{meta}---\n{text}\n"))
                     .map_err(|e| e.to_string())?;
@@ -388,17 +390,11 @@ impl MemoryState {
         }
 
         let idx = fresh(&mut self.index, &self.stores, now);
-        let norm = |s: &str| {
-            s.split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_lowercase()
-        };
-        let want = norm(text);
+        let want = crate::memory::dup_norm_body(text);
         if let Some(d) = idx
             .docs
             .iter()
-            .find(|d| d.scope == scope && norm(&d.body) == want)
+            .find(|d| d.scope == scope && crate::memory::dup_norm_body(&d.body) == want)
         {
             return Ok(ToolOutput::ok(format!(
                 "memory: already remembered as {} (no change).",
@@ -412,11 +408,9 @@ impl MemoryState {
         if let Some(path) = path {
             use std::io::Write;
             let _lock = crate::memory::StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
-            let old = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+            let old = crate::tools::read_no_follow(&path).map_err(|e| e.to_string())?;
             let sep = if old.ends_with('\n') { "" } else { "\n" };
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
+            crate::tools::open_append_no_follow(&path)
                 .and_then(|mut f| {
                     f.write_all(
                         format!("{sep}\n## {}\n{text}\n", crate::memory::rfc3339(now)).as_bytes(),
@@ -463,14 +457,14 @@ impl MemoryState {
             .ok_or_else(|| format!("no {} store in this session", scope.name()))?
             .to_path_buf();
         let _lock = crate::memory::StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let text = crate::tools::read_no_follow(&path).map_err(|e| e.to_string())?;
         let mut text = crate::memory::set_meta_key(&text, "valid_to", &crate::memory::rfc3339(now));
         if !text.ends_with('\n') {
             text.push('\n');
         }
         let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
         text.push_str(&format!("forgotten: {reason}\n"));
-        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        crate::memory::store_write(&dir, &rel, text.as_bytes()).map_err(|e| e.to_string())?;
         crate::memory::commit(&dir, &format!("memory: forget {rel}"));
         // DEFERRED(owner): hard purge — gate: owner demand
         Ok(ToolOutput::ok(format!(

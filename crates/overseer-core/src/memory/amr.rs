@@ -23,7 +23,12 @@ const IMPORT_SLUG: &str = "amr-import";
 /// store, `project <slug>` for a project store (the key's slug), else
 /// the dir's own name for anything ad-hoc.
 pub fn label(dir: &Path) -> String {
-    label_with(dir, stores::overseer_home().map(|h| stores::user_store(&h)).as_deref())
+    label_with(
+        dir,
+        stores::overseer_home()
+            .map(|h| stores::user_store(&h))
+            .as_deref(),
+    )
 }
 
 /// `label` with the user-store path injected — the user check runs
@@ -75,7 +80,7 @@ fn label_with(dir: &Path, user_store: Option<&Path>) -> String {
 /// `- [[layer/name]] — title` per live pointer (links drop the `.md`).
 pub fn render(label: &str, dir: &Path, now: u64) -> String {
     let mut out = format!("# Memory: {label}\n");
-    let core = std::fs::read_to_string(dir.join(super::CORE_NAME)).unwrap_or_default();
+    let core = crate::tools::read_no_follow(&dir.join(super::CORE_NAME)).unwrap_or_default();
     for line in core.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let line = line.strip_prefix("- ").unwrap_or(line);
         out.push_str(&format!("\n- {line}"));
@@ -104,16 +109,47 @@ fn bullets(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The MEMORY.md bytes the import pass may read at most — the rest is
+/// ignored with one warning (F-large-memory-md).
+const MEMORY_MD_READ_MAX: u64 = 256 * 1024;
+
+/// Read `dir/MEMORY.md` for the import pass: `O_NOFOLLOW` (a symlinked
+/// file is never read — it is simply replaced at write time), bounded
+/// to [`MEMORY_MD_READ_MAX`] bytes with a one-line warning past that.
+fn read_memory_md(dir: &Path) -> String {
+    use std::io::Read;
+    let path = dir.join(MEMORY_MD);
+    let oversized = path
+        .metadata()
+        .map(|m| m.len() > MEMORY_MD_READ_MAX)
+        .unwrap_or(false);
+    let f = match crate::tools::open_read_no_follow(&path) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    let mut buf = Vec::new();
+    if f.take(MEMORY_MD_READ_MAX + 1)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return String::new();
+    }
+    if oversized || buf.len() as u64 > MEMORY_MD_READ_MAX {
+        eprintln!("memory: MEMORY.md exceeds 256 KiB — importing from the first 256 KiB only");
+        buf.truncate(MEMORY_MD_READ_MAX as usize);
+    }
+    String::from_utf8(buf).unwrap_or_default()
+}
+
 /// Regenerate `dir/MEMORY.md`, importing foreign bullet additions first
 /// when the on-disk file's sha differs from the recorded generated one.
 /// Returns the imported bullet count (0 when the file is engine-owned).
 /// Caller is expected to hold the store's [`super::StoreLock`].
 pub(crate) fn regen(dir: &Path, now: u64) -> std::io::Result<usize> {
     let label = label(dir);
-    let path = dir.join(MEMORY_MD);
     let index_dir = dir.join(".index");
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
-    let recorded = std::fs::read_to_string(index_dir.join(SHA_NAME)).unwrap_or_default();
+    let current = read_memory_md(dir);
+    let recorded = crate::tools::read_no_follow(&index_dir.join(SHA_NAME)).unwrap_or_default();
     let foreign = !current.is_empty() && super::sha_hex(current.as_bytes(), 64) != recorded.trim();
     if foreign {
         let fresh = render(&label, dir, now);
@@ -121,6 +157,11 @@ pub(crate) fn regen(dir: &Path, now: u64) -> std::io::Result<usize> {
         let mut new: Vec<String> = Vec::new();
         for b in bullets(&current) {
             if known.contains(&b) || new.contains(&b) {
+                continue;
+            }
+            // F-edited-bullet-import: a `[[…]]` line is generated
+            // content (an index link, edited or not) — never imported.
+            if b.contains("[[") {
                 continue;
             }
             if super::threat::strict_refusal(&b).is_some() {
@@ -133,12 +174,18 @@ pub(crate) fn regen(dir: &Path, now: u64) -> std::io::Result<usize> {
         }
     }
     let text = render(&label, dir, now);
-    std::fs::write(&path, &text)?;
+    // Temp file in the store root, renamed over MEMORY.md: a symlinked
+    // entry is REPLACED by a regular file, never written through
+    // (F-symlink-memory-md).
+    super::store_write(dir, MEMORY_MD, text.as_bytes()).map_err(std::io::Error::other)?;
     crate::harden::ensure_private_dir(&index_dir)?;
-    std::fs::write(
-        index_dir.join(SHA_NAME),
-        format!("{}\n", super::sha_hex(text.as_bytes(), 64)),
-    )?;
+    super::real_dir(dir, ".index").map_err(std::io::Error::other)?;
+    super::store_write(
+        dir,
+        &format!(".index/{SHA_NAME}"),
+        format!("{}\n", super::sha_hex(text.as_bytes(), 64)).as_bytes(),
+    )
+    .map_err(std::io::Error::other)?;
     Ok(usize::from(foreign))
 }
 
@@ -148,9 +195,7 @@ pub(crate) fn regen(dir: &Path, now: u64) -> std::io::Result<usize> {
 fn import(dir: &Path, bullets: &[String], now: u64) -> std::io::Result<()> {
     let date = &super::rfc3339(now)[..10];
     let rel = format!("semantic/{IMPORT_SLUG}-{date}.md");
-    let path = dir.join(&rel);
-    if path.exists() {
-        let mut body = std::fs::read_to_string(&path)?;
+    if let Ok(mut body) = super::store_read(dir, &rel) {
         let have: HashSet<String> = body
             .lines()
             .map(str::trim_end)
@@ -169,16 +214,17 @@ fn import(dir: &Path, bullets: &[String], now: u64) -> std::io::Result<()> {
         for b in extra {
             body.push_str(&format!("- {b}\n"));
         }
-        std::fs::write(&path, body)?;
+        super::store_write(dir, &rel, body.as_bytes()).map_err(std::io::Error::other)?;
     } else {
         crate::harden::ensure_private_dir(&dir.join("semantic"))?;
+        super::real_dir(dir, "semantic").map_err(std::io::Error::other)?;
         let mut body = format!(
             "---\nprovenance: amr-import\nconfidence: 0.5\nsource: overseer:{MEMORY_MD}\nadded: {date}\n---\n# Imported MEMORY.md bullets\n"
         );
         for b in bullets {
             body.push_str(&format!("- {b}\n"));
         }
-        std::fs::write(&path, &body)?;
+        super::store_write(dir, &rel, body.as_bytes()).map_err(std::io::Error::other)?;
         super::append_pointer(dir, &format!("{rel} — imported MEMORY.md bullets"))?;
     }
     Ok(())

@@ -243,3 +243,104 @@ fn learn_needs_a_real_session_and_has_early_exits() {
         (0, "memory learn: nothing new since e0\n")
     );
 }
+
+// F4: `memory learn` refuses a session whose live.lock another
+// overseer process holds. This test re-execs itself as the holder —
+// `OV_LIVE_WORKER=<session dir>\t<marker>` acquires live.lock, writes
+// the marker file, then idles (a file, since libtest captures stdout).
+#[test]
+fn learn_refuses_a_session_open_in_another_process() {
+    if let Ok(spec) = std::env::var("OV_LIVE_WORKER") {
+        let (dir, marker) = spec.split_once('\t').unwrap();
+        let _hold = overseer_core::live::LiveLock::acquire(std::path::Path::new(dir)).unwrap();
+        std::fs::write(marker, "held").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        return;
+    }
+    let d = temp("live-learn");
+    let sess = d.join("sess");
+    std::fs::create_dir_all(&sess).unwrap();
+    let marker = d.join("held.txt");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("learn_refuses_a_session_open_in_another_process")
+        .env(
+            "OV_LIVE_WORKER",
+            format!("{}\t{}", sess.display(), marker.display()),
+        )
+        .spawn()
+        .expect("spawn lock holder");
+    // Wait for the child's flock before asking the CLI to learn.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "holder never reported ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_overseer"))
+        .arg("memory")
+        .arg("learn")
+        .arg(&sess)
+        .env("OVERSEER_HOME", d.join("home"))
+        .output()
+        .expect("run overseer memory learn");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("session is open in another overseer process"),
+        "{err}"
+    );
+}
+
+// R5: `overseer rewind` refuses a session live in another process —
+// truncating the log under a live writer would fork the hash chain.
+// Same re-exec'd holder as the learn test above.
+#[test]
+fn rewind_refuses_a_session_open_in_another_process() {
+    if let Ok(spec) = std::env::var("OV_LIVE_WORKER") {
+        let (dir, marker) = spec.split_once('\t').unwrap();
+        let _hold = overseer_core::live::LiveLock::acquire(std::path::Path::new(dir)).unwrap();
+        std::fs::write(marker, "held").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        return;
+    }
+    let d = temp("live-rewind");
+    let sess = d.join("sess");
+    std::fs::create_dir_all(&sess).unwrap();
+    let marker = d.join("held.txt");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("rewind_refuses_a_session_open_in_another_process")
+        .env(
+            "OV_LIVE_WORKER",
+            format!("{}\t{}", sess.display(), marker.display()),
+        )
+        .spawn()
+        .expect("spawn lock holder");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "holder never reported ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_overseer"))
+        .arg("rewind")
+        .arg(&sess)
+        .env("OVERSEER_HOME", d.join("home"))
+        .output()
+        .expect("run overseer rewind");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("session is open in another overseer process"),
+        "{err}"
+    );
+}

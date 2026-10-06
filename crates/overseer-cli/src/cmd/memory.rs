@@ -335,14 +335,41 @@ fn session_stores(
 /// `events.jsonl` and the review call's usage row in its `ledger.jsonl`
 /// (`purpose: memory_review`). Contract: one process writes a session
 /// at a time — never run this against a session a live agent is writing.
-fn cmd_learn(
-    flags: &crate::flags::ExecFlags,
-    session_dir: &Path,
-    focus: Option<&str>,
-) -> i32 {
+fn cmd_learn(flags: &crate::flags::ExecFlags, session_dir: &Path, focus: Option<&str>) -> i32 {
     use overseer_core::memory::learn;
+    // F4: this command appends a MemoryReview to the session's
+    // events.jsonl — refusing on a live session protects the hash chain
+    // from two writers minting the same next id. `held` is a read-only
+    // probe (no file created), so it can run before the session is even
+    // validated; acquire below is the authoritative check.
+    if overseer_core::live::held(session_dir) {
+        eprintln!(
+            "overseer memory learn: {} — run learn after it exits",
+            overseer_core::live::BUSY
+        );
+        return 1;
+    }
+    // Validate the session BEFORE the lock: acquire creates live.lock in
+    // the given dir, and a hostile session path must not write anything
+    // there (I-hostile-args). EventLog::open below replays again under
+    // the held lock, so a writer landing between replay and acquire is
+    // still seen.
     let events = match EventLog::replay(session_dir.join("events.jsonl")) {
         Ok(e) => e,
+        Err(e) => {
+            eprintln!("overseer memory learn: {}: {e}", session_dir.display());
+            return 1;
+        }
+    };
+    let _live = match overseer_core::live::LiveLock::acquire(session_dir) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            eprintln!(
+                "overseer memory learn: {} — run learn after it exits",
+                overseer_core::live::BUSY
+            );
+            return 1;
+        }
         Err(e) => {
             eprintln!("overseer memory learn: {}: {e}", session_dir.display());
             return 1;
@@ -394,8 +421,8 @@ fn cmd_learn(
             (d.id(), memory::index::snippet(d, &digest.query, 160))
         })
         .collect();
-    // DEFERRED(owner): learned-skill listing — gate: H2.
-    let prompt = learn::prompt(&digest, &related, &[], focus);
+    // DEFERRED(owner): learned-skill listing + SKILL grammar — gate: H2
+    let prompt = learn::prompt(&digest, &related, &[], focus, false);
 
     let mut cred_cfg = agent_config(flags);
     apply_credentials(&mut cred_cfg);
@@ -515,6 +542,7 @@ fn cmd_learn(
                 skipped: None,
                 model,
                 cost_usd: cost,
+                taint: digest.taint_reason.clone(),
             }) {
                 eprintln!("overseer memory learn: event append: {e}");
             } else {

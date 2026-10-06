@@ -361,12 +361,21 @@ struct Walked {
 }
 
 /// Topic files of one store: the root and each layer dir, never
-/// `proposals/`. Sorted for a deterministic doc order.
+/// `proposals/`. Sorted for a deterministic doc order. Neither a
+/// symlinked layer dir nor a symlinked note is ever walked — the index
+/// would otherwise serve a file outside the store (D-symlink-*).
 fn topic_files(dir: &Path) -> Vec<Walked> {
     let mut out = Vec::new();
     let subdirs = std::iter::once(None).chain(Layer::ALL.iter().map(|l| Some(l.name())));
     for sub in subdirs {
-        let d = sub.map_or_else(|| dir.to_path_buf(), |s| dir.join(s));
+        let d = match sub {
+            None => dir.to_path_buf(),
+            // A symlinked layer dir lists files outside the store — skip.
+            Some(s) => match super::real_dir(dir, s) {
+                Ok(d) if d.is_dir() => d,
+                _ => continue,
+            },
+        };
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
@@ -379,12 +388,17 @@ fn topic_files(dir: &Path) -> Vec<Walked> {
             if !is_topic {
                 continue;
             }
+            // `file_type` does not follow links: a symlinked note is
+            // never indexed (its target's bytes never read).
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            if !ft.is_file() {
+                continue;
+            }
             let Ok(md) = e.metadata() else {
                 continue;
             };
-            if !md.is_file() {
-                continue;
-            }
             out.push(Walked {
                 rel: sub.map_or_else(|| name.clone(), |s| format!("{s}/{name}")),
                 path: e.path(),
@@ -428,7 +442,7 @@ fn read_sized(path: &Path, size: u64) -> std::io::Result<String> {
     use std::io::Read;
     let cap = usize::try_from(size).unwrap_or(0).saturating_add(1);
     let mut buf = Vec::with_capacity(cap);
-    std::fs::File::open(path)?
+    crate::tools::open_read_no_follow(path)?
         .take(u64::MAX)
         .read_to_end(&mut buf)?;
     String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -478,7 +492,7 @@ impl Index {
                 .filter(|(stat, _)| stat.is_some() && *stat == snap.index)
                 .map(|(_, text)| std::mem::take(text));
             let text = cached.unwrap_or_else(|| {
-                std::fs::read_to_string(dir.join(INDEX_NAME)).unwrap_or_default()
+                crate::tools::read_no_follow(&dir.join(INDEX_NAME)).unwrap_or_default()
             });
             let walked: HashSet<&str> = snap.files.iter().map(|w| w.rel.as_str()).collect();
             let lines: HashMap<String, String> =

@@ -52,6 +52,13 @@ pub(crate) fn cmd_exec(args: &[String]) -> i32 {
         match Agent::resume(provider.clone(), config, session_dir.clone()) {
             Ok(a) => a,
             Err(e) => {
+                // F4: a session opened by another process between
+                // resolve_session and here — same refusal as the flag
+                // pre-check (exit 2, same reason).
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    eprintln!("overseer exec: {}", overseer_core::live::BUSY);
+                    return 2;
+                }
                 eprintln!(
                     "overseer exec: cannot resume {}: {e}",
                     session_dir.display()

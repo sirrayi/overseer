@@ -21,6 +21,13 @@ pub(crate) fn resolve_session(flags: &ExecFlags) -> (PathBuf, bool) {
         );
     }
     if let Some(d) = &flags.resume {
+        // F4: an explicit resume of a session open in another overseer
+        // process is a usage error — two writers would fork the event
+        // log's hash chain.
+        if overseer_core::live::held(d) {
+            eprintln!("overseer: {}", overseer_core::live::BUSY);
+            std::process::exit(2);
+        }
         return (d.clone(), true);
     }
     let root = dirs_home().join("sessions");
@@ -29,7 +36,8 @@ pub(crate) fn resolve_session(flags: &ExecFlags) -> (PathBuf, bool) {
         .canonicalize()
         .unwrap_or_else(|_| flags.cwd.clone());
     if flags.cont {
-        if let Some(d) = overseer_core::session::most_recent(&root, Some(&cwd)) {
+        // F4: skip sessions live elsewhere; pick the next newest free one.
+        if let Some(d) = overseer_core::session::most_recent_resumable(&root, Some(&cwd)) {
             return (d, true);
         }
         eprintln!(
@@ -38,7 +46,7 @@ pub(crate) fn resolve_session(flags: &ExecFlags) -> (PathBuf, bool) {
         );
     }
     if flags.last {
-        if let Some(d) = overseer_core::session::most_recent(&root, None) {
+        if let Some(d) = overseer_core::session::most_recent_resumable(&root, None) {
             return (d, true);
         }
     }
@@ -223,6 +231,18 @@ pub(crate) fn memory_stores(flags: &ExecFlags, cwd: &Path) -> (Option<PathBuf>, 
     } else {
         home.map(|h| overseer_core::memory::stores::project_store(&h, cwd))
     };
+    // I-world-writable-store: any resolved store that exists is pulled
+    // back to 0700 when group/other bits crept in (e.g. an operator's
+    // loose umask or a hostile chmod) — `.index/` included.
+    for d in [&user, &project].into_iter().flatten() {
+        if d.is_dir() {
+            overseer_core::memory::tighten_perms(d);
+            let idx = d.join(".index");
+            if idx.is_dir() {
+                overseer_core::memory::tighten_perms(&idx);
+            }
+        }
+    }
     (user, project)
 }
 

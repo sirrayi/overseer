@@ -118,6 +118,20 @@ pub fn most_recent(root: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
     candidates.into_iter().next().map(|s| s.dir)
 }
 
+/// [`most_recent`] minus live sessions (F4): `--continue`/`--last` skip
+/// a session whose `live.lock` is held — it is open in another overseer
+/// process — and take the next newest free one.
+pub fn most_recent_resumable(root: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    let candidates = match cwd {
+        Some(cwd) => for_cwd(root, cwd),
+        None => list(root),
+    };
+    candidates
+        .into_iter()
+        .map(|s| s.dir)
+        .find(|d| !crate::live::held(d))
+}
+
 /// Checkpoint boundaries on disk for a session (`checkpoints/e<N>`).
 pub fn checkpoints(session_dir: &Path) -> Vec<u64> {
     let cp_root = session_dir.join("checkpoints");
