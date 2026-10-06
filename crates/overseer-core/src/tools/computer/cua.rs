@@ -1952,7 +1952,7 @@ mod tests {
         let mut last = Err(String::new());
         for _ in 0..60 {
             match run(input, c, st) {
-                Err(e) if e.contains("Text file busy") => {
+                Err(e) if e.contains("Text file busy") || e.contains("os error 26") => {
                     last = Err(e);
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -2223,7 +2223,7 @@ done
         let (driver, _log) = fake_driver(&dir, "fake.sh", "");
         let mut st = state(&driver);
         let c = ctx(&dir);
-        let out = run(
+        let out = run_ok(
             &json!({"action": "observe", "pid": 11, "window_id": 101}),
             &c,
             &mut st,
@@ -2249,7 +2249,7 @@ done
         let (driver, _log) = fake_driver(&dir, "fake.sh", "");
         let mut st = state(&driver);
         let c = ctx(&dir);
-        let out = run(
+        let out = run_ok(
             &json!({"action": "observe", "pid": 11, "window_id": 101, "limit": 1}),
             &c,
             &mut st,
@@ -2265,7 +2265,7 @@ done
         let (driver, _log) = fake_driver(&dir, "fake.sh", "");
         let mut st = state(&driver);
         let c = ctx(&dir);
-        let out = run(
+        let out = run_ok(
             &json!({"action": "screenshot", "pid": 11, "window_id": 101}),
             &c,
             &mut st,
@@ -2323,7 +2323,7 @@ done
             &mut st,
         )
         .unwrap();
-        let out = run(
+        let out = run_ok(
             &json!({"action": "click", "pid": 11, "window_id": 101, "element": 1}),
             &c,
             &mut st,
@@ -2356,14 +2356,14 @@ done
         .unwrap();
         let last = last_act(&log);
         assert!(last.contains("\"pid\":11"), "string coerced: {last}");
-        let err = run(
+        let err = run_ok(
             &json!({"action": "screenshot", "pid": "abc", "window_id": 101}),
             &c,
             &mut st,
         )
         .unwrap_err();
         assert!(err.contains("'pid' must be a number"), "{err}");
-        let err = run(
+        let err = run_ok(
             &json!({"action": "screenshot", "pid": -1, "window_id": 101}),
             &c,
             &mut st,
@@ -2371,7 +2371,7 @@ done
         .unwrap_err();
         assert!(err.contains("non-negative"), "{err}");
         // A negative element index is refused, not wrapped.
-        let err = run(
+        let err = run_ok(
             &json!({"action": "click", "pid": 11, "window_id": 101, "element": -1}),
             &c,
             &mut st,
@@ -2386,7 +2386,7 @@ done
         let driver = stderr_driver(&dir);
         let mut st = state(&driver);
         let c = ctx(&dir);
-        let err = run(&json!({"action": "apps"}), &c, &mut st).unwrap_err();
+        let err = run_ok(&json!({"action": "apps"}), &c, &mut st).unwrap_err();
         assert!(err.contains("driver stderr"), "{err}");
         assert!(err.contains("TCC denied"), "{err}");
     }
@@ -2439,7 +2439,7 @@ done
         let (driver, log) = fake_driver(&dir, "fake.sh", "");
         let mut st = state(&driver);
         let c = ctx(&dir);
-        let out = run(
+        let out = run_ok(
             &json!({"action": "zoom", "pid": 11, "window_id": 101,
                     "x1": 10.0, "y1": 10.0, "x2": 50.0, "y2": 40.0}),
             &c,
@@ -2494,7 +2494,7 @@ done
         )
         .unwrap();
         // A non-pointer x/y act cannot translate the crop: refused.
-        let err = run(
+        let err = run_ok(
             &json!({"action": "type", "pid": 11, "text": "a", "x": 5.0, "y": 5.0}),
             &c,
             &mut st,
@@ -2551,7 +2551,7 @@ done
         let (driver, _log) = fake_driver(&dir, "fake.sh", "");
         let mut st = state(&driver);
         let c = ctx(&dir);
-        let out = run(
+        let out = run_ok(
             &json!({"action": "verify", "pid": 11, "window_id": 101,
                     "expect": {"window": {"exists": true}}}),
             &c,
@@ -2568,7 +2568,7 @@ done
         let (driver, log) = fake_driver(&dir, "fake.sh", "");
         let mut st = state(&driver);
         let c = ctx(&dir);
-        let out = run(
+        let out = run_ok(
             &json!({"action": "browser", "pid": 11, "window_id": 101}),
             &c,
             &mut st,
@@ -2625,7 +2625,7 @@ done
         assert!(last.contains("\"name\":\"browser_navigate\""), "{last}");
         assert!(last.contains("\"url\":\"https://example.com\""), "{last}");
         // An unbound tab is refused before any driver call.
-        let err = run(
+        let err = run_ok(
             &json!({"action": "navigate", "tab": "tab-9", "url": "https://x"}),
             &c,
             &mut st,
@@ -2647,7 +2647,7 @@ done
         )
         .unwrap();
         // element 99 has no remembered token → refused locally, never sent.
-        let err = run(
+        let err = run_ok(
             &json!({"action": "click", "pid": 11, "window_id": 101, "element": 99}),
             &c,
             &mut st,
@@ -2690,7 +2690,7 @@ done
         let (driver, _log) = fake_driver(&dir, "fake.sh", extra);
         let mut st = state(&driver);
         let c = ctx(&dir);
-        let err = run(
+        let err = run_ok(
             &json!({"action": "key", "pid": 11, "keys": "a"}),
             &c,
             &mut st,
@@ -2808,7 +2808,7 @@ done
             &mut st,
         )
         .unwrap();
-        let v = run(
+        let v = run_ok(
             &json!({"action": "verify", "pid": pid, "window_id": wid,
                     "expect": {"element": {"selector": {"role": "AXTextArea"},
                                 "value_equals": "overseer"}}}),
@@ -2831,7 +2831,7 @@ done
             &mut st,
         )
         .unwrap();
-        let v = run(
+        let v = run_ok(
             &json!({"action": "verify", "pid": pid, "window_id": wid,
                     "expect": {"element": {"selector": {"role": "AXTextArea"},
                                 "exists": true, "value_equals": "overseer"}}}),

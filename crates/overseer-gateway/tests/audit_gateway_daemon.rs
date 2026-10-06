@@ -50,6 +50,32 @@ fn channel_message_never_acts_directly_and_approved_run_keeps_the_floor() {
     )
     .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // ETXTBSY drain: a just-written script stays "text file busy" while a
+    // sibling test thread's forked child still holds the write fd — exec
+    // it once (retrying) so the daemon's later spawn cannot race that
+    // window, then drop the probe's argv.txt so the daemon's own run is
+    // the only record.
+    let mut execed = false;
+    for _ in 0..10 {
+        match std::process::Command::new(&bin)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut c) => {
+                let _ = c.wait();
+                execed = true;
+                break;
+            }
+            Err(e) if e.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("probe exec {}: {e}", bin.display()),
+        }
+    }
+    assert!(execed, "probe exec {} stayed text-busy", bin.display());
+    let _ = std::fs::remove_file(&argv_out);
 
     let cfg = json!({
         "triggers": [{"kind": "webhook", "id": "wh", "secret_env": "AUDIT_GW_WH_SECRET",

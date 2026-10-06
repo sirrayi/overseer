@@ -1315,6 +1315,33 @@ mod tests {
         assert_eq!(kc.entry(), (KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT));
     }
 
+    /// ETXTBSY drain: a just-written executable stays "text file busy"
+    /// while a sibling test thread's forked child still holds the write
+    /// fd before its own exec. Exec it once (retrying) so a later spawn
+    /// inside production code cannot race that window. The script must
+    /// be side-effect-free on a bare run.
+    #[cfg(unix)]
+    fn probe_exec(path: &std::path::Path) {
+        for _ in 0..10 {
+            match std::process::Command::new(path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(mut c) => {
+                    let _ = c.wait();
+                    return;
+                }
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("probe exec {}: {e}", path.display()),
+            }
+        }
+        panic!("probe exec {} stayed text-busy", path.display());
+    }
+
     /// A stale (unparseable) keychain entry is cleared before the env
     /// fallback, so the next run doesn't inherit it. Driven through a fake
     /// backend script — the same Command path production uses.
@@ -1337,6 +1364,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        probe_exec(&bin);
 
         let kc = Keychain::new(
             Some(&bin.to_string_lossy()),
@@ -1371,6 +1399,7 @@ mod tests {
             ),
         )
         .unwrap();
+        probe_exec(&bin);
         let r = resolve_store_with(CredentialStore::Auto, &kc, kc.fetch(), None);
         assert_eq!(r.store, CredentialStore::Env);
         assert!(r.note.contains("stale"), "{}", r.note);

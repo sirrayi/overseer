@@ -119,6 +119,10 @@ fn ctl_idle_half_line_connection_is_timed_out() {
     let mut idle: Vec<UnixStream> = (0..200)
         .map(|_| {
             let mut c = UnixStream::connect(&sock).unwrap();
+            // Set at connect time: on macOS setsockopt(SO_RCVTIMEO)
+            // EINVALs once the peer has closed — which is the very
+            // outcome this test waits for.
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             c.write_all(b"{\"method\":\"status\"").unwrap();
             c
         })
@@ -127,9 +131,6 @@ fn ctl_idle_half_line_connection_is_timed_out() {
     let grown = thread_count().saturating_sub(before);
 
     let probe = idle.last_mut().unwrap();
-    probe
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
     let started = Instant::now();
     let mut buf = [0u8; 256];
     let r = probe.read(&mut buf);
@@ -163,12 +164,36 @@ fn spawn_cfg() -> SpawnConfig {
     serde_json::from_value(json!({"max_concurrent": 1, "max_steps": 7, "timeout_s": 30})).unwrap()
 }
 
+/// `spawn_run_from`, retried on ETXTBSY: a just-written script can stay
+/// "text file busy" for a few ms while a sibling test thread's forked
+/// child still holds the write fd before its own exec.
+fn spawn_retry(
+    cfg: &SpawnConfig,
+    runs_dir: &Path,
+    prompt: &str,
+    bin: &Path,
+    origin: &Origin,
+) -> overseer_gateway::spawn::Spawned {
+    let mut last = String::new();
+    for _ in 0..10 {
+        match spawn_run_from(cfg, runs_dir, prompt, None, bin, origin) {
+            Ok(sp) => return sp,
+            Err(e) if e.contains("Text file busy") || e.contains("os error 26") => {
+                last = e;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("spawn overseer: still text-busy after retries: {last}")
+}
+
 fn spawn_and_record(origin: &Origin, prompt: &str) -> Vec<String> {
     let dir = tmp("spawn");
     let (bin, out) = recording_bin(&dir);
     let runs = dir.join("runs");
     std::fs::create_dir_all(&runs).unwrap();
-    let mut sp = spawn_run_from(&spawn_cfg(), &runs, prompt, None, &bin, origin).unwrap();
+    let mut sp = spawn_retry(&spawn_cfg(), &runs, prompt, &bin, origin);
     sp.child.wait().unwrap();
     std::fs::read_to_string(out)
         .unwrap()
@@ -252,15 +277,13 @@ fn dash_leading_prompt_reaches_the_child_as_a_prompt() {
     let runs = dir.join("runs");
     std::fs::create_dir_all(&runs).unwrap();
     let prompt = "- fix the failing build\n- then rerun CI";
-    let mut sp = spawn_run_from(
+    let mut sp = spawn_retry(
         &spawn_cfg(),
         &runs,
         prompt,
-        None,
         &wrapper,
         &Origin::Untrusted("channel:approved:telegram:7".into()),
-    )
-    .unwrap();
+    );
     let deadline = Instant::now() + Duration::from_secs(60);
     while sp.child.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {

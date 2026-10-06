@@ -471,8 +471,43 @@ fn setup(tag: &str) -> (ToolCtx<'static>, ComputerState) {
     (ctx(&tmp(tag)), st)
 }
 
+/// `computer::run_with`, retried on ETXTBSY: a just-written fake driver
+/// can stay "text file busy" for a few ms while a sibling test thread's
+/// forked child still holds the write fd before its own exec.
 fn run(input: Value, c: &mut ToolCtx, st: &mut ComputerState) -> Result<Value, String> {
-    computer::run_with(&input, c, st)
+    let mut last = Err(String::new());
+    for _ in 0..10 {
+        match computer::run_with(&input, c, st) {
+            Err(e) if e.contains("Text file busy") || e.contains("os error 26") => {
+                last = Err(e);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+    last
+}
+
+/// `ToolRegistry::call` with the same busy retry — the registry path
+/// spawns the same fake drivers.
+fn call(
+    reg: &mut overseer_core::tools::ToolRegistry,
+    name: &str,
+    input: &Value,
+    c: &mut ToolCtx,
+) -> overseer_core::tools::ToolOutput {
+    let mut last = None;
+    for _ in 0..10 {
+        let out = reg.call(name, input, c);
+        if out.is_error && (out.text.contains("Text file busy") || out.text.contains("os error 26"))
+        {
+            last = Some(out);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        return out;
+    }
+    last.unwrap()
 }
 
 fn act(extra: Value) -> Value {
@@ -696,7 +731,8 @@ fn an_acts_post_read_latches_untrusted_on_its_own() {
     std::env::set_var("OVERSEER_COMPUTER_DRIVER", &fakes()["latch"].path);
     let mut reg = ToolRegistry::core_with(overseer_core::perm::Policy::allow_all(), Optional::ALL);
     let mut c = ctx(&tmp("latch"));
-    let out = reg.call(
+    let out = call(
+        &mut reg,
         "computer",
         &act(json!({"action": "key", "keys": "return"})),
         &mut c,

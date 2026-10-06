@@ -2816,6 +2816,33 @@ mod tests {
         d
     }
 
+    /// ETXTBSY drain: a just-written executable stays "text file busy"
+    /// while a sibling test thread's forked child still holds the write
+    /// fd before its own exec. Exec it once (retrying) so a later lazy
+    /// spawn — inside the agent loop, where the test cannot retry —
+    /// cannot race that window. The script must be side-effect-free on a
+    /// bare run.
+    fn probe_exec(path: &std::path::Path) {
+        for _ in 0..10 {
+            match std::process::Command::new(path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(mut c) => {
+                    let _ = c.wait();
+                    return;
+                }
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("probe exec {}: {e}", path.display()),
+            }
+        }
+        panic!("probe exec {} stayed text-busy", path.display());
+    }
+
     /// 5 tool turns with usage far above a tiny compact threshold → the
     /// engine must compact mid-run, record the boundary event, and the
     /// live view must equal the resume view (playbook Ch.3 §9.1 invariant).
@@ -4440,6 +4467,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        probe_exec(&driver);
         let shot = |n: usize| Response {
             blocks: vec![Block::ToolCall {
                 id: format!("s{n}"),

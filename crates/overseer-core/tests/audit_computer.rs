@@ -538,8 +538,43 @@ fn state(tag: &str) -> ComputerState {
     })
 }
 
+/// `computer::run_with`, retried on ETXTBSY: a just-written fake driver
+/// can stay "text file busy" for a few ms while a sibling test thread's
+/// forked child still holds the write fd before its own exec.
 fn run(input: Value, c: &mut ToolCtx, st: &mut ComputerState) -> Result<Value, String> {
-    computer::run_with(&input, c, st)
+    let mut last = Err(String::new());
+    for _ in 0..10 {
+        match computer::run_with(&input, c, st) {
+            Err(e) if e.contains("Text file busy") || e.contains("os error 26") => {
+                last = Err(e);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+    last
+}
+
+/// `ToolRegistry::call` with the same busy retry — the registry path
+/// spawns the same fake drivers.
+fn call(
+    reg: &mut ToolRegistry,
+    name: &str,
+    input: &Value,
+    c: &mut ToolCtx,
+) -> overseer_core::tools::ToolOutput {
+    let mut last = None;
+    for _ in 0..10 {
+        let out = reg.call(name, input, c);
+        if out.is_error && (out.text.contains("Text file busy") || out.text.contains("os error 26"))
+        {
+            last = Some(out);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        return out;
+    }
+    last.unwrap()
 }
 
 /// `(tool, arguments)` of every `tools/call` in a log, optionally only for
@@ -808,7 +843,8 @@ fn padded_observe_action_still_latches_untrusted() {
     let mut reg = registry();
     let dir = session("taintpad");
     let mut c = ctx(&dir);
-    let out = reg.call(
+    let out = call(
+        &mut reg,
         "computer",
         &with(win(), json!({"action": " observe"})),
         &mut c,
@@ -930,7 +966,7 @@ fn every_observation_latches_untrusted_via_the_registry() {
         } else {
             "computer"
         };
-        let out = reg.call(tool, input, &mut c);
+        let out = call(&mut reg, tool, input, &mut c);
         assert!(!out.is_error, "#{i} {input}: {}", out.text);
         assert!(reg.policy().taint_untrusted(), "#{i} {input} did not latch");
     }
@@ -942,7 +978,7 @@ fn navigate_is_external_comms_and_headless_denies_it() {
     assert_eq!(classify("computer", &nav), Irreversibility::ExternalComms);
     let mut reg = registry();
     let dir = session("navdeny");
-    let out = reg.call("computer", &nav, &mut ctx(&dir));
+    let out = call(&mut reg, "computer", &nav, &mut ctx(&dir));
     assert!(out.is_error, "{}", out.text);
     assert!(calls("env", Some(&label_of(&dir))).is_empty());
 }
@@ -955,7 +991,8 @@ fn armed_taint_gates_navigate_and_credential_typing_headless() {
     let dir = session("taintact");
     let mut c = ctx(&dir);
     assert!(
-        !reg.call(
+        !call(
+            &mut reg,
             "computer",
             &with(win(), json!({"action": "observe"})),
             &mut c
@@ -964,13 +1001,15 @@ fn armed_taint_gates_navigate_and_credential_typing_headless() {
     );
     reg.policy().mark_sensitive("audit");
     assert!(reg.policy().taint_armed());
-    let nav = reg.call(
+    let nav = call(
+        &mut reg,
         "computer",
         &json!({"action": "navigate", "tab": "tab-1", "url": "https://attacker.example"}),
         &mut c,
     );
     assert!(nav.is_error, "{}", nav.text);
-    let cred = reg.call(
+    let cred = call(
+        &mut reg,
         "computer",
         &with(
             win(),
@@ -1000,7 +1039,8 @@ fn armed_taint_forces_ask_for_a_computer_type_act() {
     let dir = session("taintarm");
     let mut c = ctx(&dir);
     assert!(
-        !reg.call(
+        !call(
+            &mut reg,
             "computer",
             &with(win(), json!({"action": "observe"})),
             &mut c
@@ -1015,7 +1055,8 @@ fn armed_taint_forces_ask_for_a_computer_type_act() {
         &mut c,
     );
     assert!(w.is_error, "control: write must be gated: {}", w.text);
-    let out = reg.call(
+    let out = call(
+        &mut reg,
         "computer",
         &with(
             win(),
