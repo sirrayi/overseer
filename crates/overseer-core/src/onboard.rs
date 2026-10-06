@@ -265,6 +265,8 @@ pub fn persona_body(dir: &Path) -> String {
 /// Flip every draft to approved, then git-version the dir (reusing
 /// `memory::commit`). Returns the files changed.
 pub fn approve(dir: &Path) -> std::io::Result<Vec<&'static str>> {
+    // W1: the draft flips and the commit are one store mutation.
+    let _lock = crate::memory::StoreLock::acquire(dir)?;
     let mut changed = Vec::new();
     for file in PERSONA_FILES {
         let path = dir.join(file);
@@ -389,6 +391,8 @@ pub fn write_drafts(
     drafts: &[(String, Vec<Insight>)],
     source_answers: usize,
 ) -> std::io::Result<usize> {
+    // W1: the draft writes and the commit are one store mutation.
+    let _lock = crate::memory::StoreLock::acquire(dir)?;
     let mut wrote = 0usize;
     for (file, insights) in drafts {
         if !PERSONA_FILES.contains(&file.as_str()) {

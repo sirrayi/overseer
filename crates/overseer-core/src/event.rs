@@ -233,6 +233,47 @@ pub enum EventKind {
         backend: String,
         reason: String,
     },
+    /// Memory v3 (§1.3): a user input carried a learn signal —
+    /// `kind` is `remember` or `correction`, `excerpt` the matching
+    /// sentence (bounded, redacted). Audit-only — never rehydrates.
+    LearnSignal {
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        excerpt: String,
+    },
+    /// Memory v3 (§1.2/§1.8): a learning review ran (or was skipped with
+    /// a reason) over the event window ending at `through` — the review
+    /// cursor. `applied`/`staged`/`quarantined` name what the write
+    /// policy did; `rejected` counts refused ops. Audit-only — the
+    /// review never mutates the message view.
+    MemoryReview {
+        #[serde(default)]
+        trigger: String,
+        /// Last event id the review covered; the next window opens
+        /// right after it.
+        #[serde(default)]
+        through: u64,
+        #[serde(default)]
+        applied: Vec<String>,
+        #[serde(default)]
+        staged: Vec<String>,
+        #[serde(default)]
+        quarantined: Vec<String>,
+        #[serde(default)]
+        rejected: u32,
+        /// `budget`/`provider_error` when the review could not run.
+        #[serde(default)]
+        skipped: Option<String>,
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        cost_usd: f64,
+        /// Why the window was untrusted when it was (F10): a `Tainted`
+        /// latch detail or the first Context-scope pattern id.
+        #[serde(default)]
+        taint: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +345,8 @@ pub fn event_type_str(kind: &EventKind) -> &'static str {
         EventKind::PermissionDecision { .. } => "permission_decision",
         EventKind::PolicyLoad { .. } => "policy_load",
         EventKind::SandboxDenial { .. } => "sandbox_denial",
+        EventKind::LearnSignal { .. } => "learn_signal",
+        EventKind::MemoryReview { .. } => "memory_review",
     }
 }
 

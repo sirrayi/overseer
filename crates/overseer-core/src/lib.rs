@@ -16,6 +16,7 @@ pub mod harden;
 pub mod hooks;
 pub mod ir;
 pub mod ledger;
+pub mod live;
 pub mod manifest;
 pub mod mcp;
 pub mod mcp_config;

@@ -13,11 +13,18 @@
 //! rollback. Commits are engine-made at turn boundaries, not model actions.
 
 pub mod activation;
+pub mod amr;
 pub mod episode;
 pub mod index;
+pub mod learn;
+mod lock;
 pub mod notice;
+pub mod pending;
 pub mod redact;
 pub mod stores;
+pub mod threat;
+
+pub use lock::StoreLock;
 
 pub use stores::{overseer_home, Scope};
 
@@ -141,6 +148,11 @@ pub struct EntryMeta {
     pub trigger: Option<String>,
     /// v2: when the trigger fired (RFC3339). Set once by the engine.
     pub fired: Option<String>,
+    /// v3: where the note came from
+    /// (`overseer:session/<id>[#e<event>]`, `amr-import`, …).
+    pub source: Option<String>,
+    /// v3: the day the note was added, `YYYY-MM-DD`.
+    pub added: Option<String>,
 }
 
 impl Default for EntryMeta {
@@ -156,6 +168,8 @@ impl Default for EntryMeta {
             cues: Vec::new(),
             trigger: None,
             fired: None,
+            source: None,
+            added: None,
         }
     }
 }
@@ -230,6 +244,8 @@ pub(crate) fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
             }
             "trigger" => meta.trigger = Some(v.to_string()).filter(|t| !t.is_empty()),
             "fired" => meta.fired = Some(v.to_string()).filter(|t| !t.is_empty()),
+            "source" => meta.source = Some(v.to_string()).filter(|t| !t.is_empty()),
+            "added" => meta.added = Some(v.to_string()).filter(|t| !t.is_empty()),
             // Unknown keys are ignored (forward-compatible headers).
             _ => {}
         }
@@ -280,6 +296,13 @@ fn validate_meta(meta: &EntryMeta) -> Result<(), String> {
                     "memory: {name} `{s}` is not RFC3339 (want e.g. 2026-01-02T15:04:05Z)"
                 ));
             }
+        }
+    }
+    if let Some(d) = &meta.added {
+        if !valid_rfc3339(&format!("{d}T00:00:00Z")) {
+            return Err(format!(
+                "memory: added `{d}` is not YYYY-MM-DD (want e.g. 2026-01-02)"
+            ));
         }
     }
     Ok(())
@@ -518,8 +541,21 @@ const MEMORY_LEGEND: &str = "Layers: profile/ identity, episodic/ events, \
 /// Create the store owner-only with its layer subdirs, a `.gitignore`
 /// keeping the derived `.index/` out of history, and a seeded INDEX.md.
 /// Existing files are never overwritten. Returns the index path.
+/// A symlinked layer/`pending`/`proposals`/`.index` dir refuses the
+/// store outright — writes must never land outside it.
 pub fn ensure(dir: &Path) -> std::io::Result<PathBuf> {
     crate::harden::ensure_private_dir(dir)?;
+    tighten_perms(dir);
+    if dir.join(".index").is_dir() {
+        tighten_perms(&dir.join(".index"));
+    }
+    for name in Layer::ALL
+        .iter()
+        .map(|l| l.name())
+        .chain(["pending", "proposals", ".index"])
+    {
+        real_dir(dir, name).map_err(std::io::Error::other)?;
+    }
     for layer in Layer::ALL {
         crate::harden::ensure_private_dir(&dir.join(layer.name()))?;
     }
@@ -534,7 +570,185 @@ pub fn ensure(dir: &Path) -> std::io::Result<PathBuf> {
     Ok(idx)
 }
 
-/// `valid_to` expiry: the stored instant is strictly before now. Compared
+/// The store root itself may be a symlink (an operator can point a store
+/// anywhere); every component BELOW it must be real — a store never
+/// follows a symlinked dir or note (D-symlink-*, F-symlink-memory-md).
+///
+/// `<dir>/<name>` (one store subdirectory: a layer, `pending`,
+/// `proposals`, `.index`): Ok when missing (the caller may create it) or
+/// a real directory; "symlink in store" when it is a link, "not a
+/// directory" when it is anything else on disk.
+pub(crate) fn real_dir(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let p = dir.join(name);
+    match std::fs::symlink_metadata(&p) {
+        Ok(m) if m.file_type().is_symlink() => Err(format!("memory: symlink in store: {name}")),
+        Ok(m) if !m.is_dir() => Err(format!("memory: {name} is not a directory")),
+        Ok(_) => Ok(p),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(p),
+        Err(e) => Err(format!("memory: stat {name}: {e}")),
+    }
+}
+
+/// Resolve `<dir>/<rel>` for store IO. `rel` is a store-relative path —
+/// no absolute, no `..`, no empty components. The root is canonicalized
+/// once (it may itself be a link); every component below it that exists
+/// must be a real directory — the final component is left to the caller
+/// (reads open it `O_NOFOLLOW`; writes rename over it, replacing a link
+/// instead of writing through one).
+pub(crate) fn store_path(dir: &Path, rel: &str) -> Result<PathBuf, String> {
+    if rel.starts_with('/')
+        || rel.contains('\\')
+        || rel
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
+    {
+        return Err(format!("memory: bad store path `{rel}`"));
+    }
+    let root = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut cur = root;
+    let mut it = rel.split('/').peekable();
+    while let Some(comp) = it.next() {
+        cur = cur.join(comp);
+        if it.peek().is_none() {
+            break;
+        }
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!("memory: symlink in store: {}", cur.display()))
+            }
+            Ok(m) if !m.is_dir() => {
+                return Err(format!(
+                    "memory: not a directory in store: {}",
+                    cur.display()
+                ))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("memory: missing dir for store path `{rel}`"))
+            }
+            Err(e) => return Err(format!("memory: stat {}: {e}", cur.display())),
+        }
+    }
+    Ok(cur)
+}
+
+/// Write `content` to `<dir>/<rel>`: an `O_NOFOLLOW` `create_new` temp
+/// file in the same directory, then `rename` over the target — atomic,
+/// and a symlinked target is REPLACED rather than written through
+/// (F-symlink-memory-md, D-symlink-target).
+pub(crate) fn store_write(dir: &Path, rel: &str, content: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let target = store_path(dir, rel)?;
+    let Some(parent) = target.parent() else {
+        return Err(format!("memory: bad store path `{rel}`"));
+    };
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(".ov-tmp-{}-{seq}", std::process::id()));
+    let res = (|| -> Result<(), String> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(crate::tools::O_NOFOLLOW);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .map_err(|e| format!("memory: write `{rel}`: {e}"))?;
+        f.write_all(content)
+            .map_err(|e| format!("memory: write `{rel}`: {e}"))?;
+        drop(f);
+        std::fs::rename(&tmp, &target).map_err(|e| format!("memory: write `{rel}`: {e}"))
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// Read `<dir>/<rel>` as text — `O_NOFOLLOW` on the final component, so
+/// a symlinked note reads as an error, never as its target's bytes.
+pub(crate) fn store_read(dir: &Path, rel: &str) -> Result<String, String> {
+    let p = store_path(dir, rel)?;
+    crate::tools::read_no_follow(&p).map_err(|e| format!("memory: read `{rel}`: {e}"))
+}
+
+/// Tighten `dir` (the store root — itself possibly a symlink, which is
+/// fine) and `.index/` to `0700` when any group/other bit is set, with a
+/// one-line warning the first time each dir needed it (I-world-writable-store).
+pub fn tighten_perms(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Mutex, OnceLock};
+        static WARNED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+        for sub in ["", ".index"] {
+            let p = if sub.is_empty() {
+                dir.to_path_buf()
+            } else {
+                dir.join(sub)
+            };
+            // `.index` is checked without following: a symlinked one is
+            // refused at IO time, never chmod'd (that would tighten the
+            // OUTSIDE target). The root may legitimately be a link.
+            let md = if sub.is_empty() {
+                std::fs::metadata(&p)
+            } else {
+                std::fs::symlink_metadata(&p)
+            };
+            let Ok(md) = md else { continue };
+            if !md.is_dir() || md.permissions().mode() & 0o077 == 0 {
+                continue;
+            }
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+            let mut warned = WARNED
+                .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if warned.insert(p.clone()) {
+                eprintln!("memory: tightened {} to owner-only (0700)", p.display());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+}
+
+/// Duplicate-detection normal form (C-dup-markdown): markdown dressing
+/// (`#` headings, `>` quotes, `` ` ``/`*`/`_`/`~` emphasis) stripped,
+/// then [`threat::fold`] — whitespace collapsed, lowercased, unicode
+/// mapped — with trailing punctuation dropped, so
+/// "## Run `cargo fmt`", "- run *cargo fmt*." and
+/// "run cargo fmt" dedupe to one string.
+pub(crate) fn dup_norm(s: &str) -> String {
+    let stripped: String = s
+        .chars()
+        .filter(|c| !matches!(c, '`' | '*' | '_' | '#' | '>' | '~'))
+        .collect();
+    threat::fold(&stripped)
+        .trim_end_matches(|c: char| c.is_ascii_punctuation())
+        .to_string()
+}
+
+/// The stored-body half of the dupe check: leading `#` heading lines are
+/// title furniture, not content, so they leave the comparison first.
+pub(crate) fn dup_norm_body(body: &str) -> String {
+    let mut b = body.trim_start();
+    while b.starts_with('#') {
+        b = b
+            .split_once('\n')
+            .map(|(_, r)| r)
+            .unwrap_or("")
+            .trim_start();
+    }
+    dup_norm(b)
+}
+
+/// `valid_to` expiry: the stored instant is at or before now (a note
+/// forgotten this second is gone this second). Compared
 /// as epoch seconds so `Z` and `±HH:MM` stamps order by the instant they
 /// name, not by their spelling. An unparseable stamp reads as not expired
 /// — `parse_meta` already refuses one, so only a directly constructed
@@ -548,7 +762,7 @@ fn meta_expired_at(meta: &EntryMeta, now: u64) -> bool {
     meta.valid_to
         .as_deref()
         .and_then(rfc3339_epoch)
-        .is_some_and(|to| to < now)
+        .is_some_and(|to| to <= now)
 }
 
 /// True when the topic body carries a `superseded_by` trailer pointing at
@@ -616,8 +830,9 @@ enum Topic {
     /// File with no frontmatter: documented defaults apply (Personal /
     /// Private) and the whole text is the body.
     Bare(String),
-    /// File with a valid header.
-    Headed(EntryMeta, String),
+    /// File with a valid header (the meta is boxed — `EntryMeta` grew
+    /// `source`/`added` in v3 and dwarfs the other variants).
+    Headed(Box<EntryMeta>, String),
     /// File whose header does not parse: fail closed (Secret /
     /// Regulated) — an unreadable header must not open anything up. The
     /// body is deliberately not carried: nothing may serve it.
@@ -628,7 +843,7 @@ fn topic_of(dir: &Path, name: &str) -> (Topic, Option<std::time::SystemTime>) {
     let Some(path) = layer_path(dir, name) else {
         return (Topic::Missing, None);
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = crate::tools::read_no_follow(&path) else {
         return (Topic::Missing, None);
     };
     let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -636,7 +851,7 @@ fn topic_of(dir: &Path, name: &str) -> (Topic, Option<std::time::SystemTime>) {
         return (Topic::Bare(text), mtime);
     }
     match parse_meta(&text) {
-        Ok((meta, _)) => (Topic::Headed(meta, text), mtime),
+        Ok((meta, _)) => (Topic::Headed(Box::new(meta), text), mtime),
         Err(_) => (Topic::Malformed, mtime),
     }
 }
@@ -710,7 +925,7 @@ fn pointer_live(dir: &Path, line: &str) -> bool {
     let Some(path) = layer_path(dir, name) else {
         return true;
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = crate::tools::read_no_follow(&path) else {
         return true;
     };
     let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -924,7 +1139,13 @@ fn valid_pointer(name: &str) -> bool {
 /// in the memory root first, then each layer subdir. None when the
 /// pointer is invalid or no backing file exists.
 fn resolve_pointer(dir: &Path, name: &str) -> Option<String> {
-    resolve_pointer_with(name, |rel| dir.join(rel).is_file())
+    // The store-path gate keeps every component below the root real — a
+    // symlinked layer dir resolves to nothing (reads never leave the
+    // store). A symlinked note itself resolves but refuses at read time
+    // via `O_NOFOLLOW` upstream.
+    resolve_pointer_with(name, |rel| {
+        store_path(dir, rel).ok().is_some_and(|p| p.is_file())
+    })
 }
 
 fn resolve_pointer_with(name: &str, is_file: impl Fn(&str) -> bool) -> Option<String> {
@@ -969,7 +1190,12 @@ pub fn layer_path(dir: &Path, name: &str) -> Option<PathBuf> {
 /// Git-version the memory dir. Runs `git init` once, then commits any dirty
 /// state. Best-effort: memory works without history, so failures are
 /// swallowed (no git binary, read-only fs) rather than killing the turn.
+/// Every commit first regenerates the store's AMR `MEMORY.md` (§9.1) so
+/// the entry point and the history stay in sync.
 pub fn commit(dir: &Path, msg: &str) {
+    // AMR entry point (§9.1). Not behind git: a store without history
+    // still gets its MEMORY.md. Best-effort like the commit itself.
+    let _ = amr::regen(dir, now_secs());
     let git = |args: &[&str]| {
         Command::new("git")
             .arg("-C")
@@ -1034,6 +1260,60 @@ pub fn dirty_files(dir: &Path) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// `overseer memory log`: the store's git history, `--oneline`, newest
+/// first, capped. Empty when the store has no history or git is absent.
+pub fn git_log(dir: &Path, cap: usize) -> Vec<String> {
+    if !dir.join(".git").exists() {
+        return Vec::new();
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["log", "--oneline", &format!("-{cap}")])
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// `overseer memory restore` (§8): un-expire a forgotten note — clear
+/// the `valid_to` frontmatter and the `forgotten:` body line `expire_note`
+/// wrote. The INDEX pointer lives (forget never deletes it). Takes the
+/// store lock and commits, like every write path.
+pub fn restore(dir: &Path, rel: &str) -> Result<String, String> {
+    if rel.contains("..")
+        || rel.starts_with('/')
+        || rel.starts_with("pending/")
+        || rel.starts_with("proposals/")
+        || rel.starts_with(".index/")
+        || rel.starts_with(".git/")
+    {
+        return Err(format!("memory: bad note path `{rel}`"));
+    }
+    let _lock = StoreLock::acquire(dir).map_err(|e| e.to_string())?;
+    let text = store_read(dir, rel)?;
+    if !text
+        .lines()
+        .any(|l| l.trim_start().starts_with("valid_to:"))
+        && !text
+            .lines()
+            .any(|l| l.trim_start().starts_with("forgotten:"))
+    {
+        return Err(format!("memory: `{rel}` is not expired"));
+    }
+    let text = clear_forgotten(&clear_meta_key(&text, "valid_to"));
+    store_write(dir, rel, text.as_bytes())?;
+    commit(dir, &format!("memory: restore {rel}"));
+    Ok(format!("restored {rel}"))
 }
 
 /// A reconciliation plan over the memory dir (mem0 pattern, arsenal B2):
@@ -1106,10 +1386,15 @@ fn reconcile(dir: &Path, index_text: &str) -> ReconcilePlan {
     }
 
     // Untracked topics: a file on disk no pointer resolves to. Root and
-    // the layer subdirs both count.
+    // the layer subdirs both count — real dirs only, never through a
+    // link (a symlinked layer would list files outside the store).
     let mut dirs = vec![(dir.to_path_buf(), None)];
     for layer in Layer::ALL {
-        dirs.push((dir.join(layer.name()), Some(layer.name())));
+        if let Ok(d) = real_dir(dir, layer.name()) {
+            if d.is_dir() {
+                dirs.push((d, Some(layer.name())));
+            }
+        }
     }
     for (d, layer) in dirs {
         let Ok(entries) = std::fs::read_dir(&d) else {
@@ -1173,7 +1458,9 @@ fn promote_candidates(dir: &Path) -> Vec<String> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let settled = |secs: u64| secs.saturating_add(PROMOTE_AGE_SECS) < now;
-    let epi = dir.join(Layer::Episodic.name());
+    let Ok(epi) = real_dir(dir, Layer::Episodic.name()) else {
+        return Vec::new();
+    };
     let Ok(entries) = std::fs::read_dir(&epi) else {
         return Vec::new();
     };
@@ -1184,10 +1471,7 @@ fn promote_candidates(dir: &Path) -> Vec<String> {
             continue;
         }
         let p = epi.join(&name);
-        if !p.is_file() {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&p) else {
+        let Ok(text) = crate::tools::read_no_follow(&p) else {
             continue;
         };
         let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
@@ -1312,6 +1596,62 @@ fn rfc3339_epoch(s: &str) -> Option<u64> {
     u64::try_from(stamp).ok()
 }
 
+/// Every `*.md` under the store root and the real layer dirs, sorted —
+/// the shared walk for the consolidate/distill fingerprints. A
+/// symlinked layer dir contributes nothing (the store never follows it).
+pub(crate) fn note_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut dirs = vec![(dir.to_path_buf(), String::new())];
+    for layer in Layer::ALL {
+        if let Ok(d) = real_dir(dir, layer.name()) {
+            if d.is_dir() {
+                dirs.push((d, format!("{}/", layer.name())));
+            }
+        }
+    }
+    let mut notes: Vec<(String, PathBuf)> = Vec::new();
+    for (d, prefix) in dirs {
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.ends_with(".md") {
+                    notes.push((format!("{prefix}{name}"), e.path()));
+                }
+            }
+        }
+    }
+    notes.sort();
+    notes
+}
+
+/// Fold one store's fingerprint inputs into `h`: INDEX.md plus every
+/// note rel + body under the real layer dirs (a symlinked note hashes
+/// as a sentinel, never its target's bytes).
+pub(crate) fn hash_store_notes(h: &mut impl sha2::Digest, dir: &Path) {
+    h.update(store_read(dir, INDEX_NAME).unwrap_or_default().as_bytes());
+    for (rel, p) in note_files(dir) {
+        h.update(b"\0");
+        h.update(rel.as_bytes());
+        h.update(b"\0");
+        match crate::tools::read_no_follow(&p) {
+            Ok(t) => h.update(t.as_bytes()),
+            Err(_) => h.update([0xff]),
+        }
+    }
+}
+
+/// sha256 over the inputs a consolidate pass depends on: INDEX.md and
+/// every `*.md` note body under the root and the real layer dirs (a
+/// symlinked dir or note contributes nothing — the store never follows
+/// one). R1: taken before the unlocked reads/model call and again under
+/// the write lock; a mismatch means a concurrent writer touched the
+/// store mid-plan.
+fn consolidate_fingerprint(dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    hash_store_notes(&mut h, dir);
+    sha_hex(&h.finalize(), 64)
+}
+
 /// Sleep-time consolidation (P3.8): a small-tier call that dedupes and
 /// tightens `INDEX.md`, then a git commit. Topic files are read for
 /// context but only the index is rewritten — merging topic bodies is the
@@ -1325,17 +1665,31 @@ pub fn consolidate(
     model: &str,
     dir: &Path,
 ) -> Result<String, String> {
-    let idx = ensure(dir).map_err(|e| e.to_string())?;
-    let old_index = std::fs::read_to_string(&idx).unwrap_or_default();
+    // R1 optimistic concurrency: the model call is far too long to hold
+    // the store lock across (every concurrent remember would time out).
+    // The plan is computed unlocked and fingerprinted; the lock is taken
+    // only for the write, and only when the fingerprint still matches —
+    // otherwise this store's pass aborts instead of writing a stale plan.
+    ensure(dir).map_err(|e| e.to_string())?;
+    // The fingerprint of everything the reply is applied against — taken
+    // BEFORE the unlocked reads and model call, re-taken under the lock
+    // below. Any write in between (even a harmless one) aborts the pass.
+    let fp = consolidate_fingerprint(dir);
+    let old_index = store_read(dir, INDEX_NAME).unwrap_or_default();
 
     // Topic files: bounded context for the dedupe pass. Walks the top
     // level AND the P6-1 layer subdirs (F6: after layering, topics live in
     // profile/episodic/semantic/procedural — a top-level-only scan judges
-    // every layer pointer blind).
+    // every layer pointer blind). Real dirs only — a symlinked layer
+    // would walk files outside the store.
     let mut topics = String::new();
     let mut topic_dirs = vec![dir.to_path_buf()];
     for layer in Layer::ALL {
-        topic_dirs.push(dir.join(layer.name()));
+        if let Ok(d) = real_dir(dir, layer.name()) {
+            if d.is_dir() {
+                topic_dirs.push(d);
+            }
+        }
     }
     for tdir in topic_dirs {
         let Ok(entries) = std::fs::read_dir(&tdir) else {
@@ -1351,7 +1705,7 @@ pub fn consolidate(
                 // body must not be re-summarized into the index — consolidation
                 // reads only what the reader would serve.
                 let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
-                let Ok(t) = std::fs::read_to_string(&p) else {
+                let Ok(t) = crate::tools::read_no_follow(&p) else {
                     continue;
                 };
                 if !entry_valid(&t, mtime) {
@@ -1489,7 +1843,13 @@ pub fn consolidate(
         capped.push_str(line);
         restored += 1;
     }
-    std::fs::write(&idx, format!("{capped}\n")).map_err(|e| e.to_string())?;
+    // Re-acquire for the write. The store changed during the model call
+    // → the plan is stale; write nothing and tell the caller to rerun.
+    let _lock = StoreLock::acquire(dir).map_err(|e| e.to_string())?;
+    if consolidate_fingerprint(dir) != fp {
+        return Err("memory: store changed during consolidate, rerun".to_string());
+    }
+    store_write(dir, INDEX_NAME, format!("{capped}\n").as_bytes())?;
     commit(dir, "consolidate");
 
     let dropped = old_index
@@ -1592,20 +1952,99 @@ pub(crate) fn set_meta_key(text: &str, key: &str, value: &str) -> String {
     out
 }
 
+/// `text` with the frontmatter `key` line removed (no-op when absent).
+/// The body is never touched; a `forgotten:` line is a *body* line, so
+/// [`clear_forgotten`] handles that one separately.
+pub(crate) fn clear_meta_key(text: &str, key: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    let close = (lines.first().map(|l| l.trim()) == Some("---"))
+        .then(|| lines.iter().skip(1).position(|l| l.trim() == "---"))
+        .flatten()
+        .map(|i| i + 1);
+    let Some(close) = close else {
+        return text.to_string();
+    };
+    let prefix = format!("{key}:");
+    if let Some(i) = lines[1..close]
+        .iter()
+        .position(|l| l.trim_start().starts_with(&prefix))
+    {
+        lines.remove(i + 1);
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// `text` without the `forgotten: <reason>` body line a `forget` wrote.
+pub(crate) fn clear_forgotten(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.retain(|l| !l.trim_start().starts_with("forgotten:"));
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// `text` expired at `now` (`valid_to` set) with a trailing
+/// `forgotten: <reason>` body line — the one expiry shape shared by the
+/// `forget` op, review apply and pending-op approval.
+pub(crate) fn expire_note(text: &str, reason: &str, now: u64) -> String {
+    let mut text = set_meta_key(text, "valid_to", &rfc3339(now));
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    text.push_str(&format!("forgotten: {reason}\n"));
+    text
+}
+
+/// Rewrite the INDEX.md pointer line that names `rel` so its title reads
+/// `title`. The pointer table is ADD-only for the *model*; the engine
+/// keeping a superseded note's pointer honest is housekeeping, not a
+/// model write. No-op when no pointer names `rel`.
+pub(crate) fn update_pointer(dir: &Path, rel: &str, title: &str) -> std::io::Result<()> {
+    let old = crate::tools::read_no_follow(&dir.join(INDEX_NAME))?;
+    let mut changed = false;
+    let out: Vec<String> = old
+        .lines()
+        .map(|line| {
+            let hit = topic_name(line)
+                .and_then(|n| resolve_pointer(dir, n))
+                .is_some_and(|r| r == rel);
+            if hit {
+                changed = true;
+                format!("{rel} — {title}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if changed {
+        store_write(
+            dir,
+            INDEX_NAME,
+            format!("{}\n", out.join("\n").trim_end_matches('\n')).as_bytes(),
+        )
+        .map_err(std::io::Error::other)?;
+    }
+    Ok(())
+}
+
 /// Append one pointer line to a store's INDEX.md (ADD-only).
 pub(crate) fn append_pointer(dir: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write;
     let idx = dir.join(INDEX_NAME);
-    let old = std::fs::read_to_string(&idx).unwrap_or_default();
+    let old = crate::tools::read_no_follow(&idx).unwrap_or_default();
     let sep = if old.is_empty() || old.ends_with('\n') {
         ""
     } else {
         "\n"
     };
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&idx)?;
+    let mut f = crate::tools::open_append_no_follow(&idx)?;
     f.write_all(format!("{sep}{line}\n").as_bytes())
 }
 
@@ -1673,7 +2112,10 @@ pub(crate) fn add_note(
     meta: &str,
     text: &str,
 ) -> std::io::Result<String> {
-    let ldir = dir.join(layer.name());
+    // The layer dir must be real — a symlinked one would land the note
+    // outside the store (D-symlink-*). Checked before ensure_private_dir,
+    // which would otherwise chmod the link's outside target.
+    let ldir = real_dir(dir, layer.name()).map_err(std::io::Error::other)?;
     crate::harden::ensure_private_dir(&ldir)?;
     let name = create_unique(&ldir, base, &format!("---\n{meta}---\n{text}\n"))?;
     let rel = format!("{}/{name}.md", layer.name());
@@ -1699,10 +2141,9 @@ pub fn consolidate_stores(
             scope.name()
         ));
     }
+    // distill locks every store for its whole pass and commits them
+    // under the same holds (W1) — no post-pass commit loop needed here.
     let d = episode::distill(provider, model, stores, now)?;
-    for (_, dir) in stores {
-        commit(dir, "consolidate: distill");
-    }
     out.push(format!(
         "distilled {} episodes: {} added, {} superseded, {} duplicate, {} invalid lines skipped",
         d.episodes,
@@ -1826,8 +2267,10 @@ fn resident_within(stores: &[(Scope, PathBuf)], now: u64, cap: usize) -> String 
 /// proposals and orphans dropped, first line per topic wins, index order
 /// kept. Liveness is the caller's call.
 pub(crate) fn pointer_lines(dir: &Path) -> Vec<(String, String)> {
-    let index = std::fs::read_to_string(dir.join(INDEX_NAME)).unwrap_or_default();
-    pointer_lines_in(&index, |rel| dir.join(rel).is_file())
+    let index = store_read(dir, INDEX_NAME).unwrap_or_default();
+    pointer_lines_in(&index, |rel| {
+        store_path(dir, rel).ok().is_some_and(|p| p.is_file())
+    })
 }
 
 /// [`pointer_lines`] over INDEX text `index`, with `is_topic(rel)` saying
@@ -1863,7 +2306,7 @@ pub(crate) fn pointer_lines_in(
 
 /// [`pointer_lines`] whose topic is current at `now` (bare files count;
 /// malformed headers fail closed).
-fn live_pointers(dir: &Path, now: u64) -> Vec<(String, String)> {
+pub(crate) fn live_pointers(dir: &Path, now: u64) -> Vec<(String, String)> {
     pointer_lines(dir)
         .into_iter()
         .filter(|(rel, _)| match topic_of(dir, rel) {
@@ -1877,12 +2320,8 @@ fn live_pointers(dir: &Path, now: u64) -> Vec<(String, String)> {
 /// The instant a current entry stops being current (earliest of
 /// `valid_to` and the TTL clock), for index invalidation.
 pub(crate) fn expires_at(meta: &EntryMeta, mtime: u64) -> Option<u64> {
-    // `valid_to` is inclusive (expired once strictly past), the TTL is not.
-    let to = meta
-        .valid_to
-        .as_deref()
-        .and_then(rfc3339_epoch)
-        .map(|t| t.saturating_add(1));
+    // Both bounds are exclusive: expired at the instant itself.
+    let to = meta.valid_to.as_deref().and_then(rfc3339_epoch);
     let ttl = meta
         .ttl_days
         .map(|d| mtime.saturating_add(d.saturating_mul(86_400)));
@@ -2040,12 +2479,22 @@ mod tests {
     struct FixedProvider {
         reply: String,
         seen: std::sync::Mutex<Vec<String>>,
+        /// Runs inside `complete` before the reply is returned — the
+        /// R1 tests' "model call in flight" hook.
+        hook: Option<Box<dyn Fn() + Send + Sync>>,
     }
     impl FixedProvider {
         fn with_reply(reply: &str) -> Self {
             Self {
                 reply: reply.into(),
                 seen: std::sync::Mutex::new(Vec::new()),
+                hook: None,
+            }
+        }
+        fn with_reply_and_hook(reply: &str, hook: impl Fn() + Send + Sync + 'static) -> Self {
+            Self {
+                hook: Some(Box::new(hook)),
+                ..Self::with_reply(reply)
             }
         }
     }
@@ -2066,6 +2515,9 @@ mod tests {
                 })
                 .collect();
             self.seen.lock().unwrap().push(prompt);
+            if let Some(h) = &self.hook {
+                h();
+            }
             Ok(crate::provider::Response {
                 blocks: vec![crate::ir::Block::Text {
                     text: self.reply.clone(),
@@ -2117,6 +2569,70 @@ mod tests {
         assert!(new.contains("facts.md — user facts"));
         assert!(!new.contains("dupe.md"), "stale pointer dropped");
         assert!(dir.join(".git").exists(), "consolidate commits");
+    }
+
+    /// R1: a writer landing mid-model-call invalidates the plan — the
+    /// pass aborts with the rerun message, writes nothing, and the
+    /// concurrent note survives.
+    #[test]
+    fn consolidate_aborts_when_the_store_changes_mid_call() {
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(&idx, "# Memory Index\n\nfacts.md — f\n").unwrap();
+        std::fs::write(dir.join("facts.md"), "data").unwrap();
+        let before = std::fs::read_to_string(&idx).unwrap();
+        let d2 = dir.clone();
+        let p = FixedProvider::with_reply_and_hook(
+            "---INDEX---\n# Memory Index\n\nfacts.md — rewritten\n---INDEX---",
+            move || {
+                std::fs::write(d2.join("semantic").join("injected.md"), "x").unwrap();
+            },
+        );
+        let err = consolidate(&p, "tiny", &dir).unwrap_err();
+        assert_eq!(err, "memory: store changed during consolidate, rerun");
+        assert_eq!(
+            std::fs::read_to_string(&idx).unwrap(),
+            before,
+            "the stale plan wrote nothing"
+        );
+        assert!(
+            dir.join("semantic/injected.md").is_file(),
+            "the concurrent write survives"
+        );
+    }
+
+    /// R1: the model call holds no lock — another thread's StoreLock
+    /// acquire succeeds while `complete` is still in flight.
+    #[test]
+    fn store_lock_is_free_during_the_model_call() {
+        let dir = tmpdir();
+        let idx = ensure(&dir).unwrap();
+        std::fs::write(&idx, "# Memory Index\n\nfacts.md — f\n").unwrap();
+        std::fs::write(dir.join("facts.md"), "data").unwrap();
+        let (in_call_tx, in_call_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = std::sync::Arc::new(std::sync::Mutex::new(go_rx));
+        let p = FixedProvider::with_reply_and_hook(
+            "---INDEX---\n# Memory Index\n\nfacts.md — f\n---INDEX---",
+            move || {
+                let _ = in_call_tx.send(());
+                let _ = go_rx.lock().unwrap().recv();
+            },
+        );
+        let d2 = dir.clone();
+        let t = std::thread::spawn(move || consolidate(&p, "tiny", &d2));
+        in_call_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the model call reached its in-flight point");
+        let start = std::time::Instant::now();
+        let lock = StoreLock::acquire(&dir).expect("the lock is free mid-call");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "acquire waited on the model call"
+        );
+        drop(lock);
+        go_tx.send(()).unwrap();
+        t.join().unwrap().unwrap();
     }
 
     #[test]

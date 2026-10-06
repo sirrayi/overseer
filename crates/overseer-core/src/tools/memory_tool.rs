@@ -28,7 +28,7 @@ pub fn spec() -> ToolSpec {
         name: "memory".into(),
         description: concat!(
             "Long-term memory across sessions (user + project). search {query}; ",
-            "get {name}; remember {text, layer, name?, cues?, scope?, trigger?}; ",
+            "get {name}; remember {text, layer, name?, cues?, scope?, trigger?, supersedes?}; ",
             "forget {name=layer/n.md, text=reason}."
         )
         .into(),
@@ -41,7 +41,8 @@ pub fn spec() -> ToolSpec {
                 "layer": { "enum": ["profile", "episodic", "semantic", "procedural", "prospective"] },
                 "cues": str(),
                 "scope": { "enum": ["user", "project"] },
-                "trigger": str()
+                "trigger": str(),
+                "supersedes": str()
             }),
             &["op"],
         ),
@@ -75,6 +76,8 @@ pub struct MemoryState {
     subagent: bool,
     recall: bool,
     session8: String,
+    /// The full session id — feeds `source: overseer:session/<id>`.
+    session_id: String,
     index: Option<Index>,
     writes: usize,
     recalled: HashSet<String>,
@@ -116,18 +119,22 @@ impl MemoryState {
         }
         let events =
             crate::event::EventLog::replay(session_dir.join("events.jsonl")).unwrap_or_default();
-        self.session8 = events
+        self.session_id = events
             .iter()
             .find_map(|e| match &e.kind {
-                crate::event::EventKind::SessionStart { session_id, .. } => Some(id8(session_id)),
+                crate::event::EventKind::SessionStart { session_id, .. } => {
+                    Some(session_id.clone())
+                }
                 _ => None,
             })
             .unwrap_or_else(|| {
-                id8(&session_dir
+                session_dir
                     .file_name()
                     .unwrap_or_default()
-                    .to_string_lossy())
+                    .to_string_lossy()
+                    .into_owned()
             });
+        self.session8 = id8(&self.session_id);
         for e in &events {
             if let crate::event::EventKind::MemoryNotice { kind, notes, .. } = &e.kind {
                 if kind == "recall" {
@@ -135,6 +142,11 @@ impl MemoryState {
                 }
             }
         }
+    }
+
+    /// Memory is bound (stores configured) — the learn loop's gate.
+    pub fn active(&self) -> bool {
+        self.init && !self.stores.is_empty()
     }
 
     fn dir(&self, scope: Scope) -> Option<&Path> {
@@ -265,7 +277,7 @@ impl MemoryState {
             ));
         };
         let d = &idx.docs[i];
-        let Ok(text) = std::fs::read_to_string(&d.path) else {
+        let Ok(text) = crate::tools::read_no_follow(&d.path) else {
             return ToolOutput::err(format!("memory: cannot read {}", d.id()));
         };
         let mut body: String = text.chars().take(GET_CAP).collect();
@@ -287,6 +299,16 @@ impl MemoryState {
         let text = field("text")
             .filter(|t| !t.is_empty())
             .ok_or("needs `text`")?;
+        // §3 strict refusal on every user-mediated write — text and cues
+        // are scanned raw (scrubbing first could hide the payload).
+        if let Some(msg) = crate::memory::threat::strict_refusal(text) {
+            return Err(msg);
+        }
+        if let Some(cues) = field("cues") {
+            if let Some(msg) = crate::memory::threat::strict_refusal(cues) {
+                return Err(msg);
+            }
+        }
         let scrubbed = crate::memory::redact::scrub(text);
         let text = scrubbed.as_ref();
         let layer = field("layer")
@@ -310,6 +332,7 @@ impl MemoryState {
             _ => {}
         }
         let cues = field("cues")
+            .map(crate::memory::redact::scrub)
             .map(|c| {
                 c.split(',')
                     .map(|c| c.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -320,6 +343,8 @@ impl MemoryState {
             .filter(|c| !c.is_empty());
         let given = field("name")
             .map(|n| {
+                let n = crate::memory::redact::scrub(n);
+                let n = n.as_ref();
                 let n = n.split_once(':').map_or(n, |(_, r)| r);
                 let n = n.rsplit('/').next().unwrap_or(n);
                 stores::slugify(n.strip_suffix(".md").unwrap_or(n), NAME_MAX)
@@ -330,6 +355,22 @@ impl MemoryState {
             .clone()
             .or_else(|| Some(stores::slugify(&title, NAME_MAX)).filter(|n| !n.is_empty()))
             .unwrap_or_else(|| "note".into());
+        let supersedes = field("supersedes")
+            .filter(|s| !s.is_empty())
+            .map(supersedes_rel)
+            .transpose()?;
+        // Same layer only: the gate's per-layer write bar is keyed on the
+        // NEW note's layer, so a cross-layer supersede would retire (say)
+        // a profile note under the semantic bar.
+        if supersedes
+            .as_deref()
+            .is_some_and(|r| !r.starts_with(&format!("{}/", layer.name())))
+        {
+            return Err(format!(
+                "`supersedes` must name a {} note (same layer)",
+                layer.name()
+            ));
+        }
         let mut meta = format!("provenance: session:{}", self.session8);
         if let Some(origin) = quarantine {
             meta.push_str(&format!(" tainted:{origin}\nconfidence: 0.3"));
@@ -342,14 +383,30 @@ impl MemoryState {
         if let Some(t) = trigger {
             meta.push_str(&format!("\ntrigger: {t}"));
         }
+        // §9.2: every note carries where it came from and when it was
+        // written (the day granularity keeps re-dates out of the diff).
+        meta.push_str(&format!(
+            "\nsource: overseer:session/{}\nadded: {}",
+            self.session_id,
+            &crate::memory::rfc3339(now)[..10]
+        ));
         meta.push_str(&format!("\nvalid_from: {}\n", crate::memory::rfc3339(now)));
 
         if quarantine.is_some() {
-            let pdir = dir.join("proposals");
-            crate::harden::ensure_private_dir(&pdir).map_err(|e| e.to_string())?;
+            if supersedes.is_some() {
+                return Err("`supersedes` is unavailable while untrusted content is in \
+                            context — a quarantined note cannot retire a live one"
+                    .into());
+            }
+            let _lock = crate::memory::StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
+            crate::harden::ensure_private_dir(&dir.join("proposals")).map_err(|e| e.to_string())?;
+            // D-symlink-queue-dir: proposals/ must be a real dir — a
+            // symlinked one would land the quarantined note outside.
+            let pdir = crate::memory::real_dir(&dir, "proposals").map_err(|e| e.to_string())?;
             let name =
                 crate::memory::create_unique(&pdir, &base, &format!("---\n{meta}---\n{text}\n"))
                     .map_err(|e| e.to_string())?;
+            crate::memory::commit(&dir, &format!("memory: quarantine {name}"));
             return Ok(ToolOutput::ok(format!(
                 "memory: quarantined for human review as {}:proposals/{name}.md — untrusted \
                  content is in context, so this note is not indexed, recalled or resident.",
@@ -358,17 +415,11 @@ impl MemoryState {
         }
 
         let idx = fresh(&mut self.index, &self.stores, now);
-        let norm = |s: &str| {
-            s.split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_lowercase()
-        };
-        let want = norm(text);
+        let want = crate::memory::dup_norm_body(text);
         if let Some(d) = idx
             .docs
             .iter()
-            .find(|d| d.scope == scope && norm(&d.body) == want)
+            .find(|d| d.scope == scope && crate::memory::dup_norm_body(&d.body) == want)
         {
             return Ok(ToolOutput::ok(format!(
                 "memory: already remembered as {} (no change).",
@@ -379,60 +430,97 @@ impl MemoryState {
             .as_ref()
             .map(|n| dir.join(layer.name()).join(format!("{n}.md")))
             .filter(|p| p.is_file());
-        if let Some(path) = path {
-            use std::io::Write;
-            let old = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let sep = if old.ends_with('\n') { "" } else { "\n" };
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .and_then(|mut f| {
-                    f.write_all(
-                        format!("{sep}\n## {}\n{text}\n", crate::memory::rfc3339(now)).as_bytes(),
-                    )
-                })
-                .map_err(|e| e.to_string())?;
+        // One lock covers the new write and the old note's retirement.
+        let _lock = crate::memory::StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
+        let old = supersedes
+            .map(|r| {
+                crate::memory::store_read(&dir, &r)
+                    .map(|t| (r.clone(), t))
+                    .map_err(|e| format!("`supersedes`: no {} note {r} ({e})", scope.name()))
+            })
+            .transpose()?;
+        let (rel, verb) = if let Some(path) = path {
             let rel = format!(
                 "{}/{}",
                 layer.name(),
                 path.file_name().unwrap_or_default().to_string_lossy()
             );
-            let _ = activation::record(&dir, &rel, now);
-            return Ok(ToolOutput::ok(format!(
-                "memory: appended to {}:{rel}.",
-                scope.name()
-            )));
+            if old.as_ref().is_some_and(|(r, _)| *r == rel) {
+                return Err("a note cannot supersede itself".into());
+            }
+            let mut note = crate::memory::store_read(&dir, &rel)?;
+            if !note.ends_with('\n') {
+                note.push('\n');
+            }
+            note.push_str(&format!("\n## {}\n{text}\n", crate::memory::rfc3339(now)));
+            crate::memory::store_write(&dir, &rel, note.as_bytes())?;
+            (rel, "appended to")
+        } else {
+            let rel = crate::memory::add_note(&dir, layer, &base, &meta, text)
+                .map_err(|e| e.to_string())?;
+            (rel, "remembered")
+        };
+        let mut msg = format!("memory: remember {rel}");
+        let mut out = format!("memory: {verb} {}:{rel}", scope.name());
+        if let Some((old_rel, old_text)) = old {
+            // The old note stays on disk and in INDEX.md, out of search,
+            // recall and the prompt from this second on.
+            let t = crate::memory::set_meta_key(&old_text, "superseded_by", &rel);
+            let t = crate::memory::set_meta_key(&t, "valid_to", &crate::memory::rfc3339(now));
+            crate::memory::store_write(&dir, &old_rel, t.as_bytes())?;
+            msg.push_str(&format!(", supersede {old_rel}"));
+            out.push_str(&format!(", superseding {old_rel}"));
         }
-        let rel =
-            crate::memory::add_note(&dir, layer, &base, &meta, text).map_err(|e| e.to_string())?;
+        crate::memory::commit(&dir, &msg);
         let _ = activation::record(&dir, &rel, now);
-        Ok(ToolOutput::ok(format!(
-            "memory: remembered {}:{rel}.",
-            scope.name()
-        )))
+        Ok(ToolOutput::ok(format!("{out}.")))
     }
 
     fn forget(&mut self, name: &str, reason: &str, now: u64) -> Result<ToolOutput, String> {
         if name.is_empty() || reason.is_empty() {
             return Err("needs `name` and `reason`".into());
         }
-        let idx = fresh(&mut self.index, &self.stores, now);
-        let d = idx.resolve_qualified(name)?;
-        let (id, path) = (d.id(), d.path.clone());
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        if let Some(msg) = crate::memory::threat::strict_refusal(reason) {
+            return Err(msg);
+        }
+        let (id, path, scope, rel) = {
+            let idx = fresh(&mut self.index, &self.stores, now);
+            let d = idx.resolve_qualified(name)?;
+            (d.id(), d.path.clone(), d.scope, d.rel.clone())
+        };
+        let dir = self
+            .dir(scope)
+            .ok_or_else(|| format!("no {} store in this session", scope.name()))?
+            .to_path_buf();
+        let _lock = crate::memory::StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
+        let text = crate::tools::read_no_follow(&path).map_err(|e| e.to_string())?;
         let mut text = crate::memory::set_meta_key(&text, "valid_to", &crate::memory::rfc3339(now));
         if !text.ends_with('\n') {
             text.push('\n');
         }
         let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        let reason = crate::memory::redact::scrub(&reason);
         text.push_str(&format!("forgotten: {reason}\n"));
-        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        crate::memory::store_write(&dir, &rel, text.as_bytes()).map_err(|e| e.to_string())?;
+        crate::memory::commit(&dir, &format!("memory: forget {rel}"));
         // DEFERRED(owner): hard purge — gate: owner demand
         Ok(ToolOutput::ok(format!(
             "memory: forgot {id} — expired now, out of search, recall and the prompt. \
              Its text stays in the store's git history."
         )))
     }
+}
+
+/// `supersedes` as a store-relative `<layer>/<name>.md`.
+fn supersedes_rel(s: &str) -> Result<String, String> {
+    let bad = || format!("`supersedes` wants `<layer>/<name>.md`, got `{s}`");
+    let (layer, name) = s.split_once('/').ok_or_else(bad)?;
+    Layer::parse(layer).ok_or_else(bad)?;
+    let stem = name.strip_suffix(".md").ok_or_else(bad)?;
+    if stem.is_empty() || stem.starts_with('.') || name.contains(['/', '\\']) {
+        return Err(bad());
+    }
+    Ok(s.to_string())
 }
 
 /// Registry dispatch: bind the state to the agent config, then run.
@@ -528,12 +616,12 @@ mod tests {
     }
 
     #[test]
-    fn spec_fits_600_serialized_chars() {
+    fn spec_fits_640_serialized_chars() {
         let s = spec();
         let full =
             json!({"name": s.name, "description": s.description, "input_schema": s.input_schema});
         let n = serde_json::to_string(&full).unwrap().chars().count();
-        assert!(n <= 600, "memory spec is {n} chars");
+        assert!(n <= 640, "memory spec is {n} chars");
     }
 
     #[test]
@@ -549,9 +637,17 @@ mod tests {
             out.text
         );
         let note = std::fs::read_to_string(project.join("semantic/deploy-steps.md")).unwrap();
-        assert!(note.starts_with(
-            "---\nprovenance: session:aabbccdd\nconfidence: 0.7\ncues: ship, rollout\nvalid_from: "
-        ));
+        assert!(
+            note.starts_with(
+                "---\nprovenance: session:aabbccdd\nconfidence: 0.7\ncues: ship, rollout\n"
+            ),
+            "{note}"
+        );
+        // §9.2: every remember is stamped with where it came from and
+        // the day it landed.
+        assert!(note.contains("\nsource: overseer:session/"), "{note}");
+        assert!(note.contains("\nadded: "), "{note}");
+        assert!(note.contains("\nvalid_from: "), "{note}");
         let index = std::fs::read_to_string(project.join("INDEX.md")).unwrap();
         assert_eq!(
             index
@@ -667,7 +763,7 @@ mod tests {
             note.contains("legacy kiwi endpoint")
                 && note.ends_with("forgotten: endpoint retired\n")
         );
-        // Expired strictly after NOW's second: search at a later clock.
+        // Expired from NOW's second on (`valid_to <= now`).
         let later = st.run(&json!({"op": "search", "query": "kiwi"}), None, NOW + 1);
         assert!(
             later.text.starts_with("memory: no notes match"),
@@ -678,6 +774,62 @@ mod tests {
             call(&mut st, json!({"op": "forget", "name": "old"})).is_error,
             "reason required"
         );
+    }
+
+    /// `supersedes` retires the old note in the same write: it stays on
+    /// disk and in INDEX.md, but is out of search from this second.
+    #[test]
+    fn remember_supersedes_an_old_note() {
+        let (mut st, _, project) = state("supersede");
+        call(
+            &mut st,
+            json!({"op": "remember", "layer": "semantic", "name": "db", "text": "kiwi postgres 15"}),
+        );
+        for bad in [
+            "../db.md",
+            "semantic/db",
+            "semantic/a/b.md",
+            "semantic/.md",
+            "kiwi/db.md",
+        ] {
+            assert!(supersedes_rel(bad).is_err(), "{bad}");
+        }
+        let out = call(
+            &mut st,
+            json!({"op": "remember", "layer": "semantic", "name": "db2", "text": "kiwi pg", "supersedes": "semantic/nope.md"}),
+        );
+        assert!(out.is_error, "{}", out.text);
+        assert!(
+            !project.join("semantic/db2.md").exists(),
+            "refused before writing"
+        );
+        let out = call(
+            &mut st,
+            json!({"op": "remember", "layer": "semantic", "name": "db", "text": "kiwi pg 17", "supersedes": "semantic/db.md"}),
+        );
+        assert!(out.is_error, "{}", out.text);
+        let out = call(
+            &mut st,
+            json!({"op": "remember", "layer": "procedural", "name": "db-proc", "text": "kiwi pg", "supersedes": "semantic/db.md"}),
+        );
+        assert!(out.is_error, "cross-layer supersede: {}", out.text);
+        let out = call(
+            &mut st,
+            json!({"op": "remember", "layer": "semantic", "name": "db16", "text": "kiwi postgres 16", "supersedes": "semantic/db.md"}),
+        );
+        assert_eq!(
+            out.text,
+            "memory: remembered project:semantic/db16.md, superseding semantic/db.md."
+        );
+        let old = std::fs::read_to_string(project.join("semantic/db.md")).unwrap();
+        assert!(old.contains("superseded_by: semantic/db16.md"), "{old}");
+        assert!(old.contains(&format!("valid_to: {}", crate::memory::rfc3339(NOW))));
+        assert!(old.contains("kiwi postgres 15"));
+        let found = call(&mut st, json!({"op": "search", "query": "kiwi postgres"})).text;
+        assert!(found.contains("semantic/db16.md"), "{found}");
+        assert!(!found.contains("semantic/db.md"), "{found}");
+        let index = std::fs::read_to_string(project.join("INDEX.md")).unwrap();
+        assert!(index.contains("semantic/db.md"), "{index}");
     }
 
     /// `forget` takes `scope:layer/name.md` or `layer/name.md` (scope by

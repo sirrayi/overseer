@@ -168,12 +168,66 @@ pub fn write(dir: &Path, events: &[Event]) -> std::io::Result<Option<String>> {
         return Ok(None);
     };
     crate::harden::ensure_private_dir(&dir.join("episodic"))?;
-    std::fs::write(dir.join(&ep.rel), &ep.text)?;
-    let index = std::fs::read_to_string(dir.join(super::INDEX_NAME)).unwrap_or_default();
+    super::real_dir(dir, "episodic").map_err(std::io::Error::other)?;
+    let text = match super::store_read(dir, &ep.rel) {
+        Ok(old) => carry_over(&ep.text, &old),
+        Err(_) => ep.text,
+    };
+    super::store_write(dir, &ep.rel, text.as_bytes()).map_err(std::io::Error::other)?;
+    let index = crate::tools::read_no_follow(&dir.join(super::INDEX_NAME)).unwrap_or_default();
     if !index.lines().any(|l| l.trim_start().starts_with(&ep.rel)) {
         super::append_pointer(dir, &format!("{} — {}", ep.rel, ep.title))?;
     }
     Ok(Some(ep.rel))
+}
+
+/// `fresh` (a regenerated episode) with the lifecycle marks a `forget` or
+/// supersession left on `old` carried over: the `valid_to` and
+/// `superseded_by` frontmatter keys and the `forgotten:` / `superseded_by`
+/// body lines. A rewrite never resurrects a forgotten episode.
+fn carry_over(fresh: &str, old: &str) -> String {
+    let mut text = fresh.to_string();
+    let (head, body) = split_frontmatter(old);
+    for key in ["valid_to", "superseded_by"] {
+        let value = head.iter().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            (k.trim() == key)
+                .then(|| v.trim())
+                .filter(|v| !v.is_empty())
+        });
+        if let Some(v) = value {
+            text = super::set_meta_key(&text, key, v);
+        }
+    }
+    for l in body.lines().map(str::trim) {
+        if l.starts_with("forgotten:") || l.starts_with("superseded_by") {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(l);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// `text`'s frontmatter lines (without the `---` fences) and the rest;
+/// no or unterminated frontmatter → no lines and the whole text.
+fn split_frontmatter(text: &str) -> (Vec<&str>, &str) {
+    let mut lines = text.split_inclusive('\n');
+    if lines.next().map(str::trim) != Some("---") {
+        return (Vec::new(), text);
+    }
+    let mut off = text.find('\n').map_or(text.len(), |i| i + 1);
+    let mut head = Vec::new();
+    for l in lines {
+        off += l.len();
+        if l.trim() == "---" {
+            return (head, &text[off..]);
+        }
+        head.push(l.trim_end());
+    }
+    (Vec::new(), text)
 }
 
 /// Consolidation input cap, chars (instructions, note list and episodes).
@@ -191,12 +245,33 @@ fn body_hash(text: &str) -> String {
 }
 
 fn read_ledger(project: &Path) -> std::collections::BTreeMap<String, String> {
-    std::fs::read_to_string(project.join(DISTILLED))
+    super::store_read(project, DISTILLED)
         .unwrap_or_default()
         .lines()
         .filter_map(|l| l.split_once('\t'))
         .map(|(r, h)| (r.to_string(), h.to_string()))
         .collect()
+}
+
+/// sha256 over the inputs a distill pass depends on: each store's notes
+/// (index + layer bodies — the dupe corpus and supersede targets) and
+/// the project store's distillation ledger. R1: taken before the
+/// unlocked model call and again under the write locks; a mismatch
+/// means a concurrent writer touched a store mid-plan.
+fn distill_fingerprint(stores: &[(Scope, PathBuf)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for (scope, dir) in stores {
+        h.update(scope.name().as_bytes());
+        super::hash_store_notes(&mut h, dir);
+        h.update(b"\0ledger\0");
+        h.update(
+            super::store_read(dir, DISTILLED)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
+    super::sha_hex(&h.finalize(), 64)
 }
 
 /// What one distillation pass did.
@@ -222,6 +297,15 @@ pub fn distill(
     stores: &[(Scope, PathBuf)],
     now: u64,
 ) -> Result<Distilled, String> {
+    // R1 optimistic concurrency: the reads and the model call run
+    // unlocked (the call is far too long to hold the store locks
+    // across), fingerprinted before and re-verified under the locks
+    // before anything writes.
+    let commit_all = |stores: &[(Scope, PathBuf)]| {
+        for (_, dir) in stores {
+            super::commit(dir, "consolidate: distill");
+        }
+    };
     let Some(project) = stores
         .iter()
         .find(|(s, _)| *s == Scope::Project)
@@ -229,8 +313,10 @@ pub fn distill(
     else {
         return Ok(Distilled::default());
     };
+    let fp = distill_fingerprint(stores);
     let mut ledger = read_ledger(project);
-    let mut fresh: Vec<(u64, String, String, String)> = std::fs::read_dir(project.join("episodic"))
+    let episodic = super::real_dir(project, "episodic").unwrap_or_default();
+    let mut fresh: Vec<(u64, String, String, String)> = std::fs::read_dir(&episodic)
         .into_iter()
         .flatten()
         .flatten()
@@ -241,7 +327,13 @@ pub fn distill(
             }
             let mtime = e.metadata().ok()?.modified().ok()?;
             let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-            let text = std::fs::read_to_string(e.path()).ok()?;
+            let text = crate::tools::read_no_follow(&e.path()).ok()?;
+            // Forgotten, expired or superseded episodes are never distilled;
+            // a malformed header fails closed like the index.
+            let (meta, _) = super::parse_meta(&text).ok()?;
+            if !super::current_at(&meta, &text, secs, now) {
+                return None;
+            }
             let hash = body_hash(&text);
             let rel = format!("episodic/{name}");
             (ledger.get(&rel) != Some(&hash)).then_some((secs, name, text, hash))
@@ -249,6 +341,7 @@ pub fn distill(
         .collect();
     fresh.sort();
     if fresh.is_empty() {
+        commit_all(stores);
         return Ok(Distilled::default());
     }
     let idx = super::index::Index::build(stores, now);
@@ -300,6 +393,17 @@ pub fn distill(
     let resp = provider
         .complete(&req)
         .map_err(|e| format!("distill: {e}"))?;
+    // Re-acquire every store the pass can write for the write phase; a
+    // store changed during the model call makes the plan stale — write
+    // nothing and tell the caller to rerun. `stores` order is a
+    // consistent acquisition order.
+    let mut locks = Vec::with_capacity(stores.len());
+    for (_, dir) in stores {
+        locks.push(super::StoreLock::acquire(dir).map_err(|e| e.to_string())?);
+    }
+    if distill_fingerprint(stores) != fp {
+        return Err("memory: store changed during consolidate, rerun".to_string());
+    }
     let reply: String = resp
         .blocks
         .iter()
@@ -371,11 +475,9 @@ pub fn distill(
                     .map(|(_, d)| d)?;
                 let rel = super::add_note(dir, layer, &new, &meta(""), text).ok()?;
                 use std::io::Write;
-                let old_text = std::fs::read_to_string(&doc.path).ok()?;
+                let old_text = crate::tools::read_no_follow(&doc.path).ok()?;
                 let sep = if old_text.ends_with('\n') { "" } else { "\n" };
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&doc.path)
+                crate::tools::open_append_no_follow(&doc.path)
                     .and_then(|mut f| f.write_all(format!("{sep}superseded_by {rel}\n").as_bytes()))
                     .ok()?;
                 out.added.push(format!("{}:{rel}", doc.scope.name()));
@@ -395,8 +497,10 @@ pub fn distill(
         }
         let lines: String = ledger.iter().map(|(r, h)| format!("{r}\t{h}\n")).collect();
         crate::harden::ensure_private_dir(&project.join(".index")).map_err(|e| e.to_string())?;
-        std::fs::write(project.join(DISTILLED), lines).map_err(|e| e.to_string())?;
+        super::real_dir(project, ".index")?;
+        super::store_write(project, DISTILLED, lines.as_bytes())?;
     }
+    commit_all(stores);
     Ok(out)
 }
 

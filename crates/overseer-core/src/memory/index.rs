@@ -234,14 +234,73 @@ static CLASS: [u8; 256] = {
     t
 };
 
-/// [`terms`] as slices through [`each_token`]: stopwords dropped, then the
-/// plural strip.
+/// [`terms`] as slices through [`each_token`] then [`each_ident_part`]:
+/// stopwords dropped, then the plural strip.
+// DEFERRED(memory): char-trigram field for typos — gate: typo R@3 ≥ 0.5 without build-time regression
 fn each_term(text: &str, scratch: &mut String, mut f: impl FnMut(&str)) {
-    each_token(text, scratch, |t| {
+    let mut emit = |t: &str| {
         if !is_stopword(t) {
             f(plural_stem(t));
         }
-    });
+    };
+    each_token(text, scratch, &mut emit);
+    each_ident_part(text, scratch, &mut emit);
+}
+
+/// The identifier terms [`each_token`] does not produce, lowercased: a
+/// snake_case or kebab-case identifier whole (`connect_timeout`), and the
+/// camelCase parts of a run (`parseKiwiConfig` → `parse`, `kiwi`,
+/// `config`; `HTTPServer` → `http`, `server`). ASCII identifiers only.
+fn each_ident_part(text: &str, scratch: &mut String, mut f: impl FnMut(&str)) {
+    let b = text.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+    let mut i = 0;
+    while i < b.len() {
+        if !word(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let (mut sep, mut upper) = (false, false);
+        while i < b.len() && word(b[i]) {
+            sep |= matches!(b[i], b'_' | b'-');
+            upper |= b[i].is_ascii_uppercase();
+            i += 1;
+        }
+        // Fast path (plain words), and never half of a non-ASCII word.
+        let glued = (start > 0 && b[start - 1] >= 0x80) || (i < b.len() && b[i] >= 0x80);
+        if !(sep || upper) || glued {
+            continue;
+        }
+        let span = text[start..i].trim_matches(['_', '-']);
+        let mut segments = 0;
+        for seg in span.split(['_', '-']).filter(|s| !s.is_empty()) {
+            segments += 1;
+            let sb = seg.as_bytes();
+            let cut = |k: usize| {
+                sb[k].is_ascii_uppercase()
+                    && (!sb[k - 1].is_ascii_uppercase()
+                        || sb.get(k + 1).is_some_and(u8::is_ascii_lowercase))
+            };
+            if !upper || !(1..sb.len()).any(cut) {
+                continue;
+            }
+            let mut from = 0;
+            for to in (1..=sb.len()).filter(|&k| k == sb.len() || cut(k)) {
+                scratch.clear();
+                scratch.push_str(&seg[from..to]);
+                scratch.make_ascii_lowercase();
+                f(scratch);
+                from = to;
+            }
+        }
+        if segments > 1 {
+            scratch.clear();
+            scratch.push_str(span);
+            scratch.make_ascii_lowercase();
+            f(scratch);
+        }
+    }
 }
 
 /// Minimal plural strip: longer than 3 chars, ends in `s` but not `ss`.
@@ -261,7 +320,7 @@ fn strip_plural(tok: String) -> String {
 }
 
 /// Index terms of `text`, in order, repeats kept: stopwords dropped, then
-/// the plural strip.
+/// the plural strip; identifier parts follow the plain terms.
 pub fn terms(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     each_term(text, &mut String::new(), |t| out.push(t.to_string()));
@@ -361,12 +420,21 @@ struct Walked {
 }
 
 /// Topic files of one store: the root and each layer dir, never
-/// `proposals/`. Sorted for a deterministic doc order.
+/// `proposals/`. Sorted for a deterministic doc order. Neither a
+/// symlinked layer dir nor a symlinked note is ever walked — the index
+/// would otherwise serve a file outside the store (D-symlink-*).
 fn topic_files(dir: &Path) -> Vec<Walked> {
     let mut out = Vec::new();
     let subdirs = std::iter::once(None).chain(Layer::ALL.iter().map(|l| Some(l.name())));
     for sub in subdirs {
-        let d = sub.map_or_else(|| dir.to_path_buf(), |s| dir.join(s));
+        let d = match sub {
+            None => dir.to_path_buf(),
+            // A symlinked layer dir lists files outside the store — skip.
+            Some(s) => match super::real_dir(dir, s) {
+                Ok(d) if d.is_dir() => d,
+                _ => continue,
+            },
+        };
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
@@ -374,16 +442,22 @@ fn topic_files(dir: &Path) -> Vec<Walked> {
             let name = e.file_name().to_string_lossy().into_owned();
             let is_topic = name.ends_with(".md")
                 && name.len() > 3
-                && (sub.is_some() || (name != INDEX_NAME && name != CORE_NAME));
+                && (sub.is_some()
+                    || (name != INDEX_NAME && name != CORE_NAME && name != super::amr::MEMORY_MD));
             if !is_topic {
+                continue;
+            }
+            // `file_type` does not follow links: a symlinked note is
+            // never indexed (its target's bytes never read).
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            if !ft.is_file() {
                 continue;
             }
             let Ok(md) = e.metadata() else {
                 continue;
             };
-            if !md.is_file() {
-                continue;
-            }
             out.push(Walked {
                 rel: sub.map_or_else(|| name.clone(), |s| format!("{s}/{name}")),
                 path: e.path(),
@@ -427,7 +501,7 @@ fn read_sized(path: &Path, size: u64) -> std::io::Result<String> {
     use std::io::Read;
     let cap = usize::try_from(size).unwrap_or(0).saturating_add(1);
     let mut buf = Vec::with_capacity(cap);
-    std::fs::File::open(path)?
+    crate::tools::open_read_no_follow(path)?
         .take(u64::MAX)
         .read_to_end(&mut buf)?;
     String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -477,7 +551,7 @@ impl Index {
                 .filter(|(stat, _)| stat.is_some() && *stat == snap.index)
                 .map(|(_, text)| std::mem::take(text));
             let text = cached.unwrap_or_else(|| {
-                std::fs::read_to_string(dir.join(INDEX_NAME)).unwrap_or_default()
+                crate::tools::read_no_follow(&dir.join(INDEX_NAME)).unwrap_or_default()
             });
             let walked: HashSet<&str> = snap.files.iter().map(|w| w.rel.as_str()).collect();
             let lines: HashMap<String, String> =
@@ -795,7 +869,7 @@ impl Index {
             if a <= 0.0 {
                 continue;
             }
-            for t in links.iter().filter(|t| !lex.contains_key(t)) {
+            for t in links {
                 let e = assoc.entry(*t).or_insert(a);
                 *e = e.max(a);
             }
@@ -803,18 +877,33 @@ impl Index {
         let mut linked: Vec<(u32, f64)> = assoc.into_iter().collect();
         linked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| id(a.0).cmp(&id(b.0))));
 
+        // Activation and confidence vote only within the lexical top tier
+        // (every distinct query term the best hit matched, and at least
+        // half its BM25F): use and trust reorder near-equal matches, never
+        // lift a partial match over a fuller one.
+        let max_matched = lex.values().map(|v| v.1).max().unwrap_or(0);
+        let best = lexical.first().map_or(0.0, |l| l.1);
+        let tier: HashSet<u32> = lexical
+            .iter()
+            .filter(|(d, bm25)| lex[d].1 == max_matched && *bm25 >= 0.5 * best)
+            .map(|(d, _)| *d)
+            .collect();
         let act = |d: u32| activation::base_level(&self.docs[d as usize].uses, now);
-        let cands: Vec<u32> = lexical.iter().chain(&linked).map(|(d, _)| *d).collect();
-        let mut by_act: Vec<(u32, f64)> = cands.iter().map(|&d| (d, act(d))).collect();
+        let cands: Vec<u32> = lexical
+            .iter()
+            .chain(linked.iter().filter(|(d, _)| !lex.contains_key(d)))
+            .map(|(d, _)| *d)
+            .collect();
+        let mut by_act: Vec<(u32, f64)> = tier.iter().map(|&d| (d, act(d))).collect();
         by_act.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| id(a.0).cmp(&id(b.0))));
-        let mut by_conf: Vec<(u32, f64)> = cands
+        let mut by_conf: Vec<(u32, f64)> = tier
             .iter()
             .map(|&d| (d, self.docs[d as usize].meta.confidence))
             .collect();
         by_conf.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| id(a.0).cmp(&id(b.0))));
 
-        // Link-only candidates rank on the lexical axis by association,
-        // after every direct match.
+        // Linked notes rank on the association axis after every direct
+        // match; a direct match that is also linked collects both votes.
         let mut fused: HashMap<u32, f64> = HashMap::new();
         for (list, offset) in [
             (&lexical, 0),
@@ -843,9 +932,19 @@ impl Index {
                 }
             })
             .collect();
+        // The tier first by fused score; every other hit after it by BM25F.
+        let in_tier = |h: &Hit| tier.contains(&(h.doc as u32));
         hits.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
+            in_tier(b)
+                .cmp(&in_tier(a))
+                .then_with(|| {
+                    if in_tier(a) {
+                        std::cmp::Ordering::Equal
+                    } else {
+                        b.bm25.total_cmp(&a.bm25)
+                    }
+                })
+                .then_with(|| b.score.total_cmp(&a.score))
                 .then_with(|| self.order[a.doc].cmp(&self.order[b.doc]))
         });
         hits
@@ -967,8 +1066,35 @@ mod tests {
                 .filter(|(_, t)| !is_stopword(t))
                 .map(|(_, t)| strip_plural(t))
                 .collect();
-            assert_eq!(terms(text), want, "{text}");
+            // Identifier parts follow the plain terms.
+            assert_eq!(terms(text)[..want.len()], want[..], "{text}");
         }
+    }
+
+    /// Identifiers index whole and by their camelCase and snake/kebab parts.
+    #[test]
+    fn identifiers_emit_their_parts_and_the_whole() {
+        let got = terms("parseKiwiConfig connect_timeout HTTPServer blue-green naïve_x");
+        for want in [
+            "parsekiwiconfig",
+            "parse",
+            "kiwi",
+            "config",
+            "connect_timeout",
+            "connect",
+            "timeout",
+            "httpserver",
+            "http",
+            "server",
+            "blue-green",
+        ] {
+            assert!(got.iter().any(|t| t == want), "{want} missing from {got:?}");
+        }
+        assert!(
+            !got.iter().any(|t| t.contains('_') && t.starts_with("ve")),
+            "{got:?}"
+        );
+        assert_eq!(terms("plain kiwi words"), ["plain", "kiwi", "word"]);
     }
 
     /// Activation is folded at build: search never reads the journal, and

@@ -15,6 +15,10 @@ ignore = "0.4"
 globset = "0.4"
 regex-lite = "0.1"
 sha2 = "0.10"
+# threat::scan decodes base64-looking runs to catch encoded payloads
+# (memory-v3 B-base64). Version pinned to ureq's — one base64 in the
+# lock tree (cargo-deny bans duplicates).
+base64 = "0.23"
 # QuickJS for `run_code` (code-mode). No `std`/`loader`/`dyn-load`: the
 # engine gets no filesystem, OS, module or native-library access.
 rquickjs = { version = "=0.13.0", default-features = false, optional = true }

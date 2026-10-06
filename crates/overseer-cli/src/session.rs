@@ -21,6 +21,13 @@ pub(crate) fn resolve_session(flags: &ExecFlags) -> (PathBuf, bool) {
         );
     }
     if let Some(d) = &flags.resume {
+        // F4: an explicit resume of a session open in another overseer
+        // process is a usage error — two writers would fork the event
+        // log's hash chain.
+        if overseer_core::live::held(d) {
+            eprintln!("overseer: {}", overseer_core::live::BUSY);
+            std::process::exit(2);
+        }
         return (d.clone(), true);
     }
     let root = dirs_home().join("sessions");
@@ -29,7 +36,8 @@ pub(crate) fn resolve_session(flags: &ExecFlags) -> (PathBuf, bool) {
         .canonicalize()
         .unwrap_or_else(|_| flags.cwd.clone());
     if flags.cont {
-        if let Some(d) = overseer_core::session::most_recent(&root, Some(&cwd)) {
+        // F4: skip sessions live elsewhere; pick the next newest free one.
+        if let Some(d) = overseer_core::session::most_recent_resumable(&root, Some(&cwd)) {
             return (d, true);
         }
         eprintln!(
@@ -38,7 +46,7 @@ pub(crate) fn resolve_session(flags: &ExecFlags) -> (PathBuf, bool) {
         );
     }
     if flags.last {
-        if let Some(d) = overseer_core::session::most_recent(&root, None) {
+        if let Some(d) = overseer_core::session::most_recent_resumable(&root, None) {
             return (d, true);
         }
     }
@@ -58,6 +66,9 @@ pub(crate) fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConf
         .canonicalize()
         .unwrap_or_else(|_| flags.cwd.clone());
     let (user_memory, project_memory) = memory_stores(flags, &cwd_canonical);
+    // Memory v3 §10: learning is on when memory is; --bare/--no-memory
+    // leave no store, so `learn` follows the stores.
+    let memory_on = user_memory.is_some() || project_memory.is_some();
     overseer_core::agent::AgentConfig {
         model: flags.model.clone(),
         max_steps: flags.max_steps,
@@ -81,6 +92,9 @@ pub(crate) fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConf
         user_memory_dir: user_memory,
         memory_recall: true,
         is_subagent: false,
+        learn: !flags.no_learn && !flags.bare && memory_on,
+        learn_every: flags.learn_every,
+        learn_stage: flags.learn_stage,
         // P6-2: the parent agent sees the full index; the ceiling applies
         // to the quarantined subagent view only.
         memory_filter: overseer_core::memory::Sensitivity::Personal,
@@ -217,6 +231,18 @@ pub(crate) fn memory_stores(flags: &ExecFlags, cwd: &Path) -> (Option<PathBuf>, 
     } else {
         home.map(|h| overseer_core::memory::stores::project_store(&h, cwd))
     };
+    // I-world-writable-store: any resolved store that exists is pulled
+    // back to 0700 when group/other bits crept in (e.g. an operator's
+    // loose umask or a hostile chmod) — `.index/` included.
+    for d in [&user, &project].into_iter().flatten() {
+        if d.is_dir() {
+            overseer_core::memory::tighten_perms(d);
+            let idx = d.join(".index");
+            if idx.is_dir() {
+                overseer_core::memory::tighten_perms(&idx);
+            }
+        }
+    }
     (user, project)
 }
 

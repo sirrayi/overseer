@@ -27,7 +27,20 @@ fn real_main() -> i32 {
     // filesystem: umask 0o077 + proxy-env scrub (harden.rs). Cheap enough
     // that even --version pays it without noticing.
     overseer_core::harden::harden_startup();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // args_os + an explicit UTF-8 gate: `env::args()` panics on a
+    // non-UTF-8 argument (I-non-utf8-argv) — a hostile argv must be a
+    // usage error, never a crash.
+    let mut args: Vec<String> = Vec::new();
+    for (n, arg) in std::env::args_os().enumerate() {
+        match arg.into_string() {
+            Ok(s) => args.push(s),
+            Err(_) => {
+                eprintln!("overseer: argument {n} is not valid UTF-8");
+                return 2;
+            }
+        }
+    }
+    args.remove(0);
 
     // Fast paths first — no provider init, no env probing (Ch.10 §2.2:
     // --version/--help must be instant).
@@ -103,6 +116,16 @@ fn usage() {
          \x20 overseer memory where [FLAGS]  print the user and project store paths\n\
          \x20 overseer memory search <query> [FLAGS]\n\
          \x20                             ranked memory hits, as the memory tool\n\
+         \x20 overseer memory pending | approve <id|all> | reject <id|all>\n\
+         \x20                             staged review ops and proposals queue\n\
+         \x20 overseer memory stats         notes per layer, pending, last review\n\
+         \x20 overseer memory log [--store user|project]\n\
+         \x20                             the store's git history, newest first\n\
+         \x20 overseer memory restore <scope:layer/name.md>\n\
+         \x20                             un-expire a forgotten note\n\
+         \x20 overseer memory learn <session-dir> [--focus <text>]\n\
+         \x20                             attended review over the session's\n\
+         \x20                             unreviewed window (appends MemoryReview)\n\
          \x20 overseer stats <session-dir>    ledger dashboard (tokens, cache-hit, cost)\n\
          \x20 overseer mcp list               MCP servers from ~/.overseer/mcp.json:\n\
          \x20                             spawn each, print the tool names the\n\
@@ -171,6 +194,10 @@ fn usage() {
          \x20                     tools can write it); memory is otherwise on\n\
          \x20                     by default under $OVERSEER_HOME (~/.overseer)\n\
          \x20 --no-memory         No memory: no stores, recall or episodes\n\
+         \x20 --no-learn          Disable the memory review pass entirely\n\
+         \x20 --learn-every <n>   User-turn cadence for reviews (default: 6)\n\
+         \x20 --learn-stage       Stage every review op for approval instead\n\
+         \x20                     of applying (overseer memory pending/approve)\n\
          \x20 --autonomy <d=l>    Per-domain autonomy, repeatable (P5-B):\n\
          \x20                     domains internal|external|money|identity;\n\
          \x20                     levels observe|suggest|approve|report|silent\n\

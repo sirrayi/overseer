@@ -54,13 +54,13 @@ impl Uses {
     }
 }
 
-/// Append one use of `rel` at `t` to the store's journal.
+/// Append one use of `rel` at `t` to the store's journal. A symlinked
+/// `.index/` errors (the store never follows one); callers treat the
+/// journal as best-effort, so the refusal never fails a recall.
 pub fn record(store: &Path, rel: &str, t: u64) -> std::io::Result<()> {
-    crate::harden::ensure_private_dir(&store.join(".index"))?;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(store.join(JOURNAL))?;
+    let idx = super::real_dir(store, ".index").map_err(std::io::Error::other)?;
+    crate::harden::ensure_private_dir(&idx)?;
+    let mut f = crate::tools::open_append_no_follow(&store.join(JOURNAL))?;
     let line = serde_json::json!({ "n": rel, "t": t });
     f.write_all(format!("{line}\n").as_bytes())
 }
@@ -68,7 +68,11 @@ pub fn record(store: &Path, rel: &str, t: u64) -> std::io::Result<()> {
 /// Folded history per note (`layer/name.md`) — compacted state plus the
 /// journal. Unreadable files and malformed lines contribute nothing.
 pub fn load(store: &Path) -> BTreeMap<String, Uses> {
-    let mut out: BTreeMap<String, Uses> = std::fs::read_to_string(store.join(COMPACTED))
+    // A symlinked `.index/` reads as empty — the store never follows one.
+    if super::real_dir(store, ".index").is_err() {
+        return BTreeMap::new();
+    }
+    let mut out: BTreeMap<String, Uses> = crate::tools::read_no_follow(&store.join(COMPACTED))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
@@ -77,7 +81,7 @@ pub fn load(store: &Path) -> BTreeMap<String, Uses> {
         n: String,
         t: u64,
     }
-    let journal = std::fs::read_to_string(store.join(JOURNAL)).unwrap_or_default();
+    let journal = crate::tools::read_no_follow(&store.join(JOURNAL)).unwrap_or_default();
     for l in journal.lines() {
         let Ok(Line { n, t }) = serde_json::from_str::<Line>(l) else {
             continue;
@@ -93,19 +97,25 @@ pub fn load(store: &Path) -> BTreeMap<String, Uses> {
 }
 
 /// Fold the journal into `activation.json` and truncate it. Returns the
-/// number of notes tracked. Single writer: callers (consolidate) must not
-/// race sessions that append — a use appended between the fold and the
-/// truncate is lost, which costs ranking precision, never correctness.
+/// number of notes tracked. Single writer: the store lock makes the
+/// fold+truncate one mutation, so a use appended between them is never
+/// lost to a race (a use arriving later just lands in the next fold).
+/// A symlinked `.index/` refuses — the fold would otherwise rewrite a
+/// file outside the store.
 pub fn compact(store: &Path) -> std::io::Result<usize> {
+    let _lock = super::StoreLock::acquire(store)?;
     let folded = load(store);
+    super::real_dir(store, ".index").map_err(std::io::Error::other)?;
     crate::harden::ensure_private_dir(&store.join(".index"))?;
-    let tmp = store.join(".index/activation.json.tmp");
-    std::fs::write(
-        &tmp,
-        serde_json::to_string(&folded).map_err(std::io::Error::other)?,
-    )?;
-    std::fs::rename(&tmp, store.join(COMPACTED))?;
-    std::fs::write(store.join(JOURNAL), "")?;
+    super::store_write(
+        store,
+        COMPACTED,
+        serde_json::to_string(&folded)
+            .map_err(std::io::Error::other)?
+            .as_bytes(),
+    )
+    .map_err(std::io::Error::other)?;
+    super::store_write(store, JOURNAL, b"").map_err(std::io::Error::other)?;
     Ok(folded.len())
 }
 
