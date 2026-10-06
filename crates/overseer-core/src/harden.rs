@@ -107,10 +107,12 @@ pub fn is_private_dir(dir: &Path) -> bool {
 }
 
 /// Torn-tail repair before an append-only log is reopened for append: a
-/// file that does not end in `\n` had its last write cut mid-line. The
-/// torn bytes are kept in `<file>.torn-<unix-ms>` for audit and the file
-/// is truncated back to its last `\n`, so the next append starts a fresh
-/// line instead of gluing onto the fragment.
+/// file that does not end in `\n` had its last write cut. When the bytes
+/// after the last `\n` parse as one complete JSON object only the newline
+/// was lost: it is appended and the record kept. Any other fragment is
+/// kept in `<file>.torn-<unix-ms>` for audit and the file is truncated
+/// back to its last `\n`, so the next append starts a fresh line instead
+/// of gluing onto the fragment.
 pub fn repair_torn_tail(path: &std::path::Path) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     const CHUNK: u64 = 64 * 1024;
@@ -145,6 +147,15 @@ pub fn repair_torn_tail(path: &std::path::Path) -> std::io::Result<()> {
     let mut torn = Vec::with_capacity((len - keep) as usize);
     f.seek(SeekFrom::Start(keep))?;
     f.read_to_end(&mut torn)?;
+    if matches!(
+        serde_json::from_slice::<serde_json::Value>(&torn),
+        Ok(serde_json::Value::Object(_))
+    ) {
+        use std::io::Write;
+        f.seek(SeekFrom::End(0))?;
+        f.write_all(b"\n")?;
+        return f.sync_data();
+    }
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -178,6 +189,29 @@ mod tests {
         assert!(std::env::var_os("ALL_PROXY").is_none());
         // Idempotent: second call is a no-op, not a panic.
         harden_startup();
+    }
+
+    #[test]
+    fn torn_tail_keeps_a_complete_record_and_sets_a_fragment_aside() {
+        let root = tmpdir("torn");
+        let whole = root.join("ledger.jsonl");
+        std::fs::write(&whole, "{\"a\":1}\n{\"cost_usd\":0.5}").unwrap();
+        repair_torn_tail(&whole).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&whole).unwrap(),
+            "{\"a\":1}\n{\"cost_usd\":0.5}\n"
+        );
+        let torn = root.join("events.jsonl");
+        std::fs::write(&torn, "{\"a\":1}\n{\"cost_usd\":0.").unwrap();
+        repair_torn_tail(&torn).unwrap();
+        assert_eq!(std::fs::read_to_string(&torn).unwrap(), "{\"a\":1}\n");
+        let asides: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".torn-"))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert_eq!(asides, vec!["{\"cost_usd\":0.".to_string()]);
     }
 
     #[test]

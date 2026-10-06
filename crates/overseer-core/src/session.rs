@@ -338,6 +338,9 @@ fn snap_out_of_batch(events: &[crate::event::Event], boundary: u64) -> u64 {
 /// on the parent session's books.
 pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::io::Result<()> {
     let src = session_dir.join("events.jsonl");
+    // Validate the whole source first: a corrupt middle line is an error
+    // naming its line, and nothing is created for a source that fails.
+    let source = EventLog::replay(&src)?;
     let text = std::fs::read_to_string(&src)?;
     let mut lines: Vec<(&str, Option<crate::event::Event>)> = text
         .lines()
@@ -348,11 +351,13 @@ pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::i
     if lines.last().is_some_and(|(_, e)| e.is_none()) {
         lines.pop();
     }
-    let at_event = at_event.map(|b| {
-        let events: Vec<crate::event::Event> =
-            lines.iter().filter_map(|(_, e)| e.clone()).collect();
-        snap_out_of_batch(&events, b)
-    });
+    if lines.len() != source.len() || lines.iter().any(|(_, e)| e.is_none()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: changed while forking", src.display()),
+        ));
+    }
+    let at_event = at_event.map(|b| snap_out_of_batch(&source, b));
     let kept: Vec<&str> = lines
         .iter()
         .filter(|(_, e)| match (at_event, e) {
@@ -361,7 +366,26 @@ pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::i
         })
         .map(|(l, _)| *l)
         .collect();
+    if new_dir.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{}: already exists", new_dir.display()),
+        ));
+    }
     crate::harden::ensure_private_dir(new_dir)?;
+    // The dir is ours from here: a failure removes it, never leaving a
+    // half-created session behind.
+    fork_into(session_dir, at_event, new_dir, &kept).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(new_dir);
+    })
+}
+
+fn fork_into(
+    session_dir: &Path,
+    at_event: Option<u64>,
+    new_dir: &Path,
+    kept: &[&str],
+) -> std::io::Result<()> {
     std::fs::write(new_dir.join("events.jsonl"), kept.join("\n") + "\n")?;
     // A fork is a NEW session — fresh ledger (spend starts at 0), and
     // resume's `Ledger::open` refuses a missing file outright.
