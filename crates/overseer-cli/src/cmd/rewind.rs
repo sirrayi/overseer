@@ -14,6 +14,25 @@ const REWIND_FLAGS: &[Flag] = &[Flag::value(&["--checkpoint"]), Flag::value(&["-
 /// `both` (default), `summarize` (truncate + compact what remains).
 /// Blind spot: `bash` side effects are never snapshotted — only
 /// write/edit edits are recorded in the manifest.
+/// Claim `dir`'s live lock for a restore; `Err` is the exit code (2 =
+/// busy). A missing dir takes no lock — `restore` reports it.
+fn lock_session(dir: &std::path::Path) -> Result<Option<overseer_core::live::LiveLock>, i32> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    match overseer_core::live::LiveLock::acquire(dir) {
+        Ok(l) => Ok(Some(l)),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            eprintln!("overseer rewind: {}", overseer_core::live::BUSY);
+            Err(2)
+        }
+        Err(e) => {
+            eprintln!("overseer rewind: {}: {e}", dir.display());
+            Err(1)
+        }
+    }
+}
+
 pub(crate) fn cmd_rewind(argv: &[String]) -> i32 {
     let parsed = match args::parse(argv, REWIND_FLAGS) {
         Ok(p) => p,
@@ -62,12 +81,13 @@ pub(crate) fn cmd_rewind(argv: &[String]) -> i32 {
     };
 
     // R5: a session live in another overseer process keeps appending to
-    // its log — truncating it here would fork the hash chain. CLI-only
-    // check: the TUI's in-process /rewind already holds the lock itself.
-    if overseer_core::live::held(&dir) {
-        eprintln!("overseer rewind: {}", overseer_core::live::BUSY);
-        return 2;
-    }
+    // its log — truncating it here would fork the hash chain. The lock is
+    // held for the whole restore so no process can open the session
+    // mid-rewind. CLI-only: the TUI's in-process /rewind holds it itself.
+    let _live = match lock_session(&dir) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
 
     let m = Mode::parse(&mode).unwrap_or(Mode::Both);
     match overseer_core::rewind::restore(&dir, want_cp, m) {
@@ -93,5 +113,25 @@ pub(crate) fn cmd_rewind(argv: &[String]) -> i32 {
             eprintln!("overseer rewind: {e}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// S3: the restore runs under a held live lock, not a probe.
+    #[test]
+    fn rewind_holds_the_live_lock_for_the_restore() {
+        let d = std::env::temp_dir().join(format!("overseer-rewind-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let guard = super::lock_session(&d).unwrap();
+        assert!(guard.is_some());
+        assert!(overseer_core::live::held(&d), "lock held while restoring");
+        drop(guard);
+        assert!(!overseer_core::live::held(&d));
+        let missing = d.join("nope");
+        assert!(super::lock_session(&missing).unwrap().is_none());
+        assert!(!missing.exists(), "a missing dir is not created");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
