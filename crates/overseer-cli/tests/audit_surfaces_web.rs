@@ -263,7 +263,6 @@ fn token_file_is_private() {
 /// `--bare` is documented as hermetic, but `web --bare` still writes
 /// `~/.overseer/web/token`.
 #[test]
-#[ignore = "audit: web-bare-home — other wave"]
 fn bare_web_does_not_touch_home_overseer() {
     let w = boot(&["--bare"]);
     assert!(

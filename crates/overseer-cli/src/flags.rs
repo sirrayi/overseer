@@ -184,7 +184,7 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
             }
             "--base-url" => f.base_url = Some(v.clone()),
             "--max-steps" => f.max_steps = v.parse().map_err(|_| "bad --max-steps")?,
-            "--max-cost" => f.max_cost = v.parse().map_err(|_| "bad --max-cost")?,
+            "--max-cost" => f.max_cost = parse_amount(&v, "--max-cost")?,
             "--thinking" => f.thinking = Some(v.parse().map_err(|_| "bad --thinking")?),
             "--effort" => {
                 f.effort = Some(
@@ -205,7 +205,7 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
                     }
                 }
             }
-            "--compact-at" => f.compact_at = Some(v.parse().map_err(|_| "bad --compact-at")?),
+            "--compact-at" => f.compact_at = Some(parse_amount(&v, "--compact-at")?),
             "--no-compact" => f.auto_compact = false,
             "--keep-results" => f.keep_results = v.parse().map_err(|_| "bad --keep-results")?,
             "--verify" => f.verify = Some(v.clone()),
@@ -273,7 +273,22 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
             other => return Err(format!("unknown flag '{other}'")),
         }
     }
+    // Checked at parse time, so exec, tui and web all refuse it.
+    if f.bare && (f.resume.is_some() || f.cont || f.last || f.session.is_some()) {
+        return Err("--bare is hermetic — drop --resume/--continue/--last/--session".into());
+    }
     Ok(f)
+}
+
+/// A float flag: NaN, ±inf and negatives are refused — a NaN cap makes
+/// every `spent > max` comparison false, i.e. no cap at all.
+fn parse_amount<T: std::str::FromStr + Into<f64> + Copy>(v: &str, flag: &str) -> Result<T, String> {
+    let x: T = v.parse().map_err(|_| format!("bad {flag}"))?;
+    let d: f64 = x.into();
+    if !d.is_finite() || d < 0.0 {
+        return Err(format!("bad {flag} (want a finite number ≥ 0)"));
+    }
+    Ok(x)
 }
 
 #[cfg(test)]
@@ -286,7 +301,8 @@ mod tests {
         let f = parse_exec(&["--bare".into(), "do it".into()]).unwrap();
         assert!(f.bare);
         assert!(f.json, "--bare must imply --json");
-        let (dir, resume) = resolve_session(&f);
+        let (dir, resume) = resolve_session(&f).unwrap();
+        let _ = std::fs::remove_dir(&dir);
         assert!(!resume, "--bare never resumes");
         // Throwaway session — never under ~/.overseer.
         assert!(
@@ -397,6 +413,44 @@ mod syntax_tests {
             assert!(f.cont);
             assert_eq!(f.prompt.as_deref(), Some("go"));
         }
+    }
+
+    #[test]
+    fn float_flags_refuse_non_finite_and_negative() {
+        for flag in ["--max-cost", "--compact-at"] {
+            for bad in ["NaN", "nan", "inf", "-inf", "infinity", "-1", "-0.5"] {
+                let e = parse_exec(&argv(&[&format!("{flag}={bad}"), "x"]))
+                    .err()
+                    .unwrap_or_else(|| panic!("{flag}={bad} must not parse"));
+                assert_eq!(e, format!("bad {flag} (want a finite number ≥ 0)"));
+            }
+            let e = parse_exec(&argv(&[flag, "lots", "x"])).err().unwrap();
+            assert_eq!(e, format!("bad {flag}"));
+        }
+        let f = parse_exec(&argv(&["--max-cost", "0", "--compact-at", "0.8", "x"])).unwrap();
+        assert_eq!(f.max_cost, 0.0);
+        assert_eq!(f.compact_at, Some(0.8));
+    }
+
+    #[test]
+    fn bare_conflicts_with_every_resume_flag_at_parse_time() {
+        for extra in [
+            &["--resume", "/r"][..],
+            &["--session", "/s"],
+            &["--continue"],
+            &["-c"],
+            &["--last"],
+        ] {
+            let mut a = vec!["--bare"];
+            a.extend_from_slice(extra);
+            a.push("x");
+            let e = parse_exec(&argv(&a)).err().unwrap();
+            assert_eq!(
+                e, "--bare is hermetic — drop --resume/--continue/--last/--session",
+                "{a:?}"
+            );
+        }
+        assert!(parse_exec(&argv(&["--resume", "/r", "x"])).is_ok());
     }
 
     #[test]

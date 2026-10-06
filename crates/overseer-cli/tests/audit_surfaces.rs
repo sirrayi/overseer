@@ -171,7 +171,6 @@ fn missing_values_and_malformed_flags_exit_2() {
 /// `--max-cost NaN` parses as f64 NaN; every `spent > max` comparison is
 /// then false, so the cost budget (invariant 3) silently never trips.
 #[test]
-#[ignore = "audit: cli-max-cost-nan — other wave"]
 fn max_cost_nan_is_rejected() {
     let home = tmp("nan");
     let mut a = vec!["exec", "--bare", "--max-cost", "NaN"];
@@ -188,7 +187,6 @@ fn max_cost_nan_is_rejected() {
 
 /// `-h` after `--` is a literal prompt, not a help request.
 #[test]
-#[ignore = "audit: cli-dashdash-help — other wave"]
 fn help_flag_after_double_dash_is_a_positional() {
     let home = tmp("dashdash");
     let mut a = vec!["exec", "--bare"];
@@ -363,7 +361,6 @@ fn bare_exec_never_touches_home_overseer() {
 /// "cannot start session: File exists", exit 1). Parallel CI/eval
 /// workers hit this.
 #[test]
-#[ignore = "audit: cli-bare-dir — other wave"]
 fn concurrent_bare_runs_never_collide() {
     let home = tmp("bare-par");
     let tmpdir = tmp("bare-par-tmp");
@@ -400,7 +397,6 @@ fn concurrent_bare_runs_never_collide() {
 /// exists (create_dir_all), so on a shared /tmp another user can
 /// pre-create it and own the directory the session writes into.
 #[test]
-#[ignore = "audit: cli-bare-dir — other wave"]
 fn bare_run_never_adopts_a_preexisting_directory() {
     let home = tmp("bare-plant");
     let tmpdir = tmp("bare-plant-tmp");
@@ -415,25 +411,28 @@ fn bare_run_never_adopts_a_preexisting_directory() {
     a.extend_from_slice(DEAD);
     a.push("hi");
     let o = cmd(&home).env("TMPDIR", &tmpdir).args(&a).output().unwrap();
-    let adopted: Vec<_> = std::fs::read_dir(&tmpdir)
+    // Only the planted names count as adoption; the run's own fresh dir
+    // (`overseer-bare-<16 hex>`) is expected to hold its events.
+    let planted = |n: &str| n.len() > 14 && n[14..].bytes().all(|b| b.is_ascii_digit());
+    let (adopted, fresh): (Vec<_>, Vec<_>) = std::fs::read_dir(&tmpdir)
         .unwrap()
         .flatten()
         .filter(|e| e.path().join("events.jsonl").exists())
-        .map(|e| e.file_name())
-        .collect();
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .partition(|n| planted(n));
     let _ = std::fs::remove_dir_all(&tmpdir);
     assert!(
         adopted.is_empty(),
         "session written into planted dir {adopted:?}: {}",
         text(&o)
     );
+    assert_eq!(fresh.len(), 1, "one fresh bare dir expected: {fresh:?}");
 }
 
 /// `exec` rejects `--bare` with resume flags (exit 2, "hermetic"); the
 /// tui/web entry points share the flag set but skip the check, so
 /// `--resume` is silently dropped and a fresh throwaway session starts.
 #[test]
-#[ignore = "audit: cli-tui-bare-resume — other wave"]
 fn tui_rejects_bare_with_resume_flags() {
     let home = tmp("tui-bare");
     for flag in [
@@ -505,7 +504,6 @@ fn line_mode_does_not_forward_model_escape_sequences() {
 /// ≥ 10 000 are passed through as milliseconds: a one-day snooze
 /// (86400) becomes 86.4 s.
 #[test]
-#[ignore = "audit: cli-inbox-snooze-units — other wave"]
 fn inbox_snooze_seconds_are_seconds_for_large_values() {
     use std::os::unix::net::UnixListener;
     let home = tmp("snooze");

@@ -100,6 +100,7 @@ fn web_opts(f: &TuiFlags) -> overseer_tui::web::WebOpts {
     overseer_tui::web::WebOpts {
         port: f.web_port,
         open: !f.no_open,
+        ephemeral_token: f.exec.bare,
     }
 }
 
@@ -129,7 +130,13 @@ fn run(argv: &[String], cmd: &str) -> i32 {
             return 2;
         }
     };
-    let (session_dir, resume) = resolve_session(flags);
+    let (session_dir, resume) = match resolve_session(flags) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("overseer {cmd}: cannot create session dir: {e}");
+            return 1;
+        }
+    };
     let cfg = overseer_tui::TuiConfig {
         provider,
         agent: config,
@@ -207,6 +214,26 @@ mod tests {
         let o = web_opts(&f);
         assert_eq!(o.port, Some(8641));
         assert!(!o.open);
+        assert!(!o.ephemeral_token);
+        // --bare: per-run, in-memory token.
+        assert!(web_opts(&parse_tui(&argv(&["--bare"]), true).unwrap()).ephemeral_token);
+    }
+
+    #[test]
+    fn tui_and_web_reject_bare_with_resume_flags() {
+        for web in [false, true] {
+            for extra in [
+                &["--resume", "/r"][..],
+                &["--continue"],
+                &["--last"],
+                &["--session", "/s"],
+            ] {
+                let mut a = vec!["--bare"];
+                a.extend_from_slice(extra);
+                let e = parse_tui(&argv(&a), web).err().unwrap();
+                assert!(e.contains("--bare is hermetic"), "{a:?}: {e}");
+            }
+        }
     }
 
     #[test]
