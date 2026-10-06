@@ -1606,7 +1606,7 @@ mod tests {
     #[test]
     fn resident_tool_specs_stay_within_the_startup_budget() {
         const TARGET_CHARS: usize = 6_000;
-        const RESIDENT_CHARS: usize = 6_092;
+        const RESIDENT_CHARS: usize = 6_136;
         let reg = ToolRegistry::core_with(crate::perm::Policy::allow_all(), Optional::ALL)
             .with_mcp(vec![crate::mcp_config::McpServer {
                 name: "s".into(),

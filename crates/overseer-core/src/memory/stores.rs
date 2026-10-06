@@ -2,8 +2,9 @@
 //!
 //! The user store is `<overseer home>/memory`; the project store is
 //! `<overseer home>/projects/<slug>-<hash8>/memory`, keyed by the canonical
-//! git toplevel (found by walking up for `.git`, no process spawn) or the
-//! canonical cwd outside a repository.
+//! git toplevel (found by walking up for `.git`, no process spawn; a
+//! linked worktree resolves to its main checkout) or the canonical cwd
+//! outside a repository.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -50,14 +51,57 @@ pub fn user_store(home: &Path) -> PathBuf {
 }
 
 /// The project key for `cwd`: the nearest ancestor holding a `.git` dir or
-/// file (worktrees and submodules use a file), else `cwd` itself — both
-/// canonicalized first.
+/// file, else `cwd` itself — both canonicalized first. A linked worktree
+/// (a `.git` file whose `gitdir:` has a `commondir`) keys to its main
+/// checkout, so every worktree of a repository shares one store.
+// DEFERRED(memory): stable project id across moves — H3 portability/sync
 pub fn project_key(cwd: &Path) -> PathBuf {
     let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    canon
-        .ancestors()
-        .find(|a| a.join(".git").exists())
-        .map_or_else(|| canon.clone(), Path::to_path_buf)
+    let Some(top) = canon.ancestors().find(|a| a.join(".git").exists()) else {
+        return canon.clone();
+    };
+    main_checkout(top).unwrap_or_else(|| top.to_path_buf())
+}
+
+/// The main checkout of worktree `top`, read from files only (no git
+/// spawn): `<top>/.git` is a file naming `gitdir: <dir>`, and `<dir>/commondir`
+/// names the shared git dir `<main>/.git`. None — the caller keeps `top` —
+/// when `.git` is a directory or anything is missing or malformed (a
+/// submodule's gitdir has no `commondir`).
+fn main_checkout(top: &Path) -> Option<PathBuf> {
+    let dot_git = top.join(".git");
+    if !std::fs::symlink_metadata(&dot_git).ok()?.is_file() {
+        return None;
+    }
+    let text = read_small(&dot_git)?;
+    let gitdir = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+    if gitdir.is_empty() {
+        return None;
+    }
+    let gitdir = top.join(gitdir);
+    let common = read_small(&gitdir.join("commondir"))?;
+    let common = common.lines().next()?.trim();
+    if common.is_empty() {
+        return None;
+    }
+    let common = std::fs::canonicalize(gitdir.join(common)).ok()?;
+    if common.file_name()? != ".git" || !common.is_dir() {
+        return None;
+    }
+    let main = common.parent()?;
+    main.join(".git").is_dir().then(|| main.to_path_buf())
+}
+
+/// A git pointer file's text, refused past 4 KiB.
+fn read_small(p: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut s = String::new();
+    std::fs::File::open(p)
+        .ok()?
+        .take(4_096)
+        .read_to_string(&mut s)
+        .ok()?;
+    Some(s)
 }
 
 pub fn project_store(home: &Path, cwd: &Path) -> PathBuf {

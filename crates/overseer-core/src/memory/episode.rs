@@ -169,12 +169,65 @@ pub fn write(dir: &Path, events: &[Event]) -> std::io::Result<Option<String>> {
     };
     crate::harden::ensure_private_dir(&dir.join("episodic"))?;
     super::real_dir(dir, "episodic").map_err(std::io::Error::other)?;
-    super::store_write(dir, &ep.rel, ep.text.as_bytes()).map_err(std::io::Error::other)?;
+    let text = match super::store_read(dir, &ep.rel) {
+        Ok(old) => carry_over(&ep.text, &old),
+        Err(_) => ep.text,
+    };
+    super::store_write(dir, &ep.rel, text.as_bytes()).map_err(std::io::Error::other)?;
     let index = crate::tools::read_no_follow(&dir.join(super::INDEX_NAME)).unwrap_or_default();
     if !index.lines().any(|l| l.trim_start().starts_with(&ep.rel)) {
         super::append_pointer(dir, &format!("{} — {}", ep.rel, ep.title))?;
     }
     Ok(Some(ep.rel))
+}
+
+/// `fresh` (a regenerated episode) with the lifecycle marks a `forget` or
+/// supersession left on `old` carried over: the `valid_to` and
+/// `superseded_by` frontmatter keys and the `forgotten:` / `superseded_by`
+/// body lines. A rewrite never resurrects a forgotten episode.
+fn carry_over(fresh: &str, old: &str) -> String {
+    let mut text = fresh.to_string();
+    let (head, body) = split_frontmatter(old);
+    for key in ["valid_to", "superseded_by"] {
+        let value = head.iter().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            (k.trim() == key)
+                .then(|| v.trim())
+                .filter(|v| !v.is_empty())
+        });
+        if let Some(v) = value {
+            text = super::set_meta_key(&text, key, v);
+        }
+    }
+    for l in body.lines().map(str::trim) {
+        if l.starts_with("forgotten:") || l.starts_with("superseded_by") {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(l);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// `text`'s frontmatter lines (without the `---` fences) and the rest;
+/// no or unterminated frontmatter → no lines and the whole text.
+fn split_frontmatter(text: &str) -> (Vec<&str>, &str) {
+    let mut lines = text.split_inclusive('\n');
+    if lines.next().map(str::trim) != Some("---") {
+        return (Vec::new(), text);
+    }
+    let mut off = text.find('\n').map_or(text.len(), |i| i + 1);
+    let mut head = Vec::new();
+    for l in lines {
+        off += l.len();
+        if l.trim() == "---" {
+            return (head, &text[off..]);
+        }
+        head.push(l.trim_end());
+    }
+    (Vec::new(), text)
 }
 
 /// Consolidation input cap, chars (instructions, note list and episodes).
@@ -275,6 +328,12 @@ pub fn distill(
             let mtime = e.metadata().ok()?.modified().ok()?;
             let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
             let text = crate::tools::read_no_follow(&e.path()).ok()?;
+            // Forgotten, expired or superseded episodes are never distilled;
+            // a malformed header fails closed like the index.
+            let (meta, _) = super::parse_meta(&text).ok()?;
+            if !super::current_at(&meta, &text, secs, now) {
+                return None;
+            }
             let hash = body_hash(&text);
             let rel = format!("episodic/{name}");
             (ledger.get(&rel) != Some(&hash)).then_some((secs, name, text, hash))

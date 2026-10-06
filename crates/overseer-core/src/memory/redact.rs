@@ -17,13 +17,19 @@ fn patterns() -> &'static [(Regex, &'static str)] {
                 r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?s:.*?)(?:-----END [A-Z ]*PRIVATE KEY-----|\z)",
                 "private-key",
             ),
-            (r"AKIA[0-9A-Z]{16}", "aws-key"),
+            (r"(?:AKIA|ASIA)[0-9A-Z]{16}", "aws-key"),
+            (r"github_pat_[A-Za-z0-9_]{60,}", "github-token"),
             (r"gh[pousr]_[A-Za-z0-9]{36,}", "github-token"),
+            (r"hooks\.slack\.com/services/[A-Za-z0-9/_-]+", "slack-webhook"),
             (r"xox[baprs]-\S+", "slack-token"),
-            (r"sk-[A-Za-z0-9_-]{20,}", "api-key"),
+            (r"xapp-[A-Za-z0-9-]{10,}", "slack-token"),
+            (r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{20,}", "stripe-key"),
+            (r"\bsk-[A-Za-z0-9_-]{20,}", "api-key"),
+            (r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "jwt"),
             (r"Bearer \S{20,}", "bearer-token"),
+            (r"://(?P<s>[^/\s:@]*:[^/\s@]+)@", "url-credential"),
             (
-                r"(?i)(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S{8,}",
+                r#"(?i)(?:api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|credentials|auth|token|secret|password)(?:[_-][A-Za-z0-9]+)*["']?\s*[:=]\s*["']?\S{8,}"#,
                 "secret",
             ),
         ]
@@ -45,9 +51,17 @@ pub fn scrub(text: &str) -> Cow<'_, str> {
             .replace_all(&out, |c: &Captures| {
                 let m = &c[0];
                 if m.contains(PLACEHOLDER) {
-                    m.to_string()
-                } else {
-                    format!("{PLACEHOLDER}{kind}]")
+                    return m.to_string();
+                }
+                // A pattern with an `s` group redacts only that span
+                // (URL userinfo keeps its scheme and host).
+                match (c.get(0), c.name("s")) {
+                    (Some(all), Some(s)) => format!(
+                        "{}{PLACEHOLDER}{kind}]{}",
+                        &m[..s.start() - all.start()],
+                        &m[s.end() - all.start()..]
+                    ),
+                    _ => format!("{PLACEHOLDER}{kind}]"),
                 }
             })
             .into_owned();

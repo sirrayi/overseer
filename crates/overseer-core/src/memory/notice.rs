@@ -237,10 +237,24 @@ pub fn due(idx: &Index, ev: &Event, now: u64) -> Vec<usize> {
         .collect()
 }
 
+/// The fired-claim file name: `rel` plus sha256 of the trigger and the
+/// body, so a new reminder saved under a reused name claims afresh.
+fn claim_name(doc: &Doc) -> String {
+    let trigger = doc.meta.trigger.as_deref().unwrap_or("");
+    let key = format!(
+        "{}\n{}\n{}",
+        doc.rel,
+        super::sha_hex(trigger.as_bytes(), 64),
+        super::sha_hex(doc.body.as_bytes(), 64)
+    );
+    super::sha_hex(key.as_bytes(), 16)
+}
+
 /// Fire one due reminder, exactly once across processes: claim it with
-/// `create_new` on `<store>/.index/fired/<sha256(rel)[..16]>`, then stamp
-/// `fired: <now>` into the note (the engine's only frontmatter write) and
-/// render the notice. `None` when another process already claimed it.
+/// `create_new` on `<store>/.index/fired/<claim_name>`, then stamp
+/// `fired: <now>` into the note (the engine's only frontmatter write,
+/// through the store's no-follow write) and render the notice. `None`
+/// when another process already claimed it.
 pub fn fire(doc: &mut Doc, now: u64) -> std::io::Result<Option<Notice>> {
     let stamp = super::rfc3339(now);
     let depth = doc.rel.split('/').count();
@@ -251,7 +265,10 @@ pub fn fire(doc: &mut Doc, now: u64) -> std::io::Result<Option<Notice>> {
         .ok_or_else(|| std::io::Error::other("note outside its store"))?;
     let claims = store.join(".index").join("fired");
     crate::harden::ensure_private_dir(&claims)?;
-    let claim = claims.join(super::sha_hex(doc.rel.as_bytes(), 16));
+    // Read before claiming: a note swapped for a symlink fails here and
+    // never burns its claim.
+    let text = super::store_read(store, &doc.rel).map_err(std::io::Error::other)?;
+    let claim = claims.join(claim_name(doc));
     let won = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -265,8 +282,12 @@ pub fn fire(doc: &mut Doc, now: u64) -> std::io::Result<Option<Notice>> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
         Err(e) => return Err(e),
     }
-    let text = std::fs::read_to_string(&doc.path)?;
-    std::fs::write(&doc.path, super::set_meta_key(&text, "fired", &stamp))?;
+    super::store_write(
+        store,
+        &doc.rel,
+        super::set_meta_key(&text, "fired", &stamp).as_bytes(),
+    )
+    .map_err(std::io::Error::other)?;
     let body: String = doc.body.trim().chars().take(REMINDER_BODY).collect();
     Ok(Some(Notice {
         kind: "reminder",
@@ -498,9 +519,8 @@ mod tests {
                 .count()
         });
         assert_eq!(won, 1);
-        let claim = dir
-            .join(".index/fired")
-            .join(crate::memory::sha_hex(b"prospective/kw.md", 16));
+        let idx = build(&dir);
+        let claim = dir.join(".index/fired").join(claim_name(&idx.docs[0]));
         assert!(claim.is_file());
     }
 
