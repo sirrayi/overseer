@@ -521,6 +521,7 @@ fn ctx(dir: &Path) -> ToolCtx<'static> {
         provider: None,
         agent_config: None,
         subagents: SubagentCtx {
+            control: Default::default(),
             seq: 0,
             spend: None,
         },

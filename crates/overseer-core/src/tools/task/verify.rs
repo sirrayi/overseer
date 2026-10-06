@@ -32,6 +32,8 @@ pub struct Verdict {
     /// pass | fail | partial | unknown (missing/unparsable — never a pass).
     pub verdict: String,
     pub blockers: usize,
+    /// What the verifier changed (set by the tamper check).
+    pub tampered: Option<String>,
 }
 
 impl Verdict {
@@ -44,11 +46,10 @@ impl Verdict {
         }
     }
 
-    /// A verifier that changed files can at best be `partial`.
-    pub fn tampered(&mut self) {
-        if self.verdict == "pass" {
-            self.verdict = "partial".into();
-        }
+    /// A verifier that changed the repository fails, whatever it claimed.
+    pub fn tampered(&mut self, what: &str) {
+        self.verdict = "fail".into();
+        self.tampered = Some(what.to_string());
     }
 }
 
@@ -72,6 +73,7 @@ pub fn parse(text: &str) -> Verdict {
     let unknown = Verdict {
         verdict: "unknown".into(),
         blockers: 0,
+        tampered: None,
     };
     let Some(v) = blocks
         .last()
@@ -92,6 +94,7 @@ pub fn parse(text: &str) -> Verdict {
                         .count()
                 })
                 .unwrap_or(0),
+            tampered: None,
         },
         _ => unknown,
     }
@@ -141,33 +144,83 @@ pub fn has_changes(cwd: &Path, base: &str) -> bool {
     !matches!((tracked, untracked), (Ok(false), Ok(false)))
 }
 
-/// Path → hash of (status, content) — catches edits to already-dirty
-/// files that `git status` alone would miss.
-pub fn snapshot(cwd: &Path) -> Option<BTreeMap<String, u64>> {
-    let rows = porcelain(cwd).ok()?;
-    Some(
-        rows.into_iter()
-            .map(|(code, path)| {
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                code.hash(&mut h);
-                std::fs::read(cwd.join(&path)).ok().hash(&mut h);
-                (path, h.finish())
-            })
-            .collect(),
-    )
+/// The repository state a verifier must leave alone: `HEAD`, the sha256
+/// of `git for-each-ref` (any branch/tag moved, made or deleted), `git
+/// stash list`, and path → hash of (status, content) from the porcelain
+/// — the last catches edits to already-dirty files `git status` misses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    head: String,
+    refs: String,
+    stash: String,
+    files: BTreeMap<String, u64>,
 }
 
-/// Paths whose status or content differs between two snapshots.
-pub fn changed(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> Vec<String> {
+pub fn snapshot(cwd: &Path) -> Option<Snapshot> {
+    use sha2::{Digest, Sha256};
+    let rows = porcelain(cwd).ok()?;
+    let head = git(cwd, &["rev-parse", "--verify", "HEAD"])
+        .map(|h| h.trim().to_string())
+        .unwrap_or_default();
+    let refs = git(cwd, &["for-each-ref"]).ok()?;
+    let refs = format!("{:x}", Sha256::digest(refs.as_bytes()));
+    let stash = git(cwd, &["stash", "list"]).ok()?;
+    let files = rows
+        .into_iter()
+        .map(|(code, path)| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            code.hash(&mut h);
+            std::fs::read(cwd.join(&path)).ok().hash(&mut h);
+            (path, h.finish())
+        })
+        .collect();
+    Some(Snapshot {
+        head,
+        refs,
+        stash,
+        files,
+    })
+}
+
+fn short(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+/// What differs between two snapshots, one entry per kind of change.
+pub fn changed(before: &Snapshot, after: &Snapshot) -> Vec<String> {
+    let mut out = Vec::new();
+    if before.head != after.head {
+        out.push(format!(
+            "HEAD {}→{}",
+            short(&before.head),
+            short(&after.head)
+        ));
+    }
+    if before.refs != after.refs {
+        out.push("refs changed".into());
+    }
+    if before.stash != after.stash {
+        out.push("stash changed".into());
+    }
     let mut paths: Vec<String> = before
+        .files
         .iter()
-        .filter(|(p, h)| after.get(*p) != Some(h))
+        .filter(|(p, h)| after.files.get(*p) != Some(h))
         .map(|(p, _)| p.clone())
-        .chain(after.keys().filter(|p| !before.contains_key(*p)).cloned())
+        .chain(
+            after
+                .files
+                .keys()
+                .filter(|p| !before.files.contains_key(*p))
+                .cloned(),
+        )
         .collect();
     paths.sort();
     paths.dedup();
-    paths
+    if !paths.is_empty() {
+        out.push(format!("files {}", paths.join(", ")));
+    }
+    out
 }
 
 /// The verifier's first message: the stated task, the diff against
@@ -240,7 +293,8 @@ mod tests {
         let unclosed = "```json\n{\"verdict\":\"pass\"}\n```\n```json\n{\"verdict\":";
         assert_eq!(parse(unclosed).verdict, "unknown");
         let mut p = parse("```json\n{\"verdict\":\"pass\"}\n```");
-        p.tampered();
-        assert_eq!(p.verdict, "partial");
+        p.tampered("HEAD a→b");
+        assert_eq!(p.verdict, "fail");
+        assert_eq!(p.tampered.as_deref(), Some("HEAD a→b"));
     }
 }

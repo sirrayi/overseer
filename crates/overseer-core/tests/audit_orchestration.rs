@@ -153,6 +153,7 @@ fn task_ctx(ws: &Path, session_dir: PathBuf, p: Arc<Scripted>) -> ToolCtx<'stati
         provider: Some(p),
         agent_config: Some(cfg(ws)),
         subagents: tools::task::SubagentCtx {
+            control: Default::default(),
             seq: 0,
             spend: Some(Arc::new(tools::task::SpendAccount::new(5.0, 0.0))),
         },
@@ -245,7 +246,6 @@ fn unpaired(msgs: &[Message]) -> Vec<String> {
 /// the FIRST user message as the goal; the current request (older than the
 /// 2-turn tail) vanishes from the model's view.
 #[test]
-#[ignore = "audit: compact-latest-goal"]
 fn compaction_keeps_the_latest_user_request() {
     let dir = tmpdir("compact");
     let path = dir.join("events.jsonl");
@@ -300,7 +300,6 @@ fn compaction_keeps_the_latest_user_request() {
 /// `ToolResult` leaves a tool_use with no tool_result; resume replays it
 /// as-is and the next request violates the pairing rule.
 #[test]
-#[ignore = "audit: resume-dangling-tool-use"]
 fn resume_after_crash_mid_tool_pairs_every_tool_use() {
     let dir = tmpdir("dangling");
     let ws = dir.join("ws");
@@ -351,7 +350,6 @@ fn resume_after_crash_mid_tool_pairs_every_tool_use() {
 /// deleted, so the first writer of every later session in the same repo
 /// fails.
 #[test]
-#[ignore = "audit: worktree-branch-collision"]
 fn second_session_writer_gets_its_own_branch() {
     let dir = tmpdir("branch");
     let ws = dir.join("ws");
@@ -370,7 +368,6 @@ fn second_session_writer_gets_its_own_branch() {
 /// only, so a verifier that edits AND commits leaves a clean status and
 /// keeps its `pass` — while it moved HEAD in the user's checkout.
 #[test]
-#[ignore = "audit: verify-tamper-commit"]
 fn verifier_that_commits_a_change_is_flagged() {
     let dir = tmpdir("tamper");
     let ws = dir.join("ws");
@@ -409,7 +406,6 @@ fn verifier_that_commits_a_change_is_flagged() {
 /// real provider call that never reaches the ledger, so it is invisible to
 /// `max_cost_usd`, RunEnd and the run outcome.
 #[test]
-#[ignore = "audit: reflect-unledgered"]
 fn reflection_call_is_ledgered() {
     let dir = tmpdir("reflect");
     let ws = dir.join("ws");
@@ -445,7 +441,6 @@ fn reflection_call_is_ledgered() {
 /// flag and the effort boost are per-Agent, not per-run. One repetition in
 /// a later user turn ends that turn as `Stuck` with no nudge.
 #[test]
-#[ignore = "audit: stuck-state-across-turns"]
 fn stuck_detector_resets_per_user_turn() {
     let dir = tmpdir("stuck");
     let ws = dir.join("ws");
@@ -483,7 +478,6 @@ fn stuck_detector_resets_per_user_turn() {
 /// reading a file at an absolute path outside events.jsonl, so moving the
 /// session dir changes the rehydrated view (Invariant 1).
 #[test]
-#[ignore = "audit: subagent-done-replay-offlog"]
 fn background_digest_replays_from_the_log_alone() {
     let dir = tmpdir("bgreplay");
     let ws = dir.join("ws");
@@ -536,7 +530,6 @@ fn background_digest_replays_from_the_log_alone() {
 /// `<microagent …>…</microagent>` unescaped, so a repo file can close the
 /// provenance wrapper and continue as unwrapped harness-styled text.
 #[test]
-#[ignore = "audit: microagent-wrapper-breakout"]
 fn microagent_body_cannot_close_its_wrapper() {
     let ws = tmpdir("micro");
     let d = ws.join(".overseer/microagents/x");
@@ -557,7 +550,6 @@ fn microagent_body_cannot_close_its_wrapper() {
 /// microagent-no-cap: a matching MICROAGENT.md enters the context whole,
 /// every turn; nothing bounds it (tool results are capped near 30K chars).
 #[test]
-#[ignore = "audit: microagent-no-cap"]
 fn microagent_injection_is_size_capped() {
     let dir = tmpdir("microcap");
     let ws = dir.join("ws");
@@ -585,7 +577,6 @@ fn microagent_injection_is_size_capped() {
 /// written and after budget-stop outcomes are built, so both under-report
 /// the run's spend by the review call.
 #[test]
-#[ignore = "audit: review-cost-after-runend"]
 fn run_end_and_outcome_include_review_spend() {
     let dir = tmpdir("review");
     let ws = dir.join("ws");
@@ -640,7 +631,6 @@ fn run_end_and_outcome_include_review_spend() {
 /// progress) trips it. OpenHands' pattern also requires the observations
 /// to repeat.
 #[test]
-#[ignore = "audit: stuck-pingpong-progress"]
 fn ping_pong_with_progressing_observations_does_not_trip() {
     let mut d = stuck::StuckDetector::new();
     let a = json!({"command": "tail -1 build.log"});
@@ -662,7 +652,6 @@ fn ping_pong_with_progressing_observations_does_not_trip() {
 /// so a run stops with spend above the cap. Consult mode already does
 /// this preflight (consult.rs).
 #[test]
-#[ignore = "audit: budget-cost-overshoot"]
 fn run_spend_never_exceeds_max_cost() {
     let dir = tmpdir("overshoot");
     let ws = dir.join("ws");

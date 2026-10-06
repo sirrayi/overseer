@@ -21,6 +21,8 @@ pub enum State {
     Done,
     /// Its process exited while it ran (threads die with their process).
     Dead,
+    /// Stopped by `task action=cancel` or a parent interrupt.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

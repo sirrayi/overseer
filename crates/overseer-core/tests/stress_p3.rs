@@ -74,6 +74,7 @@ fn task_ctx_at(cwd: &Path, session_dir: PathBuf, delay_ms: u64) -> ToolCtx<'stat
             ..Default::default()
         }),
         subagents: tools::task::SubagentCtx {
+            control: Default::default(),
             seq: 0,
             spend: Some(Arc::new(tools::task::SpendAccount::new(
                 AgentConfig::default().max_cost_usd,
@@ -395,13 +396,14 @@ fn write_worktree_storm_isolation() {
         c.subagents.seq = i - 1;
         let out = tools::task::run(&json!({"prompt": "w", "mode": "write"}), &mut c);
         assert!(!out.is_error, "iter {i}: {}", out.text);
-        assert!(sess.join(format!("s{i}/subagents/wt-{i}/wt")).exists());
+        // A no-op writer's worktree and branch are removed.
+        assert!(!sess.join(format!("s{i}/subagents/wt-{i}/wt")).exists());
     }
     eprintln!(
         "4 sequential write worktrees: {}ms",
         t.elapsed().as_millis()
     );
-    // Each run leaves an auditable worktree + doesn't dirty the main tree.
+    // No run dirties the main tree.
     let dirty = std::process::Command::new("git")
         .args(["-C", dir.to_str().unwrap(), "status", "--porcelain"])
         .output()
@@ -478,12 +480,16 @@ fn event_log_30k_mixed_kinds_replay() {
                     model: "m".into(),
                     verdict: None,
                     run: 1,
+                    digest: None,
+                    footer: None,
+                    status: String::new(),
                 })
                 .unwrap();
             }
             1 => {
                 log.append(EventKind::Tainted {
                     detail: format!("latch {i}"),
+                    latch: String::new(),
                 })
                 .unwrap();
             }
@@ -589,10 +595,16 @@ fn fork_storm_60_over_p3_log() {
             model: "m".into(),
             verdict: None,
             run: 1,
+            digest: None,
+            footer: None,
+            status: String::new(),
         })
         .unwrap();
-        log.append(EventKind::Tainted { detail: "x".into() })
-            .unwrap();
+        log.append(EventKind::Tainted {
+            detail: "x".into(),
+            latch: String::new(),
+        })
+        .unwrap();
     }
     drop(log);
     let t = Instant::now();
@@ -849,6 +861,7 @@ fn compaction_view_preserves_p3_audit() {
             .unwrap();
         log.append(EventKind::Tainted {
             detail: format!("d{i}"),
+            latch: String::new(),
         })
         .unwrap();
     }
