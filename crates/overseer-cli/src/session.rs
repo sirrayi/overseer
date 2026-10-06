@@ -8,18 +8,48 @@ use crate::flags::ExecFlags;
 
 /// Session directory + whether to resume it. Precedence: --resume >
 /// --continue (cwd-scoped) > --last > --session > fresh timestamped dir.
-/// `--bare` never lands in ~/.overseer — the session is a throwaway.
-pub(crate) fn resolve_session(flags: &ExecFlags) -> (PathBuf, bool) {
+/// `--bare` never lands in ~/.overseer — the session is a throwaway made
+/// by [`bare_session_dir`] (the only fallible branch).
+pub(crate) fn resolve_session(flags: &ExecFlags) -> std::io::Result<(PathBuf, bool)> {
     if flags.bare {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        return (
-            std::env::temp_dir().join(format!("overseer-bare-{ts}")),
-            false,
-        );
+        return Ok((bare_session_dir(&std::env::temp_dir())?, false));
     }
+    Ok(resolve_persistent(flags))
+}
+
+/// `--bare` session dir: `<tmp>/overseer-bare-<16 hex>` from the OS RNG,
+/// made by a non-recursive `create_dir` at 0700. An existing name is
+/// never adopted (on a shared /tmp anyone could have planted it): a
+/// fresh name is drawn instead, up to 8 tries.
+pub(crate) fn bare_session_dir(tmp: &Path) -> std::io::Result<PathBuf> {
+    const TRIES: usize = 8;
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    for _ in 0..TRIES {
+        let mut raw = [0u8; 8];
+        getrandom::fill(&mut raw).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        let dir = tmp.join(format!("overseer-bare-{hex}"));
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "no free overseer-bare-* name in {} after {TRIES} tries",
+            tmp.display()
+        ),
+    ))
+}
+
+fn resolve_persistent(flags: &ExecFlags) -> (PathBuf, bool) {
     if let Some(d) = &flags.resume {
         return (d.clone(), true);
     }
@@ -240,4 +270,49 @@ pub(crate) fn dirs_home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".overseer")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ovs-cli-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn bare_dirs_are_random_private_and_fresh() {
+        let t = tmp("bare");
+        let a = bare_session_dir(&t).unwrap();
+        let b = bare_session_dir(&t).unwrap();
+        assert_ne!(a, b);
+        for d in [&a, &b] {
+            assert_eq!(d.parent(), Some(t.as_path()));
+            let name = d.file_name().unwrap().to_str().unwrap();
+            let hex = name.strip_prefix("overseer-bare-").unwrap();
+            assert_eq!(hex.len(), 16, "{name}");
+            assert!(hex.bytes().all(|c| c.is_ascii_hexdigit()), "{name}");
+            assert_eq!(std::fs::read_dir(d).unwrap().count(), 0);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(d).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn bare_dir_never_creates_a_missing_parent() {
+        let t = tmp("bare-missing");
+        let absent = t.join("absent");
+        let e = bare_session_dir(&absent).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+        assert!(!absent.exists());
+        let _ = std::fs::remove_dir_all(&t);
+    }
 }

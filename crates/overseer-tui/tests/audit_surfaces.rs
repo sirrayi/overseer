@@ -219,7 +219,6 @@ fn dialog_shows_or_flags_every_line_of_the_bash_command() {
 /// command into the line-oriented rules file, so each embedded line
 /// becomes its own permanent allow rule.
 #[test]
-#[ignore = "audit: tui-rules-newline-injection — other wave"]
 fn allow_always_cannot_plant_extra_rules_via_newlines() {
     let dir = tmp("rules");
     let rules = dir.join("rules");

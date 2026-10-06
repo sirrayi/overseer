@@ -54,7 +54,12 @@ fn real_main() -> i32 {
     let rest = &args[1..];
     // `-h`/`--help` after any subcommand prints the same usage — the
     // shared arg parser would otherwise reject it as an unknown flag.
-    if rest.iter().any(|a| a == "--help" || a == "-h") {
+    // After `--` it is a positional (a literal `-h` prompt).
+    if rest
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "--help" || a == "-h")
+    {
         usage();
         return 0;
     }

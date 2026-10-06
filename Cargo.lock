@@ -1137,6 +1137,7 @@ dependencies = [
 name = "overseer-cli"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "overseer-core",
  "overseer-gateway",
  "overseer-tui",

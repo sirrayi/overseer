@@ -85,11 +85,14 @@ const SEC_HEADERS: &str = concat!(
     "Referrer-Policy: no-referrer\r\n"
 );
 
-/// Web-surface options: the port (None → scan [`PORT_RANGE`]) and
-/// whether to auto-open a browser.
+/// Web-surface options: the port (None → scan [`PORT_RANGE`]), whether
+/// to auto-open a browser, and whether the token is per-run.
 pub struct WebOpts {
     pub port: Option<u16>,
     pub open: bool,
+    /// `--bare`: a fresh token held in memory only — nothing is read or
+    /// written under `~/.overseer`.
+    pub ephemeral_token: bool,
 }
 
 /// Run the session on the web surface. Blocks until /quit (like `run`).
@@ -99,7 +102,11 @@ pub struct WebOpts {
 pub fn run_web_with(cfg: TuiConfig, opts: WebOpts) -> std::io::Result<i32> {
     let listener = bind_port(opts.port)?;
     let port = listener.local_addr()?.port();
-    let token = web_token()?;
+    let token = if opts.ephemeral_token {
+        fresh_token()?
+    } else {
+        web_token()?
+    };
     let url = format!("http://127.0.0.1:{port}/#t={token}");
 
     let (input_tx, input_rx) = mpsc::channel::<CtEvent>();
@@ -312,11 +319,16 @@ fn web_token() -> std::io::Result<String> {
             }
         }
     }
-    let mut raw = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
-    let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    let token = fresh_token()?;
     write_private(&path, token.as_bytes())?;
     Ok(token)
+}
+
+/// 32 bytes of `/dev/urandom`, hex (64 chars).
+fn fresh_token() -> std::io::Result<String> {
+    let mut raw = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
+    Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Create-or-replace `path` owner-only (0600). A preexisting symlink
@@ -1460,6 +1472,16 @@ mod tests {
 
         std::env::remove_var("HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn fresh_tokens_are_hex_and_distinct() {
+        let (a, b) = (fresh_token().unwrap(), fresh_token().unwrap());
+        assert_ne!(a, b);
+        for t in [a, b] {
+            assert_eq!(t.len(), 64);
+            assert!(t.bytes().all(|c| c.is_ascii_hexdigit()));
+        }
     }
 
     #[test]

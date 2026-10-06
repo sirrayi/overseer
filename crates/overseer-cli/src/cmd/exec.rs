@@ -26,13 +26,13 @@ pub(crate) fn cmd_exec(args: &[String]) -> i32 {
             return 2;
         }
     };
-    if flags.bare && (flags.resume.is_some() || flags.cont || flags.last || flags.session.is_some())
-    {
-        eprintln!("overseer exec: --bare is hermetic — drop --resume/--continue/--last/--session");
-        return 2;
-    }
-
-    let (session_dir, resume) = resolve_session(&flags);
+    let (session_dir, resume) = match resolve_session(&flags) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("overseer exec: cannot create session dir: {e}");
+            return 1;
+        }
+    };
 
     let mut config = agent_config(&flags);
     apply_credentials(&mut config);

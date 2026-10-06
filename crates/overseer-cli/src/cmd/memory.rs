@@ -335,11 +335,7 @@ fn session_stores(
 /// `events.jsonl` and the review call's usage row in its `ledger.jsonl`
 /// (`purpose: memory_review`). Contract: one process writes a session
 /// at a time — never run this against a session a live agent is writing.
-fn cmd_learn(
-    flags: &crate::flags::ExecFlags,
-    session_dir: &Path,
-    focus: Option<&str>,
-) -> i32 {
+fn cmd_learn(flags: &crate::flags::ExecFlags, session_dir: &Path, focus: Option<&str>) -> i32 {
     use overseer_core::memory::learn;
     let events = match EventLog::replay(session_dir.join("events.jsonl")) {
         Ok(e) => e,

@@ -126,7 +126,18 @@ impl App {
             if let Some(decision) = decide {
                 if let Some(d) = decision {
                     if d == AskDecision::AllowAlways {
-                        self.set_toast("rule saved to ~/.overseer/rules".into());
+                        // Mirrors `Policy::persist_rule`: a command with a
+                        // newline/control char is allowed once, never saved
+                        // (the engine's note lands on the tool result).
+                        let (dlg, _) = self.dialog.as_ref().unwrap();
+                        let unsavable = dlg
+                            .bash_command()
+                            .is_some_and(|c| c.chars().any(char::is_control));
+                        self.set_toast(if unsavable {
+                            "approved once — not saved (command has a newline/control char)".into()
+                        } else {
+                            "rule saved to ~/.overseer/rules".into()
+                        });
                     }
                     let (_, tx) = self.dialog.take().unwrap();
                     let _ = tx.send(d);

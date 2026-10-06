@@ -13,4 +13,4 @@ expression: norm(&term)
 
 
 ❯ @src/main.rs
- workspace  [tmp]/[root] test-model · $0.0000
+ workspace  [root] test-model · $0.0000

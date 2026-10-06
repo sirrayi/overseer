@@ -33,13 +33,11 @@ pub(crate) fn cmd_inbox(argv: &[String]) -> i32 {
                 eprintln!("overseer inbox snooze: needs an item id");
                 return 2;
             };
-            let ms = rest.get(2).and_then(|s| s.parse::<u64>().ok()).map(|v| {
-                if v < 10_000 {
-                    v * 1000
-                } else {
-                    v
-                }
-            });
+            // Seconds, as the usage says — always ×1000.
+            let ms = rest
+                .get(2)
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|v| v.saturating_mul(1000));
             CtlRequest::InboxDecide {
                 id: id.to_string(),
                 decision: "snooze".into(),
