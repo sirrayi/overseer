@@ -190,3 +190,51 @@ episodic/session-2026-10-06-s1.md — Session 2026-10-06 s1: from now on, always
 semantic/this-project-targets-rust-1-80-as-its-toolchain.md — This project targets Rust 1.80 as its toolchain/MSRV. Do NOT use let-chains (`if
 episodic/session-2026-10-06-s2.md — Session 2026-10-06 s2: add a function mul(a,b) with a test
 ```
+
+## Part 2: red-team suites (release, REDTEAM_ITERS=200000)
+
+Ran with `timeout -s KILL 540` (9 minutes) on each suite × seed. **The three seeds of each suite ran at the same time** on 8 cores, 31 GiB, so each time below was measured under 3-way contention. `rc=137` means the run was killed at the cap. "iters" is the count the suite printed (`iters_done=`). A capped suite prints counts only from the fuzz tests that finished before the kill.
+
+| Suite | Seed | Result | Time | Iterations / notes |
+|---|---:|---|---:|---|
+| memory_v3_redteam_parser | 1 | pass (5/5) | 341.8s | A: iters_done=200000 |
+| memory_v3_redteam_parser | 12648430 | pass (5/5) | 345.9s | A: iters_done=200000 |
+| memory_v3_redteam_parser | 20261006 | pass (5/5) | 344.9s | A: iters_done=200000 |
+| memory_v3_redteam_threat | 1 | pass (19/19) | 18.5s | B: iters_done=200000, transformed-evasions=24834; false positives 0/25 |
+| memory_v3_redteam_threat | 12648430 | pass (19/19) | 18.4s | B: iters_done=200000, transformed-evasions=24901; false positives 0/25 |
+| memory_v3_redteam_threat | 20261006 | pass (19/19) | 18.5s | B: iters_done=200000, transformed-evasions=24876; false positives 0/25 |
+| memory_v3_redteam_review | 1 | capped (rc=137) | 540.0s | capped. `c4_fuzz_apply_never_escapes_the_store` was still running; it printed no iters_done |
+| memory_v3_redteam_review | 12648430 | capped (rc=137) | 540.0s | capped (same test still running) |
+| memory_v3_redteam_review | 20261006 | capped (rc=137) | 540.0s | capped (same test still running) |
+| memory_v3_redteam_store | 1 | capped (rc=137) | 540.0s | D: iters_done=200000 applied=874. `f_fuzz_memory_md_edits_regenerate_cleanly` was still running; no F count |
+| memory_v3_redteam_store | 12648430 | capped (rc=137) | 540.0s | D: iters_done=200000 applied=866; F still running |
+| memory_v3_redteam_store | 20261006 | capped (rc=137) | 540.0s | D: iters_done=200000 applied=931; F still running |
+| memory_v3_redteam_lock | 1 | pass (10/10) | 10.2s | no iteration count printed |
+| memory_v3_redteam_lock | 12648430 | pass (10/10) | 10.2s | no iteration count printed |
+| memory_v3_redteam_lock | 20261006 | pass (10/10) | 10.2s | no iteration count printed |
+| audit_memory2_notes | 1 | pass (16/16) | 0.2s | — |
+| audit_memory2_notes | 12648430 | pass (16/16) | 0.2s | — |
+| audit_memory2_notes | 20261006 | pass (16/16) | 0.3s | — |
+
+No assertion failed and no panic showed up in any red-team log, so there is no minimal failing input to report. The capped runs ended because the external kill fired.
+
+What the code says (not measured): the fuzz loops stop at whichever comes first, `REDTEAM_ITERS` or an internal deadline of `REDTEAM_SECS`, which defaults to 600s. You can see this at `memory_v3_redteam_review.rs:494` and `memory_v3_redteam_store.rs:550`. That 600s default is longer than the 540s cap, so a fuzz test that is still under `REDTEAM_ITERS` at 540s gets killed before it prints `iters_done`. `REDTEAM_SECS` was not set in this run.
+
+### Slow lock
+`REDTEAM_SLOW=1 cargo test --release -p overseer-core --test memory_v3_redteam_lock e_slow_live_holder_31s_keeps_exclusivity`: **pass**, rc=0, 31.1s wall. The test spawns its own `e_worker` child test (1 passed, finished in 31.00s), then `e_slow_live_holder_31s_keeps_exclusivity ... ok` (1 passed, 9 filtered out, finished in 31.03s).
+
+### Extra suites (release, once each, run one after another with nothing else running)
+
+| Suite | Package | Result | Wall time |
+|---|---|---|---:|
+| audit_orchestration | overseer-core | pass, 12 passed / 0 failed / 0 ignored | 0.2s |
+| audit_data | overseer-core | pass, 22 / 0 / 0 | 0.1s |
+| audit_tools | overseer-core | pass, 26 / 0 / 0 (plus 1 child-process run: 1 passed, 25 filtered) | 2.3s |
+| audit_computer | overseer-core | pass, 32 / 0 / 0 | 30.1s |
+| computer_v2 | overseer-core | pass, 23 / 0 / 0 | 0.8s |
+| stress_p3 | overseer-core | pass, 14 / 0 / 0 | 0.3s |
+| audit_gateway | overseer-gateway | pass, 19 / 0 / 0 | 1.7s |
+| audit_surfaces | overseer-cli | pass, 14 / 0 / 0 | 3.1s |
+| audit_surfaces_web | overseer-cli | pass, 14 / 0 / 0 | 10.1s |
+
+Wall times are measured after the release build was already cached.
