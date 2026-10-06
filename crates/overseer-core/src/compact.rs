@@ -23,6 +23,8 @@ use crate::ir::Block;
 pub const TAIL_TURNS: usize = 2;
 
 const GOAL_CAP: usize = 4_000;
+/// Total cap on the "Earlier requests" section (chars).
+const EARLIER_CAP: usize = 1_500;
 const NOTE_CAP: usize = 400;
 const ERROR_CAP: usize = 300;
 const PENDING_CAP: usize = 1_000;
@@ -64,7 +66,7 @@ pub fn latest(events: &[Event]) -> Option<(String, u64)> {
 pub fn summarize(events: &[Event], tail_from: u64) -> String {
     let covered = events.iter().filter(|e| e.id < tail_from);
 
-    let mut goal: Option<String> = None;
+    let mut requests: Vec<&str> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
     let mut read_only: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -75,11 +77,7 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
 
     for e in covered {
         match &e.kind {
-            EventKind::UserInput { text } => {
-                if goal.is_none() {
-                    goal = Some(truncate(text, GOAL_CAP));
-                }
-            }
+            EventKind::UserInput { text } => requests.push(text),
             EventKind::ToolCallStart { name, input, .. } => {
                 // Deferred tools the model called through `tools` — their
                 // schemas were loaded by an op=search now condensed away.
@@ -153,8 +151,15 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
             "(supersedes {n_compactions} earlier compaction(s))\n"
         ));
     }
-    if let Some(g) = goal {
-        out.push_str(&format!("\n## Goal (first user message, verbatim)\n{g}\n"));
+    if let Some((latest, earlier)) = requests.split_last() {
+        out.push_str(&format!(
+            "\n## Goal (latest user request, verbatim)\n{}\n",
+            truncate(latest, GOAL_CAP)
+        ));
+        if !earlier.is_empty() {
+            out.push_str("\n## Earlier requests (newest first)\n");
+            out.push_str(&earlier_block(earlier));
+        }
     }
     if !modified.is_empty() {
         out.push_str("\n## Files modified\n");
@@ -186,6 +191,31 @@ pub fn summarize(events: &[Event], tail_from: u64) -> String {
         out.push_str(&format!(
             "\n## Pending state (last assistant text, verbatim)\n{p}\n"
         ));
+    }
+    out
+}
+
+/// Earlier user requests, newest first, `EARLIER_CAP` chars in total;
+/// the entry that crosses the cap is cut and the rest are counted.
+fn earlier_block(earlier: &[&str]) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for (i, text) in earlier.iter().rev().enumerate() {
+        let left = EARLIER_CAP.saturating_sub(used);
+        if left == 0 {
+            out.push_str(&format!("(+{} older)\n", earlier.len() - i));
+            break;
+        }
+        let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let n = one.chars().count();
+        let line = if n > left {
+            let head: String = one.chars().take(left).collect();
+            format!("{head}…[{n} chars]")
+        } else {
+            one
+        };
+        used += n.min(left);
+        out.push_str(&format!("- {line}\n"));
     }
     out
 }

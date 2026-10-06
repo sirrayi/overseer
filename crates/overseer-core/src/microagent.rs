@@ -161,20 +161,81 @@ pub fn matching(cwd: &Path, prompt: &str) -> Vec<Microagent> {
         .collect()
 }
 
+/// Per-body injection cap (bytes) — a repo file can't flood the context.
+pub const BODY_CAP: usize = 8 * 1024;
+/// Cap on one turn's whole microagent injection (bytes).
+pub const TURN_CAP: usize = 16 * 1024;
+/// Marker appended where a body or the turn's injection was cut.
+pub const TRUNCATED: &str = "[truncated]";
+
+/// Neutralize every `</microagent` (any case) so a body can't close its
+/// provenance wrapper and continue as unwrapped text.
+fn escape_body(body: &str) -> String {
+    const NEEDLE: &str = "</microagent";
+    let lower = body.to_ascii_lowercase();
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0;
+    for (i, _) in lower.match_indices(NEEDLE) {
+        out.push_str(&body[last..i]);
+        out.push_str("&lt;/microagent");
+        last = i + NEEDLE.len();
+    }
+    out.push_str(&body[last..]);
+    out
+}
+
+fn escape_attr(v: &str) -> String {
+    v.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The longest prefix of `s` within `cap` bytes, on a char boundary.
+fn clip(s: &str, cap: usize) -> &str {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut end = cap;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Provenance-wrapped rendering of the matching bodies — what the agent
 /// injects as a Nudge. Wrapped like a skill body so repo-authored
-/// instructions can never pose as user/system text.
+/// instructions can never pose as user/system text. Bodies are escaped,
+/// capped at [`BODY_CAP`] each and [`TURN_CAP`] in total, with a visible
+/// [`TRUNCATED`] marker wherever text was cut.
 pub fn render(agents: &[Microagent]) -> String {
     let mut out = String::new();
-    for a in agents {
+    let mut used = 0usize;
+    for (n, a) in agents.iter().enumerate() {
+        let left = TURN_CAP.saturating_sub(used);
+        if left == 0 {
+            out.push_str(&format!(
+                "\n{TRUNCATED} {} more microagent(s) omitted",
+                agents.len() - n
+            ));
+            break;
+        }
+        let escaped = escape_body(&a.body);
+        let cap = BODY_CAP.min(left);
+        let body = if escaped.len() > cap {
+            format!("{}\n{TRUNCATED}", clip(&escaped, cap))
+        } else {
+            escaped
+        };
+        used += body.len();
         if !out.is_empty() {
             out.push('\n');
         }
         out.push_str(&format!(
             "<microagent name=\"{}\" path=\"{}\">\n{}\n</microagent>",
-            a.name,
-            a.path.display(),
-            a.body
+            escape_attr(&a.name),
+            escape_attr(&a.path.display().to_string()),
+            body
         ));
     }
     out
