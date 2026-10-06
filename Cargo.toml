@@ -6,6 +6,7 @@ members = [
     "crates/overseer-gateway",
     "crates/overseer-proto",
     "crates/overseer-tui",
+    "crates/overseer-life",
 ]
 
 [workspace.package]

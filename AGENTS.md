@@ -181,6 +181,22 @@ Computer use: `tools/computer.rs` + `tools/computer/{cua,shape}.rs` — a cua-dr
   (`spawn.rs`): channel input never reaches the act tier directly.
   Unix-only.
 - `crates/overseer-proto` — wire protocol types (request/notification)
+- `crates/overseer-life` — Overseer Life connectors (plan:
+  `docs/research/2026-10-05-digital-life.md`, rules:
+  `docs/research/2026-10-05-life-security.md`). Sync, injectable `Ctx`
+  (home, env, clock, `Http`, `CommandRunner`); every fetch returns a
+  `Snapshot` whose `status` carries the outcome. Usage readers ported from
+  Synara (MIT, NOTICE + file headers) for Claude, Codex, Cursor, Devin,
+  OpenCode, plus Claude/Codex local-archive totals; X API v2 with PKCE,
+  follower scans and a per-UTC-day cost cap (owned-read pricing only for
+  the 12 owned endpoints when the user owns the app). Hard rules: never
+  call another app's token/refresh endpoint, never write another app's
+  files (Cursor's DB via `sqlite3 -readonly`), keychain secret reads only
+  with `allow_keychain_secrets`, no secrets on argv/logs/snapshots, origin
+  allow-list + no redirects + size caps + timeouts. X tokens are
+  memory-only until the Phase 1 Keychain vault. `examples/probe.rs`
+  (discovery; `--live` = one request per source) and
+  `examples/x_spike.rs` (interactive one-process X test, revokes on exit).
 - `crates/overseer-tui` — ratatui/crossterm TUI (library). Agent runs on a
   worker thread; UI renders `Event`s over a channel. Two surfaces share
   one `App` state machine (`app.rs` + `app/{input,overlay,panel,render,
@@ -309,7 +325,7 @@ Computer use: `tools/computer.rs` + `tools/computer/{cua,shape}.rs` — a cua-dr
   and narrow gates only. CI (`ci.yml`) runs on the self-hosted Mac runner
   for same-repo PRs and `main` pushes — fork PRs are refused.
 
-## Git workflow (github.com/sirrayi/overseer, private)
+## Git workflow (github.com/sirrayi/overseer, public)
 
 Branch ladder — promotion flows upward, work flows downward:
 
@@ -325,10 +341,11 @@ review ← default branch; all PRs target here first
 - Open PR → `review`. Fix conflicts + final polish there.
 - `review` → `dev` merge gates a dev release (stress testing).
 - `dev` → `main` only when a release is finalized.
-- Direct pushes to `main` are forbidden by convention (no Pro-tier
-  protection available on a private repo — enforced socially).
-- CI runs on PRs and on pushes to `main`; keep main pushes rare to
-  conserve Actions minutes.
+- Direct pushes to `main` are forbidden by convention (no branch
+  protection is configured — enforced socially).
+- CI runs on PRs and on pushes to `main`. Owner rule (2026-10-05): do not
+  trigger GitHub Actions. Branch pushes are fine (nothing runs on them);
+  every PR's newest commit carries `[skip actions]`.
 
 ## Standing rule: deferred-item comments (confirmed 2026-09-18)
 
