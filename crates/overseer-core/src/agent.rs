@@ -378,6 +378,11 @@ pub struct Agent {
     /// the agent saving on its own resets the turn/signal triggers
     /// (never the tools trigger or the review window itself).
     learn_floor: u64,
+    /// Models that billed `reasoning > 0` on a review call. Some reason
+    /// without their profile saying so (e.g. a gateway model with no
+    /// `reasoning_effort` param); once observed, their reviews get the
+    /// reasoner headroom. Session-scoped — never persisted.
+    review_reasoners: std::collections::HashSet<String>,
     /// F4: `live.lock` on the session dir for this Agent's lifetime —
     /// one live writer per session, so a second process' `EventLog`
     /// can't mint the same next ids and fork the hash chain.
@@ -451,6 +456,7 @@ impl Agent {
             run_cache_start: crate::ledger::CacheStats::default(),
             review_cursor: 0,
             learn_floor: 0,
+            review_reasoners: std::collections::HashSet::new(),
             _live: live,
         };
         agent.reconcile_subagents()?;
@@ -592,6 +598,7 @@ impl Agent {
             // so a covered window is never reviewed twice.
             review_cursor: crate::memory::learn::cursor_of(&events),
             learn_floor: crate::memory::learn::remember_floor(&events),
+            review_reasoners: std::collections::HashSet::new(),
             _live: live,
         };
         // C1b + perm-latch-resume: both Rule-of-Two latches are
@@ -2004,7 +2011,7 @@ impl Agent {
             if seen.insert(m.clone()) {
                 worst += profile::lookup(&m).cost_usd(&crate::ir::Usage {
                     fresh_input: est_tokens,
-                    output: u64::from(review_max_tokens(&m)),
+                    output: u64::from(self.review_max_tokens(&m)),
                     ..Default::default()
                 });
             }
@@ -2102,9 +2109,11 @@ impl Agent {
     /// §1.7: the review's model call. Small tier first (the same
     /// escalate-on-failure/empty contract `aux_call` has); every attempt
     /// passes the spend gate and is ledgered `purpose: "memory_review"`.
-    /// Effort Min, `max_tokens` 1,200 — plus 4,000 of headroom on a model
-    /// that reasons anyway. A reply with no text that hit its limit
-    /// retries once at double the limit (≤ 12,000).
+    /// Effort Min, `max_tokens` per `review_max_tokens`. A no-text reply
+    /// that hit its limit after billing reasoning retries once at
+    /// `min(12_000, max(2×, reasoning + 2_400))` — a model that reasons
+    /// without advertising it lands in `review_reasoners`, so its next
+    /// review starts at the headroom limit instead of paying a retry.
     fn review_call(&mut self, prompt: &str) -> Result<(String, String, f64), String> {
         const RETRY_CEILING: u32 = 12_000;
         let msgs = [Message::user_text(prompt.to_string())];
@@ -2118,8 +2127,7 @@ impl Agent {
         let mut last = String::from("review call produced no text");
         for (i, model) in models.iter().enumerate() {
             let last_try = i + 1 == models.len();
-            let reasons = profile::lookup(model).reasons();
-            let mut max_tokens = review_max_tokens(model);
+            let mut max_tokens = self.review_max_tokens(model);
             let mut retried = false;
             loop {
                 let mut req = Request {
@@ -2135,6 +2143,12 @@ impl Agent {
                 };
                 match self.gated(&mut req, Some(crate::ledger::REVIEW_PURPOSE)) {
                     Ok((r, cost)) => {
+                        // A model that billed reasoning reasons whether
+                        // its profile admits it or not — remember it so
+                        // later reviews start at the headroom limit.
+                        if r.usage.reasoning > 0 {
+                            self.review_reasoners.insert(model.clone());
+                        }
                         let text: String = r
                             .blocks
                             .iter()
@@ -2149,11 +2163,19 @@ impl Agent {
                         let used = r.usage.output.saturating_add(r.usage.reasoning);
                         let hit = r.stop_reason == StopReason::MaxTokens
                             || used >= u64::from(req.max_tokens);
-                        // Reasoning ate the limit: one retry at double.
-                        let reasoned = reasons || r.usage.reasoning > 0;
+                        // Reasoning ate the limit: one retry, sized to
+                        // what it actually spent on reasoning plus the
+                        // text headroom (never below double).
+                        let reasoned = profile::lookup(model).reasons() || r.usage.reasoning > 0;
                         if hit && reasoned && !retried && max_tokens < RETRY_CEILING {
                             retried = true;
-                            max_tokens = max_tokens.saturating_mul(2).min(RETRY_CEILING);
+                            let reasoning_need =
+                                u32::try_from(r.usage.reasoning.saturating_add(2_400))
+                                    .unwrap_or(u32::MAX);
+                            max_tokens = max_tokens
+                                .saturating_mul(2)
+                                .max(reasoning_need)
+                                .min(RETRY_CEILING);
                             continue;
                         }
                         break;
@@ -2215,6 +2237,19 @@ impl Agent {
         )
     }
 
+    /// §1.7 review output limit: 1,200, plus 4,000 of headroom on a
+    /// model that reasons anyway — its reasoning bills against the same
+    /// limit. `reasons()` covers advertised reasoners;
+    /// `review_reasoners` covers ones observed billing reasoning on a
+    /// review reply (a model can reason without saying so).
+    fn review_max_tokens(&self, model: &str) -> u32 {
+        if profile::lookup(model).reasons() || self.review_reasoners.contains(model) {
+            1_200 + 4_000
+        } else {
+            1_200
+        }
+    }
+
     /// Memory v2 episode note, rewritten from the log at each run end
     /// (project store; never in subagents). Best-effort, like the commit.
     fn write_episode(&self) {
@@ -2243,16 +2278,6 @@ impl Agent {
 
 /// Serialize the current message view for the B1-9 token estimate.
 /// Runs once per turn at the budget checkpoint — never in hot loops.
-/// §1.7 review output limit: 1,200, plus 4,000 of headroom on a model
-/// that reasons anyway (its reasoning bills against the same limit).
-fn review_max_tokens(model: &str) -> u32 {
-    if profile::lookup(model).reasons() {
-        1_200 + 4_000
-    } else {
-        1_200
-    }
-}
-
 fn prompt_text_for_estimate(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
@@ -2665,6 +2690,124 @@ mod tests {
             .filter(|r| r.purpose.as_deref() == Some("memory_review"))
             .count();
         assert_eq!(review_rows, 3);
+    }
+
+    /// A model whose profile does not advertise reasoning but still
+    /// spends the whole review limit on it (deepseek-v4.1-flash through
+    /// a gateway did exactly this): the first review retries sized to
+    /// the observed reasoning spend, the model lands in
+    /// `review_reasoners`, and the next review opens at the headroom
+    /// limit instead of paying a retry.
+    #[test]
+    fn hidden_reasoner_review_learns_its_headroom() {
+        struct Hidden {
+            reviews: Mutex<Vec<(String, u32)>>,
+        }
+        impl Provider for Hidden {
+            fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
+                if !req.tools.is_empty() {
+                    return Ok(done());
+                }
+                self.reviews
+                    .lock()
+                    .unwrap()
+                    .push((req.model.to_string(), req.max_tokens));
+                let (blocks, reasoning) = if req.max_tokens < 3_600 {
+                    (vec![], u64::from(req.max_tokens))
+                } else {
+                    (
+                        vec![Block::Text {
+                            text: "NOTHING".into(),
+                        }],
+                        2_000,
+                    )
+                };
+                Ok(Response {
+                    blocks,
+                    stop_reason: StopReason::MaxTokens,
+                    usage: Usage {
+                        fresh_input: 100,
+                        output: u64::from(req.max_tokens).saturating_sub(reasoning),
+                        reasoning,
+                        ..Usage::default()
+                    },
+                    request_bytes: 0,
+                    latency_ms: 0,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "hidden"
+            }
+        }
+        assert!(!profile::lookup("deepseek-v4.1-flash").reasons());
+        let dir = tmpdir();
+        let (user, project, ws) = (
+            dir.join("user-mem"),
+            dir.join("project-mem"),
+            dir.join("ws"),
+        );
+        crate::memory::ensure(&user).unwrap();
+        crate::memory::ensure(&project).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let cfg = AgentConfig {
+            cwd: ws,
+            full_access: true,
+            model: "deepseek-v4.1-flash".into(),
+            small_model: None,
+            memory_dir: Some(project),
+            user_memory_dir: Some(user),
+            reflect: ReflectMode::Off,
+            max_cost_usd: 5.0,
+            ..AgentConfig::default()
+        };
+        let p = Arc::new(Hidden {
+            reviews: Mutex::new(Vec::new()),
+        });
+        let mut agent = Agent::start(p.clone(), cfg, dir.join("s"), "s".into()).unwrap();
+
+        agent
+            .run_turn("remember that tea beats coffee", &mut |_: &Event| {})
+            .unwrap();
+        {
+            let calls = p.reviews.lock().unwrap();
+            assert_eq!(
+                calls.as_slice(),
+                [
+                    ("deepseek-v4.1-flash".to_string(), 1_200),
+                    ("deepseek-v4.1-flash".to_string(), 3_600),
+                ],
+                "first review: 1,200 then one retry sized to reasoning"
+            );
+        }
+
+        agent
+            .run_turn("remember that coffee beats tea", &mut |_: &Event| {})
+            .unwrap();
+        let calls = p.reviews.lock().unwrap().clone();
+        assert_eq!(
+            calls.as_slice(),
+            [
+                ("deepseek-v4.1-flash".to_string(), 1_200),
+                ("deepseek-v4.1-flash".to_string(), 3_600),
+                ("deepseek-v4.1-flash".to_string(), 5_200),
+            ],
+            "second review opens at the learned headroom — no retry"
+        );
+
+        // Both reviews applied (no `skipped` reason), and every provider
+        // call got its own ledger row.
+        let events = EventLog::replay(dir.join("s/events.jsonl")).unwrap();
+        let applied = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::MemoryReview { skipped: None, .. }))
+            .count();
+        assert_eq!(applied, 2);
+        let rows = Ledger::read_all(dir.join("s/ledger.jsonl"));
+        let review_rows = rows
+            .iter()
+            .filter(|r| r.purpose.as_deref() == Some("memory_review"))
+            .count();
+        assert_eq!(review_rows, calls.len());
     }
 
     fn tmpdir() -> PathBuf {
