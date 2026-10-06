@@ -359,6 +359,18 @@ impl MemoryState {
             .filter(|s| !s.is_empty())
             .map(supersedes_rel)
             .transpose()?;
+        // Same layer only: the gate's per-layer write bar is keyed on the
+        // NEW note's layer, so a cross-layer supersede would retire (say)
+        // a profile note under the semantic bar.
+        if supersedes
+            .as_deref()
+            .is_some_and(|r| !r.starts_with(&format!("{}/", layer.name())))
+        {
+            return Err(format!(
+                "`supersedes` must name a {} note (same layer)",
+                layer.name()
+            ));
+        }
         let mut meta = format!("provenance: session:{}", self.session8);
         if let Some(origin) = quarantine {
             meta.push_str(&format!(" tainted:{origin}\nconfidence: 0.3"));
@@ -796,6 +808,11 @@ mod tests {
             json!({"op": "remember", "layer": "semantic", "name": "db", "text": "kiwi pg 17", "supersedes": "semantic/db.md"}),
         );
         assert!(out.is_error, "{}", out.text);
+        let out = call(
+            &mut st,
+            json!({"op": "remember", "layer": "procedural", "name": "db-proc", "text": "kiwi pg", "supersedes": "semantic/db.md"}),
+        );
+        assert!(out.is_error, "cross-layer supersede: {}", out.text);
         let out = call(
             &mut st,
             json!({"op": "remember", "layer": "semantic", "name": "db16", "text": "kiwi postgres 16", "supersedes": "semantic/db.md"}),
