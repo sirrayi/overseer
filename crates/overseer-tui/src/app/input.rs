@@ -106,6 +106,14 @@ impl App {
                     }
                     Some(None)
                 }
+                (KeyCode::Tab, m)
+                    if m.is_empty() && self.dialog.as_ref().unwrap().0.hidden_lines() > 0 =>
+                {
+                    let (dlg, _) = self.dialog.as_ref().unwrap();
+                    let cmd = dlg.bash_command().unwrap_or_default().to_string();
+                    self.open_command_view(cmd);
+                    Some(None)
+                }
                 (KeyCode::Char(c), m) if m.is_empty() && matches!(c, '1' | '2' | '3' | '4') => {
                     let (dlg, _) = self.dialog.as_ref().unwrap();
                     match dlg.resolve(c) {
@@ -118,7 +126,18 @@ impl App {
             if let Some(decision) = decide {
                 if let Some(d) = decision {
                     if d == AskDecision::AllowAlways {
-                        self.set_toast("rule saved to ~/.overseer/rules".into());
+                        // Mirrors `Policy::persist_rule`: a command with a
+                        // newline/control char is allowed once, never saved
+                        // (the engine's note lands on the tool result).
+                        let (dlg, _) = self.dialog.as_ref().unwrap();
+                        let unsavable = dlg
+                            .bash_command()
+                            .is_some_and(|c| c.chars().any(char::is_control));
+                        self.set_toast(if unsavable {
+                            "approved once — not saved (command has a newline/control char)".into()
+                        } else {
+                            "rule saved to ~/.overseer/rules".into()
+                        });
                     }
                     let (_, tx) = self.dialog.take().unwrap();
                     let _ = tx.send(d);

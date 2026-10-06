@@ -196,7 +196,27 @@ const INJECTION_MARKERS: &[&str] = &[
     "your real instructions",
 ];
 
-/// Path fragments that mark a tool call as touching secrets.
+/// Credential stores under `$HOME` — the ONE list behind the bwrap masks,
+/// the seatbelt read-denies (`tools/bash.rs`) and the sensitive latch here.
+pub(crate) const HOME_SECRETS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".config/gh",
+    ".gnupg",
+    ".overseer",
+    ".kube",
+    ".docker",
+    ".config/gcloud",
+    ".azure",
+    ".netrc",
+    ".npmrc",
+    ".pgpass",
+    ".git-credentials",
+    ".config/op",
+];
+
+/// Path fragments that mark a tool call as touching secrets (on top of
+/// [`HOME_SECRETS`]).
 const SENSITIVE_PATHS: &[&str] = &[
     ".env",
     ".envrc",
@@ -205,13 +225,84 @@ const SENSITIVE_PATHS: &[&str] = &[
     "id_dsa",
     ".pem",
     ".key",
-    ".aws/",
-    ".ssh/",
-    ".gnupg/",
-    ".netrc",
     "credentials",
     "secrets/",
 ];
+
+/// Whether lowercased `s` names a [`HOME_SECRETS`] entry as a whole path
+/// segment run (so `.kube` matches `~/.kube/config`, not `.kubernetes`).
+fn mentions_home_secret(s: &str) -> bool {
+    let seg = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    HOME_SECRETS.iter().any(|rel| {
+        s.match_indices(rel).any(|(i, _)| {
+            !s[..i].chars().next_back().is_some_and(seg)
+                && !s[i + rel.len()..].chars().next().is_some_and(seg)
+        })
+    })
+}
+
+/// A path character that can extend a path segment — same alphabet
+/// [`mentions_home_secret`] uses for its segment boundary.
+fn is_path_seg_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
+
+/// Collapse every workspace-root occurrence in lowercased tool input to
+/// `.` before the sensitive-path scan. Writer worktrees live under
+/// `~/.overseer/sessions/<ms>/subagents/wt-N/wt`, so any absolute path a
+/// writer names would otherwise match `.overseer` in [`HOME_SECRETS`]
+/// and arm the sensitive latch on its own cwd — one injected file then
+/// denies every side effect. Only the root itself is stripped
+/// (`<root>/x` → `./x`, a boundary-delimited bare `<root>` → `.`), so an
+/// in-workspace secret (`<root>/.env` → `./.env`, still a
+/// [`SENSITIVE_PATHS`] hit) and secret dirs elsewhere keep latching.
+fn strip_workspace_root(input_s: &str, root: &Path) -> String {
+    let mut out = input_s.to_string();
+    for form in [Some(root.to_path_buf()), root.canonicalize().ok()]
+        .into_iter()
+        .flatten()
+    {
+        if !form.is_absolute() {
+            continue;
+        }
+        let pat = form.to_string_lossy().to_lowercase();
+        if pat.len() < 2 {
+            continue;
+        }
+        out = collapse_path_prefix(&out, &pat);
+    }
+    out
+}
+
+/// Replace each `<pat>/` in `s` with `./` and each bare `<pat>` followed
+/// by a non-segment char (quote, whitespace, end, …) with `.`. A `<pat>`
+/// followed by a segment char is a different path sharing the prefix
+/// and is left alone.
+fn collapse_path_prefix(s: &str, pat: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(pat) {
+        let after = &rest[i + pat.len()..];
+        match after.chars().next() {
+            Some('/') => {
+                out.push_str(&rest[..i]);
+                out.push('.');
+            }
+            Some(c) if is_path_seg_char(c) => {
+                out.push_str(&rest[..i + pat.len()]);
+                rest = after;
+                continue;
+            }
+            _ => {
+                out.push_str(&rest[..i]);
+                out.push('.');
+            }
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
 
 /// Content markers that mark a result as carrying secret material.
 /// Lowercase: compared against lowercased text (RT-1: uppercase markers
@@ -326,7 +417,7 @@ const IDENTITY_MARKERS: &[&str] = &[
 /// Classify a tool call into the irreversibility taxonomy (P5-B).
 /// Pure function of (tool, input) — deterministic, zero deps.
 /// P7-1/S5 computer-use arms: `computer` dispatches on `action` — the
-/// observation set (apps/windows/observe/screenshot/zoom/verify/browser)
+/// observation set ([`crate::tools::computer::OBSERVE_ACTIONS`])
 /// reads (Read); side-effect acts (click/type/key/set/scroll/drag/menu/
 /// launch/browser_click/browser_type) mutate local UI state
 /// (InternalWrite); `navigate` emits a URL outward (ExternalComms — a URL
@@ -345,11 +436,7 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
         };
     }
     if tool == "computer" {
-        let action = input
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_lowercase();
+        let action = crate::tools::computer::normalize_action(input).unwrap_or_default();
         // Credential-field focus is an identity touch regardless of the
         // physical action — keystrokes near secrets outrank the click.
         if input
@@ -361,23 +448,17 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
         {
             return Irreversibility::Identity;
         }
-        if [
-            "apps",
-            "windows",
-            "observe",
-            "screenshot",
-            "zoom",
-            "verify",
-            "browser",
-        ]
-        .contains(&action.as_str())
-        {
+        if crate::tools::computer::OBSERVE_ACTIONS.contains(&action.as_str()) {
             return Irreversibility::Read;
         }
         if action == "navigate" {
             return Irreversibility::ExternalComms;
         }
-        return Irreversibility::InternalWrite; // side-effect acts + future actions default up
+        // An action dispatch would refuse classifies fail-closed.
+        if action != "batch" && !crate::tools::computer::ACTIONS.contains(&action.as_str()) {
+            return Irreversibility::ExternalComms;
+        }
+        return Irreversibility::InternalWrite;
     }
     match tool {
         t if READ_TOOLS.contains(&t) => Irreversibility::Read,
@@ -603,6 +684,8 @@ pub struct Policy {
     /// Memory v2: `memory` remember/forget are denied (every subagent —
     /// its stores are throwaway filtered copies). Search/get stay allowed.
     pub memory_readonly: bool,
+    /// Notes from `gate` for the caller to surface (`take_notes`).
+    notes: Mutex<Vec<String>>,
 }
 
 impl Policy {
@@ -625,6 +708,7 @@ impl Policy {
             persona_approved: false,
             mcp_read_servers: Vec::new(),
             memory_readonly: false,
+            notes: Mutex::new(Vec::new()),
         }
     }
 
@@ -646,6 +730,7 @@ impl Policy {
             persona_approved: false,
             mcp_read_servers: Vec::new(),
             memory_readonly: false,
+            notes: Mutex::new(Vec::new()),
         }
     }
 
@@ -668,6 +753,7 @@ impl Policy {
             persona_approved: false,
             mcp_read_servers: Vec::new(),
             memory_readonly: false,
+            notes: Mutex::new(Vec::new()),
         }
     }
 
@@ -710,9 +796,15 @@ impl Policy {
 
     /// Append a key to the rules file. Best-effort: a write failure
     /// leaves the session-allow in place, it just doesn't persist.
-    fn persist_rule(&self, key: &str) {
+    /// Returns false (nothing written) for a key with a control character:
+    /// the file is line-oriented, so an embedded newline would plant extra
+    /// rules.
+    fn persist_rule(&self, key: &str) -> bool {
+        if key.chars().any(char::is_control) {
+            return false;
+        }
         let Some(path) = &self.rules_path else {
-            return;
+            return true;
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -725,6 +817,16 @@ impl Policy {
         {
             let _ = writeln!(f, "{key}");
         }
+        true
+    }
+
+    /// Drain the notes `gate` left for the caller to show (a refused
+    /// "always" rule). The registry appends them to the tool result.
+    pub fn take_notes(&self) -> Vec<String> {
+        self.notes
+            .lock()
+            .map(|mut n| std::mem::take(&mut *n))
+            .unwrap_or_default()
     }
 
     /// Session-scoped allow key: what `AllowSession` records and later
@@ -763,8 +865,27 @@ impl Policy {
     /// benign-looking capture still latches. Phrase matching is retained
     /// as an additional signal, not the gate.
     pub fn note_result(&self, tool: &str, input: &Value, text: &str) -> Option<String> {
+        self.note_result_at(None, tool, input, text)
+    }
+
+    /// [`note_result`] with the caller's workspace root: the root is
+    /// collapsed out of the input (`strip_workspace_root`) before the
+    /// sensitive-path scan, so a workspace inside a HOME_SECRETS dir —
+    /// writer worktrees live under `~/.overseer/sessions/…` — does not
+    /// arm the latch on its own cwd.
+    pub fn note_result_at(
+        &self,
+        root: Option<&Path>,
+        tool: &str,
+        input: &Value,
+        text: &str,
+    ) -> Option<String> {
         let lower = text.to_lowercase();
         let input_s = input.to_string().to_lowercase();
+        let input_s = match root {
+            Some(r) => strip_workspace_root(&input_s, r),
+            None => input_s,
+        };
         let mut t = self.taint.lock().ok()?;
         let mut notices = Vec::new();
         if !t.untrusted
@@ -776,6 +897,9 @@ impl Policy {
                 // `mcp` result latches untrusted, marker or not.
                 || tool == "mcp"
                 || Self::is_screenshot_context(tool, input)
+                // An act's post read is screen content in the result even
+                // though the input action never observes.
+                || (tool == "computer" && crate::tools::computer::post_observed(text))
                 || INJECTION_MARKERS.iter().any(|m| lower.contains(m)))
         {
             t.untrusted = true;
@@ -784,6 +908,7 @@ impl Policy {
         }
         if !t.sensitive
             && (SENSITIVE_PATHS.iter().any(|m| input_s.contains(m))
+                || mentions_home_secret(&input_s)
                 || SENSITIVE_CONTENT.iter().all(|m| lower.contains(m)))
         {
             t.sensitive = true;
@@ -807,13 +932,45 @@ impl Policy {
         Some(format!("sensitive data touched (via {via})"))
     }
 
+    /// The latch state, to carry across a policy rebuild (`set_preset`).
+    pub fn taint_snapshot(&self) -> Taint {
+        self.taint.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    /// Carry latches into this (fresh) policy: latches only ever arm.
+    pub fn restore_taint(&self, from: &Taint) {
+        if let Ok(mut t) = self.taint.lock() {
+            if from.untrusted && !t.untrusted {
+                t.untrusted = true;
+                t.untrusted_via = from.untrusted_via.clone();
+            }
+            t.sensitive |= from.sensitive;
+        }
+    }
+
+    /// Re-arm one latch from a replayed `Tainted` event (resume). Silent:
+    /// the event is already on the log.
+    pub fn rearm(&self, latch: &str, via: &str) {
+        let Ok(mut t) = self.taint.lock() else {
+            return;
+        };
+        match latch {
+            "sensitive" => t.sensitive = true,
+            _ if !t.untrusted => {
+                t.untrusted = true;
+                t.untrusted_via = Some(via.to_string());
+            }
+            _ => {}
+        }
+    }
+
     /// The sensitive latch alone (RT-4 regression surface).
     pub fn taint_sensitive(&self) -> bool {
         self.taint.lock().map(|t| t.sensitive).unwrap_or(false)
     }
 
     /// P7-1/S5 observation-context detector: EVERY computer observation
-    /// action (apps/windows/observe/screenshot/zoom/verify/browser)
+    /// action ([`crate::tools::computer::OBSERVE_ACTIONS`])
     /// latches `untrusted` regardless of result text — screen and page
     /// content is attacker-controllable, and pixels bypass text scanning
     /// (D5). A `batch` latches when any member observes.
@@ -821,22 +978,11 @@ impl Policy {
         if tool != "computer" {
             return false;
         }
-        let action = input.get("action").and_then(Value::as_str).unwrap_or("");
-        if [
-            "apps",
-            "windows",
-            "observe",
-            "screenshot",
-            "zoom",
-            "verify",
-            "browser",
-        ]
-        .iter()
-        .any(|a| action.eq_ignore_ascii_case(a))
-        {
+        let action = crate::tools::computer::normalize_action(input).unwrap_or_default();
+        if crate::tools::computer::OBSERVE_ACTIONS.contains(&action.as_str()) {
             return true;
         }
-        if action.eq_ignore_ascii_case("batch") {
+        if action == "batch" {
             return input
                 .get("actions")
                 .and_then(Value::as_array)
@@ -901,8 +1047,15 @@ impl Policy {
                     AskDecision::AllowOnce => Gate::Allow,
                     d @ (AskDecision::AllowSession | AskDecision::AllowAlways) => {
                         if let Some(key) = self.session_key(tool, input) {
-                            if d == AskDecision::AllowAlways {
-                                self.persist_rule(&key);
+                            if d == AskDecision::AllowAlways && !self.persist_rule(&key) {
+                                if let Ok(mut n) = self.notes.lock() {
+                                    n.push(format!(
+                                        "{tool}: approved once — not saved as an \"always\" \
+                                         rule (the command contains a newline or control \
+                                         character)"
+                                    ));
+                                }
+                                return Gate::Allow;
                             }
                             // P8-B: `AllowSession` grants honor the
                             // policy's session TTL (None = session-long).
@@ -966,6 +1119,16 @@ impl Policy {
                 return Verdict::Allow;
             }
             if op.eq_ignore_ascii_case("call") && self.mcp_call_read_trusted(input) {
+                // Armed: the call's arguments leave the process, so a
+                // read-trusted server is still an exfil channel.
+                if self.taint_armed() {
+                    return Verdict::Ask {
+                        reason: "mcp: Rule-of-Two — untrusted content and sensitive data are \
+                                 both in context; this call's arguments leave the process \
+                                 and need human confirmation"
+                            .into(),
+                    };
+                }
                 return Verdict::Allow;
             }
         }
@@ -1189,6 +1352,13 @@ impl Policy {
             // Read-class (screenshot/observe) falls through to Allow; ladder
             // Ask/Deny already won for side-effecting actions. Explicit
             // autonomy keeps the default ActWithApproval Ask for acts.
+            // Rule of Two: once the exfil triangle is armed, no screen act
+            // rides a silent lane.
+            "computer" if class != Irreversibility::Read && self.taint_armed() => Verdict::Ask {
+                reason: format!(
+                    "computer: untrusted + sensitive context — needs approval (class {class:?})"
+                ),
+            },
             "computer" => Verdict::Allow,
             // R6 `mcp` arm — reached only after the ladder floor above, and
             // only for a `call`: `search` and read-trust calls returned Allow
@@ -1338,6 +1508,20 @@ impl Policy {
                             reason: format!("bash: '{pattern}' needs confirmation — {why}"),
                         };
                     }
+                }
+                Verdict::Allow
+            }
+
+            // `cargo check` runs `build.rs` and proc-macros: code execution,
+            // gated like a plain shell call.
+            "diagnostics" => {
+                if self.taint_armed() {
+                    return Verdict::Ask {
+                        reason: "diagnostics: Rule-of-Two — untrusted content and sensitive \
+                                 data are both in context; running the checker needs human \
+                                 confirmation"
+                            .into(),
+                    };
                 }
                 Verdict::Allow
             }
@@ -1590,6 +1774,25 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+/// One `(latch, detail)` per latch a taint notice reports — a single
+/// `note_result` can flip both (`"untrusted …; sensitive …"`), and each
+/// arm is logged as its own `Tainted` event.
+pub fn split_notice(notice: &str) -> Vec<(String, String)> {
+    notice
+        .split("; ")
+        .filter(|p| !p.is_empty())
+        .map(|p| (crate::event::latch_of("", p).to_string(), p.to_string()))
+        .collect()
+}
+
+/// The `via` of a latch detail (`… (via X)`), or the whole detail.
+pub fn via_of(detail: &str) -> &str {
+    detail
+        .rsplit_once("(via ")
+        .and_then(|(_, r)| r.strip_suffix(')'))
+        .unwrap_or(detail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1659,6 +1862,10 @@ mod tests {
             Irreversibility::Read
         );
         assert_eq!(
+            classify("computer", &json!({"action": "wait_for", "expect": []})),
+            Irreversibility::Read
+        );
+        assert_eq!(
             classify("computer", &json!({"action": "browser"})),
             Irreversibility::Read
         );
@@ -1698,10 +1905,10 @@ mod tests {
             classify("computer", &json!({"action": "type", "cred_field": true})),
             Irreversibility::Identity
         );
-        // Unknown actions default up, never down.
+        // Unknown actions fail closed, never down.
         assert_eq!(
             classify("computer", &json!({"action": "frobnicate"})),
-            Irreversibility::InternalWrite
+            Irreversibility::ExternalComms
         );
     }
 
@@ -1717,6 +1924,7 @@ mod tests {
             "screenshot",
             "zoom",
             "verify",
+            "wait_for",
             "browser",
         ] {
             let p = pol();
@@ -1866,6 +2074,76 @@ mod tests {
             p.check("write", &json!({"path": "a.txt"})),
             Verdict::Ask { .. }
         ));
+    }
+
+    /// A scratch root under a fake `$HOME/.overseer/sessions/…` path —
+    /// the shape a writer subagent's worktree cwd actually has.
+    fn session_root(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "ovs-perm-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join(".overseer/sessions/1/subagents/wt-1/wt");
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn workspace_root_under_home_secrets_does_not_arm_sensitive() {
+        let root = session_root("ws");
+        let p = pol();
+        // An absolute path inside the workspace names `.overseer` only
+        // via the root itself — it must not self-arm the latch.
+        let n = p.note_result_at(
+            Some(&root),
+            "read",
+            &json!({"path": root.join("src/lib.rs")}),
+            "fn main() {}",
+        );
+        assert!(n.is_none(), "{n:?}");
+        assert!(!p.taint_snapshot().sensitive);
+
+        // A secret INSIDE the workspace still latches: `<root>/.env`
+        // collapses to `./.env`, still a SENSITIVE_PATHS hit.
+        let n = p.note_result_at(
+            Some(&root),
+            "read",
+            &json!({"path": root.join(".env")}),
+            "KEY=1",
+        );
+        assert_eq!(n.as_deref(), Some("sensitive data touched (via read)"));
+        assert!(p.taint_snapshot().sensitive);
+    }
+
+    #[test]
+    fn secrets_outside_the_workspace_still_arm_sensitive() {
+        let root = session_root("out");
+        let home = root.parent().unwrap().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // `cat ~/.overseer/rules` from a workspace elsewhere.
+        let p = pol();
+        let n = p.note_result_at(
+            Some(&root),
+            "bash",
+            &json!({"command": "cat ~/.overseer/rules"}),
+            "bash:ok",
+        );
+        assert_eq!(n.as_deref(), Some("sensitive data touched (via bash)"));
+
+        // `cat <home>/.ssh/id_ed25519` likewise.
+        let p = pol();
+        let n = p.note_result_at(
+            Some(&root),
+            "bash",
+            &json!({"command": format!("cat {}/.ssh/id_ed25519", home.display())}),
+            "bash:ok",
+        );
+        assert_eq!(n.as_deref(), Some("sensitive data touched (via bash)"));
     }
 
     #[test]

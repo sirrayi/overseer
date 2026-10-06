@@ -16,6 +16,7 @@ overseer-core = { path = "../overseer-core", version = "0.1.0", default-features
 overseer-gateway = { path = "../overseer-gateway", version = "0.1.0" }
 overseer-tui = { path = "../overseer-tui", version = "0.1.0", default-features = false }
 serde_json = "1"
+getrandom = "0.4"
 
 # `overseer-core`'s only default feature is `code-mode`; it is re-exposed
 # here so `--no-default-features` really drops `run_code`.

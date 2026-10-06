@@ -80,6 +80,12 @@ impl StuckDetector {
         Self::default()
     }
 
+    /// Forget all history — called at the start of every user turn so one
+    /// turn's repetition never trips the next.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     /// Record a completed tool call + its observation. Call once per pair.
     pub fn observe_step(
         &mut self,
@@ -155,19 +161,21 @@ impl StuckDetector {
             .all(|(a, o)| a == first_action && o.starts_with("err=true"))
     }
 
-    /// P4: last 6+ steps alternate between exactly two actions (A,B,A,B,A,B).
+    /// P4: last 6+ steps alternate between exactly two (action,
+    /// observation) pairs (A,B,A,B,A,B) — changing observations are
+    /// progress, not a loop.
     fn ping_pong(&self) -> bool {
         if self.steps.len() < PINGPONG_WINDOW {
             return false;
         }
         let tail: Vec<_> = self.steps.iter().rev().take(PINGPONG_WINDOW).collect();
-        let a = &tail[0].0;
-        let b = &tail[1].0;
-        a != b
+        let a = tail[0];
+        let b = tail[1];
+        a.0 != b.0
             && tail
                 .iter()
                 .enumerate()
-                .all(|(i, (s, _))| s == if i % 2 == 0 { a } else { b })
+                .all(|(i, s)| *s == if i % 2 == 0 { a } else { b })
     }
 }
 

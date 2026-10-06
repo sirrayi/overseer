@@ -26,12 +26,21 @@
 //! [`route`]) and a cap drawn from the parent's budget ([`budget`]).
 //! Every dir is `subagents/task-N` with a `task.json` record
 //! ([`sidecar`]); the result ends with a [`Footer`] line.
+//!
+//! `action: "cancel"` stops a background task at its next step boundary;
+//! a parent interrupt reaches every subagent the same way (each spawn's
+//! [`Control`](crate::control::Control) is a registered child).
+
+// DEFERRED(orchestration): task DAG (after:) and fan-out with merge — gate: wave B
+// DEFERRED(orchestration): shared scratchpad — gate: wave B
+// DEFERRED(orchestration): writer retry in a fresh worktree — gate: wave B
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::{middle_truncate, need_str, opt_u64, schema, ToolCtx, ToolOutput};
 use crate::agent::{AgentConfig, RunOutcome};
@@ -63,11 +72,13 @@ const DEFAULT_STEPS: u64 = 10;
 const MAX_STEPS: u64 = 20;
 
 /// Per-batch subagent handles the agent lends its tools: the
-/// session-monotonic spawn counter and the parent's spend account.
+/// session-monotonic spawn counter, the parent's spend account and its
+/// steering handle (each spawn registers a child of it by task id).
 #[derive(Debug, Clone, Default)]
 pub struct SubagentCtx {
     pub seq: u64,
     pub spend: Option<Arc<SpendAccount>>,
+    pub control: crate::control::Control,
 }
 
 pub fn spec() -> ToolSpec {
@@ -84,6 +95,11 @@ pub fn spec() -> ToolSpec {
                     "type": "string",
                     "description": "Self-contained brief."
                 },
+                "action": {
+                    "type": "string",
+                    "description": "cancel: stop task `id`."
+                },
+                "id": { "type": "string" },
                 "mode": {
                     "type": "string",
                     "enum": ["read", "write", "verify", "consult"],
@@ -118,7 +134,7 @@ pub fn spec() -> ToolSpec {
                     "description": "USD cap."
                 }
             }),
-            &["prompt"],
+            &[],
         ),
     }
 }
@@ -196,15 +212,37 @@ pub fn filtered_memory_dir(
     Some(dest.to_path_buf())
 }
 
-/// `git worktree add` for a writer subagent. Returns the worktree path
-/// and the scratch branch name. Fails cleanly when cwd isn't a repo.
-fn add_worktree(cwd: &Path, dir: &Path, seq: u64) -> Result<(std::path::PathBuf, String), String> {
-    let branch = format!("overseer-task-{seq}");
+/// A writer's scratch branch: `overseer/<8 hex>/task-N` — branches are
+/// repo-global, so the id must keep sessions apart. Session dirs are
+/// named by unix ms, so a name prefix is shared by every session within
+/// a day; the sha256 prefix of the canonical session path is not.
+/// Canonicalize via the parent: the leaf may not exist yet at spawn, and
+/// hashing the raw path would differ once it does (`/var` vs
+/// `/private/var`). The resume path never lands here — it reuses the
+/// branch recorded in the sidecar.
+pub(crate) fn writer_branch(session_dir: &Path, seq: u64) -> String {
+    let canon = session_dir.canonicalize().unwrap_or_else(|_| {
+        session_dir
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .map(|p| match session_dir.file_name() {
+                Some(n) => p.join(n),
+                None => p,
+            })
+            .unwrap_or_else(|| session_dir.to_path_buf())
+    });
+    let hex = format!("{:x}", Sha256::digest(canon.to_string_lossy().as_bytes()));
+    format!("overseer/{}/task-{seq}", &hex[..8])
+}
+
+/// `git worktree add` for a writer subagent on `branch`. Returns the
+/// worktree path. Fails cleanly when cwd isn't a repo.
+fn add_worktree(cwd: &Path, dir: &Path, branch: &str) -> Result<std::path::PathBuf, String> {
     let wt = dir.join("wt");
     let out = Command::new("git")
         .arg("-C")
         .arg(cwd)
-        .args(["worktree", "add", "-b", &branch])
+        .args(["worktree", "add", "-b", branch])
         .arg(&wt)
         .output()
         .map_err(|e| format!("git worktree: {e}"))?;
@@ -214,7 +252,45 @@ fn add_worktree(cwd: &Path, dir: &Path, seq: u64) -> Result<(std::path::PathBuf,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok((wt, branch))
+    Ok(wt)
+}
+
+fn git_ok(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A writer that changed nothing: drop its worktree and its branch.
+fn remove_writer(repo: &Path, wt: &Path, branch: &str) -> Result<(), String> {
+    let wt_s = wt.display().to_string();
+    git_ok(repo, &["worktree", "remove", "--force", &wt_s])?;
+    git_ok(repo, &["branch", "-D", branch]).map(|_| ())
+}
+
+/// The exact commands to take or discard a writer's work.
+fn merge_note(id: &str, branch: &str, wt: &Path) -> String {
+    let wt_s = wt.display();
+    let dirty = git_ok(wt, &["status", "--porcelain"]).map_or(true, |s| !s.trim().is_empty());
+    let commit = if dirty {
+        format!("commit its uncommitted edits first: `git -C {wt_s} add -A && git -C {wt_s} commit -m '{id}'`; then ")
+    } else {
+        String::new()
+    };
+    format!(
+        "[to keep: {commit}`git merge {branch}` · to discard: `git worktree remove --force {wt_s} && git branch -D {branch}`]"
+    )
 }
 
 /// Bounded diffstat of what a writer subagent changed in its worktree.
@@ -326,6 +402,11 @@ struct Env {
     base_cfg: AgentConfig,
     subagents_dir: PathBuf,
     parent_cwd: PathBuf,
+    /// The parent's steering handle (this spawn is registered under it).
+    parent_control: crate::control::Control,
+    /// This spawn's own handle: `action=cancel` or a parent interrupt
+    /// sets it, and every attempt of the job stops at its next boundary.
+    cancel: crate::control::Control,
 }
 
 struct Job {
@@ -421,6 +502,7 @@ fn run_once(
         Ok(a) => a.with_tools(registry),
         Err(e) => return Attempt::failed(format!("cannot start subagent: {e}")),
     };
+    sub.set_control(env.cancel.clone());
     let mut sink = |_: &crate::event::Event| {};
     let outcome = sub
         .run_turn(&first, &mut sink)
@@ -437,13 +519,18 @@ fn run_once(
     if mode == TaskMode::Verify {
         let mut v = verify::parse(&a.text);
         let after = verify::snapshot(cwd);
-        if let (Some(b), Some(af)) = (&before, &after) {
-            let changed = verify::changed(b, af);
-            if !changed.is_empty() {
-                v.tampered();
-                a.notes
-                    .push(format!("verifier modified files: {}", changed.join(", ")));
+        // verify-tamper: any change to HEAD, refs, stash or the tree
+        // forces `fail` — the verifier's own claim is ignored.
+        let what = match (&before, &after) {
+            (Some(b), Some(af)) => {
+                Some(verify::changed(b, af).join("; ")).filter(|w| !w.is_empty())
             }
+            (Some(_), None) => Some("repository unreadable after the run".to_string()),
+            _ => None,
+        };
+        if let Some(what) = what {
+            v.tampered(&what);
+            a.notes.push(format!("tampered: {what}"));
         }
         a.verdict = Some(v);
     }
@@ -460,12 +547,24 @@ fn open_dir(env: &Env, sc: &Sidecar) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Mark `dir` done. A failed store still leaves it done for this process
-/// (never live-looking); its cap is released down to what it spent and
-/// the returned note carries the error into the digest.
+/// Mark `dir` done (`cancelled` when the job was cancelled — its
+/// reservation is released then). A failed store still leaves it
+/// finished for this process (never live-looking); its cap is released
+/// down to what it spent and the returned note carries the error into
+/// the digest.
 fn finish(env: &Env, dir: &Path) -> Option<String> {
     let mut sc = Sidecar::load(dir)?;
-    let e = sc.finish(dir, State::Done).err()?;
+    let cancelled = env.cancel.interrupted();
+    let state = if cancelled {
+        State::Cancelled
+    } else {
+        State::Done
+    };
+    let stored = sc.finish(dir, state);
+    if cancelled {
+        env.account.release(&sc.id);
+    }
+    let e = stored.err()?;
     env.account.shrink(&sc.id, sc.cost_usd);
     Some(format!(
         "[{}: finished, but task.json could not be written — {e}; its cap is released]",
@@ -610,18 +709,22 @@ fn execute(env: &Env, job: &Job) -> String {
         notes.push(format!("[provider error: {e}]"));
     }
     notes.extend(a.notes.drain(..).map(|n| format!("[{n}]")));
-    if let Some(branch) = &job.branch {
-        if job.mode == TaskMode::Write {
-            notes.push(worktree_note(branch, &job.cwd).trim().to_string());
-        }
+    let cancelled = env.cancel.interrupted();
+    let writer = job.branch.as_ref().filter(|_| job.mode == TaskMode::Write);
+    let changed = (writer.is_some() || job.verify_id.is_some())
+        && verify::has_changes(&job.cwd, job.base.as_deref().unwrap_or("HEAD"));
+    if let Some(branch) = writer.filter(|_| changed) {
+        notes.push(worktree_note(branch, &job.cwd).trim().to_string());
     }
     let mut verdict = a.verdict.as_ref().map(|v| v.verdict.clone());
-    let unchanged = job.verify_id.is_some()
-        && !verify::has_changes(&job.cwd, job.base.as_deref().unwrap_or("HEAD"));
+    let mut tampered = a.verdict.as_ref().and_then(|v| v.tampered.clone());
+    let unchanged = job.verify_id.is_some() && !changed;
     if unchanged {
         notes.push("[verify skipped: no changes]".into());
+    } else if job.verify_id.is_some() && cancelled {
+        notes.push("[verify skipped: cancelled]".into());
     }
-    if let Some(vid) = job.verify_id.as_ref().filter(|_| !unchanged) {
+    if let Some(vid) = job.verify_id.as_ref().filter(|_| !unchanged && !cancelled) {
         let vroute = route::resolve(Tier::Standard, &env.parent);
         match env.account.grant(
             vid,
@@ -646,6 +749,7 @@ fn execute(env: &Env, job: &Job) -> String {
                         let vfinish = finish(env, &vdir);
                         let v = va.verdict.clone().unwrap_or_else(|| verify::parse(""));
                         verdict = Some(v.verdict.clone());
+                        tampered = v.tampered.clone();
                         let vfooter = Footer {
                             id: vid.clone(),
                             mode: "verify".into(),
@@ -654,6 +758,7 @@ fn execute(env: &Env, job: &Job) -> String {
                             cost_usd: Some(va.cost),
                             status: status(&va.outcome).into(),
                             verdict: Some(v.verdict.clone()),
+                            tampered: v.tampered.clone(),
                             trace: vdir.display().to_string(),
                         };
                         let mut block = format!(
@@ -682,10 +787,32 @@ fn execute(env: &Env, job: &Job) -> String {
             Err(left) => notes.push(format!("[verify skipped: ${left:.4} left]")),
         }
     }
+    // worktree-branch-collision: a writer with no diff against its base
+    // leaves nothing behind; one with a diff keeps both, and says how to
+    // take or drop them.
+    if let Some(branch) = writer {
+        if changed {
+            notes.push(merge_note(&job.id, branch, &job.cwd));
+        } else {
+            match remove_writer(&env.parent_cwd, &job.cwd, branch) {
+                Ok(()) => {
+                    if let Some(mut sc) = Sidecar::load(&dir) {
+                        sc.worktree = None;
+                        let _ = sc.store(&dir);
+                    }
+                    notes.push(format!(
+                        "[no changes: worktree removed, branch `{branch}` deleted]"
+                    ));
+                }
+                Err(e) => notes.push(format!("[no changes, but cleanup failed — {e}]")),
+            }
+        }
+    }
     if run_dir != dir {
         notes.extend(finish(env, &run_dir));
     }
     notes.extend(finish(env, &dir));
+    env.parent_control.forget(&job.id);
 
     let mut out = String::new();
     if let Some(v) = &a.verdict {
@@ -703,8 +830,13 @@ fn execute(env: &Env, job: &Job) -> String {
         tier: route.tier.as_str().into(),
         model: route.model.clone(),
         cost_usd: Some(cost),
-        status: status(&a.outcome).into(),
+        status: if cancelled {
+            "cancelled".into()
+        } else {
+            status(&a.outcome).into()
+        },
         verdict,
+        tampered,
         trace: dir.display().to_string(),
     };
     out.push_str("\n\n");
@@ -773,9 +905,9 @@ fn place(
     match (mode, prior) {
         (TaskMode::Write, None) => {
             let base = head_sha(&ctx.cwd).map_err(|e| format!("mode=write {e}"))?;
-            let (wt, branch) =
-                add_worktree(&ctx.cwd, &subagents_dir.join(format!("wt-{seq}")), seq)
-                    .map_err(|e| format!("mode=write needs a git worktree — {e}"))?;
+            let branch = writer_branch(&ctx.session_dir, seq);
+            let wt = add_worktree(&ctx.cwd, &subagents_dir.join(format!("wt-{seq}")), &branch)
+                .map_err(|e| format!("mode=write needs a git worktree — {e}"))?;
             Ok(Placement {
                 cwd: wt.clone(),
                 worktree: Some(wt),
@@ -816,6 +948,11 @@ fn place(
 }
 
 pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
+    match input.get("action").and_then(Value::as_str) {
+        None | Some("spawn") => {}
+        Some("cancel") => return cancel(input, ctx),
+        Some(other) => return ToolOutput::err(format!("task: unknown action `{other}`")),
+    }
     let prompt = match need_str(input, "prompt") {
         Ok(p) => p,
         Err(e) => return e,
@@ -823,6 +960,33 @@ pub fn run(input: &Value, ctx: &mut ToolCtx) -> ToolOutput {
     match spawn(prompt, input, ctx) {
         Ok(text) => ToolOutput::ok(text),
         Err(e) => ToolOutput::err(format!("task: {e}")),
+    }
+}
+
+/// `action=cancel id=task-N`: interrupt a running background task. It
+/// stops at its next step boundary, goes `cancelled`, releases its
+/// reservation and still delivers a `SubagentDone` (status cancelled).
+fn cancel(input: &Value, ctx: &ToolCtx) -> ToolOutput {
+    let id = match need_str(input, "id") {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let sc = match load_task(&ctx.session_dir.join("subagents"), id, "cancel") {
+        Ok(sc) => sc,
+        Err(e) => return ToolOutput::err(format!("task: {e}")),
+    };
+    if !sc.is_live() {
+        return ToolOutput::err(format!("task: cancel: {id} is not running"));
+    }
+    match ctx.subagents.control.child_of(id) {
+        Some(c) => {
+            c.interrupt();
+            ToolOutput::ok(format!(
+                "Cancelling {id}: it stops at its next step boundary; its notice \
+                 still arrives (status cancelled)."
+            ))
+        }
+        None => ToolOutput::err(format!("task: cancel: {id} has no handle in this process")),
     }
 }
 
@@ -1001,6 +1165,8 @@ fn spawn(prompt: &str, input: &Value, ctx: &mut ToolCtx) -> Result<String, Strin
         base_cfg,
         subagents_dir,
         parent_cwd: ctx.cwd.clone(),
+        parent_control: ctx.subagents.control.clone(),
+        cancel: ctx.subagents.control.child(&id),
     };
     let job = Job {
         id: id.clone(),
@@ -1025,6 +1191,7 @@ fn spawn(prompt: &str, input: &Value, ctx: &mut ToolCtx) -> Result<String, Strin
         cost_usd: None,
         status: "background".into(),
         verdict: None,
+        tampered: None,
         trace: dir.display().to_string(),
     };
     let delivery = sidecar::Delivery::new(&dir);
@@ -1165,6 +1332,7 @@ mod tests {
             spill_seq: 0,
             provider: Some(mock.clone()),
             subagents: SubagentCtx {
+                control: Default::default(),
                 seq: 0,
                 spend: Some(Arc::new(SpendAccount::new(cfg.max_cost_usd, 0.0))),
             },
@@ -1270,6 +1438,72 @@ mod tests {
                 .count();
         println!("task spec: {n} chars");
         assert!(n <= 1_000, "task spec is {n} chars");
+    }
+
+    /// Hierarchical cancel: the child blocks in its first call until its
+    /// own control is interrupted, then stops at its next boundary.
+    fn cancel_case(by_action: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let dir = tmpdir();
+        let parent = crate::control::Control::default();
+        let started = Arc::new(AtomicBool::new(false));
+        let (s, h) = (started.clone(), parent.clone());
+        let hook: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+            s.store(true, Ordering::SeqCst);
+            let t = Instant::now();
+            while !h.child_of("task-1").is_some_and(|c| c.interrupted())
+                && t.elapsed() < Duration::from_secs(10)
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let looping = (0..40)
+            .map(|n| {
+                call(
+                    n,
+                    "glob",
+                    json!({"pattern": format!("*{n}")}),
+                    Usage::default(),
+                )
+            })
+            .collect();
+        let (mut c, _mock) = ctx_hooked(&dir, looping, cfg(&dir), Some(hook));
+        c.subagents.control = parent.clone();
+        let out = run(&json!({"prompt": "loop", "background": true}), &mut c);
+        assert!(!out.is_error, "{}", out.text);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !started.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(started.load(Ordering::SeqCst), "child never called");
+        if by_action {
+            let o = run(&json!({"action": "cancel", "id": "task-1"}), &mut c);
+            assert!(!o.is_error, "{}", o.text);
+        } else {
+            parent.interrupt();
+        }
+        let marker = dir.join("session/subagents/task-1/done.txt");
+        wait_for(&marker);
+        assert_eq!(sc(&dir, "task-1").state, sidecar::State::Cancelled);
+        let spend = c.subagents.spend.clone().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while spend.reserved_usd() > 0.0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(spend.reserved_usd(), 0.0);
+        let done = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(Footer::parse(&done).unwrap().status, "cancelled", "{done}");
+    }
+
+    #[test]
+    fn parent_interrupt_cancels_a_looping_background_child() {
+        cancel_case(false);
+    }
+
+    #[test]
+    fn task_action_cancel_stops_a_background_child() {
+        cancel_case(true);
     }
 
     #[test]
@@ -1407,14 +1641,46 @@ mod tests {
     fn write_mode_uses_worktree() {
         let dir = repo();
         let mut c = ctx(&dir);
+        let branch = writer_branch(&c.session_dir, 1);
         let out = run(&json!({"prompt": "write stuff", "mode": "write"}), &mut c);
         assert!(!out.is_error, "{}", out.text);
-        assert!(out.text.contains("overseer-task-1"));
-        assert!(dir.join("session/subagents/wt-1/wt").exists());
+        // A writer that changed nothing leaves no worktree or branch.
+        assert!(
+            out.text.contains(&format!("branch `{branch}` deleted")),
+            "{}",
+            out.text
+        );
+        assert!(!dir.join("session/subagents/wt-1/wt").exists());
         let s = sc(&dir, "task-1");
-        assert_eq!(s.branch.as_deref(), Some("overseer-task-1"));
+        assert_eq!(s.branch.as_deref(), Some(branch.as_str()));
+        assert_eq!(s.worktree, None);
         assert_eq!(s.tier, Tier::Standard);
         assert!(s.base.is_some());
+    }
+
+    /// Session dirs are unix-ms names: two sessions inside the same
+    /// window share their first 8 chars, so a name prefix cannot keep
+    /// their writer branches apart — the path sha can.
+    #[test]
+    fn writer_branch_ids_differ_for_same_window_sessions() {
+        let root = tmpdir();
+        let a = root.join("1790724600269");
+        let b = root.join("1790724600999");
+        let (ba, bb) = (writer_branch(&a, 1), writer_branch(&b, 1));
+        assert_eq!(
+            a.file_name().unwrap().to_string_lossy()[..8],
+            b.file_name().unwrap().to_string_lossy()[..8],
+            "the name prefix really is shared"
+        );
+        assert_ne!(ba, bb);
+        for br in [&ba, &bb] {
+            let (scope, name) = br.rsplit_once('/').unwrap();
+            assert_eq!(name, "task-1");
+            assert!(scope.starts_with("overseer/"), "{br}");
+            let hex = &scope["overseer/".len()..];
+            assert_eq!(hex.len(), 8, "{br}");
+            assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{br}");
+        }
     }
 
     /// A full-access writer's policy root is `/`, but its skills live in
@@ -1454,9 +1720,6 @@ mod tests {
         let (mut c, mock) = ctx_with(&dir, vec![done_text("digest body")], cfg(&dir));
         let out = run(&json!({"prompt": "write stuff", "mode": "write"}), &mut c);
         assert!(!out.is_error, "{}", out.text);
-        assert!(dir
-            .join("session/subagents/wt-1/wt/.overseer/skills/demo/SKILL.md")
-            .is_file());
         let seen = mock.seen.lock().unwrap();
         assert!(!seen.is_empty());
         assert!(
@@ -1468,7 +1731,19 @@ mod tests {
     #[test]
     fn background_write_mode_reports_its_worktree_in_done_txt() {
         let dir = repo();
-        let mut c = ctx(&dir);
+        let (mut c, _) = ctx_with(
+            &dir,
+            vec![
+                call(
+                    1,
+                    "bash",
+                    json!({"command": "echo x > new.txt"}),
+                    Usage::default(),
+                ),
+                done_text("digest body"),
+            ],
+            cfg(&dir),
+        );
         let out = run(
             &json!({"prompt": "write stuff", "mode": "write", "background": true}),
             &mut c,
@@ -1477,9 +1752,15 @@ mod tests {
         let marker = dir.join("session/subagents/task-1/done.txt");
         wait_for(&marker);
         let done = std::fs::read_to_string(&marker).expect("done.txt");
+        let branch = writer_branch(&c.session_dir, 1);
         assert!(done.contains("digest body"), "{done}");
-        assert!(done.contains("worktree branch `overseer-task-1`"), "{done}");
+        assert!(
+            done.contains(&format!("worktree branch `{branch}`")),
+            "{done}"
+        );
         assert!(done.contains("changes:"), "{done}");
+        assert!(done.contains(&format!("`git merge {branch}`")), "{done}");
+        assert!(done.contains("git worktree remove --force"), "{done}");
     }
 
     #[test]
@@ -1631,7 +1912,7 @@ mod tests {
         let dir = repo();
         let mut c = ctx(&dir);
         assert!(!run(&json!({"prompt": "w", "mode": "write"}), &mut c).is_error);
-        std::fs::remove_dir_all(dir.join("session/subagents/wt-1/wt")).unwrap();
+        let _ = std::fs::remove_dir_all(dir.join("session/subagents/wt-1/wt"));
         let out = run(&json!({"prompt": "more", "resume": "task-1"}), &mut c);
         assert!(out.is_error);
         assert!(
@@ -1740,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_that_writes_is_partial_at_best() {
+    fn verifier_that_writes_fails() {
         let dir = repo();
         let (mut c, _) = ctx_with(
             &dir,
@@ -1756,9 +2037,9 @@ mod tests {
             cfg(&dir),
         );
         let out = run(&json!({"prompt": "check", "mode": "verify"}), &mut c);
-        assert!(out.text.starts_with("verdict: partial"), "{}", out.text);
+        assert!(out.text.starts_with("verdict: fail"), "{}", out.text);
         assert!(
-            out.text.contains("verifier modified files: tampered.txt"),
+            out.text.contains("tampered: files tampered.txt"),
             "{}",
             out.text
         );
@@ -1822,7 +2103,19 @@ mod tests {
     #[test]
     fn verify_whose_brief_fails_reports_unknown() {
         let dir = repo();
-        let mut c = ctx(&dir);
+        let (mut c, _) = ctx_with(
+            &dir,
+            vec![
+                call(
+                    1,
+                    "bash",
+                    json!({"command": "echo x > new.txt"}),
+                    Usage::default(),
+                ),
+                done_text("digest body"),
+            ],
+            cfg(&dir),
+        );
         let out = run(&json!({"prompt": "w", "mode": "write"}), &mut c);
         assert!(!out.is_error, "{}", out.text);
         let wdir = dir.join("session/subagents/task-1");
@@ -1901,8 +2194,9 @@ mod tests {
     fn consult_cap_refusal_does_not_escalate() {
         let dir = tmpdir();
         let (mut c, mock) = ctx_with(&dir, vec![done_text("advice")], cfg(&dir));
+        // $0.01 can't buy 1,024 standard-tier output tokens.
         let out = run(
-            &json!({"prompt": "q", "mode": "consult", "tier": "light", "max_cost_usd": 0.01}),
+            &json!({"prompt": "q", "mode": "consult", "tier": "standard", "max_cost_usd": 0.01}),
             &mut c,
         );
         assert!(out.text.contains("above its $0.0100 cap"), "{}", out.text);

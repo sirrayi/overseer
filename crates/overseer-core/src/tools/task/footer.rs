@@ -12,6 +12,8 @@ pub struct Footer {
     pub cost_usd: Option<f64>,
     pub status: String,
     pub verdict: Option<String>,
+    /// What a verifier changed in the tree it reviewed (forces `fail`).
+    pub tampered: Option<String>,
     pub trace: String,
 }
 
@@ -30,6 +32,9 @@ impl Footer {
         parts.push(self.status.clone());
         if let Some(v) = &self.verdict {
             parts.push(format!("verdict {v}"));
+        }
+        if let Some(t) = &self.tampered {
+            parts.push(format!("tampered: {t}"));
         }
         parts.push(format!("trace: {}", self.trace));
         format!("[{}]", parts.join(SEP))
@@ -53,6 +58,7 @@ impl Footer {
             cost_usd: None,
             status: String::new(),
             verdict: None,
+            tampered: None,
             trace: String::new(),
         };
         for p in parts {
@@ -60,6 +66,8 @@ impl Footer {
                 f.cost_usd = c.parse().ok();
             } else if let Some(v) = p.strip_prefix("verdict ") {
                 f.verdict = Some(v.to_string());
+            } else if let Some(t) = p.strip_prefix("tampered: ") {
+                f.tampered = Some(t.to_string());
             } else if let Some(t) = p.strip_prefix("trace: ") {
                 f.trace = t.to_string();
             } else {
@@ -97,6 +105,7 @@ mod tests {
             cost_usd: Some(0.0123),
             status: "completed".into(),
             verdict: Some("fail".into()),
+            tampered: Some("HEAD abc→def".into()),
             trace: "/s/subagents/task-3".into(),
         };
         let text = format!("[task-1 · read · light (x) · early]\nbody\n{}", f.render());

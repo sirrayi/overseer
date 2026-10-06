@@ -296,6 +296,28 @@ fn bubblewrap_invocation(
         return None;
     }
     let root = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
+    // Secret masks: a mask that contains the workspace goes under its bind
+    // (the workspace stays visible), one inside it goes on top.
+    let (mut outer, mut inner): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for p in home_secret_paths() {
+        let Ok(p) = p.canonicalize() else {
+            continue;
+        };
+        let into = if root.starts_with(&p) {
+            &mut outer
+        } else {
+            &mut inner
+        };
+        if p.is_dir() {
+            into.extend(["--tmpfs".into(), p.display().to_string()]);
+        } else {
+            into.extend([
+                "--ro-bind".into(),
+                "/dev/null".into(),
+                p.display().to_string(),
+            ]);
+        }
+    }
     let mut args: Vec<String> = vec![
         "--ro-bind".into(),
         "/".into(),
@@ -305,18 +327,41 @@ fn bubblewrap_invocation(
         // writable on top of it.
         "--tmpfs".into(),
         "/tmp".into(),
+    ];
+    args.extend(outer);
+    args.extend([
         "--bind".into(),
         root.display().to_string(),
         root.display().to_string(),
+    ]);
+    args.extend(inner);
+    args.extend([
         "--dev".into(),
         "/dev".into(),
+        // A fresh pid namespace gets its own /proc: host argv stays hidden.
         "--proc".into(),
         "/proc".into(),
         "--unshare-net".into(),
+        "--unshare-pid".into(),
+        "--unshare-ipc".into(),
+        "--new-session".into(),
         "--die-with-parent".into(),
-    ];
+    ]);
     args.extend(argv.iter().cloned());
     Some(("bwrap".into(), args, None))
+}
+
+/// `$HOME`/[`crate::perm::HOME_SECRETS`] — the paths both backends hide.
+#[cfg(target_os = "linux")]
+fn home_secret_paths() -> Vec<std::path::PathBuf> {
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return Vec::new();
+    };
+    let home = std::path::PathBuf::from(home);
+    crate::perm::HOME_SECRETS
+        .iter()
+        .map(|rel| home.join(rel))
+        .collect()
 }
 
 /// macOS Seatbelt profile for `sandbox-exec -p` (P1.5) for `cwd`, the
@@ -375,11 +420,25 @@ fn seatbelt_profile(
             tmp.display()
         ));
     }
+    let reopen_root = crate::perm::HOME_SECRETS
+        .iter()
+        .any(|rel| root.starts_with(home.join(rel)));
     let (home, root, tmp) = (
         lit(home, "HOME")?,
         lit(root, "workspace")?,
         lit(tmp, "temp")?,
     );
+    let deny_read: String = crate::perm::HOME_SECRETS
+        .iter()
+        .map(|rel| format!(" (subpath \"{home}/{rel}\")"))
+        .collect();
+    // A workspace inside a denied dir (a writer worktree under
+    // ~/.overseer) must stay readable: the later allow re-opens it.
+    let reopen = if reopen_root {
+        format!("(allow file-read* (subpath \"{root}\"))\n")
+    } else {
+        String::new()
+    };
     Ok(format!(
         "(version 1)\n\
          (deny default)\n\
@@ -390,8 +449,8 @@ fn seatbelt_profile(
          (allow file-read*)\n\
          (allow file-write* (subpath \"{root}\") (subpath \"/private/tmp\") \
          (subpath \"{tmp}\") (literal \"/dev/null\") (literal \"/dev/tty\"))\n\
-         (deny file-read* (subpath \"{home}/.ssh\") (subpath \"{home}/.aws\") \
-         (subpath \"{home}/.gnupg\") (subpath \"{home}/.kube\") (subpath \"{home}/.docker\"))\n\
+         (deny file-read*{deny_read})\n\
+         {reopen}\
          (deny network*)\n"
     ))
 }

@@ -175,7 +175,14 @@ pub fn ensure_persona_dir(dir: &Path) -> std::io::Result<PathBuf> {
     for file in PERSONA_FILES {
         let path = dir.join(file);
         if !path.exists() {
-            std::fs::write(&path, render(&PersonaMeta::default(), &seed_body(file)))?;
+            // temp + rename: a dangling symlink is replaced, never
+            // written through.
+            crate::memory::store_write(
+                dir,
+                file,
+                render(&PersonaMeta::default(), &seed_body(file)).as_bytes(),
+            )
+            .map_err(std::io::Error::other)?;
         }
     }
     Ok(dir.to_path_buf())
@@ -187,7 +194,7 @@ pub fn statuses(dir: &Path) -> Vec<(&'static str, PersonaMeta)> {
     PERSONA_FILES
         .iter()
         .map(|file| {
-            let meta = std::fs::read_to_string(dir.join(file))
+            let meta = crate::tools::read_no_follow(&dir.join(file))
                 .ok()
                 .and_then(|t| parse_frontmatter(&t).ok().map(|(m, _)| m))
                 .unwrap_or_default();
@@ -228,7 +235,7 @@ pub fn persona_body(dir: &Path) -> String {
     }
     let mut parts: Vec<String> = Vec::new();
     for file in PERSONA_FILES {
-        let Ok(text) = std::fs::read_to_string(dir.join(file)) else {
+        let Ok(text) = crate::tools::read_no_follow(&dir.join(file)) else {
             continue;
         };
         let Ok((_, body)) = parse_frontmatter(&text) else {
@@ -269,8 +276,9 @@ pub fn approve(dir: &Path) -> std::io::Result<Vec<&'static str>> {
     let _lock = crate::memory::StoreLock::acquire(dir)?;
     let mut changed = Vec::new();
     for file in PERSONA_FILES {
-        let path = dir.join(file);
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        // O_NOFOLLOW: a symlinked persona file is never read through —
+        // it stays a draft and is skipped rather than flipped.
+        let Ok(text) = crate::tools::read_no_follow(&dir.join(file)) else {
             continue;
         };
         let (mut meta, body) = parse_frontmatter(&text).map_err(std::io::Error::other)?;
@@ -278,7 +286,8 @@ pub fn approve(dir: &Path) -> std::io::Result<Vec<&'static str>> {
             continue;
         }
         meta.status = Status::Approved;
-        std::fs::write(&path, render(&meta, &body))?;
+        crate::memory::store_write(dir, file, render(&meta, &body).as_bytes())
+            .map_err(std::io::Error::other)?;
         changed.push(file);
     }
     crate::memory::commit(dir, "persona approved");
@@ -409,7 +418,10 @@ pub fn write_drafts(
             status: Status::Draft,
             source_answers,
         };
-        std::fs::write(dir.join(file), render(&meta, &body))?;
+        // temp + rename over the target: a symlinked persona file is
+        // replaced by a regular file, never written through.
+        crate::memory::store_write(dir, file, render(&meta, &body).as_bytes())
+            .map_err(std::io::Error::other)?;
         wrote += insights.len();
     }
     crate::memory::commit(dir, "onboard draft");
@@ -425,8 +437,8 @@ pub fn verify_trace(dir: &Path, answers: usize) -> Result<usize, Vec<String>> {
     let mut orphans: Vec<String> = Vec::new();
     let mut traced = 0usize;
     for file in PERSONA_FILES {
-        let Ok(text) = std::fs::read_to_string(dir.join(file)) else {
-            continue; // a missing file has nothing to trace
+        let Ok(text) = crate::tools::read_no_follow(&dir.join(file)) else {
+            continue; // a missing or symlinked file has nothing to trace
         };
         let (meta, body) = match parse_frontmatter(&text) {
             Ok(v) => v,

@@ -480,7 +480,7 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
                 link: Some(std::path::PathBuf::from(trace)),
             }])
         }
-        EventKind::Tainted { detail } => Feed::NewCells(vec![Cell::Meta {
+        EventKind::Tainted { detail, .. } => Feed::NewCells(vec![Cell::Meta {
             style: theme::warn(),
             text: format!("  ! {detail} — side effects now ask first"),
             link: None,

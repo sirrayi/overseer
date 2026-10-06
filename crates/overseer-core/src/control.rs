@@ -11,7 +11,7 @@
 //! paired with a result). A single in-flight tool is never killed —
 //! interrupt lands at the next launch boundary.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -26,12 +26,68 @@ pub struct Control {
 struct Inner {
     interrupt: Arc<AtomicBool>,
     steer: Mutex<VecDeque<String>>,
+    /// Subagent handles by task id: an interrupt here fans out to them.
+    children: Mutex<BTreeMap<String, Control>>,
 }
 
 impl Control {
     /// Request the run to stop at the next safe boundary.
+    /// Fans out to every registered child (hierarchical cancel).
     pub fn interrupt(&self) {
         self.inner.interrupt.store(true, Ordering::SeqCst);
+        for child in self.children() {
+            child.interrupt();
+        }
+    }
+
+    fn children(&self) -> Vec<Control> {
+        self.inner
+            .children
+            .lock()
+            .map(|c| c.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// A fresh handle for subagent `id`, registered so this handle's
+    /// interrupt reaches it. Born interrupted when this one already is.
+    pub fn child(&self, id: &str) -> Control {
+        let c = Control::default();
+        if let Ok(mut m) = self.inner.children.lock() {
+            m.insert(id.to_string(), c.clone());
+        }
+        if self.interrupted() {
+            c.interrupt();
+        }
+        c
+    }
+
+    /// The registered handle of subagent `id`.
+    pub fn child_of(&self, id: &str) -> Option<Control> {
+        self.inner.children.lock().ok()?.get(id).cloned()
+    }
+
+    /// Drop subagent `id`'s registration (it finished).
+    pub fn forget(&self, id: &str) {
+        if let Ok(mut m) = self.inner.children.lock() {
+            m.remove(id);
+        }
+    }
+
+    /// Take over `other`'s children — a frontend that swaps in a new
+    /// handle per run still reaches background tasks of earlier runs.
+    pub fn adopt(&self, other: &Control) {
+        if Arc::ptr_eq(&self.inner, &other.inner) {
+            return;
+        }
+        let kids: Vec<(String, Control)> = other
+            .inner
+            .children
+            .lock()
+            .map(|c| c.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        if let Ok(mut m) = self.inner.children.lock() {
+            m.extend(kids);
+        }
     }
 
     pub fn interrupted(&self) -> bool {
@@ -100,6 +156,26 @@ mod tests {
         assert!(!c.interrupted());
         clone.interrupt();
         assert!(c.interrupted());
+    }
+
+    #[test]
+    fn interrupt_fans_out_to_children() {
+        let parent = Control::default();
+        let a = parent.child("task-1");
+        let grand = a.child("task-1");
+        let b = parent.child("task-2");
+        parent.forget("task-2");
+        parent.interrupt();
+        assert!(a.interrupted() && grand.interrupted());
+        assert!(!b.interrupted(), "a forgotten child is not reached");
+        let next = Control::default();
+        let c = parent.child("task-3");
+        next.adopt(&parent);
+        assert!(next.child_of("task-3").is_some());
+        assert!(
+            c.interrupted(),
+            "born interrupted under an interrupted parent"
+        );
     }
 
     #[test]

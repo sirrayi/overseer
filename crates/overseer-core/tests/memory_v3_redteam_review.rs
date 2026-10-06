@@ -238,7 +238,9 @@ fn injected_tool_call(id: &str) -> Response {
 #[test]
 fn c1_later_clean_window_in_tainted_session_stays_quarantined() {
     let dir = tmpdir("c1");
-    let cfg = learn_cfg(&dir);
+    // A haiku review keeps both reviews inside the review share.
+    let mut cfg = learn_cfg(&dir);
+    cfg.small_model = Some("claude-haiku-4-5".into());
     let provider = Script::new(
         vec![injected_tool_call("t1"), text("read it"), text("noted")],
         vec![
@@ -917,6 +919,7 @@ fn h_fifty_signal_turns_cost_ratio() {
         main.len(),
         rc / mc
     );
+    assert!(rc / mc <= 0.27, "review/main spend {:.3} > 0.27", rc / mc);
     assert_eq!(rev.len(), p.review_calls());
 }
 

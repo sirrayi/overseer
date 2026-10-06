@@ -18,12 +18,13 @@ pub(crate) fn gateway_args(argv: &[String], extra: &[Flag]) -> Result<Parsed, St
     args::parse(argv, &table)
 }
 
-/// `--dir <d>`, else `~/.overseer/daemon`.
+/// `--dir <d>`, else `$OVERSEER_HOME/daemon` (default `~/.overseer/daemon`).
 pub(crate) fn daemon_dirs(parsed: &Parsed) -> DaemonDirs {
-    let dir = parsed
-        .value("--dir")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dirs_home().join("daemon"));
+    let dir = parsed.value("--dir").map(PathBuf::from).unwrap_or_else(|| {
+        overseer_core::memory::overseer_home()
+            .unwrap_or_else(dirs_home)
+            .join("daemon")
+    });
     DaemonDirs::new(dir)
 }
 

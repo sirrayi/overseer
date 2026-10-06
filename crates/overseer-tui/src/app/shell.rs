@@ -12,17 +12,67 @@ pub fn line_shell(cmd: &str, cwd: &str) -> (i32, String) {
 /// output). The `!` composer prefix is a local escape hatch — its
 /// output is transcript-only, never submitted to the model.
 pub(crate) fn shell_capture(cmd: &str, cwd: &str) -> std::io::Result<(i32, String)> {
-    shell_capture_timeout(cmd, cwd, Duration::from_secs(10))
+    shell_capture_timeout(cmd, cwd, SHELL_CAP)
 }
 
-/// The cap is a parameter so tests don't wait 10 s. On timeout the
-/// child is killed AND reaped — the old version left `sleep`-style
-/// children running past the cap.
+const SHELL_CAP: Duration = Duration::from_secs(10);
+
+/// How long the reader joins wait for EOF once the group is dead.
+const JOIN_GRACE: Duration = Duration::from_millis(500);
+
+const BG_NOTE: &str = "(still running in the background)";
+
+/// The cap is a parameter so tests don't wait 10 s. The child gets its
+/// own process group and the whole group is killed on completion or
+/// timeout; a process that left the group (`setsid`, double fork) and
+/// still holds the pipes is reported as running in the background.
 pub(crate) fn shell_capture_timeout(
     cmd: &str,
     cwd: &str,
     cap: Duration,
 ) -> std::io::Result<(i32, String)> {
+    let c = capture(cmd, cwd, cap)?;
+    let mut text = c.text;
+    if c.background {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(BG_NOTE);
+        text.push('\n');
+    }
+    Ok((c.code, text))
+}
+
+pub(crate) struct Captured {
+    pub code: i32,
+    pub text: String,
+    /// A process outside the group still holds stdout/stderr.
+    pub background: bool,
+}
+
+/// Drain one pipe into `buf`, signalling `done` at EOF.
+fn drain(
+    pipe: Option<impl Read + Send + 'static>,
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: mpsc::Sender<()>,
+) {
+    std::thread::spawn(move || {
+        if let Some(mut p) = pipe {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match p.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        let _ = done.send(());
+    });
+}
+
+pub(crate) fn capture(cmd: &str, cwd: &str, cap: Duration) -> std::io::Result<Captured> {
     // A stale cwd (deleted checkout) must not kill the shell escape —
     // fall back to the process cwd.
     let dir = if std::path::Path::new(cwd).is_dir() {
@@ -38,41 +88,34 @@ pub(crate) fn shell_capture_timeout(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // Own process group: dash keeps `sleep`-style children (and any
-        // pipeline) as separate processes, so killing only `sh` orphans
-        // grandchildren that hold the pipe write ends — the reader
-        // joins below would block until they exit on their own.
+        // pipeline or `&` job) as separate processes, so killing only
+        // `sh` orphans grandchildren that hold the pipe write ends.
         .process_group(0)
         .spawn()?;
-    // Reader threads drain the pipes so a chatty child never
-    // blocks on a full buffer while we poll try_wait.
-    let mut out_pipe = child.stdout.take();
-    let mut err_pipe = child.stderr.take();
-    let out_t = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        if let Some(p) = out_pipe.as_mut() {
-            let _ = p.read_to_end(&mut v);
-        }
-        v
-    });
-    let err_t = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        if let Some(p) = err_pipe.as_mut() {
-            let _ = p.read_to_end(&mut v);
-        }
-        v
-    });
+    let pgid = child.id() as libc::pid_t;
+    // Reader threads drain the pipes so a chatty child never blocks
+    // on a full buffer while we poll try_wait. They report through a
+    // channel so the join below can give up on a pipe an escaped
+    // process keeps open.
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let err_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (done_tx, done_rx) = mpsc::channel();
+    drain(child.stdout.take(), out_buf.clone(), done_tx.clone());
+    drain(child.stderr.take(), err_buf.clone(), done_tx);
     let deadline = Instant::now() + cap;
-    // None = hit the cap: kill + reap so the child can't outlive us.
+    // None = hit the cap.
     let code = loop {
         match child.try_wait()? {
-            Some(status) => break Some(status.code().unwrap_or(-1)),
+            Some(status) => {
+                // `sh` is done; anything it left in the group (`cmd &`)
+                // goes with it so the pipes can close.
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+                break Some(status.code().unwrap_or(-1));
+            }
             None if Instant::now() >= deadline => {
-                // Kill the whole group (pgid == child.id() because of
-                // process_group(0)); ESRCH means it already exited, so
-                // also kill the child itself as a fallback. Once every
-                // group member is dead the pipes EOF and the reader
-                // joins return promptly.
-                unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+                // Kill the group before reaping `sh` (its pid can't be
+                // reused while unreaped); kill the child as a fallback.
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -80,10 +123,25 @@ pub(crate) fn shell_capture_timeout(
             None => std::thread::sleep(Duration::from_millis(5)),
         }
     };
-    let stdout = out_t.join().unwrap_or_default();
-    let stderr = err_t.join().unwrap_or_default();
-    match code {
-        Some(code) => {
+    let now = Instant::now();
+    let join_by = if code.is_some() {
+        (now + JOIN_GRACE).min(deadline.max(now))
+    } else {
+        now + JOIN_GRACE
+    };
+    let mut open = 2;
+    while open > 0 {
+        let rem = join_by.saturating_duration_since(Instant::now());
+        match done_rx.recv_timeout(rem) {
+            Ok(()) => open -= 1,
+            Err(_) => break,
+        }
+    }
+    let background = open > 0;
+    let stdout = std::mem::take(&mut *out_buf.lock().unwrap());
+    let stderr = std::mem::take(&mut *err_buf.lock().unwrap());
+    let text = match code {
+        Some(_) => {
             let mut text = String::from_utf8_lossy(&stdout).into_owned();
             let err = String::from_utf8_lossy(&stderr);
             if !err.trim().is_empty() {
@@ -92,10 +150,15 @@ pub(crate) fn shell_capture_timeout(
                 }
                 text.push_str(&err);
             }
-            Ok((code, text.chars().take(8192).collect()))
+            text.chars().take(8192).collect()
         }
-        None => Ok((-1, format!("(timed out after {cap:?})"))),
-    }
+        None => format!("(timed out after {cap:?})"),
+    };
+    Ok(Captured {
+        code: code.unwrap_or(-1),
+        text,
+        background,
+    })
 }
 
 impl App {
@@ -107,17 +170,26 @@ impl App {
             text: format!("$ {cmd}"),
             link: None,
         });
-        match shell_capture(cmd, &self.cwd) {
-            Ok((code, out)) => {
+        match capture(cmd, &self.cwd, SHELL_CAP) {
+            Ok(Captured {
+                code,
+                text: out,
+                background,
+            }) => {
                 let tail: String = out.lines().take(24).collect::<Vec<_>>().join("\n");
                 let suffix = if out.len() > 8192 { "…" } else { "" };
+                let bg = if background {
+                    format!("\n{BG_NOTE}")
+                } else {
+                    String::new()
+                };
                 self.pending.push(Cell::Meta {
                     style: if code == 0 {
                         crate::theme::dim()
                     } else {
                         crate::theme::error()
                     },
-                    text: format!("{tail}{suffix}\n(exit {code})"),
+                    text: format!("{tail}{suffix}{bg}\n(exit {code})"),
                     link: None,
                 });
             }

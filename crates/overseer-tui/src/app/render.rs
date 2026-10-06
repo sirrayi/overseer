@@ -162,7 +162,7 @@ impl App {
         // A modal overlay owns the whole live region — nothing else
         // competes for its rows. An open permission dialog outranks it
         // (the engine is blocked on that answer).
-        if self.dialog.is_none() {
+        if self.overlay_shown() {
             if let Some(o) = &self.overlay {
                 // Full mode gives Panel its own bottom band — rendering
                 // it here would double it inside the transcript region.
@@ -399,7 +399,7 @@ impl App {
         } else {
             None
         };
-        let overlay_len = if self.dialog.is_none() && !panel_open && self.overlay.is_some() {
+        let overlay_len = if self.overlay_shown() && !panel_open && self.overlay.is_some() {
             live.len() - usize::from(self.toast.is_some())
         } else {
             0

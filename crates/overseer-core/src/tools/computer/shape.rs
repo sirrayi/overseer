@@ -135,6 +135,8 @@ pub struct Element {
     pub index: i64,
     pub token: Option<String>,
     pub role: String,
+    /// macOS `AXSubrole` when the driver reports one (`AXDialog`, …).
+    pub subrole: Option<String>,
     pub label: String,
     pub value: Option<String>,
     pub actions: Vec<String>,
@@ -147,70 +149,107 @@ pub struct Element {
 }
 
 /// Parse `structuredContent.elements[]` defensively: missing fields become
-/// defaults and unknown keys are ignored — the driver may add fields.
-pub fn parse_elements(result: &Value) -> Vec<Element> {
-    result
+/// defaults and unknown keys are ignored — the driver may add fields. At
+/// most `cap` elements are parsed (P7 intake cap: `limit × 4`); the second
+/// value is how many the driver returned in total.
+pub fn parse_elements(result: &Value, cap: usize) -> (Vec<Element>, usize) {
+    let Some(els) = result
         .pointer("/structuredContent/elements")
         .or_else(|| result.get("elements"))
         .and_then(Value::as_array)
-        .map(|els| {
-            els.iter()
-                .map(|e| Element {
-                    index: e
-                        .get("element_index")
-                        .and_then(Value::as_i64)
-                        .or_else(|| e.get("index").and_then(Value::as_i64))
-                        .unwrap_or(-1),
-                    token: s(e, &["element_token", "token"]).map(str::to_string),
-                    role: s(e, &["role"]).unwrap_or("").to_string(),
-                    label: s(e, &["label", "name"]).unwrap_or("").to_string(),
-                    value: e.get("value").and_then(|v| match v {
-                        Value::Null => None,
-                        Value::String(t) if t.is_empty() => None,
-                        Value::String(t) => Some(t.clone()),
-                        other => Some(other.to_string()),
-                    }),
-                    actions: e
-                        .get("actions")
-                        .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    depth: e.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize,
-                    parent: e
-                        .get("parent_index")
-                        .or_else(|| e.get("parent"))
-                        .and_then(Value::as_i64),
-                    #[cfg(test)]
-                    frame: e.get("frame").and_then(|f| {
-                        Some((
-                            f.get("x").and_then(Value::as_f64)?,
-                            f.get("y").and_then(Value::as_f64)?,
-                            f.get("w")
-                                .or_else(|| f.get("width"))
-                                .and_then(Value::as_f64)?,
-                            f.get("h")
-                                .or_else(|| f.get("height"))
-                                .and_then(Value::as_f64)?,
-                        ))
-                    }),
+    else {
+        return (Vec::new(), 0);
+    };
+    let parsed = els
+        .iter()
+        .take(cap)
+        .map(|e| Element {
+            index: e
+                .get("element_index")
+                .and_then(Value::as_i64)
+                .or_else(|| e.get("index").and_then(Value::as_i64))
+                .unwrap_or(-1),
+            token: s(e, &["element_token", "token"]).map(str::to_string),
+            role: s(e, &["role"]).unwrap_or("").to_string(),
+            subrole: s(e, &["subrole"]).map(str::to_string),
+            label: s(e, &["label", "name"]).unwrap_or("").to_string(),
+            value: e.get("value").and_then(|v| match v {
+                Value::Null => None,
+                Value::String(t) if t.is_empty() => None,
+                Value::String(t) => Some(t.clone()),
+                other => Some(other.to_string()),
+            }),
+            actions: e
+                .get("actions")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
                 })
-                .collect()
+                .unwrap_or_default(),
+            depth: e.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize,
+            parent: e
+                .get("parent_index")
+                .or_else(|| e.get("parent"))
+                .and_then(Value::as_i64),
+            #[cfg(test)]
+            frame: e.get("frame").and_then(|f| {
+                Some((
+                    f.get("x").and_then(Value::as_f64)?,
+                    f.get("y").and_then(Value::as_f64)?,
+                    f.get("w")
+                        .or_else(|| f.get("width"))
+                        .and_then(Value::as_f64)?,
+                    f.get("h")
+                        .or_else(|| f.get("height"))
+                        .and_then(Value::as_f64)?,
+                ))
+            }),
         })
-        .unwrap_or_default()
+        .collect();
+    (parsed, els.len())
 }
 
-/// `observe` render (D4): `[idx] role "label" = value  {actions}`, two
-/// spaces per depth level, capped at `limit` rendered lines. Unlabeled,
-/// action-less containers are dropped unless a kept element sits below
-/// them — they only matter as ancestry. Ends with the truncation line
-/// when the tree is bigger than what is shown.
+/// The driver's own element total (covers server-side truncation).
+pub fn total_count(result: &Value) -> Option<u64> {
+    result
+        .pointer("/structuredContent/total_element_count")
+        .or_else(|| result.pointer("/structuredContent/element_count"))
+        .and_then(Value::as_u64)
+}
+
+/// [`render`] over a raw result with element indices as the marks.
+#[cfg(test)]
 pub fn elements(result: &Value, limit: usize) -> String {
-    let els = parse_elements(result);
+    let (els, _) = parse_elements(result, usize::MAX);
+    let marks: Vec<String> = els.iter().map(|e| e.index.to_string()).collect();
+    render(&els, &marks, total_count(result), limit)
+}
+
+/// One element's line body (no indent, no actions): `[mark] role "label"
+/// = "value"` — the unit observe renders and the post-act diff compares.
+pub fn line(e: &Element, mark: &str) -> String {
+    let value = e
+        .value
+        .as_deref()
+        .map(|v| format!(" = \"{}\"", sanitize(v)))
+        .unwrap_or_default();
+    format!(
+        "[{mark}] {} \"{}\"{value}",
+        sanitize(&e.role),
+        sanitize(&e.label)
+    )
+}
+
+/// `observe` render (D4): `[mark] role "label" = value  {actions}`, two
+/// spaces per depth level, capped at `limit` rendered lines. `marks[i]`
+/// is element `i`'s mark (P2). Unlabeled, action-less containers are
+/// dropped unless a kept element sits below them — they only matter as
+/// ancestry. Ends with the truncation line when the tree is bigger than
+/// what is shown (`total` = the driver's element count).
+pub fn render(els: &[Element], marks: &[String], total: Option<u64>, limit: usize) -> String {
     if els.is_empty() {
         return "(no elements)".to_string();
     }
@@ -241,7 +280,7 @@ pub fn elements(result: &Value, limit: usize) -> String {
     let mut shown = 0usize;
     let mut hidden_kept = 0usize;
     let kept_total = kept.iter().filter(|&&k| k).count();
-    for (e, &keep) in els.iter().zip(kept.iter()) {
+    for (i, (e, &keep)) in els.iter().zip(kept.iter()).enumerate() {
         if !keep {
             continue;
         }
@@ -250,11 +289,6 @@ pub fn elements(result: &Value, limit: usize) -> String {
             continue;
         }
         let indent = "  ".repeat(e.depth.min(20));
-        let value = e
-            .value
-            .as_deref()
-            .map(|v| format!(" = \"{}\"", sanitize(v)))
-            .unwrap_or_default();
         let actions = if e.actions.is_empty() {
             String::new()
         } else {
@@ -267,22 +301,13 @@ pub fn elements(result: &Value, limit: usize) -> String {
                     .join(", ")
             )
         };
-        out.push_str(&format!(
-            "{indent}[{}] {} \"{}\"{value}{actions}\n",
-            e.index,
-            sanitize(&e.role),
-            sanitize(&e.label)
-        ));
+        out.push_str(&format!("{indent}{}{actions}\n", line(e, &marks[i])));
         shown += 1;
     }
     // How much the model is not seeing: our own line cap, plus whatever the
     // driver truncated server-side (`total_element_count` covers both).
     let mut more = hidden_kept;
-    if let Some(total) = result
-        .pointer("/structuredContent/total_element_count")
-        .or_else(|| result.pointer("/structuredContent/element_count"))
-        .and_then(Value::as_u64)
-    {
+    if let Some(total) = total {
         more = more.max((total as usize).saturating_sub(shown));
     }
     let _ = kept_total;

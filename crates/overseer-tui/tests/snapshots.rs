@@ -352,15 +352,16 @@ fn rewind_picker_lists_checkpoints() {
     let (mut app, _e, wrx, mut term, caps, root) = session_harness();
     // A checkpoint on e2 (the user input in s1's log). The manifest
     // path must resolve under the session's recorded cwd (/repo) —
-    // S1/C7 refuses out-of-workspace paths before touching the fs. The
-    // copy target can't exist outside a real workspace, so the fixture
-    // restores 0 files but the picker + SwitchSession flow is intact.
+    // S1/C7 refuses out-of-workspace paths before touching the fs. A
+    // copy into /repo would fail (and restore now reports failed
+    // copies), so the entry is a created-then-gone file: nothing to
+    // restore or delete, but the picker + SwitchSession flow is intact.
     let cp = root.join("s1/checkpoints/e2/files");
     std::fs::create_dir_all(&cp).unwrap();
     std::fs::write(cp.join("f0"), "snapshot").unwrap();
     std::fs::write(
         root.join("s1/checkpoints/e2/manifest.jsonl"),
-        "{\"path\":\"/repo/x.txt\",\"stored\":\"f0\",\"existed\":true}\n",
+        "{\"path\":\"/repo/x.txt\",\"stored\":\"f0\",\"existed\":false}\n",
     )
     .unwrap();
     app.submit_text("/rewind");
@@ -668,10 +669,14 @@ fn bang_shell_is_local_only() {
 /// completes the path into the composer.
 #[test]
 fn at_mention_completes_paths() {
-    let root = std::env::temp_dir().join(format!("overseer-tui-at-{}", std::process::id()));
+    // Fixed child name under a per-process parent: the rendered root is
+    // swapped for one stable token, so neither TMPDIR nor the pid shows.
+    let parent = std::env::temp_dir().join(format!("overseer-tui-at-{}", std::process::id()));
+    let root = parent.join("root");
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(root.join("README.md"), "x\n").unwrap();
+    let root_s = root.display().to_string();
 
     let (etx, erx) = mpsc::channel();
     let (wtx, _wrx) = mpsc::channel();
@@ -679,15 +684,16 @@ fn at_mention_completes_paths() {
         erx,
         wtx,
         Preset::WorkspaceWrite,
-        root.display().to_string(),
+        root_s.clone(),
         "test-model".into(),
         root.join("session"),
     );
     let _ = etx;
-    // Wide enough that the status line never truncates the cwd — at 60
-    // cols a long TMPDIR prefix is cut BEFORE `norm` can replace it,
-    // making the snapshot depend on the host's temp-dir length.
-    let mut backend = TestBackend::new(140, 20);
+    // Width grows with the root so the status line never truncates it:
+    // the token replaces the whole root before any cut could apply, on
+    // any host's temp-dir shape (macOS /var/folders/…, Linux /tmp).
+    let width = u16::try_from(root_s.chars().count() + 60).unwrap();
+    let mut backend = TestBackend::new(width, 20);
     backend.set_cursor_position((0, 10)).unwrap();
     let mut term = Terminal::with_options(
         backend,
@@ -698,24 +704,16 @@ fn at_mention_completes_paths() {
     .unwrap();
     let caps = Caps::default();
 
-    // Normalize the temp-dir prefix and the pid-bearing dirname; the
-    // status line's pad before the right block is computed from the RAW
-    // cwd length, so also collapse that gap — otherwise TMPDIR length
-    // shifts the layout and the snapshot is host-dependent.
-    let tmp = std::env::temp_dir()
-        .display()
-        .to_string()
-        .trim_end_matches('/')
-        .to_string();
-    let dirname = root.file_name().unwrap().to_str().unwrap().to_string();
+    // The status line pads from the RAW cwd length to the right block, so
+    // collapse that gap to one space — the layout is then host-independent.
+    const TOKEN: &str = "[root]";
     let norm = move |t: &Terminal<TestBackend>| {
         screen(t)
-            .replace(&tmp, "[tmp]")
-            .replace(&dirname, "[root]")
+            .replace(&root_s, TOKEN)
             .lines()
-            .map(|l| match (l.find("[tmp]/[root]"), l.find("test-model")) {
+            .map(|l| match (l.find(TOKEN), l.find("test-model")) {
                 (Some(i), Some(j)) if i < j => {
-                    format!("{} {}", &l[..i + "[tmp]/[root]".len()], &l[j..])
+                    format!("{} {}", &l[..i + TOKEN.len()], &l[j..])
                 }
                 _ => l.to_string(),
             })
@@ -736,7 +734,7 @@ fn at_mention_completes_paths() {
     ));
     app.step(&mut term, &caps).unwrap();
     insta::assert_snapshot!("at_completed", norm(&term));
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&parent);
 }
 
 // ── full-window surface: transcript + 2-row prompt + 1-row footer ──

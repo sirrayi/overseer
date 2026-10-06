@@ -147,12 +147,21 @@ pub struct ModelProfile {
 }
 
 impl ModelProfile {
+    /// The model reasons by default (an effort/thinking-config knob, not
+    /// Anthropic's opt-in `thinking` budget): its replies can spend the
+    /// whole `max_tokens` on reasoning before any text.
+    pub fn reasons(&self) -> bool {
+        self.accepted_params
+            .iter()
+            .any(|p| *p == "reasoning_effort" || *p == "thinkingConfig")
+    }
+
     pub fn cost_usd(&self, u: &crate::ir::Usage) -> f64 {
         let per_m = 1_000_000.0;
         (u.fresh_input as f64 * self.price.input
             + u.cache_write as f64 * self.price.cache_write
             + u.cache_read as f64 * self.price.cache_read
-            + (u.output + u.reasoning) as f64 * self.price.output)
+            + u.output.saturating_add(u.reasoning) as f64 * self.price.output)
             / per_m
     }
 }
