@@ -141,20 +141,65 @@ fn restore_files(session_dir: &Path, boundary: u64, report: &mut Report) -> std:
         }
         plan.push((dst, stored, existed));
     }
+    let mut failed: Vec<String> = Vec::new();
     for (dst, stored, existed) in plan {
+        if let Some(link) = symlinked_parent(&root, &dst) {
+            failed.push(format!(
+                "{} (parent {} is a symlink)",
+                dst.display(),
+                link.display()
+            ));
+            continue;
+        }
+        let is_link = std::fs::symlink_metadata(&dst).is_ok_and(|m| m.file_type().is_symlink());
         if existed {
             let src = cp_dir.join("files").join(&stored);
             if let Some(parent) = dst.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    failed.push(format!("{} ({e})", dst.display()));
+                    continue;
+                }
             }
-            if std::fs::copy(&src, &dst).is_ok() {
-                report.restored += 1;
+            // Never write through a link: unlink it, then write a
+            // regular file in its place.
+            if is_link {
+                if let Err(e) = std::fs::remove_file(&dst) {
+                    failed.push(format!("{} (cannot unlink symlink: {e})", dst.display()));
+                    continue;
+                }
             }
-        } else if std::fs::remove_file(&dst).is_ok() {
-            report.deleted += 1;
+            match std::fs::copy(&src, &dst) {
+                Ok(_) => report.restored += 1,
+                Err(e) => failed.push(format!("{} ({e})", dst.display())),
+            }
+        } else {
+            match std::fs::remove_file(&dst) {
+                Ok(()) => report.deleted += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => failed.push(format!("{} (cannot delete: {e})", dst.display())),
+            }
         }
     }
+    if !failed.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "rewind: restored {} and deleted {}, but could not restore: {}",
+            report.restored,
+            report.deleted,
+            failed.join(", ")
+        )));
+    }
     Ok(())
+}
+
+/// The first component strictly between `root` and `dst` that is a
+/// symlink, if any — restore refuses paths routed through a link.
+fn symlinked_parent(root: &Path, dst: &Path) -> Option<PathBuf> {
+    let parent = dst.parent()?;
+    parent
+        .ancestors()
+        .take_while(|a| *a != root && a.starts_with(root))
+        .find(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink()))
+        .map(Path::to_path_buf)
 }
 
 /// The workspace root a session's manifest paths must stay under: the cwd
@@ -183,7 +228,8 @@ fn workspace_root(session_dir: &Path) -> std::io::Result<PathBuf> {
 
 /// Resolve a manifest `path` the way `tools::snapshot` records it
 /// (relative → anchored at the workspace, `.`/`..` folded), then resolve
-/// symlinks through the deepest existing ancestor. `Some` only when the
+/// symlinks through the deepest existing ancestor of its parent (the
+/// final component stays as named). `Some` only when the
 /// result lies under `root`; the returned path is the one fs ops use.
 fn resolve_in_workspace(root: &Path, raw: &str) -> Option<PathBuf> {
     use std::path::Component;
@@ -205,7 +251,10 @@ fn resolve_in_workspace(root: &Path, raw: &str) -> Option<PathBuf> {
             other => norm.push(other.as_os_str()),
         }
     }
-    let mut base = norm.as_path();
+    // The final component is never resolved: restore must act on the
+    // path itself (a symlink there is replaced, not followed).
+    let name = norm.file_name()?.to_os_string();
+    let mut base = norm.parent()?;
     let mut rest = Vec::new();
     let mut full = loop {
         if let Ok(c) = base.canonicalize() {
@@ -217,6 +266,7 @@ fn resolve_in_workspace(root: &Path, raw: &str) -> Option<PathBuf> {
     for r in rest.iter().rev() {
         full.push(r);
     }
+    full.push(name);
     full.starts_with(root).then_some(full)
 }
 

@@ -252,25 +252,84 @@ fn summarize(dir: &Path) -> Result<Option<SessionInfo>, String> {
     Ok(Some(info))
 }
 
-/// First 32 KiB + last 32 KiB of a large log — enough for SessionStart,
-/// first user input, and the tail timestamp. Line-count is approximate
-/// (deliberately — the picker never shows exact counts).
+/// First 32 KiB of a large log plus its tail back to the start of the
+/// last complete line — enough for SessionStart, first user input, and
+/// the final timestamp however large the final event is. The tail is
+/// found by reading backwards in 64 KiB chunks, up to 8 MiB. Line-count
+/// is approximate (deliberately — the picker never shows exact counts).
 fn head_and_tail(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
+    const SLICE: u64 = 32 * 1024;
+    const CHUNK: u64 = 64 * 1024;
+    const TAIL_MAX: u64 = 8 * 1024 * 1024;
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
-    const SLICE: u64 = 32 * 1024;
     let mut text = String::new();
     let mut head = vec![0u8; SLICE.min(len) as usize];
     f.read_exact(&mut head).ok()?;
     text.push_str(&String::from_utf8_lossy(&head));
     if len > SLICE {
-        f.seek(SeekFrom::End(-(SLICE as i64))).ok()?;
-        let mut tail = Vec::new();
-        f.read_to_end(&mut tail).ok()?;
+        let mut tail: Vec<u8> = Vec::new();
+        let mut start = len;
+        let floor = len.saturating_sub(TAIL_MAX).max(SLICE);
+        loop {
+            let from = start.saturating_sub(CHUNK).max(floor);
+            let mut buf = vec![0u8; (start - from) as usize];
+            f.seek(SeekFrom::Start(from)).ok()?;
+            f.read_exact(&mut buf).ok()?;
+            buf.extend_from_slice(&tail);
+            tail = buf;
+            start = from;
+            if let Some(cut) = last_complete_line_start(&tail) {
+                tail.drain(..cut);
+                break;
+            }
+            if start == floor {
+                break;
+            }
+        }
+        text.push('\n');
         text.push_str(&String::from_utf8_lossy(&tail));
     }
     Some(text)
+}
+
+/// Offset in `buf` where its last complete (`\n`-terminated) line
+/// starts, when a newline before it proves the line is whole.
+fn last_complete_line_start(buf: &[u8]) -> Option<usize> {
+    let end = buf.iter().rposition(|b| *b == b'\n')?;
+    buf[..end].iter().rposition(|b| *b == b'\n').map(|i| i + 1)
+}
+
+/// A cut inside a tool batch (after the `ModelResponse` that issued
+/// calls, before all their results) snaps back to just before that
+/// response, so the fork never holds a `tool_use` without its result.
+fn snap_out_of_batch(events: &[crate::event::Event], boundary: u64) -> u64 {
+    let mut cut = boundary;
+    for e in events.iter().filter(|e| e.id <= boundary) {
+        let EventKind::ModelResponse { blocks, .. } = &e.kind else {
+            continue;
+        };
+        let calls: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                crate::ir::Block::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let open = calls.iter().any(|c| {
+            !events.iter().any(|r| {
+                r.id > e.id
+                    && r.id <= boundary
+                    && matches!(&r.kind, EventKind::ToolResult { call_id, .. } if call_id == *c)
+            })
+        });
+        if open {
+            cut = cut.min(e.id.saturating_sub(1));
+            break;
+        }
+    }
+    cut
 }
 
 /// Fork a session at `at_event` (None = head) into `new_dir`: copies the
@@ -280,19 +339,28 @@ fn head_and_tail(path: &Path) -> Option<String> {
 pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::io::Result<()> {
     let src = session_dir.join("events.jsonl");
     let text = std::fs::read_to_string(&src)?;
-    let kept: Vec<&str> = match at_event {
-        Some(boundary) => text
-            .lines()
-            .filter(|l| {
-                serde_json::from_str::<serde_json::Value>(l)
-                    .ok()
-                    .and_then(|v| v.get("id").and_then(|id| id.as_u64()))
-                    .map(|id| id <= boundary)
-                    .unwrap_or(true)
-            })
-            .collect(),
-        None => text.lines().collect(),
-    };
+    let mut lines: Vec<(&str, Option<crate::event::Event>)> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| (l, serde_json::from_str::<crate::event::Event>(l).ok()))
+        .collect();
+    // A torn final line (crash mid-write) never reaches the fork.
+    if lines.last().is_some_and(|(_, e)| e.is_none()) {
+        lines.pop();
+    }
+    let at_event = at_event.map(|b| {
+        let events: Vec<crate::event::Event> =
+            lines.iter().filter_map(|(_, e)| e.clone()).collect();
+        snap_out_of_batch(&events, b)
+    });
+    let kept: Vec<&str> = lines
+        .iter()
+        .filter(|(_, e)| match (at_event, e) {
+            (Some(b), Some(e)) => e.id <= b,
+            _ => true,
+        })
+        .map(|(l, _)| *l)
+        .collect();
     crate::harden::ensure_private_dir(new_dir)?;
     std::fs::write(new_dir.join("events.jsonl"), kept.join("\n") + "\n")?;
     // A fork is a NEW session — fresh ledger (spend starts at 0), and
@@ -337,7 +405,7 @@ pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::i
         session_id: id,
         cwd,
         model,
-        harness_version: env!("CARGO_PKG_VERSION").to_string(),
+        harness_version: env!("CARGO_PKG_VERSION").into(),
         parent: if parent_id.is_empty() {
             None
         } else {

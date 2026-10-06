@@ -19,6 +19,84 @@ fn first_run() -> u32 {
     1
 }
 
+/// Cap on the digest a `SubagentDone` event embeds (bytes).
+pub const SUBAGENT_DIGEST_CAP: usize = 16 * 1024;
+
+/// The chain format a `SessionStart` marks for the events from it on.
+pub const CHAIN_V2: u32 = 2;
+
+/// `SessionStart`'s harness record: the writing harness's version and the
+/// chain format it stamps (0 = unmarked, verified with the v1 rule).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Harness {
+    #[serde(rename = "harness_version")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub chain: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+impl From<&str> for Harness {
+    fn from(v: &str) -> Self {
+        Harness {
+            version: v.to_string(),
+            chain: 0,
+        }
+    }
+}
+
+impl From<String> for Harness {
+    fn from(version: String) -> Self {
+        Harness { version, chain: 0 }
+    }
+}
+
+impl std::fmt::Display for Harness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.version)
+    }
+}
+
+/// The latch a `Tainted` event armed: its `latch` field, or — on events
+/// written before the field existed — inferred from the detail text.
+pub fn latch_of<'a>(latch: &'a str, detail: &str) -> &'a str {
+    if !latch.is_empty() {
+        return latch;
+    }
+    if detail.starts_with("sensitive") {
+        "sensitive"
+    } else {
+        "untrusted"
+    }
+}
+
+/// The user message a `SubagentDone` rehydrates to — the live drain
+/// pushes the same bytes.
+pub fn subagent_notice(id: &str, digest: &str, footer: Option<&str>) -> String {
+    match footer {
+        Some(f) => format!("[subagent {id} finished]\n{digest}\n\n{f}"),
+        None => format!("[subagent {id} finished]\n{digest}"),
+    }
+}
+
+/// Split a done-marker text into (capped digest, footer line).
+pub fn split_digest(text: &str) -> (String, Option<String>) {
+    let trimmed = text.trim_end();
+    let (body, last) = match trimmed.rsplit_once('\n') {
+        Some((b, l)) => (b.trim_end(), l),
+        None => ("", trimmed),
+    };
+    let footer = crate::tools::task::Footer::parse(last).map(|_| last.to_string());
+    let body = if footer.is_some() { body } else { text };
+    (
+        crate::tools::middle_truncate(body, SUBAGENT_DIGEST_CAP),
+        footer,
+    )
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -33,7 +111,11 @@ pub enum EventKind {
         session_id: String,
         cwd: String,
         model: String,
-        harness_version: String,
+        /// Harness version plus the log's chain format (`chain: 2` marks
+        /// a payload-hashed log, see [`verify_chain`]); flattened, so the
+        /// JSON keeps its `harness_version` key.
+        #[serde(flatten)]
+        harness_version: Harness,
         /// Session this one forked from (its session_id) — the JSONL
         /// tree's cross-session edge. `#[serde(default)]` keeps
         /// pre-fork logs loadable.
@@ -113,12 +195,27 @@ pub enum EventKind {
         /// again); picks the run's done marker. Pre-extension logs: 1.
         #[serde(default = "first_run")]
         run: u32,
+        /// The digest itself (capped at [`SUBAGENT_DIGEST_CAP`]) and its
+        /// footer line: replay uses the event alone. Absent on older
+        /// events, which fall back to the done marker file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        footer: Option<String>,
+        /// Footer status (`completed`, `cancelled`, …); empty on older
+        /// events.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        status: String,
     },
     /// A Rule-of-Two taint latch flipped (P3.10): untrusted content or
     /// sensitive data entered context. Audit-only — does not rehydrate
     /// into messages.
     Tainted {
         detail: String,
+        /// Which latch armed: `untrusted` or `sensitive`. Empty on older
+        /// events — [`latch_of`] infers it from `detail`.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        latch: String,
     },
     /// A computer-use act (P7-3): which tier served it and the pre/post
     /// observation digests — the act's diff record. Audit-only, like
@@ -281,12 +378,14 @@ pub struct Event {
     pub id: u64,
     pub parent_id: Option<u64>,
     pub ts_ms: u64,
-    /// Hash chain over (id, parent_id, kind tag, prev_hash) — FNV-1a,
-    /// see `event_hash`. `#[serde(default)]` keeps pre-chain logs
-    /// loadable; old events verify as chain genesis (prev 0).
+    /// Hash chain link: the previous event's `hash`. v1 (unmarked logs)
+    /// hashes (id, parent_id, kind tag, prev_hash) with FNV-1a, see
+    /// `event_hash`; v2 (from a `chain: 2` SessionStart on) hashes the
+    /// whole payload, see `event_hash_v2`. `#[serde(default)]` keeps
+    /// pre-chain logs loadable; old events verify as chain genesis.
     #[serde(default)]
     pub prev_hash: u64,
-    /// `event_hash(id, parent_id, kind tag, prev_hash)` at append time.
+    /// This event's chain hash at append time (v1 or v2 rule).
     #[serde(default)]
     pub hash: u64,
     #[serde(flatten)]
@@ -300,8 +399,8 @@ pub struct Event {
 /// from any real id), the serde `type` tag of `kind`, and `prev` (0 for the
 /// chain head). It detects structural tampering (reordered, inserted,
 /// dropped or re-typed events, broken parent links); it does NOT detect a
-/// payload edit — payload bytes are not hashed. Deterministic, std-only.
-// DEFERRED(owner): payload hashing — needs a versioned hash format so existing logs still verify.
+/// payload edit — payload bytes are not hashed (that is v2's job,
+/// [`event_hash_v2`]). Deterministic, std-only.
 pub fn event_hash(id: u64, parent_id: Option<u64>, type_str: &str, prev: u64) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -317,6 +416,63 @@ pub fn event_hash(id: u64, parent_id: Option<u64>, type_str: &str, prev: u64) ->
     mix(type_str.as_bytes());
     mix(&prev.to_le_bytes());
     h
+}
+
+/// Chain v2 hash: sha256 over `prev_hash` (LE bytes) followed by the
+/// canonical serialization of the event with its `prev_hash`/`hash`
+/// fields removed (JSON, object keys sorted, no whitespace); the first 8
+/// bytes of the digest, big-endian. Covers every payload byte.
+pub fn event_hash_v2(ev: &Event) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut v = serde_json::to_value(ev).unwrap_or(serde_json::Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        o.remove("prev_hash");
+        o.remove("hash");
+    }
+    let mut canon = String::new();
+    canonical_json(&v, &mut canon);
+    let mut h = Sha256::new();
+    h.update(ev.prev_hash.to_le_bytes());
+    h.update(canon.as_bytes());
+    let d = h.finalize();
+    u64::from_be_bytes(d[..8].try_into().expect("sha256 is 32 bytes"))
+}
+
+/// Deterministic JSON: object keys sorted at every level.
+fn canonical_json(v: &serde_json::Value, out: &mut String) {
+    use serde_json::Value;
+    match v {
+        Value::Object(o) => {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                out.push(':');
+                canonical_json(&o[k.as_str()], out);
+            }
+            out.push('}');
+        }
+        Value::Array(a) => {
+            out.push('[');
+            for (i, x) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonical_json(x, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&serde_json::to_string(other).unwrap_or_default()),
+    }
+}
+
+/// A `SessionStart` that opens the v2 chain.
+fn marks_v2(ev: &Event) -> bool {
+    matches!(&ev.kind, EventKind::SessionStart { harness_version, .. } if harness_version.chain >= CHAIN_V2)
 }
 
 /// The serde `type` tag for an [`EventKind`] — the stable string
@@ -350,16 +506,28 @@ pub fn event_type_str(kind: &EventKind) -> &'static str {
     }
 }
 
-/// Verify the hash chain over a replayed log: each event's `hash` must
-/// equal `event_hash(id, parent_id, type tag, prev_hash)`, and each
-/// `prev_hash` must equal the previous event's `hash` (0 for the head).
-/// Empty logs verify. Pre-chain events (both hashes 0) verify as genesis;
-/// a mixed log verifies while the chain is unbroken from the first
-/// hashed event on.
+/// Verify the hash chain over a replayed log. Each `prev_hash` must equal
+/// the previous event's `hash` (0 for the head). Empty logs verify.
+///
+/// - v1 (no marker): each `hash` must equal `event_hash(id, parent_id,
+///   type tag, prev_hash)`. Pre-chain events (both hashes 0) verify as
+///   genesis, but only before the first hashed event.
+/// - v2: from the first `SessionStart` with `chain: 2` on, every event
+///   must carry `event_hash_v2` — a missing (zero) hash or any mismatch
+///   fails, so stripping hashes or editing a payload byte is detected.
 pub fn verify_chain(events: &[Event]) -> bool {
     let mut prev = 0u64;
     let mut hashed_seen = false;
+    let mut v2 = false;
     for e in events {
+        v2 = v2 || marks_v2(e);
+        if v2 {
+            if e.hash == 0 || e.prev_hash != prev || e.hash != event_hash_v2(e) {
+                return false;
+            }
+            prev = e.hash;
+            continue;
+        }
         if e.prev_hash == 0 && e.hash == 0 {
             // Pre-chain event: only valid before any hashed event.
             if hashed_seen {
@@ -480,6 +648,8 @@ pub struct EventLog {
     /// Running chain hash: the `hash` of the last appended (or replayed)
     /// event, 0 for an empty / pre-chain log. Seeds `prev_hash` on append.
     prev_hash: u64,
+    /// The v2 chain is open (a `chain: 2` SessionStart is on the log).
+    v2: bool,
 }
 
 impl EventLog {
@@ -497,13 +667,17 @@ impl EventLog {
             head: None,
             last: None,
             prev_hash: 0,
+            v2: false,
         })
     }
 
-    /// Open an existing log for append (resume): replays to find next_id/head.
+    /// Open an existing log for append (resume): repairs a torn tail
+    /// (`harden::repair_torn_tail`), then replays to find next_id/head.
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        crate::harden::repair_torn_tail(&path)?;
         let events = Self::replay(&path)?;
+        let v2 = events.iter().any(marks_v2);
         let (next_id, head, last, prev_hash) = match events.last() {
             Some(e) => (e.id + 1, Some(e.id), Some(e.clone()), e.hash),
             None => (1, None, None, 0),
@@ -516,6 +690,7 @@ impl EventLog {
             head,
             last,
             prev_hash,
+            v2,
         })
     }
 
@@ -526,19 +701,32 @@ impl EventLog {
     /// Append an event; returns the assigned id. Buffer-flushed every call,
     /// fsync only on `flush()` (turn boundaries — durable-tail semantics).
     /// Stamps the hash chain (`prev_hash` + `hash`); Invariant 1 still
-    /// holds — past lines are never rewritten.
-    pub fn append(&mut self, kind: EventKind) -> std::io::Result<u64> {
+    /// holds — past lines are never rewritten. A `SessionStart` is
+    /// stamped `chain: 2` and opens the v2 (payload) chain.
+    pub fn append(&mut self, mut kind: EventKind) -> std::io::Result<u64> {
+        if let EventKind::SessionStart {
+            harness_version, ..
+        } = &mut kind
+        {
+            harness_version.chain = CHAIN_V2;
+            self.v2 = true;
+        }
         let id = self.next_id;
         let prev_hash = self.prev_hash;
-        let hash = event_hash(id, self.head, event_type_str(&kind), prev_hash);
-        let ev = Event {
+        let mut ev = Event {
             id,
             parent_id: self.head,
             ts_ms: now_ms(),
             prev_hash,
-            hash,
+            hash: 0,
             kind,
         };
+        ev.hash = if self.v2 {
+            event_hash_v2(&ev)
+        } else {
+            event_hash(id, self.head, event_type_str(&ev.kind), prev_hash)
+        };
+        let hash = ev.hash;
         let mut line = serde_json::to_string(&ev).map_err(std::io::Error::other)?;
         line.push('\n');
         self.file.write_all(line.as_bytes())?;
@@ -661,15 +849,23 @@ pub fn rehydrate_messages(events: &[Event]) -> Vec<crate::ir::Message> {
                 task_id: id,
                 trace,
                 run,
+                digest,
+                footer,
                 ..
             } => {
                 flush_results(&mut pending_results, &mut messages);
-                let marker = crate::tools::task::done_marker(*run);
-                let digest = std::fs::read_to_string(std::path::Path::new(trace).join(marker))
-                    .unwrap_or_else(|_| "(digest missing)".into());
-                messages.push(Message::user_text(format!(
-                    "[subagent {id} finished]\n{digest}"
-                )));
+                let text = match digest {
+                    Some(d) => subagent_notice(id, d, footer.as_deref()),
+                    // Pre-extension events: the done marker file.
+                    None => {
+                        let marker = crate::tools::task::done_marker(*run);
+                        let digest =
+                            std::fs::read_to_string(std::path::Path::new(trace).join(marker))
+                                .unwrap_or_else(|_| "(digest missing)".into());
+                        format!("[subagent {id} finished]\n{digest}")
+                    }
+                };
+                messages.push(Message::user_text(text));
             }
             EventKind::ModelResponse { blocks, .. } => {
                 flush_results(&mut pending_results, &mut messages);
@@ -1239,9 +1435,9 @@ mod tests {
         tampered[1].kind = EventKind::UserInput {
             text: "forged".into(),
         };
-        // Same-tag content edit does NOT trip the tag chain (payloads are
-        // not hashed by design) — the tag swap below is what must fail.
-        assert!(verify_chain(&tampered));
+        // Chain v2 (SessionStart marks `chain: 2`): a same-tag content
+        // edit fails too — payload bytes are hashed.
+        assert!(!verify_chain(&tampered), "v2: payload edit must fail");
         tampered[1].kind = EventKind::Nudge {
             text: "forged".into(),
         };

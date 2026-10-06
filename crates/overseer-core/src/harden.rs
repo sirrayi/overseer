@@ -106,6 +106,55 @@ pub fn is_private_dir(dir: &Path) -> bool {
     }
 }
 
+/// Torn-tail repair before an append-only log is reopened for append: a
+/// file that does not end in `\n` had its last write cut mid-line. The
+/// torn bytes are kept in `<file>.torn-<unix-ms>` for audit and the file
+/// is truncated back to its last `\n`, so the next append starts a fresh
+/// line instead of gluing onto the fragment.
+pub fn repair_torn_tail(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    const CHUNK: u64 = 64 * 1024;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut last = [0u8; 1];
+    f.seek(SeekFrom::Start(len - 1))?;
+    f.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    // Scan backwards for the last newline.
+    let mut keep = 0u64;
+    let mut end = len;
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let mut buf = vec![0u8; (end - start) as usize];
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|b| *b == b'\n') {
+            keep = start + i as u64 + 1;
+            break;
+        }
+        end = start;
+    }
+    let mut torn = Vec::with_capacity((len - keep) as usize);
+    f.seek(SeekFrom::Start(keep))?;
+    f.read_to_end(&mut torn)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "log".into());
+    let aside = path.with_file_name(format!("{name}.torn-{}", crate::event::now_ms()));
+    std::fs::write(&aside, &torn)?;
+    f.set_len(keep)?;
+    f.sync_data()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

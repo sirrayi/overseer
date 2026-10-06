@@ -58,7 +58,6 @@ fn torn_session(tag: &str) -> PathBuf {
 /// straight after it with no newline repair, so the torn fragment becomes a
 /// corrupt MIDDLE line and every later replay/resume fails.
 #[test]
-#[ignore = "audit: event-torn-tail-append — wave A"]
 fn resume_after_torn_tail_keeps_log_replayable() {
     let dir = torn_session("torn-append");
     let path = dir.join("events.jsonl");
@@ -80,7 +79,6 @@ fn resume_after_torn_tail_keeps_log_replayable() {
 /// (unparseable lines pass the filter) and gets a newline, then the fork's
 /// own SessionStart lands after it — the fork is born corrupt.
 #[test]
-#[ignore = "audit: session-fork-torn-tail — wave A"]
 fn fork_of_torn_session_is_replayable() {
     let dir = torn_session("fork-torn");
     let child = tmp("fork-torn-child").join("child");
@@ -92,7 +90,6 @@ fn fork_of_torn_session_is_replayable() {
 }
 
 #[test]
-#[ignore = "audit: session-fork-torn-tail — wave A"]
 fn fork_at_boundary_of_torn_session_is_replayable() {
     let dir = torn_session("fork-torn-at");
     let child = tmp("fork-torn-at-child").join("child");
@@ -180,7 +177,6 @@ fn chain_detects_reorder_drop_insert_retype() {
 /// which verifies unconditionally — so any reorder/drop passes once the
 /// hashes are stripped. Nothing records that the log was ever chained.
 #[test]
-#[ignore = "audit: event-chain-downgrade — wave A"]
 fn chain_rejects_stripped_hashes_on_reordered_log() {
     let mut ev = chain_log(3);
     assert!(event::verify_chain(&ev));
@@ -244,7 +240,6 @@ fn row(cost: f64) -> UsageRecord {
 /// is glued to the torn fragment and silently vanishes from every later
 /// tally — the resumed session's spend (and budget check) undercounts.
 #[test]
-#[ignore = "audit: ledger-torn-tail-append — wave A"]
 fn ledger_row_after_torn_tail_counts_on_resume() {
     let dir = tmp("ledger-torn");
     let path = dir.join("ledger.jsonl");
@@ -297,7 +292,6 @@ fn ledger_total_equals_row_sum_after_resume() {
 /// float parser is not round-trip exact), so a resumed session's spend
 /// drifts from what it showed live.
 #[test]
-#[ignore = "audit: ledger-float-roundtrip — wave A"]
 fn ledger_resumed_total_is_bit_identical_to_live() {
     let (path, live) = ledger_with_rows("ledger-bits");
     let resumed = Ledger::open(&path).unwrap().total_cost_usd;
@@ -373,7 +367,6 @@ fn write_event_line(path: &Path, id: u64, ts: u64, kind: &str) {
 /// gets `last_ms` from the head slice, so the newest session sorts as old
 /// and `most_recent` (`--continue`) picks the wrong one.
 #[test]
-#[ignore = "audit: session-large-tail-recency — wave A"]
 fn large_final_event_keeps_recency() {
     let root = tmp("recency");
     let big = root.join("big");
@@ -425,7 +418,6 @@ fn large_final_event_keeps_recency() {
 /// the forked log rehydrates to an assistant tool_use with no tool_result,
 /// which every provider rejects on the next request.
 #[test]
-#[ignore = "audit: session-fork-mid-batch — wave A"]
 fn fork_at_tool_call_boundary_keeps_pairing() {
     let dir = tmp("fork-mid");
     let path = dir.join("events.jsonl");
@@ -509,7 +501,6 @@ fn rewind_session(tag: &str, entry: serde_json::Value) -> (PathBuf, PathBuf, u64
 /// A checkpointed file that became a directory is silently skipped:
 /// `restore` returns Ok, restored=0, and the snapshot is never put back.
 #[test]
-#[ignore = "audit: rewind-file-to-directory — wave A"]
 fn rewind_restores_file_that_became_directory() {
     let (ws, sess, b) = rewind_session(
         "rw-dir",
@@ -534,7 +525,6 @@ fn rewind_restores_file_that_became_directory() {
 /// containment check (canonicalize fails on it, so its *parent* is used),
 /// and `fs::copy` follows it — rewind writes a file outside the workspace.
 #[test]
-#[ignore = "audit: rewind-dangling-symlink-escape — wave A"]
 fn rewind_refuses_dangling_symlink_out_of_workspace() {
     let (ws, sess, b) = rewind_session(
         "rw-link",

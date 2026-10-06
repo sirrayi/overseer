@@ -352,15 +352,16 @@ fn rewind_picker_lists_checkpoints() {
     let (mut app, _e, wrx, mut term, caps, root) = session_harness();
     // A checkpoint on e2 (the user input in s1's log). The manifest
     // path must resolve under the session's recorded cwd (/repo) —
-    // S1/C7 refuses out-of-workspace paths before touching the fs. The
-    // copy target can't exist outside a real workspace, so the fixture
-    // restores 0 files but the picker + SwitchSession flow is intact.
+    // S1/C7 refuses out-of-workspace paths before touching the fs. A
+    // copy into /repo would fail (and restore now reports failed
+    // copies), so the entry is a created-then-gone file: nothing to
+    // restore or delete, but the picker + SwitchSession flow is intact.
     let cp = root.join("s1/checkpoints/e2/files");
     std::fs::create_dir_all(&cp).unwrap();
     std::fs::write(cp.join("f0"), "snapshot").unwrap();
     std::fs::write(
         root.join("s1/checkpoints/e2/manifest.jsonl"),
-        "{\"path\":\"/repo/x.txt\",\"stored\":\"f0\",\"existed\":true}\n",
+        "{\"path\":\"/repo/x.txt\",\"stored\":\"f0\",\"existed\":false}\n",
     )
     .unwrap();
     app.submit_text("/rewind");
