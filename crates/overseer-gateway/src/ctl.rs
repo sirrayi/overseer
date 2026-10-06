@@ -231,9 +231,10 @@ fn handle_conn(
     s: &mut UnixStream,
     tx: std::sync::mpsc::Sender<(CtlRequest, std::sync::mpsc::Sender<CtlResponse>)>,
 ) {
+    let deadline = Instant::now() + REQUEST_DEADLINE;
     let reader = DeadlineReader {
         stream: s,
-        deadline: Instant::now() + REQUEST_DEADLINE,
+        deadline,
     };
     let resp = match read_request_line(reader) {
         Err(e) => CtlResponse::err(e),
@@ -243,7 +244,21 @@ fn handle_conn(
                 if tx.send((req, rtx)).is_err() {
                     CtlResponse::err("daemon loop gone")
                 } else {
-                    rrx.recv().unwrap_or_else(|_| CtlResponse::err("no reply"))
+                    // The same absolute deadline bounds the reply: a stalled
+                    // loop must not pin this connection's slot forever.
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match rrx.recv_timeout(left) {
+                        Ok(r) => r,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            CtlResponse::err(format!(
+                                "daemon did not reply within {}s",
+                                REQUEST_DEADLINE.as_secs()
+                            ))
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            CtlResponse::err("no reply")
+                        }
+                    }
                 }
             }
             Err(e) => CtlResponse::err(format!("bad request: {e}")),
@@ -259,16 +274,27 @@ fn write_response(s: &mut UnixStream, resp: &CtlResponse) {
     }
 }
 
+/// Client read bound: outlasts the daemon's [`REQUEST_DEADLINE`], so a
+/// stalled daemon's own timeout error normally arrives first.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Client side: send one request, read one response.
 pub fn call(sock_path: &std::path::Path, req: &CtlRequest) -> Result<CtlResponse, String> {
     let mut s = UnixStream::connect(sock_path).map_err(|e| format!("connect: {e}"))?;
+    s.set_read_timeout(Some(CALL_TIMEOUT))
+        .map_err(|e| e.to_string())?;
     let mut line = serde_json::to_string(req).map_err(|e| e.to_string())?;
     line.push('\n');
     s.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     let mut reply = String::new();
     BufReader::new(s)
         .read_line(&mut reply)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                format!("no reply from daemon within {}s", CALL_TIMEOUT.as_secs())
+            }
+            _ => e.to_string(),
+        })?;
     serde_json::from_str(&reply).map_err(|e| format!("bad reply: {e}"))
 }
 
@@ -293,6 +319,85 @@ mod ctl_serde_tests {
         srv.join().unwrap();
         let reply = writer.join().unwrap();
         serde_json::from_str(&reply).unwrap_or_else(|e| panic!("reply {reply:?}: {e}"))
+    }
+
+    /// A daemon loop that never drains its queue: every handler must time
+    /// out on the shared deadline and free its slot for the next client.
+    #[test]
+    fn stalled_daemon_loop_errors_in_time_and_frees_the_slot() {
+        let dir = crate::test_util::short_tmpdir("ctl-stall");
+        let sock = dir.join("ctl.sock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        listen(sock.clone(), tx).unwrap();
+        let started = Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for _ in 0..MAX_CONNECTIONS {
+            let sock = sock.clone();
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                let _ = done_tx.send(call(&sock, &CtlRequest::Status));
+            });
+        }
+        for _ in 0..MAX_CONNECTIONS {
+            let r = done_rx
+                .recv_timeout(REQUEST_DEADLINE + Duration::from_secs(4))
+                .expect("a stalled loop left the client hanging");
+            let err = r
+                .expect("daemon-side error reply")
+                .error
+                .unwrap_or_default();
+            assert!(err.contains("did not reply within 10s"), "{err}");
+        }
+        let took = started.elapsed();
+        assert!(
+            took >= REQUEST_DEADLINE - Duration::from_millis(500),
+            "{took:?}"
+        );
+        assert!(took < CALL_TIMEOUT, "{took:?}");
+        // The loop wakes up: every slot is free again and a request is served.
+        std::thread::spawn(move || {
+            while let Ok((_req, reply)) = rx.recv() {
+                let _ = reply.send(CtlResponse::ok(serde_json::json!({})));
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let r = call(&sock, &CtlRequest::Status).unwrap();
+            if r.ok {
+                break;
+            }
+            let err = r.error.unwrap_or_default();
+            assert_eq!(err, "too many control connections");
+            assert!(Instant::now() < deadline, "slots never freed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The client never waits unboundedly on a peer that accepts and
+    /// stays silent.
+    #[test]
+    fn client_call_times_out_on_a_silent_daemon() {
+        let dir = crate::test_util::short_tmpdir("ctl-silent");
+        let sock = dir.join("ctl.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let hold = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            std::thread::sleep(CALL_TIMEOUT + Duration::from_secs(3));
+            drop(s);
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sock2 = sock.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(call(&sock2, &CtlRequest::Status));
+        });
+        let err = rx
+            .recv_timeout(CALL_TIMEOUT + Duration::from_secs(2))
+            .expect("call() hung past its read timeout")
+            .unwrap_err();
+        assert!(err.contains("no reply from daemon within 15s"), "{err}");
+        hold.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A daemon dir under a long TMPDIR (the self-hosted runner) must
