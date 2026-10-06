@@ -8,6 +8,8 @@ all overseer work lives in `/Users/chf/Desktop/Desktop - m1/overseer` and on [gi
 - overseer life started: the plan, the security design and phase 0 of the backend are in. see [the plan](research/2026-10-05-digital-life.md), [the security design](research/2026-10-05-life-security.md) and [phase 0 results](research/2026-10-05-life-phase0-results.md).
 - the repo has a readme now.
 - the repo is public.
+- memory v3 H1 (the automatic learning loop) is in PR #54, red-teamed and hardened. a full-codebase fortify pass is stacked on it in the next PR. merge #54 first, then retarget the fortify PR to `review`.
+- live runs on cloud (deepseek-v4.1-flash through opencode): reviews apply notes, nothing gets quarantined by mistake, and the fresh session follows what it learned (runs `cargo fmt`, keeps tests inline).
 
 ## overseer life: what's waiting
 
@@ -21,13 +23,14 @@ all overseer work lives in `/Users/chf/Desktop/Desktop - m1/overseer` and on [gi
 
 ## harness: next steps
 
-1. first live run with a real model. everything since the refresh has only been tested against mock providers. run a tui or web session with memory on and check recall, reminders, `tools`/`run_code` and a subagent with `tier`/`verify`.
-2. live computer-use test. turn on **CuaDriver** under accessibility and under screen recording in system settings, run `cua-driver permissions grant`, then the ignored `computer_live` test. synara's patched driver has the same 57 tools, so it can replace the installed one.
-3. small fixes found in phase 0: `browser_type` should require `ref`, `zoom` should require `x1..y2`, and a few args overseer sends aren't in the driver's schemas (details in the phase 0 results).
-4. benchmarks stay on hold until you lift it.
-5. deferred work is listed in the #52 merge commit: persisted memory index, recurring reminders, hard purge, anthropic `defer_loading`, `computer` and memory writes from `run_code`, cross-provider verifiers, resume across a rebased parent, multi-process sessions.
+1. memory v3 H2: search over raw past sessions, and actually applying learned skills (they're parsed but not applied yet). then H3: dream pass, mounts, sync.
+2. live computer-use test on the mac. turn on **CuaDriver** under accessibility and under screen recording in system settings, run `cua-driver permissions grant`, then the ignored `computer_live` test. the fortify PR lists the live checks still pending: marks, `wait_for`, schema names, modal roles, secret typing.
+3. a live run with a priced model. the opencode model costs $0, so the spend gate and the review-share cap haven't been tested against real prices.
+4. orchestration wave B: task DAG and fan-out, shared scratchpad, writer retry.
+5. benchmarks stay on hold until you lift it.
+6. the deferred lists are in the #52 merge commit, #54 and the fortify PR.
 
-known flaky test: `tools::computer::cua::tests::observe_renders_elements_and_remembers_tokens` failed once with ETXTBSY under load.
+the ETXTBSY test flakes are fixed: every test that writes a script and runs it right away now retries.
 
 ## decisions you might revisit
 
