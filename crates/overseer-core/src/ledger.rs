@@ -318,11 +318,20 @@ pub struct Summary {
 pub const REVIEW_PURPOSE: &str = "memory_review";
 /// Below this many affordable output tokens the gate refuses a call.
 pub const MIN_OUTPUT_TOKENS: u32 = 1_024;
-/// Input-estimate stand-in for one image block.
+/// Input-estimate stand-in for an image block without sent dimensions.
 const IMAGE_TOKENS: u64 = 1_600;
 
+/// One image's input estimate: `ceil(sent_w*sent_h/750)` (how Anthropic
+/// bills an image), or [`IMAGE_TOKENS`] when the dimensions are unknown.
+fn image_tokens(sent_w: u32, sent_h: u32) -> u64 {
+    match u64::from(sent_w) * u64::from(sent_h) {
+        0 => IMAGE_TOKENS,
+        px => px.div_ceil(750),
+    }
+}
+
 /// Counted input tokens of `req`: system, tool specs and message text,
-/// images at a flat [`IMAGE_TOKENS`].
+/// plus each image's [`image_tokens`].
 pub fn request_tokens(req: &crate::provider::Request<'_>) -> u64 {
     use crate::ir::Block;
     let mut text = String::new();
@@ -345,18 +354,19 @@ pub fn request_tokens(req: &crate::provider::Request<'_>) -> u64 {
                     text.push_str(&input.to_string());
                 }
                 Block::Reasoning { raw } => text.push_str(&raw.to_string()),
-                Block::Image { .. } => images += 1,
+                Block::Image { sent_w, sent_h, .. } => {
+                    images = images.saturating_add(image_tokens(*sent_w, *sent_h))
+                }
             }
         }
     }
-    crate::tokens::count_tokens(&text, req.model)
-        .saturating_add(images.saturating_mul(IMAGE_TOKENS))
+    crate::tokens::count_tokens(&text, req.model).saturating_add(images)
 }
 
 /// The one spend gate every provider call goes through (main turn,
 /// reflection, aux, memory review, consult; subagents and escalations
 /// are agents, so theirs too). Before the call: `worst` = the counted
-/// input priced at the dearer of fresh/cache-write plus `max_tokens` of
+/// input plus a 10% margin, priced at the dearer of fresh/cache-write plus `max_tokens` of
 /// output; when `spent + reserved + worst` would pass the cap the
 /// request's `max_tokens` drops to what is left, and below
 /// [`MIN_OUTPUT_TOKENS`] the call is refused ([`GateError::Budget`]).
@@ -406,7 +416,9 @@ impl Gate<'_> {
         purpose: Option<&str>,
     ) -> Result<(crate::provider::Response, f64), GateError> {
         let profile = crate::profile::lookup(req.model);
+        // 10% over the count: tokenizers and image billing differ by vendor.
         let n = request_tokens(req);
+        let n = n.saturating_add(n.div_ceil(10));
         let in_usd = profile
             .cost_usd(&Usage {
                 fresh_input: n,
@@ -479,6 +491,13 @@ impl Gate<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn images_are_estimated_from_their_sent_size() {
+        assert_eq!(image_tokens(1568, 1568), 3_279);
+        assert_eq!(image_tokens(1280, 800), 1_366);
+        assert_eq!(image_tokens(0, 0), IMAGE_TOKENS);
+    }
 
     /// Settlement rows move cost, never tokens, and re-settling the same
     /// total (a second drain, a resume) records nothing.
