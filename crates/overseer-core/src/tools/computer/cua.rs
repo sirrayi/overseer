@@ -1962,6 +1962,26 @@ mod tests {
         last
     }
 
+    /// Same busy retry for calls that must enter through
+    /// `computer::run_with` (e.g. `batch`, which `run` never sees).
+    fn run_with_ok(
+        input: &Value,
+        c: &mut ToolCtx,
+        st: &mut super::super::ComputerState,
+    ) -> Result<Value, String> {
+        let mut last = Err(String::new());
+        for _ in 0..60 {
+            match super::super::run_with(input, c, st) {
+                Err(e) if e.contains("Text file busy") || e.contains("os error 26") => {
+                    last = Err(e);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                other => return other,
+            }
+        }
+        last
+    }
+
     /// Write an executable fake-driver script (`<path> mcp`): a POSIX-sh
     /// JSON-RPC stdio server answering initialize/tools/list/tools/call
     /// with canned results. Every request line is appended to `log` so
@@ -2710,7 +2730,7 @@ done
         let mut st = state(&driver);
         let c = ctx(&dir);
         let mut c = c;
-        let out = super::super::run_with(
+        let out = run_with_ok(
             &json!({"action": "batch", "actions": [
                 {"action": "observe", "pid": 11, "window_id": 101},
                 {"action": "click", "pid": 11, "window_id": 101, "element": 2},
