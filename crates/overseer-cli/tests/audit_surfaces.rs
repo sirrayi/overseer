@@ -72,7 +72,6 @@ fn no_panic(o: &Output) {
 // ── argv parsing / exit codes ──────────────────────────────────────────
 
 #[test]
-#[ignore = "audit: cli-non-utf8-argv — other wave"]
 fn non_utf8_argv_is_a_usage_error_not_a_panic() {
     use std::os::unix::ffi::OsStrExt;
     let home = tmp("utf8");
@@ -507,7 +506,19 @@ fn line_mode_does_not_forward_model_escape_sequences() {
 fn inbox_snooze_seconds_are_seconds_for_large_values() {
     use std::os::unix::net::UnixListener;
     let home = tmp("snooze");
-    let dd = tmp("snooze-dd");
+    // Unix socket paths are capped (SUN_LEN): the TMPDIR-nested tmp()
+    // name overflows it on macOS, so the daemon dir gets a short /tmp
+    // name instead.
+    let dd = std::path::PathBuf::from("/tmp").join(format!(
+        "ovs-sn-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 1_000_000_000
+    ));
+    std::fs::create_dir_all(&dd).unwrap();
     let mut got = Vec::new();
     for secs in ["60", "86400"] {
         let sock = dd.join("daemon.sock");
