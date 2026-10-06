@@ -455,13 +455,17 @@ fn tg_mock(update_ids: Vec<i64>) -> TgMock {
     TgMock { base, sent }
 }
 
-fn tg_trigger(base: &str) -> (TriggerSpec, Trigger) {
+fn tg_spec(base: &str) -> TriggerSpec {
     std::env::set_var("AUDIT_GW_TG_TOKEN", "audit-tg-fixture-token");
-    let spec: TriggerSpec = serde_json::from_value(json!({
+    serde_json::from_value(json!({
         "kind": "telegram", "id": "tg", "token_env": "AUDIT_GW_TG_TOKEN",
         "allow_senders": ["7"], "rate_per_min": 20, "base": base,
     }))
-    .unwrap();
+    .unwrap()
+}
+
+fn tg_trigger(base: &str) -> (TriggerSpec, Trigger) {
+    let spec = tg_spec(base);
     let t = Trigger::from_spec(&spec);
     (spec, t)
 }
@@ -483,23 +487,63 @@ fn telegram_offset_advances_within_one_process() {
     assert_eq!(inbound_count(&t.poll_at(2_000)), 0, "no re-delivery");
 }
 
-/// `Polled` promises "a restart never re-delivers", but the offset lives
-/// only in memory: after a daemon restart the first poll carries no offset
-/// and Telegram hands back the last, never-confirmed batch.
+/// `Polled` promises "a restart never re-delivers": a trigger built with
+/// `from_spec_in` (as the daemon builds it, in its channels dir) persists
+/// the offset, so the first poll after a restart confirms the last batch.
 #[test]
 fn telegram_restart_does_not_redeliver_the_last_batch() {
     let mock = tg_mock(vec![100]);
-    let (spec, mut before) = tg_trigger(&mock.base);
+    let dir = tmp("tg-restart");
+    let spec = tg_spec(&mock.base);
+    let mut before = Trigger::from_spec_in(&spec, &dir);
     assert_eq!(inbound_count(&before.poll_at(1_000)), 1);
     drop(before);
-    // Daemon restart: the trigger is rebuilt from the same config.
-    let mut after = Trigger::from_spec(&spec);
+    // Daemon restart: the trigger is rebuilt from the same config and dir.
+    let mut after = Trigger::from_spec_in(&spec, &dir);
     let again = after.poll_at(2_000);
     assert_eq!(
         inbound_count(&again),
         0,
         "update 100 was delivered a second time after a restart"
     );
+}
+
+/// `from_spec` (no state dir) keeps the offset in memory: polling writes
+/// nothing under `$HOME`. Runs in a child process so the temp HOME never
+/// leaks into the other tests of this binary.
+#[test]
+fn telegram_from_spec_writes_nothing_under_home() {
+    const CHILD: &str = "AUDIT_GW_FROM_SPEC_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let mock = tg_mock(vec![100]);
+        let (_spec, mut t) = tg_trigger(&mock.base);
+        assert_eq!(inbound_count(&t.poll_at(1_000)), 1);
+        assert_eq!(inbound_count(&t.poll_at(2_000)), 0);
+        return;
+    }
+    let home = tmp("tg-home");
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "telegram_from_spec_writes_nothing_under_home",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("HOME", &home)
+        .env_remove("OVERSEER_HOME")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "child run failed: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let left: Vec<PathBuf> = std::fs::read_dir(&home)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(left.is_empty(), "from_spec wrote under HOME: {left:?}");
 }
 
 #[test]

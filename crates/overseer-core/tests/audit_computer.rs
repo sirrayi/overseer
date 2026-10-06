@@ -636,12 +636,15 @@ fn first_subagents_of_two_sessions_get_distinct_driver_labels() {
     assert_ne!(seen[0], seen[1], "both subagents drive {}", seen[0]);
 }
 
-/// After `zoom`, a right-click / double-click by x,y is sent with
-/// `from_zoom`, which the driver's closed schemas for those tools refuse.
+/// After `zoom`, a right-click / double-click by x,y is refused locally:
+/// the driver's 0.34 schemas for those tools carry no `from_zoom`, and the
+/// crop padding can't be mapped back here. A plain click still rides
+/// `from_zoom`.
 #[test]
-#[ignore = "disputed: the brief decides right/double click after a zoom are refused locally (no from_zoom on those 0.34 schemas, crop padding unmappable); this asserts is_ok"]
-fn zoom_then_right_and_double_click_conform_to_driver_schema() {
+fn zoom_then_right_and_double_click_are_refused_locally() {
+    const REFUSAL: &str = "re-take a full screenshot before right/double click";
     let dir = session("zoom");
+    let label = label_of(&dir);
     let (mut c, mut st) = (ctx(&dir), state("schema"));
     run(
         with(win(), json!({"action": "screenshot"})),
@@ -674,8 +677,34 @@ fn zoom_then_right_and_double_click_conform_to_driver_schema() {
         &mut c,
         &mut st,
     );
-    assert!(right.is_ok(), "right-click after zoom: {right:?}");
-    assert!(double.is_ok(), "double-click after zoom: {double:?}");
+    for (what, r) in [("right-click", &right), ("double-click", &double)] {
+        let err = r
+            .as_ref()
+            .expect_err(&format!("{what} after zoom was not refused"));
+        assert!(err.contains(REFUSAL), "{what} after zoom: {err}");
+    }
+    let click = run(
+        with(win(), json!({"action": "click", "x": 40, "y": 30})),
+        &mut c,
+        &mut st,
+    );
+    assert!(click.is_ok(), "plain click after zoom: {click:?}");
+    let sent = calls("schema", Some(&label));
+    let zoomed: Vec<&(String, Value)> = sent
+        .iter()
+        .filter(|(t, a)| {
+            matches!(t.as_str(), "right_click" | "double_click") && a.get("from_zoom").is_some()
+        })
+        .collect();
+    assert!(
+        zoomed.is_empty(),
+        "driver got right/double click with from_zoom: {zoomed:?}"
+    );
+    assert!(
+        sent.iter()
+            .any(|(t, a)| t == "click" && a["from_zoom"] == json!(true)),
+        "plain click after zoom sent no from_zoom: {sent:?}"
+    );
 }
 
 /// `browser_type` needs `ref` in the driver schema; the tool's own
@@ -830,7 +859,6 @@ fn plus_key_and_cmd_plus_reach_the_driver_in_schema() {
 /// An interrupt raised while a computer batch runs does not stop the batch:
 /// every member still drives the real input device.
 #[test]
-#[ignore = "needs: crates/overseer-core/src/tools/mod.rs — ToolRegistry::set_control forwards to self.computer.set_control"]
 fn interrupt_stops_a_computer_batch_between_members() {
     let _ = fakes();
     let dir = session("intr");

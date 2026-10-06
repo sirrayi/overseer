@@ -68,20 +68,25 @@ pub enum Trigger {
         limiter: webhook::RateLimiter,
         offset: Option<i64>,
         /// Durable copy of `offset`, so a restart never re-delivers.
-        state: PathBuf,
+        /// `None` (built by `from_spec`) keeps the offset in memory only.
+        state: Option<PathBuf>,
     },
 }
 
 impl Trigger {
-    /// Build a trigger whose durable state lives under the default daemon
-    /// dir (`~/.overseer/daemon/channels`).
+    /// Build a trigger with no durable state: the Telegram offset lives in
+    /// memory only and nothing is written to disk.
     pub fn from_spec(spec: &TriggerSpec) -> Self {
-        Self::from_spec_in(spec, &default_state_dir())
+        Self::build(spec, None)
     }
 
     /// Build a trigger whose durable state (the Telegram offset) lives in
-    /// `state_dir`.
+    /// `state_dir` — the daemon passes its `channels` dir.
     pub fn from_spec_in(spec: &TriggerSpec, state_dir: &Path) -> Self {
+        Self::build(spec, Some(state_dir))
+    }
+
+    fn build(spec: &TriggerSpec, state_dir: Option<&Path>) -> Self {
         let now = now_ms();
         match spec {
             TriggerSpec::Interval {
@@ -149,7 +154,7 @@ impl Trigger {
                 limiter: webhook::RateLimiter::new(spec.rate_per_min),
             },
             TriggerSpec::Telegram(spec) => {
-                let state = telegram_state_path(state_dir, spec);
+                let state = state_dir.map(|d| telegram_state_path(d, spec));
                 Trigger::Telegram {
                     id: spec.id.clone(),
                     spec: spec.clone(),
@@ -158,7 +163,7 @@ impl Trigger {
                         .map(|c| c.with_base(spec.base.clone())),
                     allow_senders: spec.allow_senders.clone(),
                     limiter: webhook::RateLimiter::new(spec.rate_per_min),
-                    offset: load_offset(&state),
+                    offset: state.as_deref().and_then(load_offset),
                     state,
                 }
             }
@@ -375,11 +380,13 @@ impl Trigger {
                 // the same update, even if a message below is refused.
                 if polled.next_offset.is_some() && polled.next_offset != *offset {
                     *offset = polled.next_offset;
-                    if let Err(e) = save_offset(state, polled.next_offset) {
-                        events.push(channels::rejection_event(
-                            "telegram",
-                            &format!("offset not persisted: {e}"),
-                        ));
+                    if let Some(state) = state.as_deref() {
+                        if let Err(e) = save_offset(state, polled.next_offset) {
+                            events.push(channels::rejection_event(
+                                "telegram",
+                                &format!("offset not persisted: {e}"),
+                            ));
+                        }
                     }
                 }
                 for inbound in polled.messages {
@@ -457,14 +464,6 @@ fn read_spool_record(path: &Path) -> Result<String, String> {
         return Err("webhook: spool record exceeds the size cap".into());
     }
     Ok(text)
-}
-
-/// `$HOME/.overseer/daemon/channels` — the CLI's default daemon root.
-fn default_state_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".overseer/daemon/channels")
 }
 
 /// One offset file per bot identity (id, token variable, API base), so a

@@ -570,8 +570,10 @@ impl ToolRegistry {
     }
 
     /// Attach the run's steering handle: `run_code` aborts on its
-    /// interrupt, between sub-calls and inside the JS interrupt handler.
+    /// interrupt, between sub-calls and inside the JS interrupt handler,
+    /// and a `computer` batch stops between members.
     pub fn set_control(&mut self, control: crate::control::Control) {
+        self.computer.set_control(control.clone());
         self.control = control;
     }
 
