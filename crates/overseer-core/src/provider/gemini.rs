@@ -178,6 +178,11 @@ impl Gemini {
                 continue;
             }
             if let Some(t) = p.get("text").and_then(Value::as_str) {
+                // A signed text part rides opaque (the echo sends it back
+                // verbatim); the Text block beside it is the view's copy.
+                if p.get("thoughtSignature").is_some() {
+                    blocks.push(Block::Reasoning { raw: p.clone() });
+                }
                 if !t.is_empty() {
                     blocks.push(Block::Text {
                         text: t.to_string(),
@@ -185,10 +190,8 @@ impl Gemini {
                 }
                 continue;
             }
-            // Unknown part shape — preserve, don't drop.
-            blocks.push(Block::Reasoning {
-                raw: json!({"type": "unknown_part", "raw": p}),
-            });
+            // Unknown part shape — preserve its exact wire form.
+            blocks.push(Block::Reasoning { raw: p });
         }
 
         // Gemini has no dedicated tool-call finish reason — a functionCall
@@ -300,6 +303,16 @@ pub fn safety_gate(input: &Value) -> Option<crate::perm::Verdict> {
     }
 }
 
+/// The text of a signed, non-thought text part (empty text included).
+fn signed_text(raw: &Value) -> Option<&str> {
+    if raw.get("thought").and_then(Value::as_bool) == Some(true)
+        || raw.get("thoughtSignature").is_none()
+    {
+        return None;
+    }
+    raw.get("text").and_then(Value::as_str)
+}
+
 /// One IR message → one wire content (role user|model). Tool results
 /// join the SAME user content as functionResponse parts — Gemini wants
 /// them grouped per turn, not fanned out like OpenAI's `tool` role.
@@ -310,15 +323,30 @@ fn ir_message_to_wire(m: &Message, out: &mut Vec<Value>) {
     };
     let mut parts: Vec<Value> = Vec::new();
     let mut fc_signature: Option<Value> = None;
+    let mut echoed_text: Option<&str> = None;
     for b in &m.content {
+        // A signed text part was already sent verbatim; skip the Text
+        // block that duplicates it for the view.
+        let duplicate = echoed_text.take();
         match b {
+            Block::Text { text } if duplicate == Some(text.as_str()) => {}
             Block::Text { text } => parts.push(json!({"text": text})),
             Block::Reasoning { raw } if raw.get("functionCall").is_some() => {
                 fc_signature = raw.get("thoughtSignature").cloned();
             }
+            // Logs written before unknown parts were stored raw.
+            Block::Reasoning { raw }
+                if raw.get("type").and_then(Value::as_str) == Some("unknown_part")
+                    && raw.get("raw").is_some() =>
+            {
+                parts.push(raw["raw"].clone());
+            }
             // Opaque reasoning/thought parts echo back verbatim —
             // thoughtSignature continuity is load-bearing on tool turns.
-            Block::Reasoning { raw } => parts.push(raw.clone()),
+            Block::Reasoning { raw } => {
+                echoed_text = signed_text(raw);
+                parts.push(raw.clone());
+            }
             // P7-1: screenshots ride as inline_data parts (native CU shape).
             Block::Image {
                 media_type,
@@ -717,5 +745,90 @@ mod tests {
                 other => panic!("expected ToolCall, got {other:?}"),
             }
         }
+    }
+
+    fn model_reply(parts: Value) -> Value {
+        json!({"candidates": [{"content": {"role": "model", "parts": parts},
+            "finishReason": "STOP"}]})
+    }
+
+    fn echo(blocks: Vec<Block>) -> Value {
+        let m = Message {
+            role: Role::Assistant,
+            content: blocks,
+        };
+        let mut out = Vec::new();
+        ir_message_to_wire(&m, &mut out);
+        out[0]["parts"].clone()
+    }
+
+    #[test]
+    fn signed_text_part_roundtrips_verbatim() {
+        let parts = json!([{"text": "the answer", "thoughtSignature": "SIG-TEXT"}]);
+        let r = Gemini::parse_response(&model_reply(parts.clone()), 0, 0).unwrap();
+        assert!(matches!(&r.blocks[0], Block::Reasoning { raw } if raw == &parts[0]));
+        assert!(matches!(&r.blocks[1], Block::Text { text } if text == "the answer"));
+        assert_eq!(r.blocks.len(), 2);
+        assert_eq!(echo(r.blocks), parts);
+        // A signature-only empty text part is kept, and echoes alone.
+        let empty = json!([{"text": "", "thoughtSignature": "SIG-EMPTY"}, {"text": "after"}]);
+        let r = Gemini::parse_response(&model_reply(empty.clone()), 0, 0).unwrap();
+        assert!(matches!(&r.blocks[0], Block::Reasoning { raw } if raw == &empty[0]));
+        assert_eq!(r.blocks.len(), 2);
+        assert_eq!(echo(r.blocks), empty);
+        // Unsigned text is unchanged: one Text block, one plain part.
+        let plain = json!([{"text": "hi"}]);
+        let r = Gemini::parse_response(&model_reply(plain.clone()), 0, 0).unwrap();
+        assert_eq!(r.blocks.len(), 1);
+        assert_eq!(echo(r.blocks), plain);
+    }
+
+    #[test]
+    fn unknown_part_is_stored_raw_and_echoed_verbatim() {
+        let part = json!({"executableCode": {"language": "PYTHON", "code": "1+1"}});
+        let r = Gemini::parse_response(&model_reply(json!([part.clone()])), 0, 0).unwrap();
+        assert!(matches!(&r.blocks[0], Block::Reasoning { raw } if raw == &part));
+        assert_eq!(echo(r.blocks), json!([part.clone()]));
+        // Old logs carry the wrapped form; the echo unwraps it.
+        let old = vec![Block::Reasoning {
+            raw: json!({"type": "unknown_part", "raw": part.clone()}),
+        }];
+        assert_eq!(echo(old), json!([part]));
+    }
+
+    #[test]
+    fn unchanged_history_builds_byte_identical_bodies() {
+        let parts = json!([
+            {"thought": true, "text": "plan", "thoughtSignature": "SIG-T"},
+            {"text": "the answer", "thoughtSignature": "SIG-TEXT"},
+            {"executableCode": {"language": "PYTHON", "code": "1+1"}},
+            {"functionCall": {"name": "read", "args": {"p": "a"}}, "thoughtSignature": "SIG-FC"}
+        ]);
+        let r = Gemini::parse_response(&model_reply(parts.clone()), 0, 0).unwrap();
+        let msgs = vec![
+            Message::user_text("go"),
+            Message {
+                role: Role::Assistant,
+                content: r.blocks,
+            },
+            Message::tool_results(vec![Block::ToolResult {
+                tool_use_id: "read".into(),
+                content: "A".into(),
+                is_error: false,
+            }]),
+        ];
+        let system = vec![SystemSegment {
+            name: "test",
+            text: "s".into(),
+            cacheable: true,
+        }];
+        let first = Gemini::build_body(&sample_req(&system, &[], &msgs)).to_string();
+        let second = Gemini::build_body(&sample_req(&system, &[], &msgs)).to_string();
+        assert_eq!(first, second);
+        let body: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(
+            body["contents"][1]["parts"], parts,
+            "model turn echoes the wire parts"
+        );
     }
 }
