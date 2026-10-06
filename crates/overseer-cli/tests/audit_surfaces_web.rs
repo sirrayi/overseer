@@ -450,6 +450,7 @@ fn zero_resize_does_not_kill_the_session() {
         .contains("200"));
 }
 
+#[cfg(target_os = "linux")]
 fn rss_kb(pid: u32) -> u64 {
     let s = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
     s.lines()

@@ -145,6 +145,9 @@ fn sandbox_bwrap_denies_reads_of_home_secret_dirs() {
     assert!(leaked.is_empty(), "sandboxed bash read: {leaked:?}");
 }
 
+// Abstract sockets and bwrap are Linux-only — elsewhere the test could
+// never run, but the std::os::linux import still has to compile.
+#[cfg(target_os = "linux")]
 #[test]
 fn sandbox_bwrap_denies_network_dns_and_abstract_sockets() {
     if !bwrap_present() {
@@ -311,6 +314,9 @@ fn sandbox_pinned_unavailable_runtime_fails_closed() {
     let ws = scratch("ws-pin");
     let mut reg = ToolRegistry::core_in(Policy::allow_all(), &ws);
     for runtime in ["gvisor", "seatbelt", "nonsense"] {
+        // An available-runtime skip below can still have run the call —
+        // clear its marker before it is mistaken for this iteration's.
+        let _ = std::fs::remove_file(ws.join("ran.txt"));
         let mut c = pinned(&ws, runtime);
         let out = bash(&mut reg, &mut c, "echo ran > ran.txt");
         if runtime == "gvisor"
@@ -319,6 +325,11 @@ fn sandbox_pinned_unavailable_runtime_fails_closed() {
                 .output()
                 .is_ok()
         {
+            continue;
+        }
+        // seatbelt's binary exists on macOS, so a "seatbelt" pin is
+        // SATISFIED there — the unavailable-runtime arm cannot fire.
+        if runtime == "seatbelt" && std::path::Path::new("/usr/bin/sandbox-exec").exists() {
             continue;
         }
         assert!(out.is_error, "{runtime}: {}", out.text);
@@ -404,13 +415,17 @@ fn write_refuses_symlink_escape_and_unread_overwrite() {
         &mut c,
     );
     assert!(out.is_error, "{}", out.text);
-    // Case-variant name on a case-sensitive fs is a different (new) file.
-    let out = reg.call(
-        "write",
-        &json!({ "path": "UNREAD.txt", "content": "x" }),
-        &mut c,
-    );
-    assert!(!out.is_error, "{}", out.text);
+    // Case-variant name on a case-sensitive fs is a different (new) file;
+    // on a case-insensitive one it IS unread.txt — never read, so the
+    // refusal above already covered it and there is nothing new to write.
+    if !ws.join("UNREAD.txt").exists() {
+        let out = reg.call(
+            "write",
+            &json!({ "path": "UNREAD.txt", "content": "x" }),
+            &mut c,
+        );
+        assert!(!out.is_error, "{}", out.text);
+    }
     assert_eq!(
         std::fs::read_to_string(ws.join("unread.txt")).unwrap(),
         "orig"
