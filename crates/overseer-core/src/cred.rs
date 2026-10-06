@@ -898,11 +898,29 @@ pub fn scan(text: &str) -> Vec<Redaction> {
             while i < b.len() && is_token_char(b[i]) {
                 i += 1;
             }
-            if i - s >= 20
-                && !spans.iter().any(|r| r.start <= s && s < r.end)
-                && shannon(&text[s..i]) >= 3.5
-            {
-                push!(s, i, "high-entropy");
+            // Broker sentinels are already the redacted form: scan only the
+            // pieces of the token around them.
+            let mut pieces = Vec::new();
+            let (mut seg, mut k) = (s, s);
+            while let Some(rel) = text[k..i].find(SENTINEL_PREFIX) {
+                let at = k + rel;
+                let end = at + SENTINEL_PREFIX.len() + SENTINEL_HEX_LEN;
+                if end <= i && is_sentinel(&text[at..end]) {
+                    pieces.push((seg, at));
+                    seg = end;
+                    k = end;
+                } else {
+                    k = at + SENTINEL_PREFIX.len();
+                }
+            }
+            pieces.push((seg, i));
+            for (ps, pe) in pieces {
+                if pe - ps >= 20
+                    && !spans.iter().any(|r| r.start <= ps && ps < r.end)
+                    && shannon(&text[ps..pe]) >= 3.5
+                {
+                    push!(ps, pe, "high-entropy");
+                }
             }
         } else {
             i += 1;

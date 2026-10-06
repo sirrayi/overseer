@@ -174,9 +174,25 @@ pub fn build(root: &Path) -> Index {
     };
     let mut stack = vec![root.to_path_buf()];
     let mut files = Vec::new();
+    // Symlinks are never followed (they can point out of the workspace);
+    // the (dev, ino) set guards against any remaining dir cycle.
+    let mut visited = std::collections::HashSet::new();
     while let Some(dir) = stack.pop() {
         if files.len() >= MAX_FILES {
             break;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(m) = std::fs::metadata(&dir) {
+                if !visited.insert((m.dev(), m.ino())) {
+                    continue;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        if !visited.insert(dir.clone()) {
+            continue;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -184,14 +200,18 @@ pub fn build(root: &Path) -> Index {
         for e in entries.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
-            if p.is_dir() {
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.is_dir() {
                 if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
                     stack.push(p);
                 }
-            } else if EXTENSIONS
-                .iter()
-                .any(|x| p.extension().and_then(|e| e.to_str()) == Some(x))
-                && p.metadata().map(|m| m.len()).unwrap_or(0) <= MAX_FILE_BYTES
+            } else if meta.is_file()
+                && EXTENSIONS
+                    .iter()
+                    .any(|x| p.extension().and_then(|e| e.to_str()) == Some(x))
+                && meta.len() <= MAX_FILE_BYTES
             {
                 files.push(p);
             }

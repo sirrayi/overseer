@@ -196,7 +196,27 @@ const INJECTION_MARKERS: &[&str] = &[
     "your real instructions",
 ];
 
-/// Path fragments that mark a tool call as touching secrets.
+/// Credential stores under `$HOME` — the ONE list behind the bwrap masks,
+/// the seatbelt read-denies (`tools/bash.rs`) and the sensitive latch here.
+pub(crate) const HOME_SECRETS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".config/gh",
+    ".gnupg",
+    ".overseer",
+    ".kube",
+    ".docker",
+    ".config/gcloud",
+    ".azure",
+    ".netrc",
+    ".npmrc",
+    ".pgpass",
+    ".git-credentials",
+    ".config/op",
+];
+
+/// Path fragments that mark a tool call as touching secrets (on top of
+/// [`HOME_SECRETS`]).
 const SENSITIVE_PATHS: &[&str] = &[
     ".env",
     ".envrc",
@@ -205,13 +225,21 @@ const SENSITIVE_PATHS: &[&str] = &[
     "id_dsa",
     ".pem",
     ".key",
-    ".aws/",
-    ".ssh/",
-    ".gnupg/",
-    ".netrc",
     "credentials",
     "secrets/",
 ];
+
+/// Whether lowercased `s` names a [`HOME_SECRETS`] entry as a whole path
+/// segment run (so `.kube` matches `~/.kube/config`, not `.kubernetes`).
+fn mentions_home_secret(s: &str) -> bool {
+    let seg = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    HOME_SECRETS.iter().any(|rel| {
+        s.match_indices(rel).any(|(i, _)| {
+            !s[..i].chars().next_back().is_some_and(seg)
+                && !s[i + rel.len()..].chars().next().is_some_and(seg)
+        })
+    })
+}
 
 /// Content markers that mark a result as carrying secret material.
 /// Lowercase: compared against lowercased text (RT-1: uppercase markers
@@ -603,6 +631,8 @@ pub struct Policy {
     /// Memory v2: `memory` remember/forget are denied (every subagent —
     /// its stores are throwaway filtered copies). Search/get stay allowed.
     pub memory_readonly: bool,
+    /// Notes from `gate` for the caller to surface (`take_notes`).
+    notes: Mutex<Vec<String>>,
 }
 
 impl Policy {
@@ -625,6 +655,7 @@ impl Policy {
             persona_approved: false,
             mcp_read_servers: Vec::new(),
             memory_readonly: false,
+            notes: Mutex::new(Vec::new()),
         }
     }
 
@@ -646,6 +677,7 @@ impl Policy {
             persona_approved: false,
             mcp_read_servers: Vec::new(),
             memory_readonly: false,
+            notes: Mutex::new(Vec::new()),
         }
     }
 
@@ -668,6 +700,7 @@ impl Policy {
             persona_approved: false,
             mcp_read_servers: Vec::new(),
             memory_readonly: false,
+            notes: Mutex::new(Vec::new()),
         }
     }
 
@@ -710,9 +743,15 @@ impl Policy {
 
     /// Append a key to the rules file. Best-effort: a write failure
     /// leaves the session-allow in place, it just doesn't persist.
-    fn persist_rule(&self, key: &str) {
+    /// Returns false (nothing written) for a key with a control character:
+    /// the file is line-oriented, so an embedded newline would plant extra
+    /// rules.
+    fn persist_rule(&self, key: &str) -> bool {
+        if key.chars().any(char::is_control) {
+            return false;
+        }
         let Some(path) = &self.rules_path else {
-            return;
+            return true;
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -725,6 +764,16 @@ impl Policy {
         {
             let _ = writeln!(f, "{key}");
         }
+        true
+    }
+
+    /// Drain the notes `gate` left for the caller to show (a refused
+    /// "always" rule). The registry appends them to the tool result.
+    pub fn take_notes(&self) -> Vec<String> {
+        self.notes
+            .lock()
+            .map(|mut n| std::mem::take(&mut *n))
+            .unwrap_or_default()
     }
 
     /// Session-scoped allow key: what `AllowSession` records and later
@@ -784,6 +833,7 @@ impl Policy {
         }
         if !t.sensitive
             && (SENSITIVE_PATHS.iter().any(|m| input_s.contains(m))
+                || mentions_home_secret(&input_s)
                 || SENSITIVE_CONTENT.iter().all(|m| lower.contains(m)))
         {
             t.sensitive = true;
@@ -901,8 +951,15 @@ impl Policy {
                     AskDecision::AllowOnce => Gate::Allow,
                     d @ (AskDecision::AllowSession | AskDecision::AllowAlways) => {
                         if let Some(key) = self.session_key(tool, input) {
-                            if d == AskDecision::AllowAlways {
-                                self.persist_rule(&key);
+                            if d == AskDecision::AllowAlways && !self.persist_rule(&key) {
+                                if let Ok(mut n) = self.notes.lock() {
+                                    n.push(format!(
+                                        "{tool}: approved once — not saved as an \"always\" \
+                                         rule (the command contains a newline or control \
+                                         character)"
+                                    ));
+                                }
+                                return Gate::Allow;
                             }
                             // P8-B: `AllowSession` grants honor the
                             // policy's session TTL (None = session-long).
@@ -966,6 +1023,16 @@ impl Policy {
                 return Verdict::Allow;
             }
             if op.eq_ignore_ascii_case("call") && self.mcp_call_read_trusted(input) {
+                // Armed: the call's arguments leave the process, so a
+                // read-trusted server is still an exfil channel.
+                if self.taint_armed() {
+                    return Verdict::Ask {
+                        reason: "mcp: Rule-of-Two — untrusted content and sensitive data are \
+                                 both in context; this call's arguments leave the process \
+                                 and need human confirmation"
+                            .into(),
+                    };
+                }
                 return Verdict::Allow;
             }
         }
@@ -1338,6 +1405,20 @@ impl Policy {
                             reason: format!("bash: '{pattern}' needs confirmation — {why}"),
                         };
                     }
+                }
+                Verdict::Allow
+            }
+
+            // `cargo check` runs `build.rs` and proc-macros: code execution,
+            // gated like a plain shell call.
+            "diagnostics" => {
+                if self.taint_armed() {
+                    return Verdict::Ask {
+                        reason: "diagnostics: Rule-of-Two — untrusted content and sensitive \
+                                 data are both in context; running the checker needs human \
+                                 confirmation"
+                            .into(),
+                    };
                 }
                 Verdict::Allow
             }
