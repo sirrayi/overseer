@@ -841,7 +841,6 @@ fn quiet_config(ws: &Path) -> AgentConfig {
 /// rebuilds a fresh registry (fresh Policy, latches cleared) and never
 /// replays the logged `Tainted` events.
 #[test]
-#[ignore = "audit: perm-latch-resume — wave A (agent.rs)"]
 fn rule_of_two_latch_survives_resume() {
     let ws = scratch("resume-ws");
     let sess = scratch("resume-sess");
@@ -1119,7 +1118,6 @@ fn harden_startup_applies_umask_and_proxy_scrub_in_process() {
 /// builds a fresh `Policy`: the Rule-of-Two latches reset mid-session, so
 /// toggling the mode disarms an armed triangle.
 #[test]
-#[ignore = "audit: perm-latch-preset-swap — wave A (agent.rs)"]
 fn rule_of_two_latch_survives_preset_swap() {
     let ws = scratch("swap-ws");
     let sess = scratch("swap-sess");

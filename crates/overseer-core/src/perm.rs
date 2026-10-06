@@ -857,6 +857,38 @@ impl Policy {
         Some(format!("sensitive data touched (via {via})"))
     }
 
+    /// The latch state, to carry across a policy rebuild (`set_preset`).
+    pub fn taint_snapshot(&self) -> Taint {
+        self.taint.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    /// Carry latches into this (fresh) policy: latches only ever arm.
+    pub fn restore_taint(&self, from: &Taint) {
+        if let Ok(mut t) = self.taint.lock() {
+            if from.untrusted && !t.untrusted {
+                t.untrusted = true;
+                t.untrusted_via = from.untrusted_via.clone();
+            }
+            t.sensitive |= from.sensitive;
+        }
+    }
+
+    /// Re-arm one latch from a replayed `Tainted` event (resume). Silent:
+    /// the event is already on the log.
+    pub fn rearm(&self, latch: &str, via: &str) {
+        let Ok(mut t) = self.taint.lock() else {
+            return;
+        };
+        match latch {
+            "sensitive" => t.sensitive = true,
+            _ if !t.untrusted => {
+                t.untrusted = true;
+                t.untrusted_via = Some(via.to_string());
+            }
+            _ => {}
+        }
+    }
+
     /// The sensitive latch alone (RT-4 regression surface).
     pub fn taint_sensitive(&self) -> bool {
         self.taint.lock().map(|t| t.sensitive).unwrap_or(false)
@@ -1675,6 +1707,25 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// One `(latch, detail)` per latch a taint notice reports — a single
+/// `note_result` can flip both (`"untrusted …; sensitive …"`), and each
+/// arm is logged as its own `Tainted` event.
+pub fn split_notice(notice: &str) -> Vec<(String, String)> {
+    notice
+        .split("; ")
+        .filter(|p| !p.is_empty())
+        .map(|p| (crate::event::latch_of("", p).to_string(), p.to_string()))
+        .collect()
+}
+
+/// The `via` of a latch detail (`… (via X)`), or the whole detail.
+pub fn via_of(detail: &str) -> &str {
+    detail
+        .rsplit_once("(via ")
+        .and_then(|(_, r)| r.strip_suffix(')'))
+        .unwrap_or(detail)
 }
 
 #[cfg(test)]
