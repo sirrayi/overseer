@@ -633,27 +633,34 @@ impl Agent {
     /// resume-dangling-tool-use: every replayed `tool_use` without a
     /// matching result gets a synthetic error `ToolResult`, appended to the
     /// log as a real event before the first new request — so this and
-    /// every later replay rehydrate the same, provider-valid view.
+    /// every later replay rehydrate the same, provider-valid view. Pairing
+    /// is positional: a call is answered only by a result with its id that
+    /// lands after its `ModelResponse` and before the next one (providers
+    /// recycle ids like `call_0` across responses).
     fn close_dangling_calls(&mut self, events: &[Event]) -> std::io::Result<()> {
-        let answered: std::collections::HashSet<&str> = events
-            .iter()
-            .filter_map(|e| match &e.kind {
-                EventKind::ToolResult { call_id, .. } => Some(call_id.as_str()),
-                _ => None,
-            })
-            .collect();
         let mut dangling = Vec::new();
+        let mut open: Vec<(String, String)> = Vec::new();
         for e in events {
-            if let EventKind::ModelResponse { blocks, .. } = &e.kind {
-                for b in blocks {
-                    if let Block::ToolCall { id, name, .. } = b {
-                        if !answered.contains(id.as_str()) {
-                            dangling.push((id.clone(), name.clone()));
-                        }
+            match &e.kind {
+                EventKind::ModelResponse { blocks, .. } => {
+                    dangling.append(&mut open);
+                    open = blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            Block::ToolCall { id, name, .. } => Some((id.clone(), name.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                }
+                EventKind::ToolResult { call_id, .. } => {
+                    if let Some(i) = open.iter().position(|(id, _)| id == call_id) {
+                        open.remove(i);
                     }
                 }
+                _ => {}
             }
         }
+        dangling.append(&mut open);
         if dangling.is_empty() {
             return Ok(());
         }
