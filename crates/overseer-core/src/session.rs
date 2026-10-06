@@ -366,17 +366,14 @@ pub fn fork(session_dir: &Path, at_event: Option<u64>, new_dir: &Path) -> std::i
         })
         .map(|(l, _)| *l)
         .collect();
-    if new_dir.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("{}: already exists", new_dir.display()),
-        ));
-    }
+    let created = !new_dir.exists();
     crate::harden::ensure_private_dir(new_dir)?;
-    // The dir is ours from here: a failure removes it, never leaving a
-    // half-created session behind.
+    // A dir this call created is removed on failure, never leaving a
+    // half-created session behind; a pre-existing one is not ours to delete.
     fork_into(session_dir, at_event, new_dir, &kept).inspect_err(|_| {
-        let _ = std::fs::remove_dir_all(new_dir);
+        if created {
+            let _ = std::fs::remove_dir_all(new_dir);
+        }
     })
 }
 
