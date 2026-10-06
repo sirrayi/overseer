@@ -2117,90 +2117,25 @@ impl Agent {
         crate::memory::learn::prompt(digest, &related, &[], focus, false)
     }
 
-    /// §1.7: the review's model call. Small tier first (the same
-    /// escalate-on-failure/empty contract `aux_call` has); every attempt
-    /// passes the spend gate and is ledgered `purpose: "memory_review"`.
-    /// Effort Min, `max_tokens` per `review_max_tokens`. A no-text reply
-    /// that hit its limit after billing reasoning retries once at
-    /// `RETRY_CEILING` — a sized retry was observed still coming back
-    /// `0/<limit>`, all reasoning, so the retry buys all the headroom
-    /// the gate allows — while the model lands in `review_reasoners`,
-    /// so its next review starts at the headroom limit instead.
+    /// §1.7: the review's model call — [`crate::memory::learn::review_call`]
+    /// on this agent's ledger, cap and subagent reservations.
     fn review_call(&mut self, prompt: &str) -> Result<(String, String, f64), String> {
-        const RETRY_CEILING: u32 = 12_000;
-        let msgs = [Message::user_text(prompt.to_string())];
-        let mut models: Vec<String> = Vec::with_capacity(2);
-        if let Some(s) = &self.config.small_model {
-            models.push(s.clone());
-        }
-        if !models.contains(&self.config.model) {
-            models.push(self.config.model.clone());
-        }
-        let mut last = String::from("review call produced no text");
-        for (i, model) in models.iter().enumerate() {
-            let last_try = i + 1 == models.len();
-            let mut max_tokens = self.review_max_tokens(model);
-            let mut retried = false;
-            loop {
-                let mut req = Request {
-                    model,
-                    system: &[],
-                    tools: &[],
-                    messages: &msgs,
-                    max_tokens,
-                    thinking_budget: None,
-                    effort: Some(crate::provider::Effort::Min),
-                    cache_breakpoints: false,
-                    cache_key: None,
-                };
-                match self.gated(&mut req, Some(crate::ledger::REVIEW_PURPOSE)) {
-                    Ok((r, cost)) => {
-                        // A model that billed reasoning reasons whether
-                        // its profile admits it or not — remember it so
-                        // later reviews start at the headroom limit.
-                        if r.usage.reasoning > 0 {
-                            self.review_reasoners.insert(model.clone());
-                        }
-                        let text: String = r
-                            .blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                Block::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect();
-                        if !text.trim().is_empty() {
-                            return Ok((text, model.clone(), cost));
-                        }
-                        let used = r.usage.output.saturating_add(r.usage.reasoning);
-                        let hit = r.stop_reason == StopReason::MaxTokens
-                            || used >= u64::from(req.max_tokens);
-                        // Reasoning ate the limit — a reply sized to the
-                        // observed reasoning spend still came back all
-                        // reasoning live — so the one retry goes straight
-                        // to the ceiling (the spend gate clamps it on
-                        // priced models).
-                        let reasoned = profile::lookup(model).reasons() || r.usage.reasoning > 0;
-                        if hit && reasoned && !retried && max_tokens < RETRY_CEILING {
-                            retried = true;
-                            max_tokens = RETRY_CEILING;
-                            continue;
-                        }
-                        break;
-                    }
-                    Err(crate::ledger::GateError::Budget { .. }) => return Err("budget".into()),
-                    Err(crate::ledger::GateError::Io(e)) => return Err(e.to_string()),
-                    Err(crate::ledger::GateError::Provider(e)) => {
-                        last = e.to_string();
-                        break;
-                    }
-                }
-            }
-            if last_try {
-                return Err(last);
-            }
-        }
-        Err(last)
+        let models = crate::memory::learn::review_models(
+            self.config.small_model.as_deref(),
+            &self.config.model,
+        );
+        let spend = &self.spend;
+        let out = crate::memory::learn::review_call(
+            self.provider.as_ref(),
+            &mut self.ledger,
+            self.config.max_cost_usd,
+            &|| spend.reserved_usd(),
+            &models,
+            prompt,
+            &mut self.review_reasoners,
+        );
+        self.spend.sync(self.ledger.total_cost_usd);
+        out
     }
 
     /// Emit one `MemoryReview` audit event. `applied` carries the outcome
@@ -2245,17 +2180,9 @@ impl Agent {
         )
     }
 
-    /// §1.7 review output limit: 1,200, plus 4,000 of headroom on a
-    /// model that reasons anyway — its reasoning bills against the same
-    /// limit. `reasons()` covers advertised reasoners;
-    /// `review_reasoners` covers ones observed billing reasoning on a
-    /// review reply (a model can reason without saying so).
+    /// §1.7 review output limit — [`crate::memory::learn::review_max_tokens`].
     fn review_max_tokens(&self, model: &str) -> u32 {
-        if profile::lookup(model).reasons() || self.review_reasoners.contains(model) {
-            1_200 + 4_000
-        } else {
-            1_200
-        }
+        crate::memory::learn::review_max_tokens(model, &self.review_reasoners)
     }
 
     /// Memory v2 episode note, rewritten from the log at each run end

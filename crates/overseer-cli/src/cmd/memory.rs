@@ -434,64 +434,38 @@ fn cmd_learn(flags: &crate::flags::ExecFlags, session_dir: &Path, focus: Option<
                 return 2;
             }
         };
-    let model = flags
-        .small_model
-        .clone()
-        .unwrap_or_else(|| flags.model.clone());
-    let msgs = [overseer_core::ir::Message::user_text(prompt)];
-    let req = overseer_core::provider::Request {
-        model: &model,
-        system: &[],
-        tools: &[],
-        messages: &msgs,
-        max_tokens: 1_200,
-        thinking_budget: None,
-        effort: Some(overseer_core::provider::Effort::Min),
-        cache_breakpoints: false,
-        cache_key: None,
+    // §1.7: ledgered and gated — every attempt lands in the session's own
+    // ledger and is refused when `--max-cost` cannot cover it.
+    let ledger_path = session_dir.join("ledger.jsonl");
+    let ledger = if ledger_path.exists() {
+        overseer_core::ledger::Ledger::open(&ledger_path)
+    } else {
+        overseer_core::ledger::Ledger::create(&ledger_path)
     };
-    let resp = match provider.complete(&req) {
+    let mut ledger = match ledger {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("overseer memory learn: ledger: {e}");
+            return 1;
+        }
+    };
+    let models = learn::review_models(flags.small_model.as_deref(), &flags.model);
+    let mut reasoners = ledger.review_reasoners.clone();
+    let (reply, model, cost) = match learn::review_call(
+        provider.as_ref(),
+        &mut ledger,
+        flags.max_cost,
+        &|| 0.0,
+        &models,
+        &prompt,
+        &mut reasoners,
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("overseer memory learn: {e}");
             return 1;
         }
     };
-    // §1.7: ledgered — the usage row lands in the session's own ledger.
-    let cost = overseer_core::profile::lookup(&model).cost_usd(&resp.usage);
-    let ledger_path = session_dir.join("ledger.jsonl");
-    let mut ledger = if ledger_path.exists() {
-        overseer_core::ledger::Ledger::open(&ledger_path)
-    } else {
-        overseer_core::ledger::Ledger::create(&ledger_path)
-    };
-    match &mut ledger {
-        Ok(l) => {
-            let rec = overseer_core::ledger::UsageRecord {
-                purpose: Some("memory_review".into()),
-                ..overseer_core::ledger::UsageRecord::from_usage(
-                    &model,
-                    &resp.usage,
-                    resp.request_bytes,
-                    resp.latency_ms,
-                    0,
-                    cost,
-                )
-            };
-            if let Err(e) = l.record(rec) {
-                eprintln!("overseer memory learn: ledger: {e}");
-            }
-        }
-        Err(e) => eprintln!("overseer memory learn: ledger: {e}"),
-    }
-    let reply: String = resp
-        .blocks
-        .iter()
-        .filter_map(|b| match b {
-            overseer_core::ir::Block::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
     let parsed = learn::parse(&reply);
     let ctx = learn::ApplyCtx {
         stores: &stores,

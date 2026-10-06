@@ -14,8 +14,11 @@ use super::index::{self, Index};
 use super::pending::{self, PendingOp};
 use super::{stores::Scope, Layer, StoreLock};
 use crate::event::{Event, EventKind};
-use crate::ir::Block;
+use crate::ir::{Block, Message};
+use crate::ledger::{Gate, GateError, Ledger, REVIEW_PURPOSE};
+use crate::provider::{Effort, Provider, Request, StopReason};
 use serde_json::json;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Total digest size bound — oldest entries are trimmed first.
@@ -32,6 +35,124 @@ const MAX_SKILL_OPS: usize = 2;
 const TEXT_CAP: usize = 600;
 const SKILL_BODY_CAP: usize = 8_000;
 const SKILL_DESC_CAP: usize = 160;
+
+// ------------------------------------------------------------------
+// §1.7 — the review call
+// ------------------------------------------------------------------
+
+/// Review output limit: 1,200, plus 4,000 of headroom on a model that
+/// reasons anyway — its reasoning bills against the same limit.
+/// `reasons()` covers advertised reasoners; `reasoners` covers ones
+/// observed billing reasoning on a review reply (a model can reason
+/// without saying so).
+pub fn review_max_tokens(model: &str, reasoners: &HashSet<String>) -> u32 {
+    if crate::profile::lookup(model).reasons() || reasoners.contains(model) {
+        1_200 + 4_000
+    } else {
+        1_200
+    }
+}
+
+/// The models a review tries, in order: the small tier, then the main
+/// model when it differs.
+pub fn review_models(small: Option<&str>, main: &str) -> Vec<String> {
+    let mut models: Vec<String> = small.map(str::to_string).into_iter().collect();
+    if !models.iter().any(|m| m == main) {
+        models.push(main.to_string());
+    }
+    models
+}
+
+/// The review's model call, shared by the agent and `memory learn`. Each
+/// of `models` in turn (the same escalate-on-failure/empty contract
+/// `aux_call` has); every attempt passes the spend gate against `cap_usd`
+/// with `reserved()` held for subagents, and is ledgered `purpose:
+/// "memory_review"`. Effort Min, `max_tokens` per [`review_max_tokens`].
+/// A no-text reply that hit its limit after billing reasoning retries
+/// once at `RETRY_CEILING` — a sized retry was observed still coming back
+/// `0/<limit>`, all reasoning, so the retry buys all the headroom the
+/// gate allows — while the model lands in `reasoners`, so its next review
+/// starts at the headroom limit instead. `Ok((reply, model, cost))`.
+pub fn review_call(
+    provider: &dyn Provider,
+    ledger: &mut Ledger,
+    cap_usd: f64,
+    reserved: &dyn Fn() -> f64,
+    models: &[String],
+    prompt: &str,
+    reasoners: &mut HashSet<String>,
+) -> Result<(String, String, f64), String> {
+    const RETRY_CEILING: u32 = 12_000;
+    let msgs = [Message::user_text(prompt.to_string())];
+    let mut last = String::from("review call produced no text");
+    for model in models {
+        let mut max_tokens = review_max_tokens(model, reasoners);
+        let mut retried = false;
+        loop {
+            let mut req = Request {
+                model,
+                system: &[],
+                tools: &[],
+                messages: &msgs,
+                max_tokens,
+                thinking_budget: None,
+                effort: Some(Effort::Min),
+                cache_breakpoints: false,
+                cache_key: None,
+            };
+            let out = Gate {
+                provider,
+                ledger: &mut *ledger,
+                cap_usd,
+                reserved_usd: reserved(),
+            }
+            .call(&mut req, Some(REVIEW_PURPOSE));
+            match out {
+                Ok((r, cost)) => {
+                    // A model that billed reasoning reasons whether its
+                    // profile admits it or not — remember it so later
+                    // reviews start at the headroom limit.
+                    if r.usage.reasoning > 0 {
+                        reasoners.insert(model.clone());
+                    }
+                    let text: String = r
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            Block::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !text.trim().is_empty() {
+                        return Ok((text, model.clone(), cost));
+                    }
+                    let used = r.usage.output.saturating_add(r.usage.reasoning);
+                    let hit =
+                        r.stop_reason == StopReason::MaxTokens || used >= u64::from(req.max_tokens);
+                    // Reasoning ate the limit — a reply sized to the
+                    // observed reasoning spend still came back all
+                    // reasoning live — so the one retry goes straight to
+                    // the ceiling (the spend gate clamps it on priced
+                    // models).
+                    let reasoned = crate::profile::lookup(model).reasons() || r.usage.reasoning > 0;
+                    if hit && reasoned && !retried && max_tokens < RETRY_CEILING {
+                        retried = true;
+                        max_tokens = RETRY_CEILING;
+                        continue;
+                    }
+                    break;
+                }
+                Err(GateError::Budget { .. }) => return Err("budget".into()),
+                Err(GateError::Io(e)) => return Err(e.to_string()),
+                Err(GateError::Provider(e)) => {
+                    last = e.to_string();
+                    break;
+                }
+            }
+        }
+    }
+    Err(last)
+}
 
 // ------------------------------------------------------------------
 // §1.3 — learn signals

@@ -344,3 +344,56 @@ fn rewind_refuses_a_session_open_in_another_process() {
         "{err}"
     );
 }
+
+// S1: `memory learn`'s review goes through the spend gate, so a
+// `--max-cost` that cannot cover it is refused before any request leaves.
+#[test]
+fn learn_review_is_gated_by_max_cost() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let d = temp("learn-gated");
+    let home = d.join("home");
+    let cwd = d.to_str().unwrap().to_string();
+    let sess = d.join("sess");
+    std::fs::create_dir_all(&sess).unwrap();
+    std::fs::write(
+        sess.join("events.jsonl"),
+        format!(
+            "{{\"id\":1,\"parent_id\":null,\"ts_ms\":0,\"prev_hash\":0,\"hash\":0,\"type\":\"session_start\",\"session_id\":\"t\",\"cwd\":{cwd:?},\"model\":\"m\",\"harness_version\":\"0\",\"parent\":null}}\n\
+             {{\"id\":2,\"parent_id\":1,\"ts_ms\":0,\"prev_hash\":0,\"hash\":0,\"type\":\"user_input\",\"text\":\"always run the tests before committing\"}}\n"
+        ),
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hit = Arc::new(AtomicBool::new(false));
+    let seen = hit.clone();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            seen.store(true, Ordering::SeqCst);
+            drop(s);
+        }
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_overseer"))
+        .args([
+            "memory",
+            "learn",
+            &sess.display().to_string(),
+            "--cwd",
+            &cwd,
+        ])
+        .args(["--provider", "openai", "--model", "claude-sonnet-5"])
+        .args(["--base-url", &format!("http://127.0.0.1:{port}/v1")])
+        .args(["--max-cost", "0"])
+        .env("OVERSEER_HOME", &home)
+        .env("OPENAI_API_KEY", "test-key")
+        .output()
+        .expect("run overseer memory learn");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("overseer memory learn: budget"), "{err}");
+    assert!(
+        !hit.load(Ordering::SeqCst),
+        "learn sent a review request past a $0 --max-cost"
+    );
+}
