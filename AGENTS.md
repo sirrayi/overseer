@@ -22,7 +22,16 @@ architecture.
   detector (`stuck.rs`), L4 permission gate (`perm.rs`), deterministic
   compaction (`compact.rs`). `Effort` (min..max) maps per provider;
   `small_model` covers aux calls (consolidation) with escalate-to-main;
-  each stuck trip bumps effort one notch. `memory/` is memory v2: two
+  each stuck trip bumps effort one notch. Every provider call goes
+  through `ledger::Gate` — worst-case priced against the cap first
+  (`max_tokens` clamps to what is left; below the output floor the call
+  is refused `budget`), and exactly one purpose-tagged ledger row lands
+  after, answered or failed. The run-end learning review (`learn.rs`)
+  fires before `RunEnd` is written; its policy is 5,200 output tokens on
+  reasoning models (1,200 + headroom, one retry at double when reasoning
+  ate the limit), a correction waits for a 2-turn gap, and session review
+  spend stays under `review-share` (25% of main spend + $0.02).
+  `memory/` is memory v2: two
   git-versioned stores, user (`$OVERSEER_HOME/memory`, default
   `~/.overseer`) and project (`…/projects/<slug>-<hash8>/memory`, keyed by
   the git toplevel found without spawning; `--memory` keeps v1's
@@ -30,9 +39,11 @@ architecture.
   live in five layers (profile/episodic/semantic/procedural/prospective)
   with an ADD-only INDEX.md each. The resident `memory` op tool
   (`tools/memory_tool.rs`) searches (in-memory BM25F fused by RRF with
-  Petrov activation from `.index/uses.jsonl` and confidence), gets,
+  Petrov activation from `.index/uses.jsonl` and confidence — activation
+  and confidence vote only within the lexical top tier), gets,
   remembers (≤5 writes per user turn; per-layer write bars in `perm.rs`;
-  under the untrusted latch writes go to `proposals/`, never indexed) and
+  `supersedes` retires a same-layer note and is refused under the
+  untrusted latch, which sends writes to `proposals/`, never indexed) and
   forgets (expires, never deletes). On user input the engine may inject a
   `MemoryNotice` (recall of ≤3 notes, or a prospective `at:`/`kw:`
   reminder; `path:` reminders queue to the loop boundary), and each run
@@ -44,7 +55,15 @@ architecture.
   `overseer consolidate` dedupes each INDEX via a small-tier call
   (ADD-only for live pointers — any the model omits are restored),
   compacts the use journal and distils new episodes into ≤5 validated
-  semantic/procedural notes.
+  semantic/procedural notes. Store IO never follows a link below the
+  root: `store_path`/`store_write` check every component and write
+  temp-file + rename (a symlinked target is replaced, never written
+  through), reads open `O_NOFOLLOW`. `StoreLock` is a kernel flock on
+  `.index/write.lock` (10 s acquire, never stolen, released on death);
+  `live.lock` (`live.rs`) is held for an agent's life and refuses a
+  second process's `learn`/`resume`/`rewind`. `consolidate` and episode
+  distillation read and call the model unlocked, then re-hash under the
+  lock and abort on drift (`store changed during consolidate, rerun`).
   Prompt caching: Anthropic gets explicit breakpoints on the tools tail,
   the last cacheable system segment, and a rolling one on the last
   eligible block of the last message; OpenAI profiles send
@@ -59,10 +78,16 @@ architecture.
   ranked symbol index (one header per file) behind `repo_map`/`symbol`
   tools. `task` has
   read/write/verify/consult modes on light/standard/heavy tiers —
-  writers isolate into git worktrees, verify returns a parsed verdict,
-  consult is one no-tools call; each run's cap is carved from the
+  writers isolate into git worktrees on session-scoped branches
+  (`overseer/<8hex sha of the canonical session path>/task-N`; a
+  no-diff writer's worktree and branch are cleaned up), verify returns
+  a parsed verdict with a sidecar tamper check,
+  consult is one no-tools call; `task action=cancel` stops one at a
+  step boundary and a parent interrupt fans out through the control
+  tree; each run's cap is carved from the
   parent's remaining budget and its spend settles into the parent
-  ledger; background results land via SubagentDone notices (max
+  ledger; background results land via `SubagentDone` notices that carry
+  the digest + footer + status themselves (max
   `max_bg_subagents`, default 4, in flight). Task ids are
   session-monotonic `task-N` dirs under `subagents/` with a `task.json`
   sidecar (mode, tier, worktree, cap, spend) that resume reuses. Readers
@@ -71,7 +96,9 @@ architecture.
   with tools, resumes included, sees memory v2's filtered user/project
   copies under its task dir with writes denied (`memory_readonly`).
   Rule-of-Two (perm.rs): untrusted-content + sensitive-data latches
-  arm the exfil gate (side effects force Ask); tool results enter the
+  arm the exfil gate (side effects force Ask); each arm is logged as a
+  `Tainted{latch}` event, re-armed on resume and kept across
+  `set_preset`; tool results enter the
   model view provenance-wrapped. Bash calls run
   under a platform sandbox by default (macOS `sandbox-exec`, Linux
   `bwrap`): deny-by-default network, writes confined to the workspace +
@@ -117,9 +144,14 @@ architecture.
   boundary + surviving checkpoints + fresh SessionStart); `rewind.rs` is
   the shared restore implementation used by `overseer rewind` and the
   TUI's `/rewind` (manifest paths must resolve inside the workspace or
-  the restore is refused). `EventLog::replay` tolerates only a torn
+  the restore is refused). `EventLog::open` repairs a torn tail before
+  replay; `EventLog::replay` tolerates only a torn
   final line; a corrupt earlier line is an error naming the line, and
-  session listing skips such a log with a warning. New fields on an
+  session listing skips such a log with a warning. New logs stamp
+  `chain: 2` on `SessionStart`: each event's `hash` is the first 8 bytes
+  of sha256 over `prev_hash` + the canonical JSON payload
+  (`event_hash_v2`); unmarked logs keep verifying under v1's structural
+  FNV hash. New fields on an
   existing `EventKind` variant must be `#[serde(default)]` so old logs
   replay.
 - arsenal modules (ports kept only where wired — the rest was removed and
