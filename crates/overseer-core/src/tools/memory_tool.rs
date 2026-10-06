@@ -75,6 +75,8 @@ pub struct MemoryState {
     subagent: bool,
     recall: bool,
     session8: String,
+    /// The full session id — feeds `source: overseer:session/<id>`.
+    session_id: String,
     index: Option<Index>,
     writes: usize,
     recalled: HashSet<String>,
@@ -116,18 +118,22 @@ impl MemoryState {
         }
         let events =
             crate::event::EventLog::replay(session_dir.join("events.jsonl")).unwrap_or_default();
-        self.session8 = events
+        self.session_id = events
             .iter()
             .find_map(|e| match &e.kind {
-                crate::event::EventKind::SessionStart { session_id, .. } => Some(id8(session_id)),
+                crate::event::EventKind::SessionStart { session_id, .. } => {
+                    Some(session_id.clone())
+                }
                 _ => None,
             })
             .unwrap_or_else(|| {
-                id8(&session_dir
+                session_dir
                     .file_name()
                     .unwrap_or_default()
-                    .to_string_lossy())
+                    .to_string_lossy()
+                    .into_owned()
             });
+        self.session8 = id8(&self.session_id);
         for e in &events {
             if let crate::event::EventKind::MemoryNotice { kind, notes, .. } = &e.kind {
                 if kind == "recall" {
@@ -135,6 +141,11 @@ impl MemoryState {
                 }
             }
         }
+    }
+
+    /// Memory is bound (stores configured) — the learn loop's gate.
+    pub fn active(&self) -> bool {
+        self.init && !self.stores.is_empty()
     }
 
     fn dir(&self, scope: Scope) -> Option<&Path> {
@@ -287,6 +298,16 @@ impl MemoryState {
         let text = field("text")
             .filter(|t| !t.is_empty())
             .ok_or("needs `text`")?;
+        // §3 strict refusal on every user-mediated write — text and cues
+        // are scanned raw (scrubbing first could hide the payload).
+        if let Some(msg) = crate::memory::threat::strict_refusal(text) {
+            return Err(msg);
+        }
+        if let Some(cues) = field("cues") {
+            if let Some(msg) = crate::memory::threat::strict_refusal(cues) {
+                return Err(msg);
+            }
+        }
         let scrubbed = crate::memory::redact::scrub(text);
         let text = scrubbed.as_ref();
         let layer = field("layer")
@@ -342,14 +363,23 @@ impl MemoryState {
         if let Some(t) = trigger {
             meta.push_str(&format!("\ntrigger: {t}"));
         }
+        // §9.2: every note carries where it came from and when it was
+        // written (the day granularity keeps re-dates out of the diff).
+        meta.push_str(&format!(
+            "\nsource: overseer:session/{}\nadded: {}",
+            self.session_id,
+            &crate::memory::rfc3339(now)[..10]
+        ));
         meta.push_str(&format!("\nvalid_from: {}\n", crate::memory::rfc3339(now)));
 
         if quarantine.is_some() {
+            let _lock = crate::memory::StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
             let pdir = dir.join("proposals");
             crate::harden::ensure_private_dir(&pdir).map_err(|e| e.to_string())?;
             let name =
                 crate::memory::create_unique(&pdir, &base, &format!("---\n{meta}---\n{text}\n"))
                     .map_err(|e| e.to_string())?;
+            crate::memory::commit(&dir, &format!("memory: quarantine {name}"));
             return Ok(ToolOutput::ok(format!(
                 "memory: quarantined for human review as {}:proposals/{name}.md — untrusted \
                  content is in context, so this note is not indexed, recalled or resident.",
@@ -381,6 +411,7 @@ impl MemoryState {
             .filter(|p| p.is_file());
         if let Some(path) = path {
             use std::io::Write;
+            let _lock = crate::memory::StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
             let old = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
             let sep = if old.ends_with('\n') { "" } else { "\n" };
             std::fs::OpenOptions::new()
@@ -397,14 +428,17 @@ impl MemoryState {
                 layer.name(),
                 path.file_name().unwrap_or_default().to_string_lossy()
             );
+            crate::memory::commit(&dir, &format!("memory: remember {rel}"));
             let _ = activation::record(&dir, &rel, now);
             return Ok(ToolOutput::ok(format!(
                 "memory: appended to {}:{rel}.",
                 scope.name()
             )));
         }
+        let _lock = crate::memory::StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
         let rel =
             crate::memory::add_note(&dir, layer, &base, &meta, text).map_err(|e| e.to_string())?;
+        crate::memory::commit(&dir, &format!("memory: remember {rel}"));
         let _ = activation::record(&dir, &rel, now);
         Ok(ToolOutput::ok(format!(
             "memory: remembered {}:{rel}.",
@@ -416,9 +450,19 @@ impl MemoryState {
         if name.is_empty() || reason.is_empty() {
             return Err("needs `name` and `reason`".into());
         }
-        let idx = fresh(&mut self.index, &self.stores, now);
-        let d = idx.resolve_qualified(name)?;
-        let (id, path) = (d.id(), d.path.clone());
+        if let Some(msg) = crate::memory::threat::strict_refusal(reason) {
+            return Err(msg);
+        }
+        let (id, path, scope, rel) = {
+            let idx = fresh(&mut self.index, &self.stores, now);
+            let d = idx.resolve_qualified(name)?;
+            (d.id(), d.path.clone(), d.scope, d.rel.clone())
+        };
+        let dir = self
+            .dir(scope)
+            .ok_or_else(|| format!("no {} store in this session", scope.name()))?
+            .to_path_buf();
+        let _lock = crate::memory::StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
         let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let mut text = crate::memory::set_meta_key(&text, "valid_to", &crate::memory::rfc3339(now));
         if !text.ends_with('\n') {
@@ -427,6 +471,7 @@ impl MemoryState {
         let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
         text.push_str(&format!("forgotten: {reason}\n"));
         std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        crate::memory::commit(&dir, &format!("memory: forget {rel}"));
         // DEFERRED(owner): hard purge — gate: owner demand
         Ok(ToolOutput::ok(format!(
             "memory: forgot {id} — expired now, out of search, recall and the prompt. \
@@ -549,9 +594,17 @@ mod tests {
             out.text
         );
         let note = std::fs::read_to_string(project.join("semantic/deploy-steps.md")).unwrap();
-        assert!(note.starts_with(
-            "---\nprovenance: session:aabbccdd\nconfidence: 0.7\ncues: ship, rollout\nvalid_from: "
-        ));
+        assert!(
+            note.starts_with(
+                "---\nprovenance: session:aabbccdd\nconfidence: 0.7\ncues: ship, rollout\n"
+            ),
+            "{note}"
+        );
+        // §9.2: every remember is stamped with where it came from and
+        // the day it landed.
+        assert!(note.contains("\nsource: overseer:session/"), "{note}");
+        assert!(note.contains("\nadded: "), "{note}");
+        assert!(note.contains("\nvalid_from: "), "{note}");
         let index = std::fs::read_to_string(project.join("INDEX.md")).unwrap();
         assert_eq!(
             index

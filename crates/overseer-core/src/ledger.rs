@@ -32,6 +32,11 @@ pub struct UsageRecord {
     /// token stats count only its own calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
+    /// Why this call ran when it isn't an ordinary turn call —
+    /// `memory_review` for the §1.7 learning review. Absent on rows from
+    /// before the tag existed (old ledgers replay unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 impl UsageRecord {
@@ -62,6 +67,7 @@ impl UsageRecord {
                 0.0
             },
             subagent: None,
+            purpose: None,
         }
     }
 
@@ -327,6 +333,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The `purpose` tag (memory v3 review calls) round-trips and is
+    /// absent on pre-v3 rows — old ledgers replay unchanged.
+    #[test]
+    fn purpose_tag_round_trips_and_old_rows_have_none() {
+        let dir = std::env::temp_dir().join(format!("overseer-purpose-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.jsonl");
+        let mut l = Ledger::create(&path).unwrap();
+        l.record(UsageRecord {
+            purpose: Some("memory_review".into()),
+            ..rec(10, 0, 0, 5)
+        })
+        .unwrap();
+        l.record(rec(20, 0, 0, 5)).unwrap();
+        drop(l);
+        let rows = Ledger::read_all(&path);
+        assert_eq!(rows[0].purpose.as_deref(), Some("memory_review"));
+        assert_eq!(rows[1].purpose, None);
+        // A pre-v3 line (no `purpose` key at all) deserializes.
+        let old = r#"{"ts_ms":1,"model":"m","fresh_input":1,"cache_write":0,"cache_read":0,"output":1,"reasoning":0,"request_bytes":0,"latency_ms":0,"tool_calls":0,"cost_usd":0.01,"cache_hit_rate":0.0}"#;
+        let r: UsageRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(r.purpose, None);
+        // And None never serializes — the column stays out of old rows.
+        assert!(!serde_json::to_string(&r).unwrap().contains("purpose"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn rec(fresh: u64, read: u64, write: u64, output: u64) -> UsageRecord {
         UsageRecord::from_usage(
             "m",
@@ -431,6 +464,7 @@ mod tests {
             cost_usd: 0.0,
             cache_hit_rate: 0.0,
             subagent: None,
+            purpose: None,
         };
         let s = Ledger::summarize(&[rec]);
         assert_eq!(s.input_tokens, u64::MAX);
@@ -454,6 +488,7 @@ mod tests {
             cost_usd: 0.0,
             cache_hit_rate: 0.0,
             subagent: None,
+            purpose: None,
         }];
         let s = Ledger::summarize(&low);
         assert!(s.cache_alert, "0.167 hit rate must alert");
@@ -471,6 +506,7 @@ mod tests {
             cost_usd: 0.0,
             cache_hit_rate: 0.0,
             subagent: None,
+            purpose: None,
         }];
         let s2 = Ledger::summarize(&high);
         assert!(!s2.cache_alert, "0.95 hit rate must not alert");

@@ -374,7 +374,8 @@ fn topic_files(dir: &Path) -> Vec<Walked> {
             let name = e.file_name().to_string_lossy().into_owned();
             let is_topic = name.ends_with(".md")
                 && name.len() > 3
-                && (sub.is_some() || (name != INDEX_NAME && name != CORE_NAME));
+                && (sub.is_some()
+                    || (name != INDEX_NAME && name != CORE_NAME && name != super::amr::MEMORY_MD));
             if !is_topic {
                 continue;
             }

@@ -139,6 +139,9 @@ fn sub_cfg(ctx: &ToolCtx, input: &Value, cwd: &Path) -> crate::agent::AgentConfi
     cfg.auto_compact = false; // 20-step ceiling can't fill a window
     cfg.is_subagent = true;
     cfg.memory_recall = false;
+    // Memory v3 §10: subagents never learn — the review pass belongs to
+    // the parent's session (its `is_subagent` skip is the second guard).
+    cfg.learn = false;
     cfg
 }
 

@@ -13,11 +13,18 @@
 //! rollback. Commits are engine-made at turn boundaries, not model actions.
 
 pub mod activation;
+pub mod amr;
 pub mod episode;
 pub mod index;
+pub mod learn;
+mod lock;
 pub mod notice;
+pub mod pending;
 pub mod redact;
 pub mod stores;
+pub mod threat;
+
+pub use lock::StoreLock;
 
 pub use stores::{overseer_home, Scope};
 
@@ -141,6 +148,11 @@ pub struct EntryMeta {
     pub trigger: Option<String>,
     /// v2: when the trigger fired (RFC3339). Set once by the engine.
     pub fired: Option<String>,
+    /// v3: where the note came from
+    /// (`overseer:session/<id>[#e<event>]`, `amr-import`, …).
+    pub source: Option<String>,
+    /// v3: the day the note was added, `YYYY-MM-DD`.
+    pub added: Option<String>,
 }
 
 impl Default for EntryMeta {
@@ -156,6 +168,8 @@ impl Default for EntryMeta {
             cues: Vec::new(),
             trigger: None,
             fired: None,
+            source: None,
+            added: None,
         }
     }
 }
@@ -230,6 +244,8 @@ pub(crate) fn parse_meta(text: &str) -> Result<(EntryMeta, String), String> {
             }
             "trigger" => meta.trigger = Some(v.to_string()).filter(|t| !t.is_empty()),
             "fired" => meta.fired = Some(v.to_string()).filter(|t| !t.is_empty()),
+            "source" => meta.source = Some(v.to_string()).filter(|t| !t.is_empty()),
+            "added" => meta.added = Some(v.to_string()).filter(|t| !t.is_empty()),
             // Unknown keys are ignored (forward-compatible headers).
             _ => {}
         }
@@ -280,6 +296,13 @@ fn validate_meta(meta: &EntryMeta) -> Result<(), String> {
                     "memory: {name} `{s}` is not RFC3339 (want e.g. 2026-01-02T15:04:05Z)"
                 ));
             }
+        }
+    }
+    if let Some(d) = &meta.added {
+        if !valid_rfc3339(&format!("{d}T00:00:00Z")) {
+            return Err(format!(
+                "memory: added `{d}` is not YYYY-MM-DD (want e.g. 2026-01-02)"
+            ));
         }
     }
     Ok(())
@@ -616,8 +639,9 @@ enum Topic {
     /// File with no frontmatter: documented defaults apply (Personal /
     /// Private) and the whole text is the body.
     Bare(String),
-    /// File with a valid header.
-    Headed(EntryMeta, String),
+    /// File with a valid header (the meta is boxed — `EntryMeta` grew
+    /// `source`/`added` in v3 and dwarfs the other variants).
+    Headed(Box<EntryMeta>, String),
     /// File whose header does not parse: fail closed (Secret /
     /// Regulated) — an unreadable header must not open anything up. The
     /// body is deliberately not carried: nothing may serve it.
@@ -636,7 +660,7 @@ fn topic_of(dir: &Path, name: &str) -> (Topic, Option<std::time::SystemTime>) {
         return (Topic::Bare(text), mtime);
     }
     match parse_meta(&text) {
-        Ok((meta, _)) => (Topic::Headed(meta, text), mtime),
+        Ok((meta, _)) => (Topic::Headed(Box::new(meta), text), mtime),
         Err(_) => (Topic::Malformed, mtime),
     }
 }
@@ -969,7 +993,12 @@ pub fn layer_path(dir: &Path, name: &str) -> Option<PathBuf> {
 /// Git-version the memory dir. Runs `git init` once, then commits any dirty
 /// state. Best-effort: memory works without history, so failures are
 /// swallowed (no git binary, read-only fs) rather than killing the turn.
+/// Every commit first regenerates the store's AMR `MEMORY.md` (§9.1) so
+/// the entry point and the history stay in sync.
 pub fn commit(dir: &Path, msg: &str) {
+    // AMR entry point (§9.1). Not behind git: a store without history
+    // still gets its MEMORY.md. Best-effort like the commit itself.
+    let _ = amr::regen(dir, now_secs());
     let git = |args: &[&str]| {
         Command::new("git")
             .arg("-C")
@@ -1034,6 +1063,55 @@ pub fn dirty_files(dir: &Path) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// `overseer memory log`: the store's git history, `--oneline`, newest
+/// first, capped. Empty when the store has no history or git is absent.
+pub fn git_log(dir: &Path, cap: usize) -> Vec<String> {
+    if !dir.join(".git").exists() {
+        return Vec::new();
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["log", "--oneline", &format!("-{cap}")])
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// `overseer memory restore` (§8): un-expire a forgotten note — clear
+/// the `valid_to` frontmatter and the `forgotten:` body line `expire_note`
+/// wrote. The INDEX pointer lives (forget never deletes it). Takes the
+/// store lock and commits, like every write path.
+pub fn restore(dir: &Path, rel: &str) -> Result<String, String> {
+    if rel.contains("..") || rel.starts_with('/') || rel.starts_with("pending/") {
+        return Err(format!("memory: bad note path `{rel}`"));
+    }
+    let path = dir.join(rel);
+    let _lock = StoreLock::acquire(dir).map_err(|e| e.to_string())?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("memory: read `{rel}`: {e}"))?;
+    if !text
+        .lines()
+        .any(|l| l.trim_start().starts_with("valid_to:"))
+        && !text
+            .lines()
+            .any(|l| l.trim_start().starts_with("forgotten:"))
+    {
+        return Err(format!("memory: `{rel}` is not expired"));
+    }
+    let text = clear_forgotten(&clear_meta_key(&text, "valid_to"));
+    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    commit(dir, &format!("memory: restore {rel}"));
+    Ok(format!("restored {rel}"))
 }
 
 /// A reconciliation plan over the memory dir (mem0 pattern, arsenal B2):
@@ -1592,6 +1670,87 @@ pub(crate) fn set_meta_key(text: &str, key: &str, value: &str) -> String {
     out
 }
 
+/// `text` with the frontmatter `key` line removed (no-op when absent).
+/// The body is never touched; a `forgotten:` line is a *body* line, so
+/// [`clear_forgotten`] handles that one separately.
+pub(crate) fn clear_meta_key(text: &str, key: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    let close = (lines.first().map(|l| l.trim()) == Some("---"))
+        .then(|| lines.iter().skip(1).position(|l| l.trim() == "---"))
+        .flatten()
+        .map(|i| i + 1);
+    let Some(close) = close else {
+        return text.to_string();
+    };
+    let prefix = format!("{key}:");
+    if let Some(i) = lines[1..close]
+        .iter()
+        .position(|l| l.trim_start().starts_with(&prefix))
+    {
+        lines.remove(i + 1);
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// `text` without the `forgotten: <reason>` body line a `forget` wrote.
+pub(crate) fn clear_forgotten(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.retain(|l| !l.trim_start().starts_with("forgotten:"));
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// `text` expired at `now` (`valid_to` set) with a trailing
+/// `forgotten: <reason>` body line — the one expiry shape shared by the
+/// `forget` op, review apply and pending-op approval.
+pub(crate) fn expire_note(text: &str, reason: &str, now: u64) -> String {
+    let mut text = set_meta_key(text, "valid_to", &rfc3339(now));
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    text.push_str(&format!("forgotten: {reason}\n"));
+    text
+}
+
+/// Rewrite the INDEX.md pointer line that names `rel` so its title reads
+/// `title`. The pointer table is ADD-only for the *model*; the engine
+/// keeping a superseded note's pointer honest is housekeeping, not a
+/// model write. No-op when no pointer names `rel`.
+pub(crate) fn update_pointer(dir: &Path, rel: &str, title: &str) -> std::io::Result<()> {
+    let path = dir.join(INDEX_NAME);
+    let old = std::fs::read_to_string(&path)?;
+    let mut changed = false;
+    let out: Vec<String> = old
+        .lines()
+        .map(|line| {
+            let hit = topic_name(line)
+                .and_then(|n| resolve_pointer(dir, n))
+                .is_some_and(|r| r == rel);
+            if hit {
+                changed = true;
+                format!("{rel} — {title}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if changed {
+        std::fs::write(
+            &path,
+            format!("{}\n", out.join("\n").trim_end_matches('\n')),
+        )?;
+    }
+    Ok(())
+}
+
 /// Append one pointer line to a store's INDEX.md (ADD-only).
 pub(crate) fn append_pointer(dir: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write;
@@ -1863,7 +2022,7 @@ pub(crate) fn pointer_lines_in(
 
 /// [`pointer_lines`] whose topic is current at `now` (bare files count;
 /// malformed headers fail closed).
-fn live_pointers(dir: &Path, now: u64) -> Vec<(String, String)> {
+pub(crate) fn live_pointers(dir: &Path, now: u64) -> Vec<(String, String)> {
     pointer_lines(dir)
         .into_iter()
         .filter(|(rel, _)| match topic_of(dir, rel) {

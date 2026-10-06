@@ -44,6 +44,12 @@ pub(crate) struct ExecFlags {
     pub(crate) memory: bool,
     /// `--no-memory`: no user or project store (`--bare` implies it).
     pub(crate) no_memory: bool,
+    /// `--no-learn`: the memory v3 review pass never runs (`learn` off).
+    pub(crate) no_learn: bool,
+    /// `--learn-every <n>`: user-turn cadence for the review trigger.
+    pub(crate) learn_every: u32,
+    /// `--learn-stage`: review ops go to `pending/` instead of applying.
+    pub(crate) learn_stage: bool,
     /// `--no-tools a,b,c` — P4.3 ablation: named tools are removed from the
     /// spec list and refused at dispatch.
     pub(crate) no_tools: Vec<String>,
@@ -90,6 +96,9 @@ pub(crate) const EXEC_FLAGS: &[Flag] = &[
     Flag::value(&["--runtime"]),
     Flag::switch(&["--memory"]),
     Flag::switch(&["--no-memory"]),
+    Flag::switch(&["--no-learn"]),
+    Flag::value(&["--learn-every"]),
+    Flag::switch(&["--learn-stage"]),
     Flag::value(&["--autonomy"]),
     Flag::value(&["--credential-store"]),
     Flag::value(&["--no-tools"]),
@@ -133,6 +142,9 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
         runtime: None,
         memory: false,
         no_memory: false,
+        no_learn: false,
+        learn_every: 6,
+        learn_stage: false,
         no_tools: Vec::new(),
         autonomy: Vec::new(),
         credential_store: overseer_core::cred::CredentialStore::Auto,
@@ -216,6 +228,14 @@ pub(crate) fn exec_from(args: Vec<Arg>) -> Result<ExecFlags, String> {
             }
             "--memory" => f.memory = true,
             "--no-memory" => f.no_memory = true,
+            "--no-learn" => f.no_learn = true,
+            "--learn-every" => {
+                f.learn_every = v.parse().map_err(|_| "bad --learn-every")?;
+                if f.learn_every == 0 {
+                    return Err("bad --learn-every (want ≥ 1)".into());
+                }
+            }
+            "--learn-stage" => f.learn_stage = true,
             "--autonomy" => {
                 let (domain, level) = v
                     .split_once('=')
@@ -317,6 +337,45 @@ mod tests {
         };
         assert!(err.contains("bad --runtime"), "{err}");
         assert!(err.contains("gvisor"), "names the valid set: {err}");
+    }
+
+    #[test]
+    fn learn_flags_reach_agent_config() {
+        // Memory v3 §10: the review pass is on when memory is; the flags
+        // gate it and steer its cadence/staging.
+        let f = parse_exec(&["--no-learn".into(), "x".into()]).unwrap();
+        assert!(f.no_learn);
+        assert!(
+            !agent_config(&f).learn,
+            "--no-learn disables the review pass"
+        );
+        let f = parse_exec(&[
+            "--learn-every".into(),
+            "9".into(),
+            "--learn-stage".into(),
+            "x".into(),
+        ])
+        .unwrap();
+        assert_eq!(f.learn_every, 9);
+        assert!(f.learn_stage);
+        let cfg = agent_config(&f);
+        assert_eq!(cfg.learn_every, 9);
+        assert!(cfg.learn_stage);
+        for (argv, want) in [
+            (
+                vec!["--learn-every", "0", "x"],
+                "bad --learn-every (want ≥ 1)",
+            ),
+            (vec!["--learn-every", "x", "y"], "bad --learn-every"),
+        ] {
+            match parse_exec(&argv.iter().map(|s| s.to_string()).collect::<Vec<_>>()) {
+                Err(e) => assert_eq!(e, want),
+                Ok(_) => panic!("{argv:?} must not parse"),
+            }
+        }
+        // --bare is hermetic: learning is off regardless of stores.
+        let bare = agent_config(&parse_exec(&["--bare".into(), "x".into()]).unwrap());
+        assert!(!bare.learn);
     }
 }
 

@@ -515,6 +515,10 @@ pub fn feed(ev: &Event, run_elapsed: Option<std::time::Duration>) -> Feed {
         | EventKind::PermissionDecision { .. }
         | EventKind::PolicyLoad { .. }
         | EventKind::SandboxDenial { .. } => Feed::Ignore,
+        // Memory v3 review events are audit-only (§8's `MemoryLearned`
+        // summary line is the frontend stage, H2) — never rendered.
+        // DEFERRED(owner): render a learn summary line — gate: H2 frontend
+        EventKind::LearnSignal { .. } | EventKind::MemoryReview { .. } => Feed::Ignore,
         // A provider_error end follows an Error cell carrying the same
         // message — skip the summary so the failure lands as one line.
         EventKind::RunEnd { stop_reason, .. } if stop_reason == "provider_error" => Feed::Ignore,

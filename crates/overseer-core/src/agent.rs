@@ -86,6 +86,16 @@ pub struct AgentConfig {
     /// Set by `task` for subagents: memory is read-only, and recall,
     /// reminders and the episode note are off.
     pub is_subagent: bool,
+    /// Memory v3 §1: the learning review — signal/correction detection
+    /// (`LearnSignal`), a run-end review of the window since the cursor,
+    /// and a pre-compaction review. Off for `--bare` and subagents
+    /// (both are also guarded inside the review).
+    pub learn: bool,
+    /// §1.2 trigger 2 cadence — user turns since the last review.
+    pub learn_every: u32,
+    /// `--learn-stage`: every review op lands in `pending/` for human
+    /// approval instead of applying (§1.6).
+    pub learn_stage: bool,
     /// P6-3 credential broker: process-side secret store. The agent
     /// hands it to each turn's ToolCtx for bash injection + result
     /// sanitization. Default-empty (no creds); P6-4 adds persistence.
@@ -238,6 +248,9 @@ impl Default for AgentConfig {
             user_memory_dir: None,
             memory_recall: true,
             is_subagent: false,
+            learn: true,
+            learn_every: 6,
+            learn_stage: false,
             broker: crate::cred::Broker::new(),
             keep_tool_results: 5,
             verify_cmd: None,
@@ -354,6 +367,14 @@ pub struct Agent {
     /// CacheStats snapshot at the current run's start — RunEnd reports
     /// the delta so a run summary shows ITS hit rate, not the session's.
     run_cache_start: crate::ledger::CacheStats,
+    /// Memory v3 review cursor: the last `MemoryReview.through` — the
+    /// review window is `(review_cursor, last event]`. Replayed from the
+    /// log on resume so a covered window is never reviewed twice.
+    review_cursor: u64,
+    /// §1.2 cadence floor: the last successful `memory remember` call —
+    /// the agent saving on its own resets the turn/signal triggers
+    /// (never the tools trigger or the review window itself).
+    learn_floor: u64,
 }
 
 /// A stop gate's verdict: let the stop through, block it (a nudge was
@@ -417,6 +438,8 @@ impl Agent {
             system: Vec::new(),
             cache_key: Some(session_id.clone()),
             run_cache_start: crate::ledger::CacheStats::default(),
+            review_cursor: 0,
+            learn_floor: 0,
         };
         agent.reconcile_subagents()?;
         if let Some(dir) = agent.config.memory_dir.clone() {
@@ -546,6 +569,10 @@ impl Agent {
             system,
             cache_key,
             run_cache_start: crate::ledger::CacheStats::default(),
+            // §1.8: resume replays the cursor (and the remember floor),
+            // so a covered window is never reviewed twice.
+            review_cursor: crate::memory::learn::cursor_of(&events),
+            learn_floor: crate::memory::learn::remember_floor(&events),
         };
         agent.reconcile_subagents()?;
         Ok(agent)
@@ -1185,6 +1212,15 @@ impl Agent {
                 },
                 on_event,
             )?;
+            // §1.2 cadence reset: the agent saving to memory on its own
+            // IS the learning — the turn/signal triggers restart here.
+            if ran == "memory"
+                && !out.is_error
+                && !out.denied
+                && ran_input.get("op").and_then(serde_json::Value::as_str) == Some("remember")
+            {
+                self.learn_floor = self.log.last().map(|e| e.id).unwrap_or(self.learn_floor);
+            }
             // Audit-only record of each `run_code` sub-call.
             for rec in self.tools.take_script_calls() {
                 self.emit(
@@ -1254,7 +1290,13 @@ impl Agent {
         let mut files = Vec::new();
         for (scope, dir) in crate::memory::stores::of_config(&self.config) {
             let dirty = crate::memory::dirty_files(&dir);
-            crate::memory::commit(&dir, &format!("turn {steps}"));
+            // commit() now regenerates MEMORY.md, so it takes the store
+            // lock like every other write path. When another session
+            // holds the lock, this boundary's commit is skipped — the
+            // next boundary or write commits the same dirty files.
+            if let Ok(_lock) = crate::memory::StoreLock::acquire(&dir) {
+                crate::memory::commit(&dir, &format!("turn {steps}"));
+            }
             files.extend(dirty.into_iter().map(|f| format!("{}:{f}", scope.name())));
         }
         if !files.is_empty() {
@@ -1273,6 +1315,21 @@ impl Agent {
         on_event: &mut dyn FnMut(&Event),
     ) -> std::io::Result<()> {
         self.tools.memory.init(&self.config, &self.session_dir);
+        // §1.3: learn signals ride the same boundary as memory notices —
+        // the lexicon is deterministic and the event is audit-only.
+        if let Some(text) = input {
+            if self.config.learn && !self.config.is_subagent && self.tools.memory.active() {
+                if let Some((kind, excerpt)) = crate::memory::learn::signal(text) {
+                    self.emit(
+                        EventKind::LearnSignal {
+                            kind: kind.as_str().into(),
+                            excerpt,
+                        },
+                        on_event,
+                    )?;
+                }
+            }
+        }
         let notices = match input {
             Some(text) => self.tools.memory.on_input(text, crate::memory::now_secs()),
             None => self.tools.memory.take_queued(),
@@ -1581,6 +1638,12 @@ impl Agent {
         else {
             return Ok(false);
         };
+        // §1.2 trigger 4 (hermes on_pre_compress): review the window the
+        // summary is about to cover — the review is audit+memory only and
+        // never touches the message view. The `events` replay predates
+        // the MemoryReview event by construction; summaries and
+        // rehydrate never consume it.
+        self.maybe_review(Some("pre_compaction"), anchor, on_event)?;
         let summary = crate::compact::summarize(&events, anchor);
         self.emit(
             EventKind::Compaction {
@@ -1680,7 +1743,284 @@ impl Agent {
         )?;
         self.log.flush()?;
         self.write_episode();
+        // §1.2: the run-end review, after the episode write. The
+        // MemoryReview event lands after RunEnd (audit only); its cost
+        // is already in the ledger, so the RunOutcome the caller builds
+        // includes it.
+        self.maybe_review(None, u64::MAX, on_event)?;
+        self.log.flush()?;
         Ok(())
+    }
+
+    /// §1.2: evaluate the review triggers over `(review_cursor, upto]`
+    /// and, when one fires and no skip condition holds, run the review —
+    /// digest → ledgered review call → validated line protocol → §1.6
+    /// write policy. `forced` (`pre_compaction`) fires whenever the
+    /// window holds user turns. Configuration states (subagent,
+    /// `learn` off, no memory) return silently — a disabled session
+    /// must not accrue MemoryReview noise; only a triggered review that
+    /// then couldn't run (budget, nothing-new, provider) logs
+    /// `MemoryReview { skipped }`. Internal failures degrade to a
+    /// `skipped` record — only log-append errors propagate.
+    fn maybe_review(
+        &mut self,
+        forced: Option<&'static str>,
+        upto: u64,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<()> {
+        use crate::memory::learn;
+        let stores = crate::memory::stores::of_config(&self.config);
+        // Configuration states exit silently, before any trigger check:
+        // a subagent or a --no-learn session must not accrue a
+        // MemoryReview row on every run. Only a triggered review that
+        // then couldn't run records a `skipped` reason (budget,
+        // provider error, nothing-new).
+        if self.config.is_subagent || !self.config.learn || stores.is_empty() {
+            return Ok(());
+        }
+        let events = EventLog::replay(self.log.path())?;
+        let stats = learn::window_stats(&events, self.review_cursor, upto);
+        let trigger = match forced {
+            Some(t) if stats.user_turns > 0 => Some(t),
+            Some(_) => None,
+            None => {
+                // The remember floor resets the turn and signal triggers
+                // (the tools trigger keeps counting work since the
+                // cursor — a save doesn't erase it).
+                let floored = if self.learn_floor > self.review_cursor {
+                    learn::window_stats(&events, self.learn_floor, upto)
+                } else {
+                    stats
+                };
+                if floored.signals > 0 {
+                    Some("signal")
+                } else if floored.user_turns >= self.config.learn_every.max(1) {
+                    Some("turns")
+                } else if stats.tool_calls >= 15 {
+                    Some("tools")
+                } else {
+                    None
+                }
+            }
+        };
+        let Some(trigger) = trigger else {
+            return Ok(());
+        };
+        if stats.user_turns == 0 && stats.tool_calls == 0 {
+            return self.emit_review(
+                trigger,
+                None,
+                Some("nothing-new".into()),
+                None,
+                0.0,
+                on_event,
+            );
+        }
+        let now = crate::memory::now_secs();
+        let digest = learn::digest(&events, self.review_cursor, upto);
+        if digest.through <= self.review_cursor {
+            return self.emit_review(
+                trigger,
+                None,
+                Some("nothing-new".into()),
+                None,
+                0.0,
+                on_event,
+            );
+        }
+        let prompt = self.review_prompt(&digest, &stores, now, None);
+        // §1.7: skip when the worst-case review cost (chars/4 in + 1,200
+        // out, priced at the dearer candidate model) exceeds the budget
+        // left after own spend and subagent reservations.
+        let est_tokens = (prompt.len() as f64 / 4.0).ceil() as u64;
+        let mut worst = 0.0f64;
+        for m in [
+            self.config.small_model.clone(),
+            Some(self.config.model.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let u = crate::ir::Usage {
+                fresh_input: est_tokens,
+                output: 1_200,
+                ..Default::default()
+            };
+            worst = worst.max(profile::lookup(&m).cost_usd(&u));
+        }
+        let remaining =
+            self.config.max_cost_usd - self.ledger.total_cost_usd - self.spend.reserved_usd();
+        if worst > remaining {
+            return self.emit_review(trigger, None, Some("budget".into()), None, 0.0, on_event);
+        }
+        match self.review_call(&prompt) {
+            Ok((reply, model, cost)) => {
+                let parsed = learn::parse(&reply);
+                let ctx = learn::ApplyCtx {
+                    stores: &stores,
+                    tainted: digest.tainted,
+                    attended: false,
+                    stage_all: self.config.learn_stage,
+                    session_id: self.cache_key.as_deref().unwrap_or("unknown"),
+                    trigger,
+                    through: digest.through,
+                    now,
+                };
+                let out = learn::apply(&parsed, &ctx);
+                let rejected = out.rejected.len() + parsed.rejected.len();
+                self.emit_review(
+                    trigger,
+                    Some((digest.through, &out, rejected as u32)),
+                    None,
+                    Some(model),
+                    cost,
+                    on_event,
+                )?;
+                // §1.8: the cursor covers up to the review's through —
+                // the MemoryReview event itself stays outside (a window
+                // is never re-reviewed).
+                self.review_cursor = digest.through;
+            }
+            Err(e) => {
+                let reason = e.chars().take(120).collect::<String>();
+                self.emit_review(trigger, None, Some(reason), None, 0.0, on_event)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Assemble the §1.4 review prompt: digest plus the bm25-top-8
+    /// related notes (id + 160-char snippet) and an operator focus.
+    /// Learned skills land here in H2 — `&[]` for now.
+    // DEFERRED(owner): learned-skill listing in the prompt — gate: H2
+    fn review_prompt(
+        &self,
+        digest: &crate::memory::learn::Digest,
+        stores: &[(crate::memory::Scope, PathBuf)],
+        now: u64,
+        focus: Option<&str>,
+    ) -> String {
+        use crate::memory::index;
+        let idx = index::Index::build(stores, now);
+        let related: Vec<(String, String)> = idx
+            .search(&digest.query, now)
+            .iter()
+            .take(8)
+            .map(|h| {
+                let d = &idx.docs[h.doc];
+                (d.id(), index::snippet(d, &digest.query, 160))
+            })
+            .collect();
+        crate::memory::learn::prompt(digest, &related, &[], focus)
+    }
+
+    /// §1.7: the review's one model call. Small tier first (the same
+    /// escalate-on-failure/empty contract `aux_call` has), but unlike
+    /// `aux_call` every attempt is ledgered: a `UsageRecord` tagged
+    /// `purpose: "memory_review"` whose cost lands in the run total.
+    /// `max_tokens` 1,200, effort Min, no reasoning.
+    fn review_call(&mut self, prompt: &str) -> Result<(String, String, f64), String> {
+        let msgs = [Message::user_text(prompt.to_string())];
+        let mut models: Vec<String> = Vec::with_capacity(2);
+        if let Some(s) = &self.config.small_model {
+            models.push(s.clone());
+        }
+        if !models.contains(&self.config.model) {
+            models.push(self.config.model.clone());
+        }
+        let mut last = String::from("review call produced no text");
+        for (i, model) in models.iter().enumerate() {
+            let last_try = i + 1 == models.len();
+            let req = Request {
+                model,
+                system: &[],
+                tools: &[],
+                messages: &msgs,
+                max_tokens: 1_200,
+                thinking_budget: None,
+                effort: Some(crate::provider::Effort::Min),
+                cache_breakpoints: false,
+                cache_key: None,
+            };
+            match self.provider.complete(&req) {
+                Ok(r) => {
+                    let cost = profile::lookup(model).cost_usd(&r.usage);
+                    self.ledger
+                        .record(crate::ledger::UsageRecord {
+                            purpose: Some("memory_review".into()),
+                            ..crate::ledger::UsageRecord::from_usage(
+                                model,
+                                &r.usage,
+                                r.request_bytes,
+                                r.latency_ms,
+                                0,
+                                cost,
+                            )
+                        })
+                        .map_err(|e| e.to_string())?;
+                    self.spend.sync(self.ledger.total_cost_usd);
+                    let text: String = r
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            Block::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !text.trim().is_empty() {
+                        return Ok((text, model.clone(), cost));
+                    }
+                    if last_try {
+                        return Err(last);
+                    }
+                }
+                Err(e) => {
+                    last = e.to_string();
+                    if last_try {
+                        return Err(last);
+                    }
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// Emit one `MemoryReview` audit event. `applied` carries the outcome
+    /// when a review ran; `skipped` carries the reason when it didn't.
+    /// Never rehydrated into the message view.
+    fn emit_review(
+        &mut self,
+        trigger: &str,
+        applied: Option<(u64, &crate::memory::learn::Outcome, u32)>,
+        skipped: Option<String>,
+        model: Option<String>,
+        cost_usd: f64,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> std::io::Result<()> {
+        let (through, applied_, staged, quarantined, rejected) = match applied {
+            Some((through, out, rejected)) => (
+                through,
+                out.applied.clone(),
+                out.staged.clone(),
+                out.quarantined.clone(),
+                rejected,
+            ),
+            None => (self.review_cursor, Vec::new(), Vec::new(), Vec::new(), 0),
+        };
+        self.emit(
+            EventKind::MemoryReview {
+                trigger: trigger.into(),
+                through,
+                applied: applied_,
+                staged,
+                quarantined,
+                rejected,
+                skipped,
+                model: model.unwrap_or_default(),
+                cost_usd,
+            },
+            on_event,
+        )
     }
 
     /// Memory v2 episode note, rewritten from the log at each run end

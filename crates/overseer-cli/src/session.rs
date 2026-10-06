@@ -58,6 +58,9 @@ pub(crate) fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConf
         .canonicalize()
         .unwrap_or_else(|_| flags.cwd.clone());
     let (user_memory, project_memory) = memory_stores(flags, &cwd_canonical);
+    // Memory v3 §10: learning is on when memory is; --bare/--no-memory
+    // leave no store, so `learn` follows the stores.
+    let memory_on = user_memory.is_some() || project_memory.is_some();
     overseer_core::agent::AgentConfig {
         model: flags.model.clone(),
         max_steps: flags.max_steps,
@@ -81,6 +84,9 @@ pub(crate) fn agent_config(flags: &ExecFlags) -> overseer_core::agent::AgentConf
         user_memory_dir: user_memory,
         memory_recall: true,
         is_subagent: false,
+        learn: !flags.no_learn && !flags.bare && memory_on,
+        learn_every: flags.learn_every,
+        learn_stage: flags.learn_stage,
         // P6-2: the parent agent sees the full index; the ceiling applies
         // to the quarantined subagent view only.
         memory_filter: overseer_core::memory::Sensitivity::Personal,
