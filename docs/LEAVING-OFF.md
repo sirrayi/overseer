@@ -1,120 +1,57 @@
-# Where we left off (2026-09-30)
+# where things stand (2026-10-06)
 
-All Overseer work lives in this checkout: `/Users/chf/Desktop/Desktop - m1/overseer`, on branch `feat/overseer-next`. Everything is pushed to `github.com/sirrayi/overseer`.
+all overseer work lives in `/Users/chf/Desktop/Desktop - m1/overseer` and on [github.com/sirrayi/overseer](https://github.com/sirrayi/overseer). the default branch is `review`.
 
-## The two open PRs (merge in this order)
+## what changed since 09-30
 
-| PR | Branch → base | What's in it | CI (Mac runner) |
-|---|---|---|---|
-| [#51](https://github.com/sirrayi/overseer/pull/51) | `feat/overseer-refresh` → `review` | Web/TUI redesign plus bowtie logo, web security hardening, prompt caching, cua-driver computer use, clean-code sweep | green, except `plan` |
-| [#52](https://github.com/sirrayi/overseer/pull/52) | `feat/overseer-next` → `feat/overseer-refresh` | Memory v2, tool economy, subagent tiers (stacked on #51) | green, except `plan` |
+- #51 (refresh) and #52 (memory v2, tool economy, subagent tiers) are merged into `review`. the merge commits carry their deferred lists.
+- overseer life started: the plan, the security design and phase 0 of the backend are in. see [the plan](research/2026-10-05-digital-life.md), [the security design](research/2026-10-05-life-security.md) and [phase 0 results](research/2026-10-05-life-phase0-results.md).
+- the repo has a readme now.
+- the repo is public.
 
-- Neither PR is merged.
-- `plan` (cargo-dist on GitHub-hosted runners) fails on every PR, including #50 since 09-20. It never gets a machine and isn't caused by this work. The fix is `pr-run-mode = "skip"` in `dist-workspace.toml`; that's the owner's call.
-- #50 (`eval/cloud-benchmark-matrix`) is fully contained in #51. Close it once #51 merges.
-- `feat/memory-v2`, `feat/tool-economy` and `feat/subagent-tiers` stay on GitHub for reference. They're already merged into `feat/overseer-next`.
+## overseer life: what's waiting
 
-## What's built
+| step | waiting on |
+|---|---|
+| live x test (`crates/overseer-life/examples/x_spike.rs`) | you: an x developer app of type native app, callback `http://127.0.0.1:8723/callback`, a few dollars of credit, and the client id. it costs about $0.03 and revokes its token at the end |
+| subscriptions from bank and email | you: which bank and which email provider |
+| apple developer account | later. needed for signed builds, passkeys and password autofill in the built-in browser |
+| phase 1 backend | encrypted storage, the vault, the connector framework, "since last open" deltas |
+| frontend | after the backend. native swiftui shell for mac and iphone over the same rust core |
 
-The research behind every choice is in `docs/research/`:
-- `2026-09-29-pillars.md`: the overview, with a status section at the top
-- `2026-09-30-memory-v2.md`
-- `2026-09-30-tool-economy.md`
-- `2026-09-30-subagent-tiers.md`
+## harness: next steps
 
-**Memory v2**
-- Two stores, both outside the workspace: a user store in `~/.overseer/memory` and a project store in `~/.overseer/projects/<slug>-<hash8>/memory`.
-- One `memory` tool with ops search, get, remember and forget.
-- Ranking: BM25F, fused by RRF with ACT-R/Petrov activation and confidence.
-- Auto-recall brings up to 3 notes into a turn, and reminders fire on `at:`, `kw:` or `path:` triggers. Both are recorded as events, so resume replays identically.
-- Each session gets a deterministic episode note, and `overseer consolidate` distils each episode once.
-- Secrets are redacted at write time, and writes made after untrusted content arrives are quarantined.
+1. first live run with a real model. everything since the refresh has only been tested against mock providers. run a tui or web session with memory on and check recall, reminders, `tools`/`run_code` and a subagent with `tier`/`verify`.
+2. live computer-use test. turn on **CuaDriver** under accessibility and under screen recording in system settings, run `cua-driver permissions grant`, then the ignored `computer_live` test. synara's patched driver has the same 57 tools, so it can replace the installed one.
+3. small fixes found in phase 0: `browser_type` should require `ref`, `zoom` should require `x1..y2`, and a few args overseer sends aren't in the driver's schemas (details in the phase 0 results).
+4. benchmarks stay on hold until you lift it.
+5. deferred work is listed in the #52 merge commit: persisted memory index, recurring reminders, hard purge, anthropic `defer_loading`, `computer` and memory writes from `run_code`, cross-provider verifiers, resume across a rebased parent, multi-process sessions.
 
-**Tool economy**
-- Rarely used tools and all MCP tools sit behind one `tools` op tool (search/call).
-- `run_code` runs model-written scripts in QuickJS, with no filesystem, network or process access; every sub-call still passes the permission gate.
+known flaky test: `tools::computer::cua::tests::observe_renders_elements_and_remembers_tokens` failed once with ETXTBSY under load.
 
-**Subagent tiers**
-- Subagent budgets now compose, which fixes a real bug where every child got the parent's whole budget.
-- Two more existing bugs fixed:
-  - task ids restarted at 1 every step, so the second spawn failed;
-  - background tasks left behind by a crash held the fan-out slots forever.
-- Light, standard and heavy tiers, with one escalation step on failure.
-- A fresh-context `verify` mode with tamper evidence, plus `resume` and `consult`.
+## decisions you might revisit
 
-**Measured on a clean VM**
+- memory is on by default. `--no-memory` turns it off, `--bare` and the eval rig never use it.
+- episode notes keep the session's first prompt, redacted.
+- the heavy tier uses the priciest model in the family. only `consult` uses it by default.
+- resident tool specs are 92 chars over the 6,000 target, accepted.
+- the `release.yml` `plan` job fails on every pr because it never gets a machine. `pr-run-mode = "skip"` in `dist-workspace.toml` would stop that.
+- #50 is fully contained in #51 and can be closed.
 
-| | Before | Now |
-|---|---|---|
-| Resident tool specs (every optional tool, MCP and skills present) | 9,886 chars | 6,092 chars (~1.5K tokens); 5,739 without skills |
-| Base static prompt | 929 chars | 615 chars |
-| Release binary | 7.0 MB | 8.94 MB (`run_code` is 1.26 MB of that; `--no-default-features` builds without it) |
-| Tests | 763 | 928 passed, 0 failed |
-| Memory index build at 500 / 5K / 20K notes | — | 10 / 86 / 367 ms |
-| Memory search at 500 / 5K / 20K notes | — | 0.13 / 1.6 / 7.3 ms |
+## how to resume
 
-## Next steps, in priority order
+- build and test: `cargo build`, `cargo test --workspace`.
+- run: `cargo run -p overseer-cli -- web` (opens a tab, ports 8641-8660) or `-- tui`.
+- don't trigger github actions. pushing a branch is fine. a pr needs `[skip actions]` in its newest commit.
+- local notes and personal results live in `notes/`, which git ignores.
 
-1. **Merge #51, then #52.** Owner.
-2. **First live run with a real model.** Everything since the refresh has only been tested against mock providers. Run a TUI or web session with memory on and check recall, reminders, `tools`/`run_code` and a subagent with `tier`/`verify`.
-3. **Live computer-use test.** In System Settings → Privacy & Security, enable **CuaDriver** under Accessibility and under Screen & System Audio Recording. Then run `cua-driver permissions grant`, followed by the ignored `computer_live` test. It opens TextEdit in the background, types `overseer`, verifies it, and closes without saving. It also shows whether pixel clicks land in the right place.
-4. **Benchmarks stay on hold** until the owner lifts it. When they resume:
-   - first a baseline with the existing `eval/` rig;
-   - then LongMemEval-S for memory (at least 3 runs; skip LoCoMo, which has a broken answer key);
-   - tier and verify ablations;
-   - an accuracy check of deferred-tool calling.
-5. **Deferred work**, listed in full in #52's Deferred section. The main items:
-   - a persisted memory index (5K and 20K notes miss their 80 and 300 ms build targets);
-   - recurring reminders;
-   - hard purge of memory;
-   - native Anthropic `defer_loading`;
-   - `computer` and memory writes from `run_code`;
-   - cross-provider verifiers;
-   - resume across a rebased parent;
-   - multi-process sessions.
-6. **Known flaky test**, older than this work: `tools::computer::cua::tests::observe_renders_elements_and_remembers_tokens` failed once with ETXTBSY under parallel load.
+## local state
 
-## Decisions made that the owner may revisit
+- nothing is running.
+- outside this folder, safe to delete whenever: worktrees `~/.cache/overseer-{integrate,te,st,next}` (use `git worktree remove`), `~/.cache/overseer-cloud-launch`, build caches `~/.cache/overseer-{integrate,next}-target` (about 4 GB), synara's driver build in `~/.cache/overseer-life`, and the old subagent worktrees in `~/.overseer/sessions/1789914292383/subagents/wt-1..4` (their staged changes are just the pre-09-24 tree, already in git).
+- a verified backup of all of that is in `notes/2026-10-04-consolidation/`.
+- this folder is in icloud-synced desktop, and `target/` is about 8.8 GB. moving the repo out of icloud would avoid sync conflicts like the old `.git/index 3`.
 
-- **Memory is on by default.**
-  - `--no-memory` turns it off.
-  - `--memory` keeps the old store inside the workspace (`<cwd>/memory`).
-  - `--bare` and the eval rig always run without memory.
-- **Episode notes keep the session's first prompt,** redacted.
-- **Tier models.** The heavy tier is the priciest model in the profile table for the family, so for Anthropic that's `claude-fable-5`. Only `consult` uses heavy by default; `verify` uses the session's normal model. `--heavy-model` overrides the choice.
-- **Tool-spec target.** The resident tool specs are 92 chars over the 6,000 target. That was accepted: the remaining specs are already tight.
-- **Logo.** The bold bowtie is the global mark, in the single file `crates/overseer-tui/web/mark.svg`.
+## security to-do
 
-## How to resume
-
-- **Build and test:** `cargo build`, `cargo test --workspace`. TUI snapshots: `cargo test -p overseer-tui`.
-- **Run:** `cargo run -p overseer-cli -- web`. It scans ports 8641–8660 and opens a browser tab. Use `-- tui` for the terminal UI.
-- **Heavy work on Devin cloud:** run `devin --cloud -p --prompt-file <brief.md>` from a trusted directory under `~` (this checkout works). Keep local work to debug builds and narrow gates.
-- **Workflow this project used:**
-  1. decision record with sourced research;
-  2. brief;
-  3. pre-review of the brief against the code;
-  4. implementation on a cloud VM;
-  5. hostile line-by-line review;
-  6. follow-up fixes;
-  7. `--no-ff` integration;
-  8. full gates on a clean VM;
-  9. PR with a Deferred section.
-- **Last session's briefs, reviews, cloud reports, logo exploration and screenshots** are in `notes/2026-09-30-session/`. It's local only: `/notes/` is listed in `.git/info/exclude`.
-
-## Local state
-
-- **No local servers are running.** Both were stopped when the session ended.
-  - **Web app:** `cargo run -p overseer-cli -- web`. It prints a tokenized `http://127.0.0.1:<port>/#t=…` URL and opens it; the token is in `~/.overseer/web/token`. To reopen the demo session, add `--resume notes/2026-09-30-session/demo-session/1789920214220`.
-  - **Logo sheet:** `cd notes/2026-09-30-session/brand && python3 -m http.server 8650 --bind 127.0.0.1`.
-- **Leftovers outside this folder.** All are clean, fully pushed, and safe to delete whenever:
-  - worktrees `~/.cache/overseer-{integrate,te,st,next}` (remove them with `git worktree remove`);
-  - `~/.cache/overseer-cloud-launch`, an old clone used only to launch cloud sessions;
-  - build caches `~/.cache/overseer-integrate-target` (2.7 GB) and `~/.cache/overseer-next-target` (1.3 GB);
-  - old subagent worktrees under `~/.overseer/sessions/1789914292383/subagents/wt-1..4`.
-- **Untracked files in the repo root** (`HANDOFF.md` from an earlier session, `devin-harness-internals.txt`, `multi-agent-stress-prompts.pdf`) are left as they were.
-- **Browser (`Search.app`).** Its cached DeepSeek-whale icon for `127.0.0.1` was moved aside to `~/Library/Application Support/Search/icons/127.0.0.1.png.deepseek-whale.bak`. Restart the browser to pick up the bowtie favicon.
-
-## Security to-do
-
-- **Rotate the provider API key** that was pasted in the 09-20 session. It still sits in local session logs.
+- rotate the provider api key pasted in the 09-20 session. it's still in local session logs.
