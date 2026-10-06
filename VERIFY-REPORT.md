@@ -63,3 +63,156 @@ Per binary (run 1; runs 2 and 3 identical):
 | crates/overseer-core/src/tools/computer/cua.rs:1984 | `computer_live` | none (bare `#[ignore]`; doc comment: live macOS smoke, needs cua-driver) |
 
 Also matched: audit_memory2_bench.rs:1 is the module doc comment, not an attribute. 6 attributes, which matches the 6 ignored in the test runs.
+
+> Parts 2 and 3 are still running and will be appended below when they finish. Part 4 was pushed first so it is not lost.
+
+## Part 4: live model
+
+`OPENCODE_API_KEY` set (value not printed). Binary: `target/release/overseer` built from f46ba1b. Per run: fresh `OVERSEER_HOME=$(mktemp -d)/ov`; scratch repo = `Cargo.toml` (name `scratch`, edition 2021, no deps) + `src/lib.rs` containing only `//! A tiny scratch crate.`, git-initialised with one commit. The repo was placed under `~/verify/live/runN/repo`, not /tmp, because bwrap mounts a tmpfs over /tmp. Flags per brief, plus `--json` (stdout captured). Turn 1 `--session <run>/sess`, turns 2–6 `--resume <run>/sess`, then the fresh session `--session <run>/fresh` (no resume). The three runs ran one after another. All 21 exec calls exited 0. `~/.overseer` was never created.
+
+Every `ledger.jsonl` row had `cost_usd: 0`, and every `run_end.total_cost_usd` was 0. crates/overseer-core/src/profile.rs prices `deepseek-v4.1-flash` at 0.0 for input, cache and output, with the comment "subscription-included; the endpoint reports cost \"0\"". So both cost columns read $0 by construction.
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| review calls (ledger rows `purpose=memory_review`, sess+fresh) | 1 (sess) | 1 (sess) | 1 (sess) |
+| MemoryReview events (sess / fresh) | 1 / 0 | 1 / 0 | 1 / 0 |
+| when review ran | event 85, trigger `tools`, through 84 (end of turn 3) | event 69, `tools`, through 68 (end of turn 3) | event 87, `tools`, through 86 (end of turn 3) |
+| review cost | $0 | $0 | $0 |
+| main cost (sess / fresh) | $0 (30 calls) / $0 (6 calls) | $0 (24) / $0 (5) | $0 (31) / $0 (9) |
+| review applied | 2: `user:procedural/rust-fmt-before-done.md (0.70→0.75)`, `user:procedural/rust-tests-inline-cfg-test.md (0.70→0.75)` | 2: `user:procedural/rust-fmt-before-done.md (0.70→0.75)`, `user:procedural/rust-tests-inline-mod.md (0.70→0.75)` | 3: `user:procedural/rename-rust-symbol-crate-wide.md` (new), `project:procedural/always-run-cargo-fmt-before-declaring-a-rust-tas.md (0.70→0.75)`, `project:procedural/keep-rust-unit-tests-in-an-inline-cfg-test-mod-t.md (0.70→0.75)` |
+| staged / quarantined / rejected | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| review skip reasons | none (`skipped: null`) | none | none |
+| review ledger row output / reasoning tokens | 39 / 474 (fresh_input 1561) | 37 / 940 (fresh_input 1645) | 214 / 667 (fresh_input 1612) |
+| LearnSignal events | 3 (remember id3, correction id31, remember id87) | 3 (ids 3, 27, 71) | 3 (ids 3, 31, 89) |
+| main-model `memory` tool `remember` calls in sess | 4 | 6 | 6 |
+| fresh: recall notice (`memory_notice` event) | no | no | yes: `kind:recall`, notes `["user:procedural/rename-rust-symbol-crate-wide.md"]` |
+| fresh: memory index lines in system_prompt.txt | 4 | 4 | 5 |
+| fresh: ran `cargo fmt` | yes (`cargo fmt && cargo test`) | yes (`cargo fmt && cargo test && git diff --stat`) | yes (`cargo fmt && …`, later `cargo fmt --check`) |
+| fresh: tests kept inline | yes: `mul` test added to the existing `#[cfg(test)] mod tests` in src/lib.rs; no `tests/` dir | yes, same | yes, same |
+| exec wall secs t1..t6 / fresh | 13,8,18,12,8,13 / 16 | 10,16,27,8,37,6 / 11 | 15,9,41,14,9,8 / 18 |
+
+Observed in all 3 runs: the third LearnSignal excerpt is cut to `"remember that this project targets rust 1."`. It stops at the period in "1.80".
+Observed in run 3: the session put the fmt and inline-tests notes in the **project** store, while runs 1–2 put them in the **user** store. The fresh run-3 session also changed README.md (to mention `mul`). Turn 4 of run 3 had already added `rust-version = "1.80"` to Cargo.toml.
+stderr on every exec: `overseer: credentials — keychain backend 'secret-tool' unavailable — fell back to env` plus the `done: …` line.
+
+### Run 1 artifacts
+
+MemoryReview and LearnSignal events (jq; sess, fresh had none):
+```
+{"s":"sess","id":3,"type":"learn_signal","kind":"remember","excerpt":"from now on, always run cargo fmt before you say a task is done."}
+{"s":"sess","id":31,"type":"learn_signal","kind":"correction","excerpt":"no, don't put tests in a separate file, keep them in a #[cfg(test)] mod at the bottom"}
+{"s":"sess","id":85,"type":"memory_review","trigger":"tools","through":84,"applied":["user:procedural/rust-fmt-before-done.md (0.70→0.75)","user:procedural/rust-tests-inline-cfg-test.md (0.70→0.75)"],"staged":[],"quarantined":[],"rejected":0,"skipped":null,"model":"deepseek-v4.1-flash","cost_usd":0,"taint":null}
+{"s":"sess","id":87,"type":"learn_signal","kind":"remember","excerpt":"remember that this project targets rust 1."}
+```
+
+Every note created under `OVERSEER_HOME` (run 1; `.git/` and `.index/` omitted, INDEX.md shown for completeness):
+
+`memory/INDEX.md`:
+```
+# Memory Index
+
+One line per topic file: `name.md — what it's about`. Keep this index small; details live in the files.
+procedural/rust-fmt-before-done.md — Always run `cargo fmt` before declaring a Rust task done.
+procedural/rust-tests-inline-cfg-test.md — For Rust: keep unit tests inline in the same file inside a `#[cfg(test)] mod tes
+```
+
+`memory/procedural/rust-fmt-before-done.md`:
+```
+---
+provenance: session:sess
+confidence: 0.75
+source: overseer:session/sess
+added: 2026-10-06
+valid_from: 2026-10-06T17:31:52Z
+---
+Always run `cargo fmt` before declaring a Rust task done.
+```
+
+`memory/procedural/rust-tests-inline-cfg-test.md`:
+```
+---
+provenance: session:sess
+confidence: 0.75
+cues: Rust tests, cfg(test), mod tests, inline tests, separate test file
+source: overseer:session/sess
+added: 2026-10-06
+valid_from: 2026-10-06T17:32:07Z
+---
+For Rust: keep unit tests inline in the same file inside a `#[cfg(test)] mod tests` block at the bottom — do not create a separate tests/ file or test module file.
+```
+
+`projects/repo-150a3486/memory/INDEX.md`:
+```
+# Memory Index
+
+One line per topic file: `name.md — what it's about`. Keep this index small; details live in the files.
+episodic/session-2026-10-06-sess.md — Session 2026-10-06 sess: from now on, always run cargo fmt before you say a task is d
+semantic/msrv-rust-1-80-no-let-chains.md — Project "scratch" targets Rust 1.80 (MSRV). Do NOT use let-chains (`if let ... &
+episodic/session-2026-10-06-fresh.md — Session 2026-10-06 fresh: add a function mul(a,b) with a test
+```
+
+`projects/repo-150a3486/memory/episodic/session-2026-10-06-fresh.md`:
+```
+---
+provenance: engine
+confidence: 0.9
+valid_from: 2026-10-06T17:33:00Z
+---
+# Session 2026-10-06 fresh: add a function mul(a,b) with a test
+Prompt: add a function mul(a,b) with a test
+Later prompts: 0
+Files changed: src/lib.rs
+Bash calls: 2
+Outcome: end_turn after 6 steps, $0.0000, model deepseek-v4.1-flash
+```
+
+`projects/repo-150a3486/memory/episodic/session-2026-10-06-sess.md`:
+```
+---
+provenance: engine
+confidence: 0.9
+valid_from: 2026-10-06T17:31:48Z
+---
+# Session 2026-10-06 sess: from now on, always run cargo fmt before you say a task is d
+Prompt: from now on, always run cargo fmt before you say a task is done. add a function add(a,b) to src/lib.rs with a test
+Later prompts: 5
+Files changed: src/lib.rs, README.md
+Bash calls: 15
+Outcome: end_turn after 30 steps, $0.0000, model deepseek-v4.1-flash
+```
+
+`projects/repo-150a3486/memory/semantic/msrv-rust-1-80-no-let-chains.md`:
+```
+---
+provenance: session:sess
+confidence: 0.7
+cues: rust 1.80, MSRV, let-chains, edition 2024, if let chains
+source: overseer:session/sess
+added: 2026-10-06
+valid_from: 2026-10-06T17:32:35Z
+---
+Project "scratch" targets Rust 1.80 (MSRV). Do NOT use let-chains (`if let ... && ...` / `while let ... && ...`), which are unstable until Rust 2024/1.88. Use nested `if let` / `match` instead. Note: local toolchain is rustc 1.97.1, so let-chains WOULD compile locally — passing `cargo test` does not prove 1.80 compatibility.
+```
+
+Both `MEMORY.md` files:
+
+`memory/MEMORY.md`:
+```
+# Memory: user
+
+
+## Index
+- [[procedural/rust-fmt-before-done]] — Always run `cargo fmt` before declaring a Rust task done.
+- [[procedural/rust-tests-inline-cfg-test]] — For Rust: keep unit tests inline in the same file inside a `#[cfg(test)] mod tes
+```
+
+`projects/repo-150a3486/memory/MEMORY.md`:
+```
+# Memory: project repo
+
+
+## Index
+- [[episodic/session-2026-10-06-sess]] — Session 2026-10-06 sess: from now on, always run cargo fmt before you say a task is d
+- [[semantic/msrv-rust-1-80-no-let-chains]] — Project "scratch" targets Rust 1.80 (MSRV). Do NOT use let-chains (`if let ... &
+- [[episodic/session-2026-10-06-fresh]] — Session 2026-10-06 fresh: add a function mul(a,b) with a test
+```
