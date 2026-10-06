@@ -36,6 +36,8 @@ pub enum PendingOp {
         source: Option<String>,
         added: Option<String>,
     },
+    /// Move `target`'s confidence (`--learn-stage` parks FEEDBACK too).
+    Feedback { target: String, helpful: bool },
     /// Reserved: fold note `b` into `a` with merged `text`.
     Merge { a: String, b: String, text: String },
     /// Reserved: keep `a` or `b` of a contradiction pair.
@@ -174,6 +176,12 @@ fn encode(
                 None,
             )
         }
+        PendingOp::Feedback { target, helpful } => (
+            "feedback".into(),
+            Some(target.clone()),
+            serde_json::json!({ "helpful": helpful }),
+            Some(pin(target)?),
+        ),
         PendingOp::Merge { a, b, text } => {
             if !valid_target(b) {
                 return Err(format!("memory: bad pending target `{b}`"));
@@ -444,13 +452,34 @@ pub fn approve(stores: &[(Scope, PathBuf)], id: &str, now: u64) -> Result<String
     let Some((_scope, dir, path)) = find_pending(stores, id) else {
         return Err(format!("memory: no pending op `{id}`"));
     };
+    // Lock first, then read: a second approver that waited on the lock
+    // must see the record gone, never apply it again.
+    let _lock = StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
+    if path.symlink_metadata().is_err() {
+        return Err(format!("memory: `{id}` was already approved or rejected"));
+    }
     let rec =
         read_record(&path).ok_or("memory: unreadable or oversized pending record — reject it")?;
-    let _lock = StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
     let done = apply_record(&dir, &rec, now)?;
     std::fs::remove_file(&path).map_err(|e| e.to_string())?;
     super::commit(&dir, &format!("memory: approve {id}"));
     Ok(done)
+}
+
+/// A record field spliced into a frontmatter value (`origin`,
+/// `payload.source`, `payload.added`): one line, no control chars, at
+/// most 200 chars, and never a `---` fence.
+fn header_field(v: &str) -> Result<(), &'static str> {
+    if v.chars().count() > 200 {
+        return Err("is over 200 chars");
+    }
+    if super::learn::bad_controls(v, false) {
+        return Err("carries control characters or line breaks");
+    }
+    if v.trim_start().starts_with("---") {
+        return Err("starts with `---`");
+    }
+    Ok(())
 }
 
 /// Apply one pending record's op. A drifted target sha is a refusal —
@@ -470,7 +499,7 @@ fn apply_record(dir: &Path, rec: &Record, now: u64) -> Result<String, String> {
     // to whatever the target has drifted into.
     if matches!(
         rec.op.as_str(),
-        "supersede" | "forget" | "merge" | "contradict"
+        "supersede" | "forget" | "feedback" | "merge" | "contradict"
     ) && rec.target_sha256.is_none()
     {
         return Err(format!(
@@ -525,6 +554,31 @@ fn apply_record(dir: &Path, rec: &Record, now: u64) -> Result<String, String> {
             )?;
             Ok(format!("approved {}: forgot {target_rel}", rec.id))
         }
+        "feedback" => {
+            let helpful = rec
+                .payload
+                .get("helpful")
+                .and_then(|v| v.as_bool())
+                .ok_or("pending feedback: missing payload.helpful")?;
+            let text = super::store_read(dir, target_rel)?;
+            let (meta, _) = super::parse_meta(&text)
+                .map_err(|e| format!("memory: approve {} — {e}", rec.id))?;
+            let cur = meta.confidence;
+            let next = if helpful {
+                (cur + 0.05).min(0.95)
+            } else {
+                (cur - 0.15).max(0.1)
+            };
+            super::store_write(
+                dir,
+                target_rel,
+                super::set_meta_key(&text, "confidence", &format!("{next:.2}")).as_bytes(),
+            )?;
+            Ok(format!(
+                "approved {}: feedback {target_rel} ({cur:.2}→{next:.2})",
+                rec.id
+            ))
+        }
         "add" => {
             let layer = rec
                 .payload
@@ -559,23 +613,43 @@ fn apply_record(dir: &Path, rec: &Record, now: u64) -> Result<String, String> {
                 }
             }
             let cues = cues_v.join(", ");
-            let mut meta = format!("provenance: approved:{}\nconfidence: 0.6\n", rec.origin);
+            let field = |what: &str, v: &str| {
+                header_field(v)
+                    .map_err(|e| format!("memory: approve {} — {what} {e}", rec.id))
+                    .map(|_| v.to_string())
+            };
+            let origin = field("origin", &rec.origin)?;
             // A review-staged add carries the session/event stamp it was
             // drafted under; a hand-staged record gets today's `added`.
-            if let Some(src) = rec.payload.get("source").and_then(|v| v.as_str()) {
-                meta.push_str(&format!("source: {src}\n"));
+            let source = match rec.payload.get("source").and_then(|v| v.as_str()) {
+                Some(src) => Some(field("source", src)?),
+                None => None,
+            };
+            let added = match rec.payload.get("added").and_then(|v| v.as_str()) {
+                Some(a) => field("added", a)?,
+                None => super::rfc3339(now)[..10].to_string(),
+            };
+            let mut head = "---\n---\n".to_string();
+            head = super::set_meta_key(&head, "provenance", &format!("approved:{origin}"));
+            head = super::set_meta_key(&head, "confidence", "0.6");
+            if let Some(src) = &source {
+                head = super::set_meta_key(&head, "source", src);
             }
-            let added = rec
-                .payload
-                .get("added")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| super::rfc3339(now)[..10].to_string());
-            meta.push_str(&format!("added: {added}\n"));
+            head = super::set_meta_key(&head, "added", &added);
             if !cues.is_empty() {
-                meta.push_str(&format!("cues: {cues}\n"));
+                head = super::set_meta_key(&head, "cues", &cues);
             }
-            meta.push_str(&format!("valid_from: {}\n", super::rfc3339(now)));
+            head = super::set_meta_key(&head, "valid_from", &super::rfc3339(now));
+            let meta = head
+                .strip_prefix("---\n")
+                .and_then(|h| h.strip_suffix("---\n"))
+                .ok_or("pending add: bad frontmatter")?
+                .to_string();
+            let note = format!("---\n{meta}---\n{text}\n");
+            super::parse_meta(&note).map_err(|e| format!("memory: approve {} — {e}", rec.id))?;
+            if let Some(msg) = super::threat::strict_refusal(&note) {
+                return Err(format!("memory: approve {} — {msg}", rec.id));
+            }
             let rel = super::add_note(dir, layer, slug, &meta, &text).map_err(|e| e.to_string())?;
             Ok(format!("approved {}: added {rel}", rec.id))
         }
@@ -683,6 +757,9 @@ pub fn reject(stores: &[(Scope, PathBuf)], id: &str) -> Result<String, String> {
         return Err(format!("memory: no pending op `{id}`"));
     };
     let _lock = StoreLock::acquire(&dir).map_err(|e| e.to_string())?;
+    if path.symlink_metadata().is_err() {
+        return Err(format!("memory: `{id}` was already approved or rejected"));
+    }
     std::fs::remove_file(&path).map_err(|e| e.to_string())?;
     super::commit(&dir, &format!("memory: reject {id}"));
     Ok(format!("rejected {id}"))
