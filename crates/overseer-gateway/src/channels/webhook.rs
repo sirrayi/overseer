@@ -100,17 +100,35 @@ impl RateLimiter {
         }
     }
 
-    fn remember(&mut self, key: &str, now_ms: u64) {
+    /// Make room to remember `key`. Only entries older than the replay
+    /// window are evicted (oldest first): forgetting a younger one would
+    /// let its untimestamped record replay. A table full of young entries
+    /// refuses the new record instead.
+    fn make_room(&mut self, key: &str, now_ms: u64) -> Result<(), String> {
         if self.seen.contains_key(key) {
-            return;
+            return Ok(());
         }
         while self.seen_order.len() >= MAX_SEEN {
-            if let Some(old) = self.seen_order.pop_front() {
-                self.seen.remove(&old);
+            let oldest = self.seen_order.front().and_then(|k| self.seen.get(k));
+            match oldest {
+                Some(t) if now_ms.saturating_sub(*t) > REPLAY_WINDOW_MS => {
+                    if let Some(old) = self.seen_order.pop_front() {
+                        self.seen.remove(&old);
+                    }
+                }
+                _ => return Err("webhook: replay table full, retry later".into()),
             }
         }
-        self.seen.insert(key.to_string(), now_ms);
-        self.seen_order.push_back(key.to_string());
+        Ok(())
+    }
+
+    fn remember(&mut self, key: &str, now_ms: u64) -> Result<(), String> {
+        self.make_room(key, now_ms)?;
+        if !self.seen.contains_key(key) {
+            self.seen.insert(key.to_string(), now_ms);
+            self.seen_order.push_back(key.to_string());
+        }
+        Ok(())
     }
 
     /// Admit (or refuse) an arrival at `now_ms`. `per_min == 0` refuses
@@ -242,13 +260,16 @@ pub fn ingest(
             inbound.sender
         ));
     }
+    // Checked before the rate window is charged: a refused record leaves
+    // no trace in either table.
+    limiter.make_room(&replay_key, now_ms)?;
     if !limiter.admit_at(&format!("{}:{}", inbound.channel, inbound.sender), now_ms) {
         return Err(format!(
             "webhook: rate limit exceeded for '{}'",
             inbound.sender
         ));
     }
-    limiter.remember(&replay_key, now_ms);
+    limiter.remember(&replay_key, now_ms)?;
     // `event_for` (not `from_channel`) so the keyword verbs are classed
     // (`msg.inbound.queue`) and the intent lands in the origin metadata.
     Ok(super::event_for(&inbound))
@@ -611,11 +632,57 @@ mod tests {
     #[test]
     fn replay_memory_is_bounded_oldest_first() {
         let mut limiter = RateLimiter::new(1);
-        for i in 0..=MAX_SEEN {
-            limiter.remember(&format!("sig{i}"), 0);
+        for i in 0..MAX_SEEN {
+            limiter.remember(&format!("sig{i}"), 0).unwrap();
         }
+        // Only entries older than the window may be evicted.
+        limiter
+            .remember(&format!("sig{MAX_SEEN}"), REPLAY_WINDOW_MS + 1)
+            .unwrap();
         assert_eq!(limiter.seen.len(), MAX_SEEN);
         assert!(!limiter.seen.contains_key("sig0"));
         assert!(limiter.seen.contains_key(&format!("sig{MAX_SEEN}")));
+    }
+
+    #[test]
+    fn full_table_of_young_entries_refuses_instead_of_evicting() {
+        // Reviewer repro: 10,001 distinct untimestamped records inside one
+        // window. Evicting the first would let it replay once its window
+        // passes; the 10,001st must be refused and nothing forgotten.
+        let s = spec("K", &["*"], 1_000_000);
+        let mut limiter = RateLimiter::new(1_000_000);
+        let rec = |i: usize| {
+            let body = format!(r#"{{"sender":"u{i}","text":"m{i}"}}"#);
+            WebhookRequest {
+                signature: hex(&hmac_sha256(b"k", body.as_bytes())),
+                body,
+            }
+        };
+        let t0 = 1_000_000u64;
+        for i in 0..MAX_SEEN {
+            ingest(&s, Some("k"), &rec(i), &mut limiter, t0).unwrap();
+        }
+        let window_before = limiter.window.len();
+        let err = ingest(&s, Some("k"), &rec(MAX_SEEN), &mut limiter, t0 + 1).unwrap_err();
+        assert_eq!(err, "webhook: replay table full, retry later");
+        assert_eq!(limiter.seen.len(), MAX_SEEN);
+        assert_eq!(
+            limiter.window.len(),
+            window_before,
+            "refusal charged the rate window"
+        );
+        let first = rec(0).signature;
+        assert!(
+            limiter.seen.contains_key(&first),
+            "a young entry was evicted"
+        );
+        assert!(!limiter.seen.contains_key(&rec(MAX_SEEN).signature));
+        // Once the window has passed, the first record is a replay — not
+        // re-accepted — and old entries make room for new ones again.
+        let later = t0 + REPLAY_WINDOW_MS + 1;
+        let err = ingest(&s, Some("k"), &rec(0), &mut limiter, later).unwrap_err();
+        assert_eq!(err, "webhook: replayed record refused");
+        ingest(&s, Some("k"), &rec(MAX_SEEN), &mut limiter, later).unwrap();
+        assert_eq!(limiter.seen.len(), MAX_SEEN);
     }
 }
