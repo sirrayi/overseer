@@ -238,3 +238,182 @@ What the code says (not measured): the fuzz loops stop at whichever comes first,
 | audit_surfaces_web | overseer-cli | pass, 14 / 0 / 0 | 10.1s |
 
 Wall times are measured after the release build was already cached.
+
+## Part 3: benchmark
+
+`cargo test -p overseer-core --release --test audit_memory2_bench -- --ignored --nocapture`. Both tests carry `#[ignore = "benchmark: ..."]`, so `--ignored` was kept. Result: **pass**, 2 passed / 0 failed, finished in 11.06s (11.1s wall). Output below is verbatim, with cargo's Compiling/Finished/Running lines removed:
+
+```text
+running 2 tests
+n=  5000 build median    87.9 ms (min 85.4)  refresh(no-op)   5.47 ms  search(3 terms)   0.36 ms avg (1815 hits avg)  common-term search   1.97 ms (4236 hits)
+
+=== variant flat (1975 notes, 200 queries) ===
+shipped Index::search    R@3 0.630  MRR 0.647
+    keyword      R@3 1.000  MRR 1.000
+    paraphrase   R@3 0.400  MRR 0.358
+    typo         R@3 0.040  MRR 0.046
+    code-id      R@3 1.000  MRR 1.000
+    multi-hop    R@3 0.400  MRR 0.500
+    negation     R@3 0.200  MRR 0.274
+    recency      R@3 1.000  MRR 1.000
+    expired      R@3 1.000  MRR 1.000
+    expired-in-top3 0
+reimpl (all signals)     R@3 0.580  MRR 0.591
+    keyword      R@3 1.000  MRR 1.000
+    paraphrase   R@3 0.400  MRR 0.358
+    typo         R@3 0.040  MRR 0.046
+    code-id      R@3 1.000  MRR 1.000
+    multi-hop    R@3 0.000  MRR 0.050
+    negation     R@3 0.200  MRR 0.274
+    recency      R@3 1.000  MRR 1.000
+    expired      R@3 1.000  MRR 1.000
+    expired-in-top3 0
+BM25F only               R@3 0.580  MRR 0.591
+    keyword      R@3 1.000  MRR 1.000
+    paraphrase   R@3 0.400  MRR 0.356
+    typo         R@3 0.040  MRR 0.046
+    code-id      R@3 1.000  MRR 1.000
+    multi-hop    R@3 0.000  MRR 0.050
+    negation     R@3 0.200  MRR 0.273
+    recency      R@3 1.000  MRR 1.000
+    expired      R@3 1.000  MRR 1.000
+    expired-in-top3 0
+BM25F + links            R@3 0.580  MRR 0.591
+    keyword      R@3 1.000  MRR 1.000
+    paraphrase   R@3 0.400  MRR 0.356
+    typo         R@3 0.040  MRR 0.046
+    code-id      R@3 1.000  MRR 1.000
+    multi-hop    R@3 0.000  MRR 0.050
+    negation     R@3 0.200  MRR 0.273
+    recency      R@3 1.000  MRR 1.000
+    expired      R@3 1.000  MRR 1.000
+    expired-in-top3 0
+- activation             R@3 0.580  MRR 0.591
+    keyword      R@3 1.000  MRR 1.000
+    paraphrase   R@3 0.400  MRR 0.356
+    typo         R@3 0.040  MRR 0.046
+    code-id      R@3 1.000  MRR 1.000
+    multi-hop    R@3 0.000  MRR 0.050
+    negation     R@3 0.200  MRR 0.273
+    recency      R@3 1.000  MRR 1.000
+    expired      R@3 1.000  MRR 1.000
+    expired-in-top3 0
+- confidence             R@3 0.580  MRR 0.591
+    keyword      R@3 1.000  MRR 1.000
+    paraphrase   R@3 0.400  MRR 0.358
+    typo         R@3 0.040  MRR 0.046
+    code-id      R@3 1.000  MRR 1.000
+    multi-hop    R@3 0.000  MRR 0.050
+    negation     R@3 0.200  MRR 0.274
+    recency      R@3 1.000  MRR 1.000
+    expired      R@3 1.000  MRR 1.000
+    expired-in-top3 0
+- links                  R@3 0.580  MRR 0.591
+    keyword      R@3 1.000  MRR 1.000
+    paraphrase   R@3 0.400  MRR 0.358
+    typo         R@3 0.040  MRR 0.046
+    code-id      R@3 1.000  MRR 1.000
+    multi-hop    R@3 0.000  MRR 0.050
+    negation     R@3 0.200  MRR 0.274
+    recency      R@3 1.000  MRR 1.000
+    expired      R@3 1.000  MRR 1.000
+    expired-in-top3 0
+reimpl top-3 agreement with shipped: 138/200
+recall notice fired 126/200, carried a gold note 106/200
+    recall keyword      fired 25/25 gold 25/25
+    recall paraphrase   fired 0/25 gold 0/25
+    recall typo         fired 1/25 gold 1/25
+    recall code-id      fired 25/25 gold 25/25
+    recall multi-hop    fired 15/25 gold 0/25
+    recall negation     fired 10/25 gold 5/25
+    recall recency      fired 25/25 gold 25/25
+    recall expired      fired 25/25 gold 25/25
+
+=== variant lived-in (1975 notes, 200 queries) ===
+shipped Index::search    R@3 0.645  MRR 0.627
+    keyword      R@3 1.000  MRR 1.000
+    paraphrase   R@3 0.760  MRR 0.507
+    typo         R@3 0.040  MRR 0.046
+    code-id      R@3 1.000  MRR 1.000
+    multi-hop    R@3 0.160  MRR 0.192
+    negation     R@3 0.200  MRR 0.269
+    recency      R@3 1.000  MRR 1.000
+    expired      R@3 1.000  MRR 1.000
+    expired-in-top3 0
+reimpl (all signals)     R@3 0.185  MRR 0.159
+    keyword      R@3 0.040  MRR 0.034
+    paraphrase   R@3 0.560  MRR 0.410
+    typo         R@3 0.000  MRR 0.007
+    code-id      R@3 0.080  MRR 0.130
+    multi-hop    R@3 0.040  MRR 0.053
+    negation     R@3 0.160  MRR 0.163
+    recency      R@3 0.240  MRR 0.091
+    expired      R@3 0.360  MRR 0.380
+    expired-in-top3 0
+BM25F only               R@3 0.580  MRR 0.591
+    keyword      R@3 1.000  MRR 1.000
+    paraphrase   R@3 0.400  MRR 0.356
+    typo         R@3 0.040  MRR 0.046
+    code-id      R@3 1.000  MRR 1.000
+    multi-hop    R@3 0.000  MRR 0.050
+    negation     R@3 0.200  MRR 0.273
+    recency      R@3 1.000  MRR 1.000
+    expired      R@3 1.000  MRR 1.000
+    expired-in-top3 0
+BM25F + links            R@3 0.580  MRR 0.591
+    keyword      R@3 1.000  MRR 1.000
+    paraphrase   R@3 0.400  MRR 0.356
+    typo         R@3 0.040  MRR 0.046
+    code-id      R@3 1.000  MRR 1.000
+    multi-hop    R@3 0.000  MRR 0.050
+    negation     R@3 0.200  MRR 0.273
+    recency      R@3 1.000  MRR 1.000
+    expired      R@3 1.000  MRR 1.000
+    expired-in-top3 0
+- activation             R@3 0.250  MRR 0.233
+    keyword      R@3 0.240  MRR 0.250
+    paraphrase   R@3 0.560  MRR 0.379
+    typo         R@3 0.000  MRR 0.013
+    code-id      R@3 0.080  MRR 0.121
+    multi-hop    R@3 0.040  MRR 0.057
+    negation     R@3 0.480  MRR 0.449
+    recency      R@3 0.240  MRR 0.246
+    expired      R@3 0.360  MRR 0.351
+    expired-in-top3 0
+- confidence             R@3 0.260  MRR 0.252
+    keyword      R@3 0.040  MRR 0.047
+    paraphrase   R@3 0.480  MRR 0.349
+    typo         R@3 0.000  MRR 0.007
+    code-id      R@3 0.120  MRR 0.181
+    multi-hop    R@3 0.040  MRR 0.085
+    negation     R@3 0.400  MRR 0.409
+    recency      R@3 0.000  MRR 0.069
+    expired      R@3 1.000  MRR 0.867
+    expired-in-top3 0
+- links                  R@3 0.185  MRR 0.159
+    keyword      R@3 0.040  MRR 0.034
+    paraphrase   R@3 0.560  MRR 0.390
+    typo         R@3 0.000  MRR 0.007
+    code-id      R@3 0.080  MRR 0.131
+    multi-hop    R@3 0.040  MRR 0.053
+    negation     R@3 0.160  MRR 0.163
+    recency      R@3 0.240  MRR 0.091
+    expired      R@3 0.360  MRR 0.401
+    expired-in-top3 0
+reimpl top-3 agreement with shipped: 53/200
+recall notice fired 126/200, carried a gold note 106/200
+    recall keyword      fired 25/25 gold 25/25
+    recall paraphrase   fired 0/25 gold 0/25
+    recall typo         fired 1/25 gold 1/25
+    recall code-id      fired 25/25 gold 25/25
+    recall multi-hop    fired 15/25 gold 0/25
+    recall negation     fired 10/25 gold 5/25
+    recall recency      fired 25/25 gold 25/25
+    recall expired      fired 25/25 gold 25/25
+test retrieval_benchmark ... ok
+n= 20000 build median   383.5 ms (min 354.8)  refresh(no-op)  22.89 ms  search(3 terms)   1.48 ms avg (7279 hits avg)  common-term search  10.25 ms (17220 hits)
+n= 50000 build median   975.2 ms (min 941.3)  refresh(no-op)  74.61 ms  search(3 terms)   4.07 ms avg (18175 hits avg)  common-term search  27.23 ms (42994 hits)
+test scale_benchmark ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.06s
+```
