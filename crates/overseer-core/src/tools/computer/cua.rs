@@ -68,14 +68,31 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
 use super::super::ToolCtx;
 use super::{action_of, cred_field, digest_short, read_obs, shape, write_owner_only, ObsState};
 
+use crate::control::Control;
 use crate::mcp::{StdioClient, CALL_TIMEOUT};
+
+/// The provider image limit already enforced here: Anthropic's Messages API
+/// rejects an image over 8000 px on an edge (P7 clamps `max_dimension`).
+const MAX_IMAGE_EDGE: u64 = 8000;
+
+/// P7: image bytes (base64, as delivered) the model may receive per turn.
+pub(crate) const IMAGE_BUDGET: usize = 8 << 20;
+
+/// P3: the post-act added/removed diff is capped at this many bytes.
+const DIFF_CAP: usize = 1024;
+
+/// P4: `wait_for` never polls longer than this in one call.
+const WAIT_MAX_MS: u64 = 10_000;
+
+/// P9: roles (or subroles) observe lifts into the top-level `modal`.
+const MODAL_ROLES: &[&str] = &["AXSheet", "AXDialog", "AXSystemDialog"];
 
 /// `end_session` gets a short leash: it is best-effort teardown, and a wedged
 /// driver must not hold the registry's drop for the full call timeout.
@@ -157,8 +174,42 @@ pub struct Live {
     snaps: HashMap<(u64, u64), Snap>,
     /// Browser `tab_id` → `target_id` minted by the bind call.
     tabs: HashMap<String, String>,
+    /// P8: driver tool → its `inputSchema` from the handshake's
+    /// `tools/list`. A tool with no entry is dispatched unchecked.
+    schemas: HashMap<String, Value>,
+    /// P8: `tool.arg` names admission dropped during the current action.
+    dropped: Vec<String>,
+    /// P5: the driver refused with its kill-switch code.
+    killed: bool,
+    /// A post-act read hit a transport failure — drop after this call.
+    dead: bool,
+    /// P1b: real secret values typed this session — scrubbed from results.
+    secrets: Vec<String>,
 }
 
+/// The read bounds of an AX-only `get_window_state`; post reads reuse the
+/// window's last observe bounds (P3).
+#[derive(Clone)]
+struct Bounds {
+    limit: usize,
+    query: Option<String>,
+    depth: Option<u64>,
+}
+
+impl Default for Bounds {
+    fn default() -> Self {
+        Bounds {
+            limit: 150,
+            query: None,
+            depth: None,
+        }
+    }
+}
+
+/// One window's latest AX snapshot. Marks (P2) are `e<n>`, numbered per
+/// window: a re-read keeps an unchanged element's mark and mints fresh
+/// numbers for new ones, so a mark below `next_mark` that the snapshot no
+/// longer holds is stale, and one at or above it was never issued.
 struct Snap {
     #[cfg(test)]
     id: Option<String>,
@@ -167,6 +218,219 @@ struct Snap {
     /// reads centres off this.
     #[cfg(test)]
     frames: HashMap<i64, (f64, f64, f64, f64)>,
+    /// mark → element_index.
+    marks: HashMap<String, i64>,
+    /// identity (depth, role, label, occurrence) → mark.
+    keys: HashMap<String, String>,
+    /// (mark, rendered line) in tree order — what the post diff compares.
+    lines: Vec<(String, String)>,
+    /// element_index → parent_index (modal membership).
+    parents: HashMap<i64, i64>,
+    next_mark: u64,
+    /// [`tree_sha`] of the elements.
+    sha: String,
+    modal: Option<Modal>,
+    bounds: Bounds,
+}
+
+/// P9: an open sheet/dialog — its own buttons are the only element acts
+/// allowed in the window until it closes.
+struct Modal {
+    index: i64,
+    role: String,
+    title: String,
+    buttons: Vec<(String, String)>,
+}
+
+/// Content digest of an element list (role, label, value, depth — never
+/// marks or tokens, which change per snapshot).
+fn tree_sha(els: &[shape::Element]) -> String {
+    let mut text = String::new();
+    for e in els {
+        text.push_str(&format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\n",
+            e.depth,
+            e.role,
+            e.label,
+            e.value.as_deref().unwrap_or("")
+        ));
+    }
+    digest_short(&text)
+}
+
+fn is_modal(e: &shape::Element) -> Option<String> {
+    if MODAL_ROLES.contains(&e.role.as_str()) {
+        return Some(e.role.clone());
+    }
+    e.subrole
+        .as_deref()
+        .filter(|r| MODAL_ROLES.contains(r))
+        .map(str::to_string)
+}
+
+/// `idx` is `anc` or sits below it (the hop bound guards a cycle).
+fn inside(parents: &HashMap<i64, i64>, idx: i64, anc: i64) -> bool {
+    let mut cur = idx;
+    for _ in 0..=parents.len() {
+        if cur == anc {
+            return true;
+        }
+        match parents.get(&cur) {
+            Some(&p) => cur = p,
+            None => return false,
+        }
+    }
+    false
+}
+
+impl Snap {
+    fn build(prev: Option<&Snap>, _r: &Value, els: &[shape::Element], bounds: Bounds) -> Snap {
+        let mut next = prev.map_or(1, |p| p.next_mark);
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut keys = HashMap::with_capacity(els.len());
+        let mut marks = HashMap::with_capacity(els.len());
+        let mut by_index = HashMap::with_capacity(els.len());
+        let mut lines = Vec::with_capacity(els.len());
+        let mut parents = HashMap::with_capacity(els.len());
+        let mut tokens = HashMap::with_capacity(els.len());
+        for e in els {
+            let base = format!("{}\u{1f}{}\u{1f}{}", e.depth, e.role, e.label);
+            let n = seen.entry(base.clone()).or_insert(0);
+            let key = format!("{base}\u{1f}{n}");
+            *n += 1;
+            let mark = match prev.and_then(|p| p.keys.get(&key)) {
+                Some(m) => m.clone(),
+                None => {
+                    next += 1;
+                    format!("e{}", next - 1)
+                }
+            };
+            marks.insert(mark.clone(), e.index);
+            by_index.insert(e.index, mark.clone());
+            lines.push((mark.clone(), shape::line(e, &mark)));
+            keys.insert(key, mark);
+            if let Some(p) = e.parent {
+                parents.insert(e.index, p);
+            }
+            if let Some(t) = &e.token {
+                tokens.insert(e.index, t.clone());
+            }
+        }
+        let modal = els.iter().find_map(|m| {
+            let role = is_modal(m)?;
+            let buttons = els
+                .iter()
+                .filter(|e| e.role == "AXButton" && inside(&parents, e.index, m.index))
+                .filter_map(|e| Some((by_index.get(&e.index)?.clone(), e.label.clone())))
+                .collect();
+            Some(Modal {
+                index: m.index,
+                role,
+                title: m.label.clone(),
+                buttons,
+            })
+        });
+        Snap {
+            #[cfg(test)]
+            id: _r
+                .pointer("/structuredContent/snapshot_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            tokens,
+            #[cfg(test)]
+            frames: els
+                .iter()
+                .filter_map(|e| e.frame.map(|f| (e.index, f)))
+                .collect(),
+            marks,
+            keys,
+            lines,
+            parents,
+            next_mark: next,
+            sha: tree_sha(els),
+            modal,
+            bounds,
+        }
+    }
+}
+
+fn modal_json(m: &Modal) -> Value {
+    json!({
+        "role": m.role,
+        "title": shape::sanitize(&m.title),
+        "buttons": m
+            .buttons
+            .iter()
+            .map(|(mark, label)| json!({"mark": mark, "label": shape::sanitize(label)}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn modal_refusal(m: &Modal) -> CallErr {
+    let buttons: Vec<String> = m
+        .buttons
+        .iter()
+        .map(|(mark, label)| format!("{mark} \"{}\"", shape::sanitize(label)))
+        .collect();
+    CallErr::Refused(format!(
+        "computer: a modal {} \"{}\" is open in this window — dismiss the modal first \
+         (its buttons: {})",
+        m.role,
+        shape::sanitize(&m.title),
+        if buttons.is_empty() {
+            "none listed — try key 'escape'".to_string()
+        } else {
+            buttons.join(", ")
+        }
+    ))
+}
+
+/// Added (`+`), removed (`-`) and changed (`~`) element lines between two
+/// snapshots of one window, capped at [`DIFF_CAP`] bytes (P3).
+fn diff(old: &Snap, new: &Snap) -> String {
+    let old_m: HashMap<&str, &str> = old
+        .lines
+        .iter()
+        .map(|(m, l)| (m.as_str(), l.as_str()))
+        .collect();
+    let new_m: HashMap<&str, &str> = new
+        .lines
+        .iter()
+        .map(|(m, l)| (m.as_str(), l.as_str()))
+        .collect();
+    let mut items = Vec::new();
+    for (m, l) in &old.lines {
+        if !new_m.contains_key(m.as_str()) {
+            items.push(format!("-{l}"));
+        }
+    }
+    for (m, l) in &new.lines {
+        match old_m.get(m.as_str()) {
+            None => items.push(format!("+{l}")),
+            Some(o) if o != l => items.push(format!("~{l}")),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    for (i, it) in items.iter().enumerate() {
+        // Keep room for the "… N more" tail.
+        if out.len() + it.len() + 1 > DIFF_CAP - 24 {
+            out.push_str(&format!("… {} more", items.len() - i));
+            return out;
+        }
+        out.push_str(it);
+        out.push('\n');
+    }
+    out.trim_end_matches('\n').to_string()
+}
+
+/// The run-scoped context a driver action needs beyond the client.
+struct Run<'r, 'c> {
+    ctx: &'r ToolCtx<'c>,
+    control: Control,
+    turn: &'r mut super::Turn,
+    /// Take the post-act read (false inside a batch: once, after the last).
+    post: bool,
 }
 
 /// How a driver call failed — the distinction that decides whether the
@@ -204,13 +468,27 @@ pub fn spawn(path: &Path, ctx: &ToolCtx) -> Result<Live, String> {
         });
     }
     Ok(Live {
-        client,
         session: session_label(ctx),
         perm_checked: false,
         frame: None,
         zoomed: false,
         snaps: HashMap::new(),
         tabs: HashMap::new(),
+        // P8: a driver without `tools/list` is dispatched unchecked.
+        schemas: client
+            .list_tools()
+            .map(|specs| {
+                specs
+                    .into_iter()
+                    .map(|t| (t.name, t.input_schema))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        client,
+        dropped: Vec::new(),
+        killed: false,
+        dead: false,
+        secrets: Vec::new(),
     })
 }
 
@@ -243,6 +521,10 @@ impl Live {
 /// Dispatch one already-validated action through the driver. `Err` is the
 /// honest, model-facing error string.
 pub fn run(input: &Value, ctx: &ToolCtx, st: &mut super::ComputerState) -> Result<Value, String> {
+    let action = action_of(input);
+    if st.turn.killed && !super::OBSERVE_ACTIONS.contains(&action.as_str()) {
+        return Err(KILLED.into());
+    }
     let mut live = match st.driver.take() {
         Some(live) => live,
         None => {
@@ -254,19 +536,124 @@ pub fn run(input: &Value, ctx: &ToolCtx, st: &mut super::ComputerState) -> Resul
             spawn(&path, ctx)?
         }
     };
-    match run_live(&mut live, input, ctx) {
-        Ok(v) => {
-            st.driver = Some(live);
+    live.dropped.clear();
+    let res = {
+        let mut rn = Run {
+            ctx,
+            control: st.control.clone(),
+            turn: &mut st.turn,
+            post: !st.batching,
+        };
+        run_live(&mut live, input, &mut rn)
+    };
+    if std::mem::take(&mut live.killed) {
+        st.kill();
+    }
+    let dead = std::mem::take(&mut live.dead);
+    let secrets = live.secrets.clone();
+    let out = match res {
+        Ok(mut v) => {
+            if !live.dropped.is_empty() {
+                live.dropped.dedup();
+                v["debug"] = json!(format!(
+                    "dropped args the driver's schema does not list: {}",
+                    live.dropped.join(", ")
+                ));
+            }
+            if !dead {
+                st.driver = Some(live);
+            }
             Ok(v)
         }
         Err(CallErr::Refused(m)) => {
-            st.driver = Some(live);
+            if !dead {
+                st.driver = Some(live);
+            }
             Err(m)
         }
         // Transport died — drop the client so the next call respawns (D2).
         Err(CallErr::Transport(m)) => Err(format!(
             "computer: {m} — driver dropped; the next call respawns it"
         )),
+    };
+    match out {
+        Ok(mut v) => {
+            scrub_value(&mut v, &secrets);
+            Ok(v)
+        }
+        Err(e) => Err(scrub(&e, &secrets)),
+    }
+}
+
+/// P5: the refusal every act gets after the driver's kill switch fired.
+pub(super) const KILLED: &str = "computer: the user pressed the kill switch (physical Escape) — \
+     the run is interrupted and acts are refused until the user's next turn";
+
+/// P1b: replace every typed secret value with `[secret]`.
+fn scrub(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for s in secrets.iter().filter(|s| !s.is_empty()) {
+        if out.contains(s.as_str()) {
+            out = out.replace(s.as_str(), "[secret]");
+        }
+    }
+    out
+}
+
+fn scrub_value(v: &mut Value, secrets: &[String]) {
+    if secrets.is_empty() {
+        return;
+    }
+    match v {
+        Value::String(s) => *s = scrub(s, secrets),
+        Value::Array(a) => a.iter_mut().for_each(|x| scrub_value(x, secrets)),
+        Value::Object(o) => o.values_mut().for_each(|x| scrub_value(x, secrets)),
+        _ => {}
+    }
+}
+
+/// The `(pid, window_id)` an input names, when it names both.
+fn win_key(input: &Value) -> Option<(u64, u64)> {
+    Some((u64_of(input, "pid")?, u64_of(input, "window_id")?))
+}
+
+/// P10: the cheap AX sha of `member`'s window — no snapshot update, so the
+/// batch's final post diff still compares against the pre-batch snapshot.
+/// `None` when the member names no window or no driver is live.
+pub(super) fn ax_sha(
+    member: &Value,
+    st: &mut super::ComputerState,
+) -> Option<((u64, u64), String)> {
+    let key = win_key(member)?;
+    let d = st.driver.as_mut()?;
+    let b = d
+        .snaps
+        .get(&key)
+        .map(|s| s.bounds.clone())
+        .unwrap_or_default();
+    match read_tree(d, member, &b) {
+        Ok((_, els, _)) => Some((key, tree_sha(&els))),
+        Err(CallErr::Refused(_)) => None,
+        Err(CallErr::Transport(_)) => {
+            st.driver = None;
+            None
+        }
+    }
+}
+
+/// P3 for a batch: one post read after the last member ran, on that
+/// member's window — fills `post`/`changed`/`diff` in the batch envelope.
+pub(super) fn batch_post(member: &Value, st: &mut super::ComputerState, out: &mut Value) {
+    let Some(d) = st.driver.as_mut() else { return };
+    if win_key(member).is_none() {
+        return;
+    }
+    post_read(d, member, out);
+    if d.dead {
+        st.driver = None;
+    } else {
+        let secrets = d.secrets.clone();
+        scrub_value(out, &secrets);
     }
 }
 
@@ -278,15 +665,74 @@ fn call(
     mut args: Map<String, Value>,
     req: &Value,
 ) -> Result<Value, CallErr> {
+    admit(d, tool, &mut args)?;
     args.insert("session".into(), json!(d.session));
     let result = d
         .client
         .call_tool_with_timeout(tool, Value::Object(args), CALL_TIMEOUT)
         .map_err(CallErr::Transport)?;
     if is_failure(&result) {
+        // P5: the driver's kill switch, surfaced as a refusal code.
+        // DEFERRED(computer): driver kill-switch capability — gate: live macOS
+        if result
+            .pointer("/structuredContent/refusal/code")
+            .and_then(Value::as_str)
+            == Some("kill_switch")
+        {
+            d.killed = true;
+            return Err(CallErr::Refused(KILLED.into()));
+        }
         return Err(CallErr::Refused(shape_failure(d, tool, &result, req)));
     }
     Ok(result)
+}
+
+/// P8 schema admission against the handshake's cached `inputSchema`: args
+/// the schema does not list are dropped (noted in the envelope's `debug`),
+/// and `required` / `minItems` are checked here — a call the driver would
+/// reject is refused locally, before anything is sent. `session` is the
+/// protocol's own label and always rides.
+fn admit(d: &mut Live, tool: &str, args: &mut Map<String, Value>) -> Result<(), CallErr> {
+    let Some(schema) = d.schemas.get(tool) else {
+        return Ok(());
+    };
+    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+        let extra: Vec<String> = args
+            .keys()
+            .filter(|k| k.as_str() != "session" && !props.contains_key(k.as_str()))
+            .cloned()
+            .collect();
+        for k in extra {
+            args.remove(&k);
+            d.dropped.push(format!("{tool}.{k}"));
+        }
+        for (k, v) in args.iter() {
+            let min = props
+                .get(k)
+                .and_then(|p| p.get("minItems"))
+                .and_then(Value::as_u64);
+            if let (Some(arr), Some(min)) = (v.as_array(), min) {
+                if (arr.len() as u64) < min {
+                    return Err(CallErr::Refused(format!(
+                        "computer: the driver's '{tool}' needs at least {min} item(s) in '{k}', \
+                         got {} — nothing was sent",
+                        arr.len()
+                    )));
+                }
+            }
+        }
+    }
+    if let Some(req) = schema.get("required").and_then(Value::as_array) {
+        for k in req.iter().filter_map(Value::as_str) {
+            if k != "session" && !args.contains_key(k) {
+                return Err(CallErr::Refused(format!(
+                    "computer: the driver's '{tool}' requires '{k}', which this call does not \
+                     supply — nothing was sent (pass it, or pick another action)"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_failure(result: &Value) -> bool {
@@ -476,22 +922,31 @@ fn target(
     tool: &str,
 ) -> Result<(), CallErr> {
     if let Some(el) = input.get("element") {
-        let Some(el) = u64_of(input, "element") else {
-            return Err(CallErr::Refused(format!(
-                "computer: 'element' must be a non-negative integer, got {el}"
-            )));
-        };
         let pid = u64_of(input, "pid").unwrap_or(0);
         let wid = u64_of(input, "window_id").unwrap_or(0);
-        let Some(token) = d
-            .snaps
-            .get(&(pid, wid))
-            .and_then(|s| s.tokens.get(&(el as i64)))
-        else {
+        let snap = d.snaps.get(&(pid, wid));
+        let (idx, shown) = match el {
+            Value::String(m) => (resolve_mark(snap, m.trim())?, m.trim().to_string()),
+            _ => match u64_of(input, "element") {
+                Some(n) => (n as i64, n.to_string()),
+                None => {
+                    return Err(CallErr::Refused(format!(
+                        "computer: 'element' must be a mark like \"e7\" from observe (or a \
+                         non-negative index), got {el}"
+                    )))
+                }
+            },
+        };
+        let Some((snap, token)) = snap.and_then(|s| Some((s, s.tokens.get(&idx)?))) else {
             return Err(CallErr::Refused(format!(
-                "computer: element {el} is unknown — observe again"
+                "computer: element {shown} is unknown — observe again"
             )));
         };
+        if let Some(m) = &snap.modal {
+            if !inside(&snap.parents, idx, m.index) {
+                return Err(modal_refusal(m));
+            }
+        }
         args.insert("element_token".into(), json!(token));
         return Ok(());
     }
@@ -528,8 +983,79 @@ fn target(
     Ok(())
 }
 
+/// P2: a mark (`e7`) → the element index it names in the window's latest
+/// snapshot; stale and unknown marks are refused with the fix.
+fn resolve_mark(snap: Option<&Snap>, m: &str) -> Result<i64, CallErr> {
+    let Some(n) = m
+        .strip_prefix(['e', 'E'])
+        .and_then(|r| r.parse::<u64>().ok())
+    else {
+        return Err(CallErr::Refused(format!(
+            "computer: 'element' must be a mark like \"e7\" from observe, got \"{}\"",
+            shape::sanitize(m)
+        )));
+    };
+    let Some(snap) = snap else {
+        return Err(CallErr::Refused(format!(
+            "computer: element e{n} is unknown — this window has not been observed; observe it \
+             first (with this pid and window_id)"
+        )));
+    };
+    if let Some(&i) = snap.marks.get(&format!("e{n}")) {
+        return Ok(i);
+    }
+    Err(CallErr::Refused(if n < snap.next_mark {
+        format!(
+            "computer: element e{n} is stale — it was in an older observe of this window and is \
+             gone now; use a mark from the latest observe"
+        )
+    } else {
+        format!("computer: element e{n} is unknown — no observe of this window issued it; observe again")
+    }))
+}
+
+/// P1b: `secret:"<name>"` → the brokered value, swapped in only here at
+/// dispatch. The envelope gets `{name, len, sha8}`; every result string is
+/// scrubbed of the value afterwards.
+fn secret_arg(
+    d: &mut Live,
+    input: &Value,
+    ctx: &ToolCtx,
+    plain: &str,
+) -> Result<(Value, Option<Value>), CallErr> {
+    let Some(name) = input.get("secret").and_then(Value::as_str) else {
+        return Ok((input[plain].clone(), None));
+    };
+    if input.get(plain).is_some() {
+        return Err(CallErr::Refused(format!(
+            "computer: pass '{plain}' or 'secret', not both"
+        )));
+    }
+    let Some(real) = ctx
+        .broker
+        .as_ref()
+        .and_then(|b| b.real_for(name))
+        .filter(|r| !r.is_empty())
+    else {
+        return Err(CallErr::Refused(format!(
+            "computer: no credential named '{}' — 'secret' takes the name of a configured \
+             credential",
+            shape::sanitize(name)
+        )));
+    };
+    let sha8 = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(real.as_bytes()))[..8].to_string()
+    };
+    if !d.secrets.iter().any(|s| s == real) {
+        d.secrets.push(real.to_string());
+    }
+    let meta = json!({"name": name, "len": real.chars().count(), "sha8": sha8});
+    Ok((json!(real), Some(meta)))
+}
+
 /// Dispatch the validated action to its driver call.
-fn run_live(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
+fn run_live(d: &mut Live, input: &Value, rn: &mut Run) -> Result<Value, CallErr> {
     let action = action_of(input);
     match action.as_str() {
         "apps" => {
@@ -545,98 +1071,121 @@ fn run_live(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr
         "launch" => {
             let mut a = Map::new();
             a.insert("name".into(), input["app"].clone());
-            act(d, "launch_app", a, input, ctx)
+            // DEFERRED(computer): per-bundle hint files — gate: live macOS eval
+            act(d, "launch_app", a, input, rn)
         }
         "observe" => observe(d, input),
-        "screenshot" => screenshot(d, input, ctx),
-        "zoom" => zoom(d, input, ctx),
-        "click" => click(d, input, ctx),
+        "screenshot" => screenshot(d, input, rn),
+        "zoom" => zoom(d, input, rn),
+        "click" => click(d, input, rn),
         "type" => {
             need(input, "type", &["pid"])?;
             let mut a = Map::new();
             put(&mut a, "pid", input)?;
             put(&mut a, "window_id", input)?;
-            a.insert("text".into(), input["text"].clone());
             target(d, input, &mut a, "type_text")?;
-            act(d, "type_text", a, input, ctx)
+            let (text, meta) = secret_arg(d, input, rn.ctx, "text")?;
+            a.insert("text".into(), text);
+            let mut env = act(d, "type_text", a, input, rn)?;
+            if let Some(m) = meta {
+                env["secret"] = m;
+            }
+            Ok(env)
         }
-        "key" => key(d, input, ctx),
+        "key" => key(d, input, rn),
         "set" => {
             need(input, "set", &["pid", "window_id"])?;
             let mut a = Map::new();
             put(&mut a, "pid", input)?;
             put(&mut a, "window_id", input)?;
-            a.insert("value".into(), input["value"].clone());
             target(d, input, &mut a, "set_value")?;
-            act(d, "set_value", a, input, ctx)
+            let (value, meta) = secret_arg(d, input, rn.ctx, "value")?;
+            a.insert("value".into(), value);
+            let mut env = act(d, "set_value", a, input, rn)?;
+            if let Some(m) = meta {
+                env["secret"] = m;
+            }
+            Ok(env)
         }
-        "scroll" => scroll(d, input, ctx),
-        "drag" => drag(d, input, ctx),
+        "scroll" => scroll(d, input, rn),
+        "drag" => drag(d, input, rn),
         "menu" => {
             need(input, "menu", &["pid", "window_id"])?;
             let mut a = Map::new();
             put(&mut a, "pid", input)?;
             put(&mut a, "window_id", input)?;
             a.insert("path".into(), input["path"].clone());
-            act(d, "invoke_menu", a, input, ctx)
+            act(d, "invoke_menu", a, input, rn)
         }
         "verify" => verify(d, input),
+        "wait_for" => wait_for(d, input, rn),
         "browser" => browser(d, input),
-        "browser_click" | "browser_type" | "navigate" => browser_act(d, &action, input, ctx),
+        "browser_click" | "browser_type" | "navigate" => browser_act(d, &action, input, rn),
         other => Err(CallErr::Refused(format!(
             "computer: '{other}' is not a driver action"
         ))),
     }
 }
 
-/// `observe` — the AX element list, no pixels (D3/D4).
-fn observe(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
-    need(input, "observe", &["pid", "window_id"])?;
-    let limit = input
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(150)
-        .clamp(1, 2000) as usize;
+/// One AX-only `get_window_state` within `b` (P7: `limit`/`depth` ride
+/// as `max_elements`/`max_depth` — admission drops whichever the schema
+/// lacks — and at most `limit × 4` elements are parsed).
+fn read_tree(
+    d: &mut Live,
+    input: &Value,
+    b: &Bounds,
+) -> Result<(Value, Vec<shape::Element>, usize), CallErr> {
     let mut a = Map::new();
     put(&mut a, "pid", input)?;
     put(&mut a, "window_id", input)?;
     a.insert("include_screenshot".into(), json!(false));
-    a.insert("max_elements".into(), json!(limit));
-    if let Some(q) = input.get("query").and_then(Value::as_str) {
-        if !q.is_empty() {
-            a.insert("query".into(), json!(q));
-        }
+    a.insert("max_elements".into(), json!(b.limit));
+    if let Some(depth) = b.depth {
+        a.insert("max_depth".into(), json!(depth));
+    }
+    if let Some(q) = &b.query {
+        a.insert("query".into(), json!(q));
     }
     let r = call(d, "get_window_state", a, input)?;
+    let (els, returned) = shape::parse_elements(&r, b.limit.saturating_mul(4));
+    Ok((r, els, returned))
+}
+
+/// `observe` — the AX element list with marks, no pixels (D3/D4, P2/P9).
+fn observe(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
+    need(input, "observe", &["pid", "window_id"])?;
+    let b = Bounds {
+        limit: input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(150)
+            .clamp(1, 2000) as usize,
+        query: input
+            .get("query")
+            .and_then(Value::as_str)
+            .filter(|q| !q.is_empty())
+            .map(str::to_string),
+        depth: u64_of(input, "depth"),
+    };
+    let (r, els, returned) = read_tree(d, input, &b)?;
     // A fresh full observation ends the zoom frame (F3).
     d.zoomed = false;
-    // Remember the snapshot: `element` acts address through element_token —
-    // an index with no remembered token is refused locally.
-    let els = shape::parse_elements(&r);
     let key = (
         u64_of(input, "pid").unwrap_or(0),
         u64_of(input, "window_id").unwrap_or(0),
     );
-    d.snaps.insert(
-        key,
-        Snap {
-            #[cfg(test)]
-            id: r
-                .pointer("/structuredContent/snapshot_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            tokens: els
-                .iter()
-                .filter_map(|e| e.token.clone().map(|t| (e.index, t)))
-                .collect(),
-            #[cfg(test)]
-            frames: els
-                .iter()
-                .filter_map(|e| e.frame.map(|f| (e.index, f)))
-                .collect(),
-        },
-    );
-    Ok(obs_envelope("observe", shape::elements(&r, limit)))
+    // Remember the snapshot: `element` acts address through element_token —
+    // a mark or index with no remembered token is refused locally.
+    let snap = Snap::build(d.snaps.get(&key), &r, &els, b.clone());
+    // DEFERRED(computer): OCR pseudo-elements for empty AX trees — gate: live macOS
+    let marks: Vec<String> = snap.lines.iter().map(|(m, _)| m.clone()).collect();
+    let total = shape::total_count(&r).or((returned > els.len()).then_some(returned as u64));
+    let mut env = obs_envelope("observe", shape::render(&els, &marks, total, b.limit));
+    if let Some(m) = &snap.modal {
+        env["modal"] = modal_json(m);
+    }
+    d.snaps.insert(key, snap);
+    Ok(env)
 }
 
 /// The capture suppression check (credential field / watch mode) — pixels
@@ -677,7 +1226,8 @@ fn suppressed_envelope(
 }
 
 /// `screenshot` — pixels only (no AX walk), capped at `max` (D3/D4).
-fn screenshot(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
+fn screenshot(d: &mut Live, input: &Value, rn: &mut Run) -> Result<Value, CallErr> {
+    let ctx = rn.ctx;
     need(input, "screenshot", &["pid", "window_id"])?;
     if is_suppressed(input, ctx) {
         let reason = if ctx
@@ -692,6 +1242,9 @@ fn screenshot(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallE
         };
         return suppressed_envelope("screenshot", ctx, reason, true);
     }
+    if rn.turn.image_bytes >= IMAGE_BUDGET {
+        return Err(budget_refusal());
+    }
     let mut a = Map::new();
     put(&mut a, "pid", input)?;
     put(&mut a, "window_id", input)?;
@@ -700,10 +1253,18 @@ fn screenshot(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallE
         .get("max")
         .and_then(Value::as_u64)
         .unwrap_or(1280)
-        .clamp(1, 8000);
+        .clamp(1, MAX_IMAGE_EDGE);
     a.insert("max_dimension".into(), json!(max));
     let r = call(d, "get_window_state", a, input)?;
-    capture_envelope(d, ctx, "screenshot", &r)
+    capture_envelope(d, ctx, rn.turn, win_key(input), "screenshot", &r)
+}
+
+fn budget_refusal() -> CallErr {
+    CallErr::Refused(format!(
+        "computer: this turn's image budget ({} MiB) is spent — use 'observe' (text) instead of \
+         another screenshot",
+        IMAGE_BUDGET >> 20
+    ))
 }
 
 /// `zoom` — crop a window region (D3/F3). The crop becomes the model's
@@ -711,10 +1272,14 @@ fn screenshot(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallE
 /// acts then carry `from_zoom:true` so the driver translates crop pixels
 /// back to full-window space itself (the crop has 20% padding only the
 /// driver knows). The envelope tells the model which frame it is in.
-fn zoom(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
+fn zoom(d: &mut Live, input: &Value, rn: &mut Run) -> Result<Value, CallErr> {
+    let ctx = rn.ctx;
     need(input, "zoom", &["pid", "window_id"])?;
     if is_suppressed(input, ctx) {
         return suppressed_envelope("zoom", ctx, "credential-field focus", true);
+    }
+    if rn.turn.image_bytes >= IMAGE_BUDGET {
+        return Err(budget_refusal());
     }
     let mut a = Map::new();
     put(&mut a, "pid", input)?;
@@ -725,7 +1290,7 @@ fn zoom(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
         }
     }
     let r = call(d, "zoom", a, input)?;
-    let mut env = capture_envelope(d, ctx, "zoom", &r)?;
+    let mut env = capture_envelope(d, ctx, rn.turn, win_key(input), "zoom", &r)?;
     env["frame"] = json!(
         "zoom crop of the window — x/y acts take crop pixels (translated via from_zoom); \
          screenshot or observe returns to window space"
@@ -743,6 +1308,8 @@ fn zoom(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
 fn capture_envelope(
     d: &mut Live,
     ctx: &ToolCtx,
+    turn: &mut super::Turn,
+    win: Option<(u64, u64)>,
     action: &str,
     r: &Value,
 ) -> Result<Value, CallErr> {
@@ -799,6 +1366,30 @@ fn capture_envelope(
     };
     let sha = digest_short(data);
     let pre = read_obs(ctx).and_then(|o| o.sha256);
+    // P7: the model already holds this exact image of this window — no
+    // second copy. (Same pixels from another window are a fresh capture.)
+    let seen = (sha.clone(), win);
+    if action == "screenshot" && turn.last_image.as_ref() == Some(&seen) {
+        d.frame = Some(CoordFrame::sent_only(sent_w, sent_h));
+        d.zoomed = false;
+        return Ok(json!({
+            "ok": true,
+            "computer": "screenshot",
+            "action": action,
+            "tier": "cua",
+            "suppressed": false,
+            "unchanged": true,
+            "sent_w": sent_w,
+            "sent_h": sent_h,
+            "pre": pre,
+            "post": sha,
+            "note": "identical to the last image you saw — no new image sent",
+        }));
+    }
+    // Counted after delivery: the capture that crosses the budget still
+    // lands; the next one is refused before dispatch.
+    turn.image_bytes += data.len();
+    turn.last_image = Some(seen);
     if action == "zoom" {
         // The crop becomes the model's frame until the next full
         // observation; pointer acts ride from_zoom (F3).
@@ -867,7 +1458,7 @@ fn capture_envelope(
     }))
 }
 
-fn click(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
+fn click(d: &mut Live, input: &Value, rn: &mut Run) -> Result<Value, CallErr> {
     need(input, "click", &["pid"])?;
     let button = input
         .get("button")
@@ -906,10 +1497,10 @@ fn click(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
             a.insert("count".into(), json!(count));
         }
     }
-    act(d, tool, a, input, ctx)
+    act(d, tool, a, input, rn)
 }
 
-fn key(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
+fn key(d: &mut Live, input: &Value, rn: &mut Run) -> Result<Value, CallErr> {
     need(input, "key", &["pid"])?;
     let keys = input
         .get("keys")
@@ -940,10 +1531,10 @@ fn key(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
         a.insert("key".into(), json!(parts.first().copied().unwrap_or(keys)));
         ("press_key", a)
     };
-    act(d, tool, a, input, ctx)
+    act(d, tool, a, input, rn)
 }
 
-fn scroll(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
+fn scroll(d: &mut Live, input: &Value, rn: &mut Run) -> Result<Value, CallErr> {
     need(input, "scroll", &["pid"])?;
     let dx = input.get("dx").and_then(Value::as_f64).unwrap_or(0.0);
     let dy = input.get("dy").and_then(Value::as_f64).unwrap_or(0.0);
@@ -966,10 +1557,10 @@ fn scroll(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> 
         json!(amount.round().clamp(1.0, 50.0) as u64),
     );
     target(d, input, &mut a, "scroll")?;
-    act(d, "scroll", a, input, ctx)
+    act(d, "scroll", a, input, rn)
 }
 
-fn drag(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
+fn drag(d: &mut Live, input: &Value, rn: &mut Run) -> Result<Value, CallErr> {
     need(input, "drag", &["pid", "window_id"])?;
     let num = |k: &str| input.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     let mut a = Map::new();
@@ -997,7 +1588,7 @@ fn drag(d: &mut Live, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
         a.insert("to_x".into(), json!(tx));
         a.insert("to_y".into(), json!(ty));
     }
-    act(d, "drag", a, input, ctx)
+    act(d, "drag", a, input, rn)
 }
 
 fn verify(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
@@ -1022,6 +1613,117 @@ fn verify(d: &mut Live, input: &Value) -> Result<Value, CallErr> {
         "satisfied": satisfied,
         "text": text,
     }))
+}
+
+/// P4 `wait_for`: poll until `expect` holds, inside one tool call —
+/// `verify_state` when the driver advertises it (or advertises nothing),
+/// else AX-state equality over a bounded read. Backoff 100 ms → 1 s, never
+/// past `timeout_ms` (≤ 10 s), and the run's interrupt is checked between
+/// polls.
+fn wait_for(d: &mut Live, input: &Value, rn: &Run) -> Result<Value, CallErr> {
+    need(input, "wait_for", &["pid", "window_id"])?;
+    let timeout =
+        Duration::from_millis(u64_of(input, "timeout_ms").unwrap_or(3000).min(WAIT_MAX_MS));
+    let expect: Vec<Value> = match input.get("expect") {
+        Some(Value::Array(v)) => v.clone(),
+        Some(v) => vec![v.clone()],
+        None => Vec::new(),
+    };
+    let by_verify = d.schemas.is_empty() || d.schemas.contains_key("verify_state");
+    let bounds = win_key(input)
+        .and_then(|k| d.snaps.get(&k))
+        .map(|s| s.bounds.clone())
+        .unwrap_or_default();
+    let t0 = Instant::now();
+    let mut delay = Duration::from_millis(100);
+    let mut polls = 0u32;
+    let env = |met: bool, polls: u32, stop: Option<(&str, String)>| {
+        let mut v = json!({
+            "ok": true,
+            "computer": "obs",
+            "action": "wait_for",
+            "tier": "cua",
+            "met": met,
+            "elapsed_ms": t0.elapsed().as_millis() as u64,
+            "polls": polls,
+        });
+        if let Some((k, text)) = stop {
+            v[k] = json!(true);
+            v["text"] = json!(text);
+        }
+        v
+    };
+    loop {
+        if rn.control.interrupted() {
+            return Ok(env(
+                false,
+                polls,
+                Some(("interrupted", "interrupted by the user".into())),
+            ));
+        }
+        polls += 1;
+        let met = if by_verify {
+            let mut a = Map::new();
+            put(&mut a, "pid", input)?;
+            put(&mut a, "window_id", input)?;
+            a.insert("expect".into(), json!(expect));
+            shape::verify(&call(d, "verify_state", a, input)?).0
+        } else {
+            let (_, els, _) = read_tree(d, input, &bounds)?;
+            ax_met(&els, &expect)
+        };
+        if met {
+            return Ok(env(true, polls, None));
+        }
+        let elapsed = t0.elapsed();
+        if elapsed >= timeout {
+            return Ok(env(
+                false,
+                polls,
+                Some((
+                    "timeout",
+                    format!(
+                        "not met within {} ms — observe to see the current state",
+                        timeout.as_millis()
+                    ),
+                )),
+            ));
+        }
+        sleep_watching(delay.min(timeout - elapsed), &rn.control);
+        delay = (delay * 2).min(Duration::from_secs(1));
+    }
+}
+
+/// Sleep `dur` in short slices, returning early on an interrupt.
+fn sleep_watching(dur: Duration, control: &Control) {
+    let end = Instant::now() + dur;
+    while !control.interrupted() {
+        let now = Instant::now();
+        if now >= end {
+            return;
+        }
+        std::thread::sleep((end - now).min(Duration::from_millis(20)));
+    }
+}
+
+/// AX-state equality: every predicate's `role`/`label` (or `title`/`name`)
+/// /`value` equals some element's — or none's, with `present:false`.
+fn ax_met(els: &[shape::Element], expect: &[Value]) -> bool {
+    expect.iter().all(|p| {
+        let want = |keys: &[&str]| keys.iter().find_map(|k| p.get(*k).and_then(Value::as_str));
+        let (role, label, value) = (
+            want(&["role"]),
+            want(&["label", "title", "name"]),
+            want(&["value"]),
+        );
+        let present = p.get("present").and_then(Value::as_bool).unwrap_or(true);
+        let hit = els.iter().any(|e| {
+            role.is_none_or(|r| e.role == r)
+                && label.is_none_or(|l| e.label == l)
+                && value.is_none_or(|v| e.value.as_deref() == Some(v))
+        });
+        hit == present
+    })
 }
 
 /// `browser` — bind a window to a CDP target (`pid` + `window_id`), or
@@ -1073,7 +1775,7 @@ fn browser_snapshot(
 }
 
 /// browser_click / browser_type / navigate — all addressed by `tab`.
-fn browser_act(d: &mut Live, action: &str, input: &Value, ctx: &ToolCtx) -> Result<Value, CallErr> {
+fn browser_act(d: &mut Live, action: &str, input: &Value, rn: &mut Run) -> Result<Value, CallErr> {
     let tab = input.get("tab").and_then(Value::as_str).unwrap_or("");
     let Some(target) = d.tabs.get(tab).cloned() else {
         return Err(CallErr::Refused(format!(
@@ -1110,7 +1812,7 @@ fn browser_act(d: &mut Live, action: &str, input: &Value, ctx: &ToolCtx) -> Resu
         }
         _ => {}
     }
-    act(d, tool, a, input, ctx)
+    act(d, tool, a, input, rn)
 }
 
 /// The observation envelope: compact rendered text plus the audit fields
@@ -1126,15 +1828,20 @@ fn obs_envelope(action: &str, text: String) -> Value {
 }
 
 /// The act envelope — same audit contract as the helper path, plus the
-/// driver's own confirmation line as `detail`. `pre` is the last
-/// observation's digest; the driver reports no post digest.
+/// driver's own confirmation line as `detail`. `pre` is the window's last
+/// AX sha (else the last observation's digest); `post`/`changed`/`diff`
+/// come from the post-act read (P3).
 fn act(
     d: &mut Live,
     tool: &str,
     a: Map<String, Value>,
     input: &Value,
-    ctx: &ToolCtx,
+    rn: &mut Run,
 ) -> Result<Value, CallErr> {
+    let pre = win_key(input)
+        .and_then(|k| d.snaps.get(&k))
+        .map(|s| s.sha.clone())
+        .or_else(|| read_obs(rn.ctx).and_then(|o| o.sha256));
     let r = call(d, tool, a, input)?;
     let detail = {
         let t = shape::content_text(&r);
@@ -1144,16 +1851,66 @@ fn act(
             t
         }
     };
-    Ok(json!({
+    let mut env = json!({
         "ok": true,
         "computer": "act",
         "action": action_of(input),
         "tier": "cua",
         "driver": tool,
         "detail": detail,
-        "pre": read_obs(ctx).and_then(|o| o.sha256),
+        "pre": pre,
         "post": Value::Null,
-    }))
+    });
+    if rn.post {
+        post_read(d, input, &mut env);
+    }
+    Ok(env)
+}
+
+/// P3: one AX-only read of the act's window, bounded like its last observe:
+/// `post` = its sha; with a prior snapshot, `changed` + the capped diff
+/// (and `modal` when one is open). A window with no snapshot gets the sha
+/// only — the diff's screen text only ever extends an observe that already
+/// latched untrusted, and only observe creates a snapshot.
+fn post_read(d: &mut Live, input: &Value, env: &mut Value) {
+    let Some(key) = win_key(input) else { return };
+    if !d.schemas.is_empty() && !d.schemas.contains_key("get_window_state") {
+        return;
+    }
+    let b = d
+        .snaps
+        .get(&key)
+        .map(|s| s.bounds.clone())
+        .unwrap_or_default();
+    match read_tree(d, input, &b) {
+        Ok((r, els, _)) => {
+            let built = d.snaps.get(&key).map(|prev| {
+                let snap = Snap::build(Some(prev), &r, &els, b.clone());
+                let changed = snap.sha != prev.sha;
+                let diff = diff(prev, &snap);
+                (snap, changed, diff)
+            });
+            match built {
+                Some((snap, changed, diff)) => {
+                    env["post"] = json!(snap.sha);
+                    env["changed"] = json!(changed);
+                    if !diff.is_empty() {
+                        env["diff"] = json!(diff);
+                    }
+                    if let Some(m) = &snap.modal {
+                        env["modal"] = modal_json(m);
+                    }
+                    d.snaps.insert(key, snap);
+                }
+                None => env["post"] = json!(tree_sha(&els)),
+            }
+        }
+        Err(CallErr::Refused(m)) => env["post_note"] = json!(m),
+        Err(CallErr::Transport(m)) => {
+            d.dead = true;
+            env["post_note"] = json!(format!("post-act read failed: {m} — driver dropped"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1384,6 +2141,17 @@ done
             .collect()
     }
 
+    /// The last request that is not a post-act AX read (P3 appends one).
+    fn last_act(log: &Path) -> String {
+        req_lines(log)
+            .into_iter()
+            .rev()
+            .find(|l| {
+                !(l.contains("\"get_window_state\"") && l.contains("\"include_screenshot\":false"))
+            })
+            .expect("a request")
+    }
+
     fn spawn_count(log: &Path) -> usize {
         std::fs::read_to_string(log)
             .unwrap_or_default()
@@ -1463,10 +2231,10 @@ done
         .unwrap();
         let text = out["text"].as_str().unwrap();
         assert!(
-            text.contains("[1] AXTextField \"Name\" = \"hi\"  {AXPress}"),
+            text.contains("[e2] AXTextField \"Name\" = \"hi\"  {AXPress}"),
             "{text}"
         );
-        assert!(text.contains("[2] AXButton \"Go\"  {AXPress}"), "{text}");
+        assert!(text.contains("[e3] AXButton \"Go\"  {AXPress}"), "{text}");
         // The unlabeled root container survives (kept children) — elements
         // tokens are stored for later addressing.
         let d = st.driver.as_ref().unwrap();
@@ -1563,7 +2331,7 @@ done
         .unwrap();
         assert_eq!(out["computer"], "act");
         assert_eq!(out["tier"], "cua");
-        let last = req_lines(&log).last().unwrap().clone();
+        let last = last_act(&log);
         assert!(last.contains("\"element_token\":\"s00000001:1\""), "{last}");
         assert!(
             !last.contains("\"x\":"),
@@ -1586,7 +2354,7 @@ done
             &mut st,
         )
         .unwrap();
-        let last = req_lines(&log).last().unwrap().clone();
+        let last = last_act(&log);
         assert!(last.contains("\"pid\":11"), "string coerced: {last}");
         let err = run(
             &json!({"action": "screenshot", "pid": "abc", "window_id": 101}),
@@ -1644,7 +2412,7 @@ done
             &mut st,
         )
         .unwrap();
-        let last = req_lines(&log).last().unwrap().clone();
+        let last = last_act(&log);
         assert!(last.contains("\"x\":640"), "no local scaling: {last}");
         assert!(last.contains("\"y\":400"), "no local scaling: {last}");
         assert!(!last.contains("from_zoom"), "{last}");
@@ -1692,7 +2460,7 @@ done
             &mut st,
         )
         .unwrap();
-        let last = req_lines(&log).last().unwrap().clone();
+        let last = last_act(&log);
         assert!(last.contains("\"from_zoom\":true"), "{last}");
         assert!(last.contains("\"x\":30"), "crop coords verbatim: {last}");
         // Element acts are unaffected — the token path needs no coords.
@@ -1708,7 +2476,7 @@ done
             &mut st,
         )
         .unwrap();
-        let last = req_lines(&log).last().unwrap().clone();
+        let last = last_act(&log);
         assert!(last.contains("element_token"), "{last}");
     }
 
@@ -1746,7 +2514,7 @@ done
             &mut st,
         )
         .unwrap();
-        let last = req_lines(&log).last().unwrap().clone();
+        let last = last_act(&log);
         assert!(!last.contains("from_zoom"), "{last}");
         assert!(last.contains("\"x\":30"), "{last}");
     }
@@ -1763,7 +2531,7 @@ done
             &mut st,
         )
         .unwrap();
-        let last = req_lines(&log).last().unwrap().clone();
+        let last = last_act(&log);
         assert!(last.contains("\"name\":\"hotkey\""), "{last}");
         assert!(last.contains("\"keys\":[\"cmd\",\"s\"]"), "{last}");
         run_ok(
@@ -1772,7 +2540,7 @@ done
             &mut st,
         )
         .unwrap();
-        let last = req_lines(&log).last().unwrap().clone();
+        let last = last_act(&log);
         assert!(last.contains("\"name\":\"press_key\""), "{last}");
         assert!(last.contains("\"key\":\"return\""), "{last}");
     }
@@ -1829,7 +2597,7 @@ done
             &mut st,
         )
         .unwrap();
-        let last = req_lines(&log).last().unwrap().clone();
+        let last = last_act(&log);
         assert!(last.contains("\"name\":\"browser_click\""), "{last}");
         assert!(last.contains("\"target_id\":\"t-1\""), "{last}");
         assert!(last.contains("\"ref\":\"p1:1\""), "{last}");
@@ -1853,7 +2621,7 @@ done
             &mut st,
         )
         .unwrap();
-        let last = req_lines(&log).last().unwrap().clone();
+        let last = last_act(&log);
         assert!(last.contains("\"name\":\"browser_navigate\""), "{last}");
         assert!(last.contains("\"url\":\"https://example.com\""), "{last}");
         // An unbound tab is refused before any driver call.
