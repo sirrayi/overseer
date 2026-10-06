@@ -373,11 +373,7 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
         };
     }
     if tool == "computer" {
-        let action = input
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_lowercase();
+        let action = crate::tools::computer::normalize_action(input).unwrap_or_default();
         // Credential-field focus is an identity touch regardless of the
         // physical action — keystrokes near secrets outrank the click.
         if input
@@ -405,7 +401,11 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
         if action == "navigate" {
             return Irreversibility::ExternalComms;
         }
-        return Irreversibility::InternalWrite; // side-effect acts + future actions default up
+        // An action dispatch would refuse classifies fail-closed.
+        if action != "batch" && !crate::tools::computer::ACTIONS.contains(&action.as_str()) {
+            return Irreversibility::ExternalComms;
+        }
+        return Irreversibility::InternalWrite;
     }
     match tool {
         t if READ_TOOLS.contains(&t) => Irreversibility::Read,
@@ -871,7 +871,7 @@ impl Policy {
         if tool != "computer" {
             return false;
         }
-        let action = input.get("action").and_then(Value::as_str).unwrap_or("");
+        let action = crate::tools::computer::normalize_action(input).unwrap_or_default();
         if [
             "apps",
             "windows",
@@ -881,12 +881,11 @@ impl Policy {
             "verify",
             "browser",
         ]
-        .iter()
-        .any(|a| action.eq_ignore_ascii_case(a))
+        .contains(&action.as_str())
         {
             return true;
         }
-        if action.eq_ignore_ascii_case("batch") {
+        if action == "batch" {
             return input
                 .get("actions")
                 .and_then(Value::as_array)
@@ -1256,6 +1255,13 @@ impl Policy {
             // Read-class (screenshot/observe) falls through to Allow; ladder
             // Ask/Deny already won for side-effecting actions. Explicit
             // autonomy keeps the default ActWithApproval Ask for acts.
+            // Rule of Two: once the exfil triangle is armed, no screen act
+            // rides a silent lane.
+            "computer" if class != Irreversibility::Read && self.taint_armed() => Verdict::Ask {
+                reason: format!(
+                    "computer: untrusted + sensitive context — needs approval (class {class:?})"
+                ),
+            },
             "computer" => Verdict::Allow,
             // R6 `mcp` arm — reached only after the ladder floor above, and
             // only for a `call`: `search` and read-trust calls returned Allow
@@ -1779,10 +1785,10 @@ mod tests {
             classify("computer", &json!({"action": "type", "cred_field": true})),
             Irreversibility::Identity
         );
-        // Unknown actions default up, never down.
+        // Unknown actions fail closed, never down.
         assert_eq!(
             classify("computer", &json!({"action": "frobnicate"})),
-            Irreversibility::InternalWrite
+            Irreversibility::ExternalComms
         );
     }
 

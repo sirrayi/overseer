@@ -68,7 +68,7 @@ pub const ENV_DRIVER: &str = "OVERSEER_COMPUTER_DRIVER";
 const MAX_BATCH: usize = 32;
 
 /// Every action the tool accepts (S5 vocabulary). `batch` wraps the rest.
-const ACTIONS: &[&str] = &[
+pub(crate) const ACTIONS: &[&str] = &[
     "apps",
     "windows",
     "launch",
@@ -316,13 +316,17 @@ impl ObsState {
     }
 }
 
-fn action_of(input: &Value) -> String {
+/// The one action normalization (trim + ASCII-lowercase) shared by
+/// dispatch, perm classification and the taint latch.
+pub fn normalize_action(input: &Value) -> Option<String> {
     input
         .get("action")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase()
+        .map(|a| a.trim().to_ascii_lowercase())
+}
+
+fn action_of(input: &Value) -> String {
+    normalize_action(input).unwrap_or_default()
 }
 
 fn has_text(input: &Value, key: &str) -> bool {
@@ -733,7 +737,12 @@ fn run_batch(input: &Value, ctx: &ToolCtx, st: &mut ComputerState) -> Result<Val
     let pre = read_obs(ctx).and_then(|o| o.sha256);
     let mut results = Vec::new();
     let mut weakest = Tier::ORDER[0];
+    let mut interrupted = None;
     for (i, a) in actions.iter().enumerate() {
+        if st.control.interrupted() {
+            interrupted = Some(format!("interrupted after {i} of {}", actions.len()));
+            break;
+        }
         let action = action_of(a);
         if action == "batch" {
             return Err(format!(
@@ -767,7 +776,7 @@ fn run_batch(input: &Value, ctx: &ToolCtx, st: &mut ComputerState) -> Result<Val
     } else {
         weakest.as_str()
     };
-    Ok(json!({
+    let mut out = json!({
         "ok": true,
         "computer": "batch",
         "count": results.len(),
@@ -775,7 +784,11 @@ fn run_batch(input: &Value, ctx: &ToolCtx, st: &mut ComputerState) -> Result<Val
         "pre": pre,
         "post": post,
         "results": results,
-    }))
+    });
+    if let Some(note) = interrupted {
+        out["interrupted"] = json!(note);
+    }
+    Ok(out)
 }
 
 fn tier_from_str(s: &str) -> Option<Tier> {
@@ -893,6 +906,9 @@ fn validate(input: &Value) -> Result<String, String> {
         "browser_type" if !has_text(input, "text") => {
             return Err("'browser_type' needs 'text'".into());
         }
+        "browser_type" if !has_text(input, "ref") => {
+            return Err("'browser_type' needs 'ref' (from 'browser')".into());
+        }
         "navigate" if !has_text(input, "url") => {
             return Err("'navigate' needs 'url'".into());
         }
@@ -918,6 +934,8 @@ fn validate(input: &Value) -> Result<String, String> {
 pub struct ComputerState {
     pub backends: Backends,
     pub(crate) driver: Option<cua::Live>,
+    /// The run's steering handle: `batch` stops between members on interrupt.
+    control: crate::control::Control,
 }
 
 impl ComputerState {
@@ -926,6 +944,7 @@ impl ComputerState {
         ComputerState {
             backends: Backends::detect(),
             driver: None,
+            control: Default::default(),
         }
     }
 
@@ -934,7 +953,13 @@ impl ComputerState {
         ComputerState {
             backends,
             driver: None,
+            control: Default::default(),
         }
+    }
+
+    /// Attach the run's steering handle (checked between batch members).
+    pub fn set_control(&mut self, control: crate::control::Control) {
+        self.control = control;
     }
 }
 
