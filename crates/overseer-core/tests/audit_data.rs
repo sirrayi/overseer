@@ -641,10 +641,10 @@ fn onboarding_hostile_draft_is_caught() {
 }
 
 /// `overseer onboard` uses `./persona` of the current repo. A repo that
-/// ships `persona/identity.md` as a symlink gets its target overwritten by
-/// `write_drafts` (and again by `approve`): `fs::write` follows the link.
+/// ships `persona/identity.md` as a symlink must not get its target
+/// overwritten by `write_drafts` (or `approve`): persona IO is no-follow
+/// read + temp-file rename.
 #[test]
-#[ignore = "audit: onboard-symlink-write"]
 fn onboarding_does_not_write_through_symlinked_persona_file() {
     use overseer_core::onboard::{self, Insight};
     let root = tmp("onboard-link");
