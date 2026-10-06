@@ -444,9 +444,10 @@ pub fn distill(
             None
         } else if let Some(rest) = line.strip_prefix("ADD ") {
             parse_add(rest).and_then(|(layer, name, cues, text)| {
-                let text = super::redact::scrub(text);
+                let text =
+                    super::learn::vetted(text, super::learn::TEXT_CAP, "text", false).ok()?;
                 let cues = super::redact::scrub(&cues);
-                let text = text.as_ref();
+                let text = text.as_str();
                 let scope = layer.default_scope();
                 let dir = stores.iter().find(|(s, _)| *s == scope).map(|(_, d)| d)?;
                 if idx
@@ -463,8 +464,9 @@ pub fn distill(
             })
         } else if let Some(rest) = line.strip_prefix("SUPERSEDE ") {
             parse_supersede(rest).and_then(|(old, new, text)| {
-                let text = super::redact::scrub(text);
-                let text = text.as_ref();
+                let text =
+                    super::learn::vetted(text, super::learn::TEXT_CAP, "text", false).ok()?;
+                let text = text.as_str();
                 let doc = idx.resolve_qualified(old).ok()?;
                 let layer = doc
                     .layer()

@@ -24,12 +24,17 @@ pub const DIGEST_CAP: usize = 14_000;
 const ITEM_CAP: usize = 600;
 /// Distinct touched files kept.
 const FILE_CAP: usize = 20;
+/// Per-path and per-tool-name clips in the digest header.
+const PATH_CAP: usize = 160;
+const TOOL_NAME_CAP: usize = 60;
+/// The digest header's tools/files/stops summary, in chars.
+const HEADER_CAP: usize = 2_000;
 /// Ops per review reply.
 const MAX_OPS: usize = 6;
 /// Skill ops per reply (parsed now, applied in H2).
 const MAX_SKILL_OPS: usize = 2;
 /// Content limits of the line protocol.
-const TEXT_CAP: usize = 600;
+pub(crate) const TEXT_CAP: usize = 600;
 const SKILL_BODY_CAP: usize = 8_000;
 const SKILL_DESC_CAP: usize = 160;
 
@@ -372,6 +377,15 @@ pub struct Digest {
     pub tool_calls: u32,
 }
 
+/// One digest entry: redacted and clipped to `ITEM_CAP` before anything
+/// scans it. The redactor only sees a bounded prefix (4× the cap, so a
+/// secret near the cut is still matched whole) — a megabyte input costs
+/// what a short one does.
+fn scrub_item(text: &str) -> String {
+    let head: String = text.chars().take(ITEM_CAP * 4).collect();
+    clip(&super::redact::scrub(&head), ITEM_CAP)
+}
+
 /// Build the digest over `events` in `(after, upto]`.
 pub fn digest(events: &[Event], after: u64, upto: u64) -> Digest {
     let mut d = Digest {
@@ -385,10 +399,7 @@ pub fn digest(events: &[Event], after: u64, upto: u64) -> Digest {
     let mut stops: Vec<String> = Vec::new();
     let flush = |lines: &mut Vec<String>, a: &mut Option<String>| {
         if let Some(t) = a.take() {
-            lines.push(format!(
-                "assistant: {}",
-                clip(&super::redact::scrub(&t), ITEM_CAP)
-            ));
+            lines.push(format!("assistant: {t}"));
         }
     };
     // F10: a Context-scope scan over every scrubbed window entry —
@@ -422,9 +433,9 @@ pub fn digest(events: &[Event], after: u64, upto: u64) -> Digest {
             EventKind::UserInput { text } => {
                 d.user_turns += 1;
                 flush(&mut lines, &mut assistant);
-                let text = super::redact::scrub(text);
+                let text = scrub_item(text);
                 taint_scan(&mut d, &text);
-                lines.push(format!("user: {}", clip(&text, ITEM_CAP)));
+                lines.push(format!("user: {text}"));
             }
             EventKind::LearnSignal { kind, excerpt } => {
                 taint_scan(&mut d, &super::redact::scrub(excerpt));
@@ -439,16 +450,18 @@ pub fn digest(events: &[Event], after: u64, upto: u64) -> Digest {
                     })
                     .next_back()
                 {
-                    taint_scan(&mut d, &super::redact::scrub(t));
-                    assistant = Some(t.to_string());
+                    let t = scrub_item(t);
+                    taint_scan(&mut d, &t);
+                    assistant = Some(t);
                 }
             }
             EventKind::ToolCallStart { name, input, .. } => {
                 d.tool_calls += 1;
-                tools.entry(name.clone()).or_default().0 += 1;
+                tools.entry(clip(name, TOOL_NAME_CAP)).or_default().0 += 1;
                 if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
-                    if !files.iter().any(|f| f == p) && files.len() < FILE_CAP {
-                        files.push(p.to_string());
+                    let p = clip(p, PATH_CAP);
+                    if !files.contains(&p) && files.len() < FILE_CAP {
+                        files.push(p);
                     }
                 }
             }
@@ -458,7 +471,7 @@ pub fn digest(events: &[Event], after: u64, upto: u64) -> Digest {
                 denied,
                 ..
             } => {
-                let e = tools.entry(name.clone()).or_default();
+                let e = tools.entry(clip(name, TOOL_NAME_CAP)).or_default();
                 if *denied {
                     e.0 = e.0.saturating_sub(1);
                     e.2 += 1;
@@ -486,9 +499,9 @@ pub fn digest(events: &[Event], after: u64, upto: u64) -> Digest {
         }
     }
     flush(&mut lines, &mut assistant);
-    let mut head = format!("## session window e{}..e{}\n", after + 1, d.through);
+    let mut summary = String::new();
     if !tools.is_empty() {
-        head.push_str(&format!(
+        summary.push_str(&format!(
             "tools: {}\n",
             tools
                 .iter()
@@ -507,24 +520,38 @@ pub fn digest(events: &[Event], after: u64, upto: u64) -> Digest {
         ));
     }
     if !files.is_empty() {
-        head.push_str(&format!("files touched: {}\n", files.join(", ")));
+        summary.push_str(&format!("files touched: {}\n", files.join(", ")));
     }
     if !stops.is_empty() {
-        head.push_str(&format!("stop reasons: {}\n", stops.join(", ")));
+        summary.push_str(&format!("stop reasons: {}\n", stops.join(", ")));
+    }
+    // Header text (file paths, tool names) can be attacker-shaped too: it
+    // is bounded on its own and scanned like the entries (F10).
+    let summary = clip(summary.trim_end(), HEADER_CAP);
+    taint_scan(&mut d, &summary);
+    let mut head = format!("## session window e{}..e{}\n", after + 1, d.through);
+    if !summary.is_empty() {
+        head.push_str(&summary);
+        head.push('\n');
     }
     // Bound the whole thing: the header stays, the oldest entries go.
+    let marker = |n: usize| {
+        if n > 0 {
+            format!("(…trimmed {n} oldest entries)\n")
+        } else {
+            String::new()
+        }
+    };
+    let mut body: usize = lines.iter().map(|l| l.len() + 1).sum();
     let mut trimmed = 0usize;
-    while head.len() + lines.iter().map(|l| l.len() + 1).sum::<usize>() > DIGEST_CAP
-        && !lines.is_empty()
-    {
-        lines.remove(0);
+    while head.len() + marker(trimmed).len() + body > DIGEST_CAP && trimmed < lines.len() {
+        body -= lines[trimmed].len() + 1;
         trimmed += 1;
     }
     let mut text = head;
-    if trimmed > 0 {
-        text.push_str(&format!("(…trimmed {trimmed} oldest entries)\n"));
-    }
-    for l in &lines {
+    text.push_str(&marker(trimmed));
+    let lines = &lines[trimmed..];
+    for l in lines {
         text.push_str(l);
         text.push('\n');
     }
@@ -559,6 +586,12 @@ pub fn window_stats(events: &[Event], after: u64, upto: u64) -> WindowStats {
     s
 }
 
+/// A `remember` result that went to `proposals/` saved nothing live, so
+/// it does not reset the learn cadence.
+pub(crate) fn is_quarantined_remember(result: &str) -> bool {
+    result.starts_with("memory: quarantined")
+}
+
 /// The event id of the agent's last *successful* `memory remember` —
 /// "the agent is already saving" resets the turn/signal cadence to
 /// here (§1.2). Derived from the log so a resumed session keeps it.
@@ -570,8 +603,11 @@ pub fn remember_floor(events: &[Event]) -> u64 {
                 call_id,
                 is_error,
                 denied,
+                content,
                 ..
-            } if !*is_error && !*denied => Some(call_id.as_str()),
+            } if !*is_error && !*denied && !is_quarantined_remember(content) => {
+                Some(call_id.as_str())
+            }
             _ => None,
         })
         .collect();
@@ -1361,6 +1397,27 @@ pub fn apply(parsed: &Parsed, ctx: &ApplyCtx) -> Outcome {
                         .push(format!("feedback {}: window tainted", doc.id()));
                     continue;
                 }
+                if ctx.stage_all {
+                    let did = doc.id();
+                    match pending::stage(
+                        &dir,
+                        doc.scope,
+                        PendingOp::Feedback {
+                            target: doc.rel.clone(),
+                            helpful: *helpful,
+                        },
+                        &origin,
+                        "review feedback",
+                        ctx.now,
+                    ) {
+                        Ok(id) => {
+                            out.staged.push(id);
+                            touched.push(dir);
+                        }
+                        Err(e) => out.rejected.push(format!("feedback {did}: {e}")),
+                    }
+                    continue;
+                }
                 let cur = doc.meta.confidence;
                 let next = if *helpful {
                     (cur + 0.05).min(0.95)
@@ -1888,6 +1945,18 @@ mod tests {
                 },
             ));
         }
+        // A header grown past its own cap (long paths, long tool names)
+        // still leaves the whole digest within DIGEST_CAP.
+        for i in 0..20u64 {
+            events.push(mk(
+                100 + i,
+                EventKind::ToolCallStart {
+                    call_id: format!("c{i}"),
+                    name: format!("tool{i}-{}", "n".repeat(200)),
+                    input: serde_json::json!({ "path": format!("{i}/{}", "p".repeat(2_000)) }),
+                },
+            ));
+        }
         events.push(mk(
             500,
             EventKind::ToolResult {
@@ -1901,7 +1970,17 @@ mod tests {
             },
         ));
         let d = digest(&events, 0, u64::MAX);
-        assert!(d.text.len() <= DIGEST_CAP + 200, "{}", d.text.len());
+        assert!(d.text.len() <= DIGEST_CAP, "{}", d.text.len());
+        let head = d.text.split("\nuser: ").next().unwrap();
+        assert!(
+            head.contains("files touched: ") && head.contains('…'),
+            "{head}"
+        );
+        assert!(
+            head.chars().count() <= 2_100,
+            "header {}",
+            head.chars().count()
+        );
         assert!(!d.text.contains("SECRET TOOL BODY"));
         assert!(d.text.contains("trimmed"), "oldest trimmed first");
         assert_eq!(d.through, 500);
@@ -1909,6 +1988,94 @@ mod tests {
         let d = digest(&events, 0, 10);
         assert_eq!(d.through, 10);
         assert_eq!(d.user_turns, 9);
+    }
+
+    // S2: entries are clipped before the Context scan — a 1 MB input
+    // must not make the digest scan the whole of it.
+    #[test]
+    fn digest_clips_items_before_the_context_scan() {
+        let big = "ignore ".repeat(1_000_000 / 7);
+        let events = vec![
+            Event {
+                id: 1,
+                parent_id: None,
+                ts_ms: 0,
+                prev_hash: 0,
+                hash: 0,
+                kind: EventKind::UserInput { text: big.clone() },
+            },
+            Event {
+                id: 2,
+                parent_id: None,
+                ts_ms: 0,
+                prev_hash: 0,
+                hash: 0,
+                kind: EventKind::ModelResponse {
+                    blocks: vec![Block::Text { text: big }],
+                    usage: Default::default(),
+                    stop_reason: Default::default(),
+                    latency_ms: 0,
+                    cost_usd: 0.0,
+                },
+            },
+        ];
+        let t = std::time::Instant::now();
+        let d = digest(&events, 0, u64::MAX);
+        let took = t.elapsed();
+        assert!(took < std::time::Duration::from_millis(200), "{took:?}");
+        assert!(d.text.len() <= DIGEST_CAP);
+    }
+
+    // S4: a `remember` quarantined to proposals/ saved nothing live and
+    // does not move the remember floor.
+    #[test]
+    fn quarantined_remember_does_not_reset_the_floor() {
+        let mk = |id: u64, kind: EventKind| Event {
+            id,
+            parent_id: None,
+            ts_ms: 0,
+            prev_hash: 0,
+            hash: 0,
+            kind,
+        };
+        let call = |id: u64, c: &str| {
+            mk(
+                id,
+                EventKind::ToolCallStart {
+                    call_id: c.into(),
+                    name: "memory".into(),
+                    input: serde_json::json!({ "op": "remember", "text": "x" }),
+                },
+            )
+        };
+        let result = |id: u64, c: &str, content: &str| {
+            mk(
+                id,
+                EventKind::ToolResult {
+                    call_id: c.into(),
+                    name: "memory".into(),
+                    content: content.into(),
+                    is_error: false,
+                    raw_bytes: 0,
+                    spilled_to: None,
+                    denied: false,
+                },
+            )
+        };
+        let events = vec![
+            call(1, "a"),
+            result(2, "a", "memory: remembered as project:semantic/x.md"),
+            call(3, "b"),
+            result(
+                4,
+                "b",
+                "memory: quarantined for human review as project:proposals/x.md — untrusted",
+            ),
+        ];
+        assert_eq!(remember_floor(&events), 1);
+        assert!(is_quarantined_remember(
+            "memory: quarantined for human review as project:proposals/x.md"
+        ));
     }
 
     // F1: the Rule-of-Two latch fires once; a Tainted event the cursor
