@@ -452,6 +452,7 @@ fn ctx(dir: &Path) -> ToolCtx<'static> {
         provider: None,
         agent_config: None,
         subagents: SubagentCtx {
+            control: Control::default(),
             seq: 0,
             spend: None,
         },
@@ -685,12 +686,11 @@ fn a_batch_takes_one_post_read_after_the_last_member() {
     }
 }
 
-/// The registry latches untrusted for observations through perm.rs's own
-/// list; an act's post read is not in it, and perm.rs is outside this
-/// slice. The diff's screen text only extends an observe that already
-/// latched (see `an_unobserved_window_gets_the_post_sha_but_no_screen_text`).
+/// The registry latches untrusted for observations and for an act's post
+/// read (perm.rs reads `computer::OBSERVE_ACTIONS` + `post_observed`).
+/// The diff's screen text only extends an observe that already latched
+/// (see `an_unobserved_window_gets_the_post_sha_but_no_screen_text`).
 #[test]
-#[ignore = "needs perm.rs to treat a computer act's post read as screenshot context"]
 fn an_acts_post_read_latches_untrusted_on_its_own() {
     let _ = fakes();
     std::env::set_var("OVERSEER_COMPUTER_DRIVER", &fakes()["latch"].path);

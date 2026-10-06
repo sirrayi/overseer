@@ -354,7 +354,7 @@ const IDENTITY_MARKERS: &[&str] = &[
 /// Classify a tool call into the irreversibility taxonomy (P5-B).
 /// Pure function of (tool, input) — deterministic, zero deps.
 /// P7-1/S5 computer-use arms: `computer` dispatches on `action` — the
-/// observation set (apps/windows/observe/screenshot/zoom/verify/browser)
+/// observation set ([`crate::tools::computer::OBSERVE_ACTIONS`])
 /// reads (Read); side-effect acts (click/type/key/set/scroll/drag/menu/
 /// launch/browser_click/browser_type) mutate local UI state
 /// (InternalWrite); `navigate` emits a URL outward (ExternalComms — a URL
@@ -385,17 +385,7 @@ pub fn classify(tool: &str, input: &Value) -> Irreversibility {
         {
             return Irreversibility::Identity;
         }
-        if [
-            "apps",
-            "windows",
-            "observe",
-            "screenshot",
-            "zoom",
-            "verify",
-            "browser",
-        ]
-        .contains(&action.as_str())
-        {
+        if crate::tools::computer::OBSERVE_ACTIONS.contains(&action.as_str()) {
             return Irreversibility::Read;
         }
         if action == "navigate" {
@@ -825,6 +815,9 @@ impl Policy {
                 // `mcp` result latches untrusted, marker or not.
                 || tool == "mcp"
                 || Self::is_screenshot_context(tool, input)
+                // An act's post read is screen content in the result even
+                // though the input action never observes.
+                || (tool == "computer" && crate::tools::computer::post_observed(text))
                 || INJECTION_MARKERS.iter().any(|m| lower.contains(m)))
         {
             t.untrusted = true;
@@ -895,7 +888,7 @@ impl Policy {
     }
 
     /// P7-1/S5 observation-context detector: EVERY computer observation
-    /// action (apps/windows/observe/screenshot/zoom/verify/browser)
+    /// action ([`crate::tools::computer::OBSERVE_ACTIONS`])
     /// latches `untrusted` regardless of result text — screen and page
     /// content is attacker-controllable, and pixels bypass text scanning
     /// (D5). A `batch` latches when any member observes.
@@ -904,17 +897,7 @@ impl Policy {
             return false;
         }
         let action = crate::tools::computer::normalize_action(input).unwrap_or_default();
-        if [
-            "apps",
-            "windows",
-            "observe",
-            "screenshot",
-            "zoom",
-            "verify",
-            "browser",
-        ]
-        .contains(&action.as_str())
-        {
+        if crate::tools::computer::OBSERVE_ACTIONS.contains(&action.as_str()) {
             return true;
         }
         if action == "batch" {
@@ -1797,6 +1780,10 @@ mod tests {
             Irreversibility::Read
         );
         assert_eq!(
+            classify("computer", &json!({"action": "wait_for", "expect": []})),
+            Irreversibility::Read
+        );
+        assert_eq!(
             classify("computer", &json!({"action": "browser"})),
             Irreversibility::Read
         );
@@ -1855,6 +1842,7 @@ mod tests {
             "screenshot",
             "zoom",
             "verify",
+            "wait_for",
             "browser",
         ] {
             let p = pol();

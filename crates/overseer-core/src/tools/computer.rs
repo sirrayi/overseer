@@ -69,9 +69,8 @@ const MAX_BATCH: usize = 32;
 
 /// Every action the tool accepts (S5 vocabulary). `batch` wraps the rest.
 /// Read-only actions: no input reaches the screen. Allowed after the kill
-/// switch fired (P5); `wait_for` (P4) is one of them.
-// perm.rs classifies computer actions from its own hard-coded read list, not
-// this table — routing it here needs a perm.rs change (outside this slice).
+/// switch fired (P5); `wait_for` (P4) is one of them. perm.rs classifies
+/// computer actions and its taint latch against this table.
 pub const OBSERVE_ACTIONS: &[&str] = &[
     "apps",
     "windows",
@@ -1158,6 +1157,24 @@ pub fn audit_event(tool_result_text: &str) -> Option<crate::event::EventKind> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
+}
+
+/// Whether a computer result carries a post-act observation: the backend
+/// re-read the window after the act or batch ran (`post` digest filled,
+/// or the `changed`/`diff`/`modal` fields it produces). Screen text is
+/// attacker-controllable even when the input action never observes, so
+/// perm.rs latches untrusted on this too.
+pub fn post_observed(tool_result_text: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(tool_result_text.trim()) else {
+        return false;
+    };
+    if v.get("computer").is_none() {
+        return false;
+    }
+    v.get("post").is_some_and(|p| !p.is_null())
+        || v.get("changed").is_some()
+        || v.get("diff").is_some()
+        || v.get("modal").is_some()
 }
 
 /// The image block a `computer` capture carries (S5): the envelope's
