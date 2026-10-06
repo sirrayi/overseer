@@ -2115,9 +2115,10 @@ impl Agent {
     /// passes the spend gate and is ledgered `purpose: "memory_review"`.
     /// Effort Min, `max_tokens` per `review_max_tokens`. A no-text reply
     /// that hit its limit after billing reasoning retries once at
-    /// `min(12_000, max(2×, reasoning + 2_400))` — a model that reasons
-    /// without advertising it lands in `review_reasoners`, so its next
-    /// review starts at the headroom limit instead of paying a retry.
+    /// `RETRY_CEILING` — a sized retry was observed still coming back
+    /// `0/<limit>`, all reasoning, so the retry buys all the headroom
+    /// the gate allows — while the model lands in `review_reasoners`,
+    /// so its next review starts at the headroom limit instead.
     fn review_call(&mut self, prompt: &str) -> Result<(String, String, f64), String> {
         const RETRY_CEILING: u32 = 12_000;
         let msgs = [Message::user_text(prompt.to_string())];
@@ -2167,19 +2168,15 @@ impl Agent {
                         let used = r.usage.output.saturating_add(r.usage.reasoning);
                         let hit = r.stop_reason == StopReason::MaxTokens
                             || used >= u64::from(req.max_tokens);
-                        // Reasoning ate the limit: one retry, sized to
-                        // what it actually spent on reasoning plus the
-                        // text headroom (never below double).
+                        // Reasoning ate the limit — a reply sized to the
+                        // observed reasoning spend still came back all
+                        // reasoning live — so the one retry goes straight
+                        // to the ceiling (the spend gate clamps it on
+                        // priced models).
                         let reasoned = profile::lookup(model).reasons() || r.usage.reasoning > 0;
                         if hit && reasoned && !retried && max_tokens < RETRY_CEILING {
                             retried = true;
-                            let reasoning_need =
-                                u32::try_from(r.usage.reasoning.saturating_add(2_400))
-                                    .unwrap_or(u32::MAX);
-                            max_tokens = max_tokens
-                                .saturating_mul(2)
-                                .max(reasoning_need)
-                                .min(RETRY_CEILING);
+                            max_tokens = RETRY_CEILING;
                             continue;
                         }
                         break;
@@ -2613,7 +2610,7 @@ mod tests {
     }
 
     /// §1.7: a reasoning-only review reply that hit its limit retries
-    /// once at double the limit — exactly one retry — then escalates.
+    /// once at the 12,000 ceiling — exactly one retry — then escalates.
     #[test]
     fn reasoning_only_review_reply_retries_exactly_once() {
         struct Reasoner {
@@ -2684,7 +2681,7 @@ mod tests {
             reviews,
             [
                 ("gpt-reasoner-1".to_string(), 5_200),
-                ("gpt-reasoner-1".to_string(), 10_400),
+                ("gpt-reasoner-1".to_string(), 12_000),
                 ("claude-fable-5".to_string(), 1_200),
             ]
         );
@@ -2698,10 +2695,10 @@ mod tests {
 
     /// A model whose profile does not advertise reasoning but still
     /// spends the whole review limit on it (deepseek-v4.1-flash through
-    /// a gateway did exactly this): the first review retries sized to
-    /// the observed reasoning spend, the model lands in
-    /// `review_reasoners`, and the next review opens at the headroom
-    /// limit instead of paying a retry.
+    /// a gateway did exactly this — including a sized 3,600 retry that
+    /// came back 0/3,600): the first review retries once at the ceiling,
+    /// the model lands in `review_reasoners`, and the next review opens
+    /// at the headroom limit instead of paying a retry.
     #[test]
     fn hidden_reasoner_review_learns_its_headroom() {
         struct Hidden {
@@ -2778,9 +2775,9 @@ mod tests {
                 calls.as_slice(),
                 [
                     ("deepseek-v4.1-flash".to_string(), 1_200),
-                    ("deepseek-v4.1-flash".to_string(), 3_600),
+                    ("deepseek-v4.1-flash".to_string(), 12_000),
                 ],
-                "first review: 1,200 then one retry sized to reasoning"
+                "first review: 1,200 then one retry at the ceiling"
             );
         }
 
@@ -2792,7 +2789,7 @@ mod tests {
             calls.as_slice(),
             [
                 ("deepseek-v4.1-flash".to_string(), 1_200),
-                ("deepseek-v4.1-flash".to_string(), 3_600),
+                ("deepseek-v4.1-flash".to_string(), 12_000),
                 ("deepseek-v4.1-flash".to_string(), 5_200),
             ],
             "second review opens at the learned headroom — no retry"
