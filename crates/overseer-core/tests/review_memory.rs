@@ -81,7 +81,6 @@ const INJECTION: &str =
 /// `source` closes the frontmatter early: the rest becomes the note BODY,
 /// never strict-scanned, and is indexed/recalled like any live note.
 #[test]
-#[ignore = "review: M1"]
 fn m1_tampered_add_record_smuggles_unscanned_body() {
     let (dir, stores) = store("m1");
     assert!(threat::strict_refusal(INJECTION).is_some(), "precondition");
@@ -119,7 +118,6 @@ fn m1_tampered_add_record_smuggles_unscanned_body() {
 /// unpinned `add` record (two `memory approve all` runs, or TUI + CLI)
 /// both apply it: the note lands twice.
 #[test]
-#[ignore = "review: M2"]
 fn m2_concurrent_approve_applies_an_add_twice() {
     let (dir, stores) = store("m2");
     let id = pending::stage(
@@ -163,7 +161,6 @@ fn m2_concurrent_approve_applies_an_add_twice() {
 /// into semantic/procedural with only `redact::scrub` — no strict scan
 /// (§3: "every memory write path … runs the strict scan").
 #[test]
-#[ignore = "review: M3"]
 fn m3_distill_writes_strict_threat_text() {
     let root = tmp("m3");
     let (user, project) = (root.join("user"), root.join("project"));
@@ -192,7 +189,6 @@ fn m3_distill_writes_strict_threat_text() {
 /// the cap loop only drops entry lines, so 20 long `path` inputs push the
 /// review prompt past DIGEST_CAP (the doc comment says `<= DIGEST_CAP`).
 #[test]
-#[ignore = "review: M4"]
 fn m4_digest_header_breaks_digest_cap() {
     let mut evs = vec![ev(1, EventKind::UserInput { text: "go".into() })];
     for i in 0..20u64 {
@@ -218,7 +214,6 @@ fn m4_digest_header_breaks_digest_cap() {
 /// — an injection in a file name (hostile repo) never taints the window,
 /// so the review's ADDs apply live instead of quarantining.
 #[test]
-#[ignore = "review: M4"]
 fn m4_injection_in_path_does_not_taint_window() {
     let path = format!("docs/{INJECTION}.md");
     assert!(
@@ -257,7 +252,6 @@ fn m4_injection_in_path_does_not_taint_window() {
 /// ADDs land twice, the call is paid twice). §1.8: "a window is never
 /// reviewed twice".
 #[test]
-#[ignore = "review: M5"]
 fn m5_rewind_regresses_the_review_cursor() {
     let s = tmp("m5");
     let mut log = EventLog::create(s.join("events.jsonl")).unwrap();
@@ -317,7 +311,6 @@ fn m5_rewind_regresses_the_review_cursor() {
 /// M6: `--learn-stage` "stages everything instead" (§1.6), yet
 /// FEEDBACK still rewrites the target's confidence in place.
 #[test]
-#[ignore = "review: M6"]
 fn m6_learn_stage_still_applies_feedback() {
     let (dir, stores) = store("m6");
     std::fs::create_dir_all(dir.join("semantic")).unwrap();
@@ -353,7 +346,6 @@ fn m6_learn_stage_still_applies_feedback() {
 /// `memory learn` validates first for exactly this reason (memory.rs
 /// "a hostile session path must not write anything there").
 #[test]
-#[ignore = "review: M7"]
 fn m7_resume_of_a_non_session_dir_writes_into_it() {
     use std::os::unix::fs::PermissionsExt;
     let d = tmp("m7");
