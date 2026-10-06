@@ -819,7 +819,10 @@ impl ToolRegistry {
         // Rule-of-Two bookkeeping (P3.10): this result may carry untrusted
         // content or secret material — latch on the RAW text before any
         // redaction (latch-order fix: sanitize must not blind the gate).
-        if let Some(notice) = self.policy.note_result(name, input, &out.text) {
+        if let Some(notice) =
+            self.policy
+                .note_result_at(Some(ctx.cwd.as_path()), name, input, &out.text)
+        {
             self.taint_notices.push(notice);
         }
         // P6-3 broker sanitize: verbatim real→sentinel over the result

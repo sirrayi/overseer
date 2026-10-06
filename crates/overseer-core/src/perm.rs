@@ -241,6 +241,69 @@ fn mentions_home_secret(s: &str) -> bool {
     })
 }
 
+/// A path character that can extend a path segment — same alphabet
+/// [`mentions_home_secret`] uses for its segment boundary.
+fn is_path_seg_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
+
+/// Collapse every workspace-root occurrence in lowercased tool input to
+/// `.` before the sensitive-path scan. Writer worktrees live under
+/// `~/.overseer/sessions/<ms>/subagents/wt-N/wt`, so any absolute path a
+/// writer names would otherwise match `.overseer` in [`HOME_SECRETS`]
+/// and arm the sensitive latch on its own cwd — one injected file then
+/// denies every side effect. Only the root itself is stripped
+/// (`<root>/x` → `./x`, a boundary-delimited bare `<root>` → `.`), so an
+/// in-workspace secret (`<root>/.env` → `./.env`, still a
+/// [`SENSITIVE_PATHS`] hit) and secret dirs elsewhere keep latching.
+fn strip_workspace_root(input_s: &str, root: &Path) -> String {
+    let mut out = input_s.to_string();
+    for form in [Some(root.to_path_buf()), root.canonicalize().ok()]
+        .into_iter()
+        .flatten()
+    {
+        if !form.is_absolute() {
+            continue;
+        }
+        let pat = form.to_string_lossy().to_lowercase();
+        if pat.len() < 2 {
+            continue;
+        }
+        out = collapse_path_prefix(&out, &pat);
+    }
+    out
+}
+
+/// Replace each `<pat>/` in `s` with `./` and each bare `<pat>` followed
+/// by a non-segment char (quote, whitespace, end, …) with `.`. A `<pat>`
+/// followed by a segment char is a different path sharing the prefix
+/// and is left alone.
+fn collapse_path_prefix(s: &str, pat: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(pat) {
+        let after = &rest[i + pat.len()..];
+        match after.chars().next() {
+            Some('/') => {
+                out.push_str(&rest[..i]);
+                out.push('.');
+            }
+            Some(c) if is_path_seg_char(c) => {
+                out.push_str(&rest[..i + pat.len()]);
+                rest = after;
+                continue;
+            }
+            _ => {
+                out.push_str(&rest[..i]);
+                out.push('.');
+            }
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Content markers that mark a result as carrying secret material.
 /// Lowercase: compared against lowercased text (RT-1: uppercase markers
 /// were dead code — lowercased text can never contain them).
@@ -802,8 +865,27 @@ impl Policy {
     /// benign-looking capture still latches. Phrase matching is retained
     /// as an additional signal, not the gate.
     pub fn note_result(&self, tool: &str, input: &Value, text: &str) -> Option<String> {
+        self.note_result_at(None, tool, input, text)
+    }
+
+    /// [`note_result`] with the caller's workspace root: the root is
+    /// collapsed out of the input (`strip_workspace_root`) before the
+    /// sensitive-path scan, so a workspace inside a HOME_SECRETS dir —
+    /// writer worktrees live under `~/.overseer/sessions/…` — does not
+    /// arm the latch on its own cwd.
+    pub fn note_result_at(
+        &self,
+        root: Option<&Path>,
+        tool: &str,
+        input: &Value,
+        text: &str,
+    ) -> Option<String> {
         let lower = text.to_lowercase();
         let input_s = input.to_string().to_lowercase();
+        let input_s = match root {
+            Some(r) => strip_workspace_root(&input_s, r),
+            None => input_s,
+        };
         let mut t = self.taint.lock().ok()?;
         let mut notices = Vec::new();
         if !t.untrusted
@@ -1992,6 +2074,76 @@ mod tests {
             p.check("write", &json!({"path": "a.txt"})),
             Verdict::Ask { .. }
         ));
+    }
+
+    /// A scratch root under a fake `$HOME/.overseer/sessions/…` path —
+    /// the shape a writer subagent's worktree cwd actually has.
+    fn session_root(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "ovs-perm-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join(".overseer/sessions/1/subagents/wt-1/wt");
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn workspace_root_under_home_secrets_does_not_arm_sensitive() {
+        let root = session_root("ws");
+        let p = pol();
+        // An absolute path inside the workspace names `.overseer` only
+        // via the root itself — it must not self-arm the latch.
+        let n = p.note_result_at(
+            Some(&root),
+            "read",
+            &json!({"path": root.join("src/lib.rs")}),
+            "fn main() {}",
+        );
+        assert!(n.is_none(), "{n:?}");
+        assert!(!p.taint_snapshot().sensitive);
+
+        // A secret INSIDE the workspace still latches: `<root>/.env`
+        // collapses to `./.env`, still a SENSITIVE_PATHS hit.
+        let n = p.note_result_at(
+            Some(&root),
+            "read",
+            &json!({"path": root.join(".env")}),
+            "KEY=1",
+        );
+        assert_eq!(n.as_deref(), Some("sensitive data touched (via read)"));
+        assert!(p.taint_snapshot().sensitive);
+    }
+
+    #[test]
+    fn secrets_outside_the_workspace_still_arm_sensitive() {
+        let root = session_root("out");
+        let home = root.parent().unwrap().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // `cat ~/.overseer/rules` from a workspace elsewhere.
+        let p = pol();
+        let n = p.note_result_at(
+            Some(&root),
+            "bash",
+            &json!({"command": "cat ~/.overseer/rules"}),
+            "bash:ok",
+        );
+        assert_eq!(n.as_deref(), Some("sensitive data touched (via bash)"));
+
+        // `cat <home>/.ssh/id_ed25519` likewise.
+        let p = pol();
+        let n = p.note_result_at(
+            Some(&root),
+            "bash",
+            &json!({"command": format!("cat {}/.ssh/id_ed25519", home.display())}),
+            "bash:ok",
+        );
+        assert_eq!(n.as_deref(), Some("sensitive data touched (via bash)"));
     }
 
     #[test]
