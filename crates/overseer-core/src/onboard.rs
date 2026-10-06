@@ -485,6 +485,56 @@ pub fn verify_trace(dir: &Path, answers: usize) -> Result<usize, Vec<String>> {
     }
 }
 
+/// Answers a durable interview transcript recorded (P6-5): the dense run
+/// of `UserInput` events labelled `answer-1`, `answer-2`, … in log order.
+/// A log whose hash chain doesn't verify records nothing.
+pub fn recorded_answers(events: &[crate::event::Event]) -> usize {
+    if !crate::event::verify_chain(events) {
+        return 0;
+    }
+    let mut n = 0;
+    for ev in events {
+        if let crate::event::EventKind::UserInput { text } = &ev.kind {
+            if text.starts_with(&format!("{}: ", answer_id(n + 1))) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The provenance bound for persona `dir` (P6-5): the most answers any
+/// onboarding transcript under `sessions` recorded for it — an
+/// `onboard-*` session whose start `cwd` is `dir`'s parent, where
+/// `overseer onboard` runs the interview. 0 when there is none.
+pub fn transcript_answers(sessions: &Path, dir: &Path) -> usize {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let dir = canon(dir);
+    let Some(want) = dir.parent().map(Path::to_path_buf) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(sessions) else {
+        return 0;
+    };
+    let mut best = 0;
+    for e in entries.flatten() {
+        if !e.file_name().to_string_lossy().starts_with("onboard-") {
+            continue;
+        }
+        let Ok(events) = crate::event::EventLog::replay(e.path().join("events.jsonl")) else {
+            continue;
+        };
+        let ours = events.iter().any(|ev| {
+            matches!(&ev.kind, crate::event::EventKind::SessionStart { cwd, .. }
+                if canon(Path::new(cwd)) == want)
+        });
+        if ours {
+            best = best.max(recorded_answers(&events));
+        }
+    }
+    best
+}
+
 /// What one interview produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Interview {
@@ -598,6 +648,75 @@ pub fn draft_from_answers(
 
 #[cfg(test)]
 mod tests {
+    /// Write an onboarding transcript: SessionStart at `cwd`, then one
+    /// question nudge + `answer-N` input per answer.
+    fn transcript(sessions: &Path, name: &str, cwd: &Path, answers: usize) {
+        use crate::event::{EventKind, EventLog};
+        let d = sessions.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut log = EventLog::create(d.join("events.jsonl")).unwrap();
+        log.append(EventKind::SessionStart {
+            session_id: name.into(),
+            cwd: cwd.display().to_string(),
+            model: "m".into(),
+            harness_version: "test".into(),
+            parent: None,
+        })
+        .unwrap();
+        for i in 1..=answers {
+            log.append(EventKind::Nudge {
+                text: format!("[{ONBOARD_TAG}] q{i}"),
+            })
+            .unwrap();
+            log.append(EventKind::UserInput {
+                text: format!("{}: a{i}", answer_id(i)),
+            })
+            .unwrap();
+        }
+        log.flush().unwrap();
+    }
+
+    /// T5: the bound is what the transcript recorded for this persona dir
+    /// — 0 with no transcript, never the drafts' own claim.
+    #[test]
+    fn transcript_answers_bound_comes_from_the_recorded_interview() {
+        let root = std::env::temp_dir().join(format!("overseer-onboard-tx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = root.join("ws");
+        let persona = ws.join("persona");
+        std::fs::create_dir_all(&persona).unwrap();
+        let sessions = root.join("sessions");
+        assert_eq!(transcript_answers(&sessions, &persona), 0, "no transcript");
+        transcript(&sessions, "onboard-1", &ws, 2);
+        transcript(&sessions, "onboard-2", &ws, 1);
+        // Another workspace's interview and a non-onboard session don't count.
+        transcript(&sessions, "onboard-3", &root, 5);
+        transcript(&sessions, "chat-1", &ws, 5);
+        assert_eq!(transcript_answers(&sessions, &persona), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recorded_answers_counts_only_the_dense_labelled_run() {
+        use crate::event::{EventKind, EventLog};
+        let d = std::env::temp_dir().join(format!("overseer-onboard-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("events.jsonl");
+        let mut log = EventLog::create(&path).unwrap();
+        for t in [
+            "answer-1: a",
+            "answer-3: skipped ahead",
+            "answer-2: b",
+            "hi",
+        ] {
+            log.append(EventKind::UserInput { text: t.into() }).unwrap();
+        }
+        log.flush().unwrap();
+        let events = crate::event::EventLog::replay(&path).unwrap();
+        assert_eq!(recorded_answers(&events), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
     use super::*;
 
     fn tmpdir() -> PathBuf {

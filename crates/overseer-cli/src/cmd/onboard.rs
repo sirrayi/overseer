@@ -38,7 +38,7 @@ pub(crate) fn cmd_onboard(args: &[String]) -> i32 {
     }
 
     if flags.approve {
-        return match approve_persona(&dir) {
+        return match approve_persona(&dir, &dirs_home().join("sessions")) {
             Ok(msg) => {
                 println!("onboard: {msg}");
                 0
@@ -146,16 +146,13 @@ pub(crate) fn cmd_onboard(args: &[String]) -> i32 {
 }
 
 /// The `--approve` step (P6-5): trace-verify every insight against the
-/// dir's own provenance claim, then flip the drafts to approved. Refuses on
-/// orphans — an unsourced persona claim is exactly what the validator
-/// exists to catch.
-fn approve_persona(dir: &Path) -> Result<String, String> {
-    let claimed = overseer_core::onboard::statuses(dir)
-        .iter()
-        .map(|(_, m)| m.source_answers)
-        .max()
-        .unwrap_or(0);
-    if let Err(orphans) = overseer_core::onboard::verify_trace(dir, claimed) {
+/// answers the interview transcripts under `sessions` recorded for `dir`
+/// (never the drafts' own `source_answers` claim; no transcript → 0), then
+/// flip the drafts to approved. Refuses on orphans — an unsourced persona
+/// claim is exactly what the validator exists to catch.
+fn approve_persona(dir: &Path, sessions: &Path) -> Result<String, String> {
+    let recorded = overseer_core::onboard::transcript_answers(sessions, dir);
+    if let Err(orphans) = overseer_core::onboard::verify_trace(dir, recorded) {
         return Err(format!(
             "refusing to approve — {} untraceable insight(s):\n  {}",
             orphans.len(),
@@ -267,8 +264,28 @@ mod onboard_flag_tests {
     fn approve_refuses_untraceable_persona() {
         let dir = std::env::temp_dir().join(format!("overseer-cli-onboard-{}", std::process::id()));
         let persona = dir.join("persona");
+        let sessions = dir.join("sessions");
         let _ = std::fs::remove_dir_all(&dir);
         overseer_core::onboard::ensure_persona_dir(&persona).unwrap();
+        // The interview transcript recorded 2 answers for this persona.
+        {
+            use overseer_core::event::{EventKind, EventLog};
+            let s = sessions.join("onboard-1");
+            std::fs::create_dir_all(&s).unwrap();
+            let mut log = EventLog::create(s.join("events.jsonl")).unwrap();
+            log.append(EventKind::SessionStart {
+                session_id: "onboard-1".into(),
+                cwd: dir.display().to_string(),
+                model: "m".into(),
+                harness_version: "test".into(),
+                parent: None,
+            })
+            .unwrap();
+            for t in ["answer-1: a", "answer-2: b"] {
+                log.append(EventKind::UserInput { text: t.into() }).unwrap();
+            }
+            log.flush().unwrap();
+        }
         overseer_core::onboard::write_drafts(
             &persona,
             &[(
@@ -282,7 +299,7 @@ mod onboard_flag_tests {
         )
         .unwrap();
         // An insight sourced from answer-4 when 2 were recorded: refused.
-        let err = approve_persona(&persona).unwrap_err();
+        let err = approve_persona(&persona, &sessions).unwrap_err();
         assert!(err.contains("refusing to approve"), "{err}");
         assert!(err.contains("identity.md:"), "{err}");
         assert!(err.contains("out of range"), "{err}");
@@ -303,11 +320,11 @@ mod onboard_flag_tests {
             2,
         )
         .unwrap();
-        let msg = approve_persona(&persona).unwrap();
+        let msg = approve_persona(&persona, &sessions).unwrap();
         assert!(msg.contains("approved 4 file(s)"), "{msg}");
         assert!(overseer_core::onboard::all_approved(&persona));
         // Idempotent: a second approve reports the already-approved state.
-        assert!(approve_persona(&persona)
+        assert!(approve_persona(&persona, &sessions)
             .unwrap()
             .contains("already approved"));
         let _ = std::fs::remove_dir_all(&dir);

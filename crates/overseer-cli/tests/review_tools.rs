@@ -17,7 +17,6 @@ use std::process::Command;
 /// own `<!-- source: answer-9 -->` trailers. No interview ever ran here,
 /// so the recorded count is 0 and approval must be refused.
 #[test]
-#[ignore = "review: T5"]
 fn onboard_approve_refuses_a_self_claimed_provenance_bound() {
     let dir = std::env::temp_dir().join(format!("overseer-review-onboard-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -37,6 +36,8 @@ fn onboard_approve_refuses_a_self_claimed_provenance_bound() {
         .arg("--dir")
         .arg(&dir)
         .arg("--approve")
+        // No interview transcript anywhere: a fresh, empty home.
+        .env("HOME", dir.join("home"))
         .output()
         .unwrap();
 
