@@ -2,7 +2,8 @@
 //! untracked files), appends the output contract, parses the verdict and
 //! runs the tamper check. Writes into `.gitignore`d paths are invisible
 //! to the tamper check — an accepted limitation (build output lands
-//! there legitimately).
+//! there legitimately) — except in the git dir: its config, hooks and
+//! info are hashed.
 // DEFERRED(owner): cross-provider verifiers (verify on another vendor's model) — gate: same-transport tiers prove insufficient
 
 use std::collections::BTreeMap;
@@ -135,25 +136,105 @@ fn porcelain(cwd: &Path) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
-/// Whether `cwd` differs from `base`: a tracked diff (committed or not)
-/// or an untracked file. A git failure counts as changed — the verifier
-/// then runs and reports it.
+/// Whether `cwd` differs from `base`: a tracked diff (committed or not),
+/// an untracked file or an ignored one. A git failure counts as changed —
+/// the verifier then runs and reports it.
 pub fn has_changes(cwd: &Path, base: &str) -> bool {
     let tracked = git(cwd, &["diff", base, "--name-only"]).map(|d| !d.trim().is_empty());
     let untracked = porcelain(cwd).map(|rows| rows.iter().any(|(c, _)| c == "??"));
-    !matches!((tracked, untracked), (Ok(false), Ok(false)))
+    let ignored = ignored(cwd).map(|rows| !rows.is_empty());
+    !matches!(
+        (tracked, untracked, ignored),
+        (Ok(false), Ok(false), Ok(false))
+    )
+}
+
+/// Gitignored paths in `cwd` (an ignored dir is one entry, `dir/`).
+pub fn ignored(cwd: &Path) -> Result<Vec<String>, String> {
+    let raw = git(cwd, &["status", "--porcelain=v1", "-z", "--ignored"])?;
+    Ok(raw
+        .split('\0')
+        .filter_map(|e| e.strip_prefix("!! "))
+        .map(str::to_string)
+        .collect())
 }
 
 /// The repository state a verifier must leave alone: `HEAD`, the sha256
 /// of `git for-each-ref` (any branch/tag moved, made or deleted), `git
-/// stash list`, and path → hash of (status, content) from the porcelain
-/// — the last catches edits to already-dirty files `git status` misses.
+/// stash list`, path → hash of (status, content) from the porcelain
+/// — which catches edits to already-dirty files `git status` misses —
+/// and the git internals that run code or redirect git: the common dir's
+/// `config`, `hooks/**` and `info/**`, plus an in-repo `core.hooksPath`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     head: String,
     refs: String,
     stash: String,
     files: BTreeMap<String, u64>,
+    internals: BTreeMap<String, u64>,
+}
+
+/// Path → hash of (mode, content or link target) for every entry at or
+/// under `path`; symlinks are hashed, never followed.
+fn hash_tree(path: &Path, label: String, out: &mut BTreeMap<String, u64>) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    meta.permissions().mode().hash(&mut h);
+    if meta.is_dir() {
+        let mut kids: Vec<_> = std::fs::read_dir(path)
+            .map(|d| d.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        kids.sort();
+        for k in kids {
+            let name = k.to_string_lossy();
+            hash_tree(&path.join(&k), format!("{label}/{name}"), out);
+        }
+    } else if meta.file_type().is_symlink() {
+        std::fs::read_link(path).ok().hash(&mut h);
+    } else {
+        std::fs::read(path).ok().hash(&mut h);
+    }
+    out.insert(label, h.finish());
+}
+
+/// [`hash_tree`] over the git internals of the repo at `cwd`. A worktree's
+/// hooks and config live in the common dir (`--git-common-dir`). Labels
+/// are relative to the work tree top when inside it, else absolute.
+fn internals(cwd: &Path) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    let Ok(common) = git(cwd, &["rev-parse", "--git-common-dir"]) else {
+        return out;
+    };
+    let common = cwd.join(common.trim());
+    let top = git(cwd, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|t| std::path::PathBuf::from(t.trim()))
+        .and_then(|t| t.canonicalize().ok());
+    let label = |p: &Path| -> String {
+        let p = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        match top.as_deref().and_then(|t| p.strip_prefix(t).ok()) {
+            Some(rel) => rel.display().to_string(),
+            None => p.display().to_string(),
+        }
+    };
+    for sub in ["config", "hooks", "info"] {
+        let p = common.join(sub);
+        hash_tree(&p, label(&p), &mut out);
+    }
+    let hooks_path = git(cwd, &["config", "--get", "core.hooksPath"])
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty());
+    if let (Some(h), Some(t)) = (hooks_path, top.as_deref()) {
+        let p = t.join(h);
+        if p.canonicalize().is_ok_and(|c| c.starts_with(t)) {
+            hash_tree(&p, label(&p), &mut out);
+        }
+    }
+    out
 }
 
 pub fn snapshot(cwd: &Path) -> Option<Snapshot> {
@@ -179,6 +260,7 @@ pub fn snapshot(cwd: &Path) -> Option<Snapshot> {
         refs,
         stash,
         files,
+        internals: internals(cwd),
     })
 }
 
@@ -201,6 +283,24 @@ pub fn changed(before: &Snapshot, after: &Snapshot) -> Vec<String> {
     }
     if before.stash != after.stash {
         out.push("stash changed".into());
+    }
+    let mut git_paths: Vec<&str> = before
+        .internals
+        .iter()
+        .filter(|(p, h)| after.internals.get(*p) != Some(h))
+        .map(|(p, _)| p.as_str())
+        .chain(
+            after
+                .internals
+                .keys()
+                .filter(|p| !before.internals.contains_key(*p))
+                .map(String::as_str),
+        )
+        .collect();
+    git_paths.sort();
+    git_paths.dedup();
+    if !git_paths.is_empty() {
+        out.push(format!("git internals ({})", git_paths.join(", ")));
     }
     let mut paths: Vec<String> = before
         .files
@@ -273,6 +373,61 @@ pub fn brief(stated: &str, cwd: &Path, base: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sh(cwd: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn worktree_and_hooks_path_internals_are_tamper_checked() {
+        let root = std::env::temp_dir().join(format!(
+            "ov-verify-internals-{}-{}",
+            std::process::id(),
+            crate::event::now_ms()
+        ));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q"]);
+        std::fs::write(repo.join(".gitignore"), ".githooks/\n").unwrap();
+        sh(&repo, &["add", "."]);
+        sh(&repo, &["commit", "-qm", "x"]);
+        sh(&repo, &["config", "core.hooksPath", ".githooks"]);
+        let wt = root.join("wt");
+        sh(
+            &repo,
+            &["worktree", "add", "-q", "-b", "w", wt.to_str().unwrap()],
+        );
+
+        // A worktree's hooks are the common dir's.
+        let before = snapshot(&wt).unwrap();
+        std::fs::write(repo.join(".git/hooks/pre-commit"), "#!/bin/sh\n").unwrap();
+        let what = changed(&before, &snapshot(&wt).unwrap()).join("; ");
+        let hook = repo.join(".git/hooks/pre-commit").canonicalize().unwrap();
+        assert_eq!(what, format!("git internals ({})", hook.display()));
+
+        // An in-repo core.hooksPath, though gitignored.
+        let before = snapshot(&repo).unwrap();
+        std::fs::create_dir_all(repo.join(".githooks")).unwrap();
+        std::fs::write(repo.join(".githooks/pre-push"), "#!/bin/sh\n").unwrap();
+        let what = changed(&before, &snapshot(&repo).unwrap()).join("; ");
+        assert!(what.contains(".githooks/pre-push"), "{what}");
+
+        // config and info.
+        let before = snapshot(&repo).unwrap();
+        sh(&repo, &["config", "alias.st", "!touch pwned"]);
+        std::fs::write(repo.join(".git/info/exclude"), "*.rs\n").unwrap();
+        let what = changed(&before, &snapshot(&repo).unwrap()).join("; ");
+        assert_eq!(what, "git internals (.git/config, .git/info/exclude)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn verdict_takes_the_final_fence_only_and_counts_blockers() {

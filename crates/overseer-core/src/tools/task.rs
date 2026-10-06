@@ -548,10 +548,10 @@ fn open_dir(env: &Env, sc: &Sidecar) -> Result<PathBuf, String> {
 }
 
 /// Mark `dir` done (`cancelled` when the job was cancelled — its
-/// reservation is released then). A failed store still leaves it
-/// finished for this process (never live-looking); its cap is released
-/// down to what it spent and the returned note carries the error into
-/// the digest.
+/// reservation is released down to what it spent then). A failed store
+/// still leaves it finished for this process (never live-looking); its
+/// cap is released down to what it spent and the returned note carries
+/// the error into the digest.
 fn finish(env: &Env, dir: &Path) -> Option<String> {
     let mut sc = Sidecar::load(dir)?;
     let cancelled = env.cancel.interrupted();
@@ -561,11 +561,12 @@ fn finish(env: &Env, dir: &Path) -> Option<String> {
         State::Done
     };
     let stored = sc.finish(dir, state);
-    if cancelled {
-        env.account.release(&sc.id);
+    // A cancelled task frees its unspent cap now; what it burned stays
+    // held until the parent's reconcile settles it into the ledger.
+    if cancelled || stored.is_err() {
+        env.account.shrink(&sc.id, sc.cost_usd);
     }
     let e = stored.err()?;
-    env.account.shrink(&sc.id, sc.cost_usd);
     Some(format!(
         "[{}: finished, but task.json could not be written — {e}; its cap is released]",
         sc.id
@@ -715,6 +716,13 @@ fn execute(env: &Env, job: &Job) -> String {
         && verify::has_changes(&job.cwd, job.base.as_deref().unwrap_or("HEAD"));
     if let Some(branch) = writer.filter(|_| changed) {
         notes.push(worktree_note(branch, &job.cwd).trim().to_string());
+        let ignored = verify::ignored(&job.cwd).unwrap_or_default();
+        if !ignored.is_empty() {
+            notes.push(format!(
+                "[output is gitignored, so only the worktree has it, not branch `{branch}`: {}]",
+                ignored.join(", ")
+            ));
+        }
     }
     let mut verdict = a.verdict.as_ref().map(|v| v.verdict.clone());
     let mut tampered = a.verdict.as_ref().and_then(|v| v.tampered.clone());
