@@ -71,7 +71,12 @@ fn build_command(
         cmd.args(channels::UNTRUSTED_AUTONOMY_FLOOR);
         cmd.env(channels::UNTRUSTED_ENV, marker);
     }
-    cmd.arg(prompt).stdout(out).stderr(err).stdin(Stdio::null());
+    // `--` ends flag parsing, so a prompt like "--full-access" stays a prompt.
+    cmd.arg("--")
+        .arg(prompt)
+        .stdout(out)
+        .stderr(err)
+        .stdin(Stdio::null());
     if let Some(cwd) = &cfg.cwd {
         cmd.current_dir(cwd);
     }
@@ -206,6 +211,7 @@ mod tests {
                 "7",
                 "--autonomy",
                 "external=approve",
+                "--",
                 "do the thing",
             ]
         );
@@ -240,7 +246,7 @@ mod tests {
             .collect();
         assert_eq!(
             local_args,
-            vec!["exec", "--bare", "--max-steps", "7", "do the thing"]
+            vec!["exec", "--bare", "--max-steps", "7", "--", "do the thing"]
         );
         assert_eq!(local.get_envs().count(), 0, "local runs export nothing");
     }

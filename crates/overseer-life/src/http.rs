@@ -263,8 +263,9 @@ impl Http {
             .limit(self.max_response_bytes)
             .read_to_vec()
             .map_err(|e| {
-                // A exceeded body limit surfaces as Io("body exceeds limit…").
-                if matches!(&e, ureq::Error::Io(io_e) if io_e.to_string().contains("limit")) {
+                if matches!(&e, ureq::Error::BodyExceedsLimit(_))
+                    || matches!(&e, ureq::Error::Io(io_e) if io_e.to_string().contains("limit"))
+                {
                     HttpError::TooLarge
                 } else {
                     map_ureq_error(e)

@@ -121,7 +121,7 @@ impl Daemon {
             .iter()
             // Webhook spools default to the daemon's own directory; a spec
             // that names its own dir is taken as written.
-            .map(|spec| Trigger::from_spec(&resolve_spec(spec, &dirs)))
+            .map(|spec| Trigger::from_spec_in(&resolve_spec(spec, &dirs), &dirs.channels()))
             .collect();
         // A channel that cannot run (unset token, bad cron) is journaled
         // once at startup: misconfiguration stays visible.
@@ -190,7 +190,8 @@ impl Daemon {
             .triggers
             .iter()
             .map(|spec| {
-                let mut t = Trigger::from_spec(&resolve_spec(spec, &self.dirs));
+                let mut t =
+                    Trigger::from_spec_in(&resolve_spec(spec, &self.dirs), &self.dirs.channels());
                 if let Some(prev) = old.remove(t.id()) {
                     t.inherit(prev);
                 }

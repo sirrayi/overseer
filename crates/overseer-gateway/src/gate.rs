@@ -41,17 +41,36 @@ pub fn route(gate: &GateConfig, class: &str, triage: &Triage, quiet: bool) -> Ro
 /// Parse "HH:MM" → minutes since midnight.
 fn hhmm(s: &str) -> Option<u16> {
     let (h, m) = s.split_once(':')?;
-    Some(h.parse::<u16>().ok()? * 60 + m.parse::<u16>().ok()?)
+    let (h, m) = (h.parse::<u16>().ok()?, m.parse::<u16>().ok()?);
+    if h > 23 || m > 59 {
+        return None;
+    }
+    h.checked_mul(60)?.checked_add(m)
 }
 
+/// Real-world UTC offsets span UTC−14:00..UTC+14:00.
+const MAX_TZ_OFFSET_MIN: i64 = 14 * 60;
+
 /// Minutes east of UTC from `OVERSEER_TZ_OFFSET_MIN` (surrounding
-/// whitespace ignored); unset or unparseable means UTC. The one parser
-/// for both the quiet-hours gate and the cron clock.
+/// whitespace ignored); unset, unparseable or outside ±840 means UTC. The
+/// one parser for both the quiet-hours gate and the cron clock.
 pub(crate) fn tz_offset_min() -> i64 {
-    std::env::var("OVERSEER_TZ_OFFSET_MIN")
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(v) = std::env::var("OVERSEER_TZ_OFFSET_MIN")
         .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0)
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    else {
+        return 0;
+    };
+    if (-MAX_TZ_OFFSET_MIN..=MAX_TZ_OFFSET_MIN).contains(&v) {
+        return v;
+    }
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "overseer daemon: OVERSEER_TZ_OFFSET_MIN={v} is outside -840..=840; ignored (UTC)"
+        );
+    }
+    0
 }
 
 /// Local-time minutes since midnight without a chrono dep: epoch →
@@ -62,9 +81,12 @@ pub(crate) fn tz_offset_min() -> i64 {
 /// (Keeps the daemon dependency-free; accurate quiet hours land with the
 /// desktop frontend that can read real clock/DND state.)
 pub fn local_minutes(now_ms_val: u64) -> u16 {
-    let offset = tz_offset_min();
-    let secs = (now_ms_val / 1000) as i64 + offset * 60;
-    (((secs % 86_400) + 86_400) % 86_400 / 60) as u16
+    let utc = i64::try_from(now_ms_val / 1000).unwrap_or(i64::MAX);
+    let secs = tz_offset_min()
+        .checked_mul(60)
+        .and_then(|o| utc.checked_add(o))
+        .unwrap_or(utc);
+    (secs.rem_euclid(86_400) / 60) as u16
 }
 
 /// Is now inside quiet hours? Range may wrap midnight ("22:00"–"08:00").
@@ -621,8 +643,8 @@ mod tests {
             assert_eq!(local_minutes(0), 1410);
         });
         with_tz_offset(Some("1500"), || {
-            // Offsets larger than a day wrap mod 1440: 1500 − 1440 = 60.
-            assert_eq!(local_minutes(0), 60);
+            // Beyond UTC±14:00 the offset is ignored: UTC.
+            assert_eq!(local_minutes(0), 0);
         });
     }
 }
